@@ -22,6 +22,8 @@ pub struct Urltest {
 }
 
 struct Shared {
+    tag: String,
+    interrupt: bool,
     members: Vec<String>,
     resolved: OnceLock<Vec<usize>>,
     current: AtomicUsize,
@@ -68,6 +70,15 @@ impl Urltest {
         let tolerance_ms = obj.get("tolerance").and_then(Value::as_u64).unwrap_or(50);
         Ok(Self {
             shared: Arc::new(Shared {
+                tag: obj
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                interrupt: obj
+                    .get("interrupt_exist_connections")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 members,
                 resolved: OnceLock::new(),
                 current: AtomicUsize::new(0),
@@ -232,7 +243,9 @@ async fn probe_all(shared: &Arc<Shared>, router: &Arc<Router>) {
         None => best_pos != current,
     };
     if switch {
-        shared.current.store(best_pos, Ordering::Relaxed);
+        crate::clash_state::switch_group(router, &shared.tag, shared.interrupt, || {
+            shared.current.swap(best_pos, Ordering::Relaxed) != best_pos
+        });
     }
 }
 
@@ -351,13 +364,8 @@ async fn probe_member(shared: &Shared, router: &Router, member: usize) -> Option
     // 6+ s (dial plus the stall cut), and the 7 s retry guard then needs
     // ~7 s left to still allow the re-roll.
     //
-    // The dial itself is never cancelled: pooled transports (xhttp's H2
-    // pool) reserve a slot before dialing and release it only on Ok/Err,
-    // so a dropped connect leaks the reservation, every later connect
-    // through that member parks forever, and the watchdog restarts the
-    // whole process over the dead proxy port. The guard before a retry
-    // keeps the budget timeout from landing mid-dial either — a dial
-    // finishes within its own ~5 s cap, 7 s of budget covers it.
+    // Keep retries inside this probe budget. Outbound setup has its own
+    // deadline and pooled dial reservations are released on cancellation.
     let deadline = Instant::now() + Duration::from_secs(14);
     for attempt in 1..=3u8 {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -580,6 +588,66 @@ fn go_duration(raw: &str) -> Result<Duration, String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn automatic_switch_respects_interruption_policy() {
+        use crate::{
+            clash_state::{ConnHandle, ConnMeta},
+            route::ConnContext,
+        };
+        use serde_json::json;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0; 1024];
+                let _ = stream.read(&mut buf).await;
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        for interrupt in [false, true] {
+            let root = json!({"outbounds":[
+                {"type":"block", "tag":"dead"}, {"type":"direct", "tag":"live"},
+                {"type":"urltest", "tag":"group", "outbounds":["dead","live"], "url":url, "interrupt_exist_connections":interrupt}
+            ]});
+            let router = Router::new(&root).unwrap();
+            let idx = router.index_of("group").unwrap();
+            let inner = router.inner();
+            let (_, _, crate::route::Outbound::Urltest(group)) =
+                inner.outbound_table().find(|(i, _, _)| *i == idx).unwrap()
+            else {
+                panic!("urltest")
+            };
+            let ctx = ConnContext::new(
+                "test",
+                "127.0.0.1:1234".parse().unwrap(),
+                Target::Domain("example.com".into(), 443),
+                "tcp",
+            );
+            let tracker = ConnHandle::open_with_context(
+                ConnMeta {
+                    network: "tcp",
+                    inbound: "test".into(),
+                    source: "local".into(),
+                    host: "example.com".into(),
+                    destination: "example.com:443".into(),
+                    chains: vec!["group".into(), "dead".into()],
+                    rule: String::new(),
+                    rule_payload: String::new(),
+                },
+                &ctx,
+                &router,
+            );
+            probe_all(&group.shared, &router).await;
+            assert_eq!(group.now(), "live");
+            assert_eq!(tracker.is_closed(), interrupt);
+        }
+        server.abort();
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -167,6 +167,92 @@ impl ConnContext {
     }
 }
 
+// A TCP socket deadline alone does not bound TLS/transport negotiation or
+// pooled capacity waits. This budget ends when a usable tunnel is returned;
+// it never limits established TCP/UDP session lifetime.
+const OUTBOUND_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Retain an explicit TCP dial budget and allow transport setup on top of it.
+/// Groups inherit their longest member budget; sequential chains/detours add
+/// their budgets. Resolve from config so every protocol shares this policy.
+fn outbound_setup_budgets(root: &Value) -> anyhow::Result<Vec<std::time::Duration>> {
+    use std::time::Duration;
+    let configs: Vec<&Value> = ["outbounds", "endpoints"]
+        .iter()
+        .flat_map(|key| {
+            root.get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .collect();
+    let tags: HashMap<&str, usize> = configs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.get("tag").and_then(Value::as_str).map(|tag| (tag, i)))
+        .collect();
+    let mut own = Vec::new();
+    for config in &configs {
+        let mut options = serde_json::Map::new();
+        if let Some(value) = config.get("connect_timeout") {
+            options.insert("connect_timeout".into(), value.clone());
+        }
+        let explicit = crate::outbound::dial::DialOptions::parse(&options)?.connect_timeout;
+        own.push(OUTBOUND_SETUP_TIMEOUT.saturating_add(explicit.unwrap_or(Duration::ZERO)));
+    }
+    fn visit(
+        i: usize,
+        configs: &[&Value],
+        tags: &HashMap<&str, usize>,
+        own: &[Duration],
+        path: &mut Vec<usize>,
+        memo: &mut [Option<Duration>],
+    ) -> Duration {
+        if let Some(budget) = memo[i] {
+            return budget;
+        }
+        if path.contains(&i) {
+            return OUTBOUND_SETUP_TIMEOUT;
+        }
+        path.push(i);
+        let c = configs[i];
+        let kind = c.get("type").and_then(Value::as_str).unwrap_or("");
+        let mut budget = own[i];
+        if matches!(kind, "selector" | "urltest" | "chain") {
+            let children = c
+                .get("outbounds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().and_then(|tag| tags.get(tag).copied()));
+            let mut group = Duration::ZERO;
+            for child in children {
+                let next = visit(child, configs, tags, own, path, memo);
+                group = if kind == "chain" {
+                    group.saturating_add(next)
+                } else {
+                    group.max(next)
+                };
+            }
+            budget = budget.max(group);
+        }
+        if let Some(&detour) = c
+            .get("detour")
+            .and_then(Value::as_str)
+            .and_then(|tag| tags.get(tag))
+        {
+            budget = budget.saturating_add(visit(detour, configs, tags, own, path, memo));
+        }
+        path.pop();
+        memo[i] = Some(budget);
+        budget
+    }
+    let mut memo = vec![None; configs.len()];
+    Ok((0..configs.len())
+        .map(|i| visit(i, &configs, &tags, &own, &mut Vec::new(), &mut memo))
+        .collect())
+}
+
 pub enum Outbound {
     Direct(Direct),
     Block(Block),
@@ -757,6 +843,7 @@ pub struct RouterInner {
     /// Clash `DelayHistory` slots, one per outbound: reference keeps a
     /// single record per proxy, replaced by every successful probe.
     pub(crate) delay_history: Vec<std::sync::Mutex<Option<(String, u32)>>>,
+    setup_timeouts: Vec<std::time::Duration>,
 }
 
 pub struct Router {
@@ -999,6 +1086,8 @@ impl RouterInner {
         let delay_history = (0..outbounds.len())
             .map(|_| std::sync::Mutex::new(None))
             .collect();
+        let mut setup_timeouts = outbound_setup_budgets(&root)?;
+        setup_timeouts.resize(outbounds.len(), OUTBOUND_SETUP_TIMEOUT);
         Ok(RouterInner {
             probe_tls: crate::tls_client::probe_connector(&root)?,
             outbounds,
@@ -1010,6 +1099,7 @@ impl RouterInner {
             find_process,
             probe_tasks: std::sync::Mutex::new(Vec::new()),
             delay_history,
+            setup_timeouts,
         })
     }
 
@@ -1263,7 +1353,25 @@ impl Router {
     }
 
     pub fn select_member(&self, group_tag: &str, member: &str) -> Result<bool, SelectError> {
-        self.inner().select_member(group_tag, member)
+        let inner = self.inner();
+        let index = inner.index_of(group_tag).ok_or(SelectError::NotFound)?;
+        let Outbound::Selector(group) = &inner.outbounds[index] else {
+            return Err(SelectError::NotSelector);
+        };
+        if !group.all().iter().any(|tag| tag == member) {
+            return Err(SelectError::NotMember);
+        }
+        crate::clash_state::switch_group(
+            self,
+            group_tag,
+            group.interrupt_exist_connections(),
+            || {
+                let changed = group.now() != member;
+                group.select(member);
+                changed
+            },
+        );
+        Ok(true)
     }
 
     pub fn start_endpoints<'a>(
@@ -1290,7 +1398,9 @@ impl Router {
             let Some(outbound) = inner.outbounds.get(index) else {
                 return Err(io::Error::other("outbound index out of range"));
             };
-            outbound.connect(self, target).await
+            tokio::time::timeout(inner.setup_timeouts[index], outbound.connect(self, target))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound setup timeout"))?
         })
     }
 
@@ -1304,7 +1414,12 @@ impl Router {
             let Some(outbound) = inner.outbounds.get(index) else {
                 return Err(io::Error::other("outbound index out of range"));
             };
-            outbound.connect_udp(self, target).await
+            tokio::time::timeout(
+                inner.setup_timeouts[index],
+                outbound.connect_udp(self, target),
+            )
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "outbound setup timeout"))?
         })
     }
 
@@ -1606,6 +1721,21 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn setup_budgets_preserve_long_dials_in_groups_and_detours() {
+        use std::time::Duration;
+        let budgets = super::outbound_setup_budgets(&serde_json::json!({"outbounds":[
+            {"type":"direct","tag":"plain"},
+            {"type":"vless","tag":"slow","connect_timeout":"30s"},
+            {"type":"selector","tag":"group","outbounds":["plain","slow"]},
+            {"type":"urltest","tag":"auto","outbounds":["group"]},
+            {"type":"vless","tag":"via","connect_timeout":"2s","detour":"slow"},
+            {"type":"chain","tag":"chain","outbounds":["plain","slow"]}
+        ]}))
+        .unwrap();
+        assert_eq!(budgets, [15, 45, 45, 45, 62, 60].map(Duration::from_secs));
+    }
+
     use super::*;
     use serde_json::json;
 

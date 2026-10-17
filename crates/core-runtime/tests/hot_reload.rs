@@ -169,6 +169,11 @@ async fn hot_reload_preserves_live_tcp_connections() {
 async fn hot_reload_preserves_selector_urltest_and_dns_cache() {
     let _echo = spawn_echo().await;
 
+    // Keep background probes pending locally while checking migration of the
+    // seeded history. A WAN failure must not race and invalidate that record.
+    let _probe_peer = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let probe_url = format!("http://{}/", _probe_peer.local_addr().unwrap());
+
     let root1 = json!({
         "log": {"level": "error"},
         "dns": {
@@ -186,7 +191,7 @@ async fn hot_reload_preserves_selector_urltest_and_dns_cache() {
             {"type": "direct", "tag": "d1"},
             {"type": "direct", "tag": "d2"},
             {"type": "selector", "tag": "sel", "outbounds": ["d1", "d2"]},
-            {"type": "urltest", "tag": "ut", "outbounds": ["d1", "d2"], "interval": "10m"}
+            {"type": "urltest", "tag": "ut", "outbounds": ["d1", "d2"], "interval": "10m", "url": probe_url}
         ],
         "route": {"final": "sel"}
     });
@@ -224,7 +229,7 @@ async fn hot_reload_preserves_selector_urltest_and_dns_cache() {
             {"type": "direct", "tag": "d2"},
             {"type": "direct", "tag": "d1"},
             {"type": "selector", "tag": "sel", "outbounds": ["d1", "d2", "d3"]},
-            {"type": "urltest", "tag": "ut", "outbounds": ["d1", "d2", "d3"], "interval": "10m"}
+            {"type": "urltest", "tag": "ut", "outbounds": ["d1", "d2", "d3"], "interval": "10m", "url": probe_url}
         ],
         "route": {"final": "d2"}
     });

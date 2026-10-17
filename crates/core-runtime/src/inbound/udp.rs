@@ -668,9 +668,13 @@ impl UdpHub {
                 let timeout = ctx.udp_timeout.unwrap_or(self.timeout);
                 // Outbound bridges read the per-flow idle policy before spawning
                 // their pumps, including route-options overrides.
-                let sock = crate::outbound::packet::UDP_BRIDGE_TIMEOUT
-                    .scope(timeout, self.router.connect_udp_index(idx, target))
-                    .await?;
+                let signal = tracker.close_signal();
+                let sock = tokio::select! {
+                    biased;
+                    _ = signal.wait() => return Err(super::closed_by_api()),
+                    result = crate::outbound::packet::UDP_BRIDGE_TIMEOUT
+                        .scope(timeout, self.router.connect_udp_index(idx, target)) => result?,
+                };
                 let sock = Arc::new(sock);
                 let task = spawn_reverse(
                     Arc::clone(&sock),
@@ -930,6 +934,59 @@ fn spawn_reverse(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn selector_switch_closes_udp_flow_and_next_packet_reopens_it() {
+        let router = Router::new(&serde_json::json!({"outbounds":[
+            {"type":"direct","tag":"a"}, {"type":"direct","tag":"b"},
+            {"type":"selector","tag":"group","outbounds":["a","b"],"interrupt_exist_connections":true}
+        ],"route":{"final":"group"}})).unwrap();
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let source = reply.local_addr().unwrap();
+        let dest = server.local_addr().unwrap();
+        let hub = UdpHub::new(router.clone(), Duration::from_secs(60), DatagramFrame::Raw);
+        hub.handle(
+            Reply::Socket(Arc::downgrade(&reply)),
+            source,
+            dest,
+            b"old",
+            "test",
+        )
+        .await
+        .unwrap();
+        let old = hub
+            .flows
+            .read()
+            .unwrap()
+            .get(&(source, dest))
+            .unwrap()
+            .tracker
+            .as_ref()
+            .unwrap()
+            .id();
+        router.select_member("group", "b").unwrap();
+        hub.handle(
+            Reply::Socket(Arc::downgrade(&reply)),
+            source,
+            dest,
+            b"new",
+            "test",
+        )
+        .await
+        .unwrap();
+        let flows = hub.flows.read().unwrap();
+        let fresh = flows
+            .get(&(source, dest))
+            .unwrap()
+            .tracker
+            .as_ref()
+            .unwrap();
+        assert_ne!(old, fresh.id());
+        assert!(!fresh.is_closed());
+        drop(flows);
+        hub.stop();
+    }
+
     #[tokio::test]
     async fn stream_eof_releases_the_dedicated_udp_hub() {
         use tokio::io::AsyncWriteExt;

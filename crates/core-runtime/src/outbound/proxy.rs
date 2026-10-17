@@ -424,6 +424,7 @@ pub(crate) fn base64_std(input: &[u8]) -> String {
 
 /// selector: first member by default (runtime switching arrives with clash_api).
 pub struct Selector {
+    interrupt: bool,
     raw_members: Vec<String>,
     default: Option<String>,
     resolved: Vec<usize>,
@@ -451,6 +452,10 @@ impl Selector {
             .and_then(Value::as_str)
             .map(str::to_string);
         Ok(Self {
+            interrupt: obj
+                .get("interrupt_exist_connections")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
             raw_members,
             default,
             resolved: Vec::new(),
@@ -489,6 +494,10 @@ impl Selector {
             return Err(io::Error::other("selector has no members"));
         };
         router.connect_index(*member, target).await
+    }
+
+    pub fn interrupt_exist_connections(&self) -> bool {
+        self.interrupt
     }
 
     /// Switch to `member` by tag (clash `PUT /proxies/{name}`).

@@ -478,7 +478,6 @@ impl Client {
             Some(session) => session,
             None => self.open_session(&mut guard).await?,
         };
-        session.streams.fetch_add(1, Ordering::SeqCst);
         let conn_task = Arc::clone(&session.conn_task);
 
         let request = http::Request::builder()
@@ -496,6 +495,9 @@ impl Client {
             .await
             .send_request(request, false)
             .map_err(|e| io::Error::other(format!("vmess: mux send: {e}")))?;
+        // Count only a successfully opened stream. Cancellation while waiting
+        // for the sender lock must not leak the session's load counter.
+        session.streams.fetch_add(1, Ordering::SeqCst);
         let stream: AnyStream = Box::new(crate::outbound::transport::h2io::H2Io {
             h2: crate::outbound::transport::h2io::H2Stream::shared(response, send),
         });

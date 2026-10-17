@@ -532,6 +532,28 @@ fn client_raw_tcp(client: &dyn std::any::Any) -> Option<&TcpStream> {
 /// Socket to socket on Linux goes through `splice(2)` (see `relay`); every other
 /// shape of stream takes the userspace loops below.
 pub async fn pump_conn_tracked<S>(
+    client: S,
+    conn: Conn,
+    prefix: &[u8],
+    tracker: Option<&clash_state::ConnHandle>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any,
+{
+    let relay = pump_conn_tracked_inner(client, conn, prefix, tracker);
+    if let Some(tracker) = tracker {
+        let signal = tracker.close_signal();
+        tokio::select! {
+            biased;
+            _ = signal.wait() => Err(closed_by_api()),
+            result = relay => result,
+        }
+    } else {
+        relay.await
+    }
+}
+
+async fn pump_conn_tracked_inner<S>(
     mut client: S,
     conn: Conn,
     prefix: &[u8],
@@ -1142,6 +1164,23 @@ pub(crate) fn network_includes_udp(obj: &serde_json::Map<String, Value>) -> bool
     }
 }
 
+/// Register before dialing so a group transition can also cancel old setup.
+pub(crate) async fn connect_tracked(
+    router: &Router,
+    index: usize,
+    ctx: &ConnContext,
+) -> io::Result<(Conn, clash_state::ConnHandle)> {
+    let tracker =
+        clash_state::ConnHandle::open_with_context(clash_meta(ctx, router, index), ctx, router);
+    let signal = tracker.close_signal();
+    let conn = tokio::select! {
+        biased;
+        _ = signal.wait() => return Err(closed_by_api()),
+        result = router.connect_index(index, &ctx.destination) => result?,
+    };
+    Ok((conn, tracker))
+}
+
 /// Route one accepted transparent connection (direct / redirect / tproxy):
 /// no SOCKS reply, destination already resolved by the inbound.
 pub(crate) async fn drive_transparent(
@@ -1177,13 +1216,9 @@ pub(crate) async fn drive_framed(
         }
         Decision::Outbound(idx) => {
             let dest = ctx.destination.clone();
-            let conn = router.connect_index(idx, &dest).await?;
+            let (conn, tracker) = connect_tracked(router, idx, &ctx).await?;
             logging::info(format_args!("inbound {tag} {peer} CONNECT {dest}"));
-            let tracker = clash_state::ConnHandle::open_with_context(
-                clash_meta(&ctx, router, idx),
-                &ctx,
-                router,
-            );
+
             pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
         }
     }

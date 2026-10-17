@@ -51,10 +51,13 @@ impl CloseSignal {
     /// Resolves once the connection was closed through the API.
     pub async fn wait(&self) {
         loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.closed.load(Ordering::Acquire) {
                 return;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -207,6 +210,30 @@ pub fn close(id: u64) -> bool {
     }
 }
 
+/// Serialize a group transition with connection registration. Entries created
+/// after the transition can never be selected for closure by that transition.
+pub(crate) fn switch_group(
+    router: &crate::route::Router,
+    group: &str,
+    interrupt: bool,
+    switch: impl FnOnce() -> bool,
+) {
+    if !interrupt {
+        switch();
+        return;
+    }
+    let scope = router.connection_scope();
+    let entries = registry().lock().expect("connections");
+    if switch() {
+        for entry in entries.values().filter(|entry| {
+            entry.scope.as_ref().is_some_and(|s| Arc::ptr_eq(s, &scope))
+                && entry.meta.chains.iter().any(|tag| tag == group)
+        }) {
+            trigger(&entry.closed, &entry.notify);
+        }
+    }
+}
+
 /// `DELETE /connections`.
 pub fn close_all() -> usize {
     let entries: Vec<Arc<Shared>> = registry()
@@ -315,6 +342,44 @@ pub fn add_udp(upload: u64, download: u64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registration_after_switch_is_not_closed_by_that_switch() {
+        use crate::{
+            inbound::Target,
+            route::{ConnContext, Router},
+        };
+        let router =
+            Router::new(&serde_json::json!({"outbounds":[{"type":"direct","tag":"node"}]}))
+                .unwrap();
+        let ctx = ConnContext::new(
+            "test",
+            "127.0.0.1:1234".parse().unwrap(),
+            Target::Domain("example.com".into(), 443),
+            "tcp",
+        );
+        let mut meta = unique_meta("registration-race.example:443");
+        meta.chains = vec!["group".into()];
+        let old = ConnHandle::open_with_context(meta.clone(), &ctx, &router);
+        let (go, ready) = std::sync::mpsc::channel();
+        let (attempt, attempting) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let router_ref = &router;
+            let worker = scope.spawn(move || {
+                ready.recv().unwrap();
+                attempt.send(()).unwrap();
+                ConnHandle::open_with_context(meta, &ctx, router_ref)
+            });
+            switch_group(&router, "group", true, || {
+                go.send(()).unwrap();
+                attempting.recv().unwrap();
+                true
+            });
+            let fresh = worker.join().unwrap();
+            assert!(old.is_closed());
+            assert!(!fresh.is_closed());
+        });
+    }
+
     use super::*;
 
     fn meta() -> ConnMeta {
