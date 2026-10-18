@@ -219,6 +219,18 @@ impl CacheFile {
         }
     }
 
+    /// Remove stale selector records in one pass without flushing per key.
+    pub(crate) fn retain_selected(&mut self, mut valid: impl FnMut(&[u8], &[u8]) -> bool) {
+        let Some(entries) = self.buckets.get_mut(BUCKET_SELECTED) else {
+            return;
+        };
+        let before = entries.len();
+        entries.retain(|key, value| valid(key, value));
+        if entries.len() != before {
+            self.dirty = true;
+        }
+    }
+
     /// Update paired records before a due flush can expose half an update.
     pub(crate) fn apply_changes(&mut self, changes: Vec<CacheChange<'_>>) {
         let mut modified = false;

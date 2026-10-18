@@ -271,6 +271,7 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
     // the clash mode is persisted like the reference persists bucketMode
     clash_mode::attach_store(cache_file.clone());
     let router = Router::new(root)?;
+    router.attach_selection_cache(cache_file.clone());
     // remote rule sets fetch before the instance is up: a failed first fetch
     // aborts the start, exactly like `RemoteRuleSet.StartContext`
     let remote_result = router

@@ -853,6 +853,7 @@ pub struct Router {
     connection_scope: Arc<()>,
     inner: std::sync::RwLock<Arc<RouterInner>>,
     applied_config: std::sync::Mutex<Value>,
+    selection_cache: std::sync::RwLock<Option<crate::cache_file::SharedCacheFile>>,
 }
 
 /// A `local` DNS server with `neighbor_domain` answers from the same tables.
@@ -1259,6 +1260,7 @@ impl Router {
             inner: std::sync::RwLock::new(Arc::new(RouterInner::build(root)?)),
             connection_scope: Arc::new(()),
             applied_config: std::sync::Mutex::new(serde_json::json!({"generation": 0})),
+            selection_cache: std::sync::RwLock::new(None),
         }))
     }
 
@@ -1268,6 +1270,7 @@ impl Router {
             inner: std::sync::RwLock::new(Arc::new(inner)),
             connection_scope: Arc::new(()),
             applied_config: std::sync::Mutex::new(serde_json::json!({"generation": 0})),
+            selection_cache: std::sync::RwLock::new(None),
         });
         let inner_ref = router.inner();
         for outbound in &inner_ref.outbounds {
@@ -1285,6 +1288,83 @@ impl Router {
 
     pub fn inner(&self) -> Arc<RouterInner> {
         self.inner.read().expect("router inner lock").clone()
+    }
+
+    /// Restore only selections that still belong to the same named group.
+    /// Keep the handle on the Router so in-place reloads retain persistence.
+    pub fn attach_selection_cache(&self, cache: Option<crate::cache_file::SharedCacheFile>) {
+        if let Some(store) = &cache {
+            let store = store.lock().expect("selection cache");
+            let inner = self.inner();
+            for (tag, index) in &inner.tags {
+                if let Outbound::Selector(group) = &inner.outbounds[*index]
+                    && let Some(selected) =
+                        store.get(crate::cache_file::BUCKET_SELECTED, tag.as_bytes())
+                    && let Ok(selected) = std::str::from_utf8(&selected)
+                {
+                    group.select(selected);
+                }
+            }
+        }
+        *self
+            .selection_cache
+            .write()
+            .expect("selection cache handle") = cache;
+        self.prune_selection_cache();
+    }
+
+    fn prune_selection_cache(&self) {
+        let cache = self.selection_cache.read().expect("selection cache handle");
+        let Some(store) = cache.as_ref() else {
+            return;
+        };
+        let mut store = store.lock().expect("selection cache");
+        let inner = self.inner();
+        // At most one record per active selector. No history of removed groups
+        // or members survives startup or a successfully applied hot reload.
+        store.retain_selected(|tag, member| {
+            let (Ok(tag), Ok(member)) = (std::str::from_utf8(tag), std::str::from_utf8(member)) else {
+                return false;
+            };
+            inner.tags.get(tag).is_some_and(|index| {
+                matches!(&inner.outbounds[*index], Outbound::Selector(group) if group.all().iter().any(|item| item == member))
+            })
+        });
+        if let Err(error) = store.flush() {
+            crate::logging::warn(format_args!("prune selector selections: {error}"));
+        }
+    }
+
+    fn persist_selection(&self, tag: &str) {
+        let cache = self.selection_cache.read().expect("selection cache handle");
+        if let Some(store) = cache.as_ref() {
+            let mut store = store.lock().expect("selection cache");
+            let inner = self.inner();
+            let Some(Outbound::Selector(group)) =
+                inner.tags.get(tag).map(|index| &inner.outbounds[*index])
+            else {
+                return;
+            };
+            // Concurrent API requests may have switched again before this
+            // writer acquired the store. Persist the current member under
+            // that lock rather than overwriting a newer choice with our input.
+            let member = group.now();
+            if store
+                .get(crate::cache_file::BUCKET_SELECTED, tag.as_bytes())
+                .as_deref()
+                == Some(member.as_bytes())
+            {
+                return;
+            }
+            store.put(
+                crate::cache_file::BUCKET_SELECTED,
+                tag.as_bytes(),
+                member.as_bytes().to_vec(),
+            );
+            if let Err(error) = store.flush() {
+                crate::logging::warn(format_args!("save selector selection: {error}"));
+            }
+        }
     }
 
     pub fn rule_sets(&self) -> Arc<rule_set::RuleSetRegistry> {
@@ -1371,6 +1451,7 @@ impl Router {
             || {
                 let changed = group.now() != member;
                 group.select(member);
+                self.persist_selection(group_tag);
                 changed
             },
         );
@@ -1502,6 +1583,7 @@ impl Router {
 
         // 4. Atomically install new inner router
         *self.inner.write().expect("router inner lock") = Arc::clone(&new_inner);
+        self.prune_selection_cache();
 
         // 5. Spawn new urltest probe tasks using self (Arc<Router>)
         for outbound in &new_inner.outbounds {
