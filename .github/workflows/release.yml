@@ -170,7 +170,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
-          name: Rust X ${{ steps.notes.outputs.version }}
+          name: Xrust ${{ steps.notes.outputs.version }}
           # scripts/finalize_release.py signs on the existing mirror and
           # publishes only after signature and checksum verification.
           draft: true

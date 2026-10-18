@@ -1,6 +1,6 @@
-# Rust X OpenWrt packages
+# Xrust OpenWrt packages
 
-Rust X 0.0.1 has APK `0.0.1-r1` for OpenWrt 25 and IPK `0.0.1-1`
+Xrust 0.0.1 has APK `0.0.1-r1` for OpenWrt 25 and IPK `0.0.1-1`
 for OpenWrt 24. Architectures: `aarch64_cortex-a53` (ARM64) and `x86_64`.
 The payload uses the existing release binaries without UPX compression.
 
@@ -8,7 +8,7 @@ The package is `rust-x`, provides `sing-box` and conflicts with other
 sing-box package variants. Dependencies: `ca-bundle`, `kmod-tun`.
 The native executable lives at `/usr/lib/rust-x/sing-box`; the wrapper
 at `/usr/bin/sing-box` supplies the existing Forkop configuration capability
-baseline while reporting Rust X identity separately. This baseline does not
+baseline while reporting Xrust identity separately. This baseline does not
 claim every Sing-Box feature or protocol. Existing configuration is retained;
 the included procd service is disabled by default on fresh installations.
 

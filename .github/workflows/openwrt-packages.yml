@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing Rust X binary release tag
+        description: Existing Xrust binary release tag
         required: true
         default: rust-x-v0.0.1
 permissions:

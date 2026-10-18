@@ -1,6 +1,6 @@
-# Releasing Rust X
+# Releasing Xrust
 
-The product/package name remains Rust X / rust-x. APKs use the same mirror-host
+The product/package name remains Xrust / rust-x. APKs use the same mirror-host
 key and apk-tools as Sing-Box X. The private signing key stays on that host.
 No new runner or signing key in GitHub Secrets is required.
 

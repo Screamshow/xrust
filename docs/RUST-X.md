@@ -1,4 +1,4 @@
-# Rust X protocol profile
+# Xrust protocol profile
 
 Supported release platforms: OpenWrt x86_64 and aarch64_cortex-a53 only.
 CI tests run on Linux; both release targets use static musl binaries.
@@ -47,14 +47,14 @@ using Rust 1.99.0, locked dependencies and the same x86_64 musl release flags.
 | Profile | Binary bytes | MiB |
 | --- | ---: | ---: |
 | Full, with legacy-protocols | 12,752,656 | 12.16 |
-| Rust X default | 11,017,744 | 10.51 |
+| Xrust default | 11,017,744 | 10.51 |
 
 Reduction: 1,734,912 bytes (1.65 MiB), 13.6%. Binaries are not UPX-packed.
 The installed UPX-packed Sing-Box X 1.0.3 binary on VM25 measured 9,972,284
-bytes: this Rust X candidate is still 1,045,460 bytes (1.00 MiB, 10.5%) larger.
+bytes: this Xrust candidate is still 1,045,460 bytes (1.00 MiB, 10.5%) larger.
 These are binary file lengths, not total package/dependency or RAM usage.
 
-Rust X SHA-256:
+Xrust SHA-256:
 `1acccb6d113c0fad4b09b2f693ceb94813d516f5f034e8de5f98337a9bf76166`.
 Full comparison SHA-256:
 `079c9946266e594ab2c749fefe6e7eb4fe97d805003f4e90ca2bfd49cb7735f8`.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package released Rust X ELF binaries for OpenWrt 24/25."""
+"""Package released Xrust ELF binaries for OpenWrt 24/25."""
 import argparse
 import gzip
 import hashlib
@@ -71,7 +71,7 @@ def main():
         wrapper = f'''#!/bin/sh
 if [ "$1" = version ]; then
     echo 'sing-box version 1.14.2-rust-x.{a.version}'
-    echo 'Rust X: {a.version}; configuration compatibility baseline: 1.14.2'
+    echo 'Xrust: {a.version}; configuration compatibility baseline: 1.14.2'
     echo 'Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2'
     echo 'Tags: with_utls,with_clash_api,with_tailscale'
     exit 0
@@ -93,8 +93,8 @@ Provides: sing-box
 Section: net
 License: GPL-3.0-only
 Maintainer: Screamshow
-Source: https://github.com/Screamshow/rust-x
-Description: Rust X router core for Forkop
+Source: https://github.com/Screamshow/xrust
+Description: Xrust router core for Forkop
 '''
         ipk = a.output/f'rust-x_{a.version}-{a.revision}_{arch}.ipk'
         ipk.write_bytes(tar_bytes([('debian-binary', b'2.0\n', 0o644),
@@ -120,8 +120,8 @@ Description: Rust X router core for Forkop
                 script.chmod(0o755)
                 cmd += ['-s', f'{hook}:{script}']
             fields = dict(name='rust-x', version=f'{a.version}-r{a.revision}', arch=arch,
-                          description='Rust X router core for Forkop', license='GPL-3.0-only',
-                          origin='rust-x', maintainer='Screamshow', url='https://github.com/Screamshow/rust-x',
+                          description='Xrust router core for Forkop', license='GPL-3.0-only',
+                          origin='rust-x', maintainer='Screamshow', url='https://github.com/Screamshow/xrust',
                           depends=' '.join(DEPENDENCIES + ['!'+c for c in CONFLICTS]), provides='sing-box')
             for key, value in fields.items(): cmd += ['-I', f'{key}:{value}']
             if os.geteuid() == 0:

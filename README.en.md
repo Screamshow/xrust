@@ -1,10 +1,15 @@
-# Rust X
+# Xrust
 
-Rust X is an independent [tachyon-core](https://github.com/Dushnilin/tachyon-core)
+Previously named Rust X. Only the repository and display name have changed.
+The `rust-x` package and Cargo feature, `rust-x-v*` tags, installation paths,
+executable version format and mirror update channel `/forkop/rust-x/` remain
+unchanged for compatibility with existing Forkop installations.
+
+Xrust is an independent [tachyon-core](https://github.com/Dushnilin/tachyon-core)
 fork for Forkop, not an official Tachyon build or an affiliated project.
 Upstream authorship and the GPL-3.0-only license are preserved.
 
-Rust X version: **0.0.2**, with selected upstream changes and a reduced protocol
+Xrust version: **0.0.2**, with selected upstream changes and a reduced protocol
 profile documented in [docs/RUST-X.md](docs/RUST-X.md). Unless stated otherwise,
 the inherited documentation below describes upstream capabilities and measurements.
 

@@ -9,7 +9,7 @@ import shlex
 import subprocess
 import tempfile
 
-REPO = 'Screamshow/rust-x'
+REPO = 'Screamshow/xrust'
 HOST = 'root@192.168.200.138'
 APK = '/root/.cache/forkop/openwrt-sdk/extracted/apk/staging_dir/host/bin/apk'
 KEY = '/srv/mirror/keys/forkop-apk.pem'
