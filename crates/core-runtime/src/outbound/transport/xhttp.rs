@@ -269,9 +269,21 @@ impl Meta {
     }
 }
 
+pub(crate) struct H2Counter {
+    active: std::sync::atomic::AtomicUsize,
+    notify: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl std::ops::Deref for H2Counter {
+    type Target = std::sync::atomic::AtomicUsize;
+    fn deref(&self) -> &Self::Target {
+        &self.active
+    }
+}
+
 struct PooledClient {
     client: h2::client::SendRequest<Bytes>,
-    active_streams: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    active_streams: std::sync::Arc<H2Counter>,
 }
 
 struct H2PoolState {
@@ -281,14 +293,11 @@ struct H2PoolState {
 
 pub(crate) struct H2Pool {
     state: std::sync::Mutex<H2PoolState>,
-    notify: tokio::sync::Notify,
+    notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 pub(crate) enum H2Acquire {
-    Ready(
-        h2::client::SendRequest<Bytes>,
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ),
+    Ready(h2::client::SendRequest<Bytes>, std::sync::Arc<H2Counter>),
     NeedDial(H2DialGuard),
 }
 
@@ -305,13 +314,14 @@ impl Drop for H2DialGuard {
 
 pub(crate) struct TrackedStream {
     inner: AnyStream,
-    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    counter: std::sync::Arc<H2Counter>,
 }
 
 impl Drop for TrackedStream {
     fn drop(&mut self) {
         self.counter
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.counter.notify.notify_waiters();
     }
 }
 
@@ -349,14 +359,14 @@ impl tokio::io::AsyncWrite for TrackedStream {
     }
 }
 
-struct CounterGuard(Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>);
+struct CounterGuard(Option<std::sync::Arc<H2Counter>>);
 
 impl CounterGuard {
-    fn new(c: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+    fn new(c: std::sync::Arc<H2Counter>) -> Self {
         Self(Some(c))
     }
 
-    fn into_inner(mut self) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    fn into_inner(mut self) -> std::sync::Arc<H2Counter> {
         self.0.take().expect("counter present")
     }
 }
@@ -365,6 +375,7 @@ impl Drop for CounterGuard {
     fn drop(&mut self) {
         if let Some(c) = self.0.take() {
             c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            c.notify.notify_waiters();
         }
     }
 }
@@ -376,11 +387,15 @@ impl H2Pool {
                 clients: Vec::new(),
                 active_dials: 0,
             }),
-            notify: tokio::sync::Notify::new(),
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    pub(crate) async fn acquire(self: &std::sync::Arc<Self>, max_conns: usize) -> H2Acquire {
+    pub(crate) async fn acquire(
+        self: &std::sync::Arc<Self>,
+        max_conns: usize,
+        max_concurrency: usize,
+    ) -> H2Acquire {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -388,29 +403,42 @@ impl H2Pool {
             let candidate = {
                 let mut guard = self.state.lock().expect("h2 pool");
 
-                if guard.clients.len() + guard.active_dials < max_conns {
+                let has_capacity = max_concurrency > 0
+                    && guard.clients.iter().any(|client| {
+                        client
+                            .active_streams
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            < max_concurrency
+                    });
+                if !has_capacity && guard.clients.len() + guard.active_dials < max_conns {
                     guard.active_dials += 1;
                     return H2Acquire::NeedDial(H2DialGuard(self.clone()));
                 }
 
-                if guard.clients.is_empty()
-                    || (guard.clients.len() < max_conns && guard.active_dials > 0)
-                {
+                if guard.clients.is_empty() {
                     None
                 } else {
-                    let (_idx, best) = guard
+                    let best = guard
                         .clients
                         .iter()
                         .enumerate()
+                        .filter(|(_, c)| {
+                            max_concurrency == 0
+                                || c.active_streams.load(std::sync::atomic::Ordering::Relaxed)
+                                    < max_concurrency
+                        })
                         .min_by_key(|(_, c)| {
                             c.active_streams.load(std::sync::atomic::Ordering::Relaxed)
                         })
-                        .expect("non-empty");
-
-                    let client = best.client.clone();
-                    let active = best.active_streams.clone();
-                    active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Some((client, active))
+                        .map(|(_, best)| best);
+                    if let Some(best) = best {
+                        let client = best.client.clone();
+                        let active = best.active_streams.clone();
+                        active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Some((client, active))
+                    } else {
+                        None
+                    }
                 }
             };
 
@@ -433,10 +461,7 @@ impl H2Pool {
         }
     }
 
-    pub(crate) async fn evict(
-        &self,
-        active_streams: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    ) {
+    pub(crate) async fn evict(&self, active_streams: &std::sync::Arc<H2Counter>) {
         let mut guard = self.state.lock().expect("h2 pool");
         guard
             .clients
@@ -449,11 +474,14 @@ impl H2Pool {
         &self,
         client: Option<h2::client::SendRequest<Bytes>>,
         max_conns: usize,
-    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicUsize>> {
+    ) -> Option<std::sync::Arc<H2Counter>> {
         let mut guard = self.state.lock().expect("h2 pool");
         let mut counter = None;
         if let Some(c) = client {
-            let cnt = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+            let cnt = std::sync::Arc::new(H2Counter {
+                active: std::sync::atomic::AtomicUsize::new(1),
+                notify: self.notify.clone(),
+            });
             if guard.clients.len() >= max_conns {
                 guard.clients.remove(0);
             }
@@ -561,7 +589,7 @@ impl XhttpConfig {
     async fn open_h2_session(
         &self,
         mut send_req: h2::client::SendRequest<Bytes>,
-        counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        counter: std::sync::Arc<H2Counter>,
         scheme: &str,
         authority: &str,
         mode: Mode,
@@ -696,7 +724,10 @@ impl XhttpConfig {
         let max_conns = self.pool.max_connections();
 
         {
-            let acq = self.h2_pool.acquire(max_conns).await;
+            let acq = self
+                .h2_pool
+                .acquire(max_conns, self.pool.max_concurrency())
+                .await;
             match acq {
                 H2Acquire::Ready(send_req, counter) => {
                     let result = self
@@ -1844,11 +1875,68 @@ fn base64_url(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn h2_xmux_capacity_waits_and_drop_wakes_next_stream() {
+        let (client_io, server_io) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let (client, connection) = h2::client::handshake(client_io).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let pool = std::sync::Arc::new(super::H2Pool::new());
+        let count = pool.finish_dial(Some(client), 1).await.unwrap();
+        let guard = super::CounterGuard::new(count.clone());
+        let waiting_pool = pool.clone();
+        let waiting = tokio::spawn(async move { waiting_pool.acquire(1, 1).await });
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(!waiting.is_finished(), "xmux limit was ignored");
+        drop(guard);
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        let super::H2Acquire::Ready(_, count) = next else {
+            panic!("reuse existing H2 connection")
+        };
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(super::CounterGuard::new(count.clone()));
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // Cancelling a waiter must not consume capacity.
+        let guard = super::CounterGuard::new({
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            count.clone()
+        });
+        let waiter_pool = pool.clone();
+        let cancelled = tokio::spawn(async move { waiter_pool.acquire(1, 1).await });
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        let _ = cancelled.await;
+        drop(guard);
+        let super::H2Acquire::Ready(_, count) = pool.acquire(1, 1).await else {
+            panic!("capacity leaked")
+        };
+        drop(super::CounterGuard::new(count));
+        let super::H2Acquire::Ready(_, count) = pool.acquire(usize::MAX, 1).await else {
+            panic!("idle connection must be reused before dialing")
+        };
+        let held = super::CounterGuard::new(count);
+        let next = pool.acquire(usize::MAX, 1).await;
+        assert!(
+            matches!(next, super::H2Acquire::NeedDial(_)),
+            "maxConcurrency must open a new connection when full"
+        );
+        drop(next);
+        drop(held);
+        driver.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn cancelled_h2_dial_releases_slot_and_wakes_waiter() {
         let pool = std::sync::Arc::new(super::H2Pool::new());
-        let first = pool.acquire(1).await;
+        let first = pool.acquire(1, 0).await;
         let waiting_pool = pool.clone();
-        let waiting = tokio::spawn(async move { waiting_pool.acquire(1).await });
+        let waiting = tokio::spawn(async move { waiting_pool.acquire(1, 0).await });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
         drop(first);
@@ -1867,7 +1955,7 @@ mod tests {
         let worker_pool = pool.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn(async move {
-            let reservation = worker_pool.acquire(1).await;
+            let reservation = worker_pool.acquire(1, 0).await;
             ready_tx.send(()).unwrap();
             std::future::pending::<()>().await;
             drop(reservation);
@@ -1875,7 +1963,7 @@ mod tests {
         ready_rx.await.unwrap();
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
-        let next = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire(1))
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), pool.acquire(1, 0))
             .await
             .unwrap();
         drop(next);

@@ -88,6 +88,8 @@ pub struct ConnContext {
     pub network: &'static str,
     pub protocol: Option<String>,
     pub domain: Option<String>,
+    /// Original DNS name recovered from FakeIP; sniff/resolve may replace the other names.
+    pub fakeip_domain: Option<String>,
     pub auth_user: Option<String>,
     pub client: Option<String>,
     pub destination_addresses: Vec<IpAddr>,
@@ -128,6 +130,7 @@ impl Default for ConnContext {
             network: "tcp",
             protocol: None,
             domain: None,
+            fakeip_domain: None,
             auth_user: None,
             client: None,
             destination_addresses: Vec::new(),
@@ -1535,6 +1538,7 @@ fn prepare(ctx: &mut ConnContext, want_process: bool) -> io::Result<()> {
         && let Some(dns) = dns::current()
     {
         if let Some(domain) = dns.fakeip_domain(addr.ip()) {
+            ctx.fakeip_domain = Some(domain.clone());
             ctx.origin_destination = Some(ctx.destination.clone());
             ctx.destination = Target::Domain(domain, addr.port());
             ctx.fakeip = true;

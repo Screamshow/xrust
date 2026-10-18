@@ -74,7 +74,6 @@
 //! matches everything in release (the shift is masked) and panics in debug. A
 //! prefix of length zero now masks to zero, which is what it means.
 
-use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::IpAddr;
 
@@ -83,7 +82,7 @@ use serde_json::Value;
 
 use crate::inbound::Target;
 use crate::route::ConnContext;
-use crate::route::rule::{domain_host, domain_suffix_match};
+use crate::route::rule::{domain_hosts, domain_suffix_match};
 use crate::route::rule_set::{list, ports};
 
 /// Masking, without pulling `num_traits` in for two shifts.
@@ -417,10 +416,8 @@ impl PlainRule {
         // Destination criteria (domain or IP)
         if self.has_domains || self.has_dest_ip {
             let mut dest_matched = false;
-            if let Some(host) = domain_host(ctx)
-                && self.has_domains
-            {
-                dest_matched = self.domains.contains(host.as_ref())
+            for host in domain_hosts(ctx).filter(|_| self.has_domains) {
+                dest_matched |= self.domains.contains(host.as_ref())
                     || self
                         .suffixes
                         .iter()
@@ -602,7 +599,7 @@ impl RuleSetIndex {
         if self.empty {
             return false;
         }
-        if let Some(host) = host_of(ctx) {
+        for host in domain_hosts(ctx) {
             if self.domains.contains(host.as_ref()) {
                 return true;
             }
@@ -728,23 +725,6 @@ impl RuleSetIndex {
             .map(AhoCorasick::patterns_len)
             .unwrap_or(0)
     }
-}
-
-/// `domain_host`, borrowed when it can be: the host is almost always lowercase
-/// already, and allocating a `String` per connection to find that out is waste.
-fn host_of(ctx: &ConnContext) -> Option<Cow<'_, str>> {
-    let raw = match &ctx.domain {
-        Some(domain) => domain.as_str(),
-        None => match &ctx.destination {
-            Target::Domain(host, _) => host.as_str(),
-            Target::Ip(_) => return None,
-        },
-    };
-    Some(if raw.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        Cow::Owned(raw.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(raw)
-    })
 }
 
 /// The old `prefix_contains` acceptance rules, applied once instead of per

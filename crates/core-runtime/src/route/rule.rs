@@ -652,7 +652,7 @@ impl Rule {
                         }
                     }
                 }
-                if let Some(host) = domain_host(ctx) {
+                for host in domain_hosts(ctx) {
                     for item in &rule.dest_address {
                         let (kind, values): (&str, Vec<&str>) = match item {
                             DomainItem::Exact(list) => (
@@ -1022,16 +1022,12 @@ impl PortItem {
 
 impl DomainItem {
     fn matches(&self, ctx: &ConnContext) -> bool {
-        let host = match domain_host(ctx) {
-            Some(h) => h,
-            None => return false,
-        };
-        match self {
+        domain_hosts(ctx).any(|host| match self {
             DomainItem::Exact(list) => list.iter().any(|d| d.as_str() == host.as_ref()),
             DomainItem::Suffix(list) => list.iter().any(|s| domain_suffix_match(&host, s)),
             DomainItem::Keyword(list) => list.iter().any(|k| host.contains(k.as_str())),
             DomainItem::Regex(list) => list.iter().any(|re| re.is_match(&host)),
-        }
+        })
     }
 }
 
@@ -1057,21 +1053,29 @@ impl IpCidrItem {
     }
 }
 
-/// The connection's host, lowercased. Borrowed when the case is already down,
-/// which is the common case: the scan is free and the `String` is not.
-pub(super) fn domain_host<'a>(ctx: &'a ConnContext) -> Option<Cow<'a, str>> {
-    let raw = match &ctx.domain {
-        Some(d) => d.as_str(),
-        None => match &ctx.destination {
-            super::Target::Domain(h, _) => h.as_str(),
-            super::Target::Ip(_) => return None,
-        },
+/// Domain candidates survive sniffing and resolution; borrow lowercase names
+/// and skip duplicates without allocating a collection on the routing path.
+pub(super) fn domain_hosts(ctx: &ConnContext) -> impl Iterator<Item = Cow<'_, str>> {
+    let sniffed = ctx.domain.as_deref();
+    let destination = match &ctx.destination {
+        super::Target::Domain(host, _) => Some(host.as_str()),
+        super::Target::Ip(_) => None,
     };
-    Some(if raw.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        Cow::Owned(raw.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(raw)
-    })
+    let destination = destination.filter(|host| Some(*host) != sniffed);
+    let fakeip = ctx
+        .fakeip_domain
+        .as_deref()
+        .filter(|host| Some(*host) != sniffed && Some(*host) != destination);
+    [sniffed, destination, fakeip]
+        .into_iter()
+        .flatten()
+        .map(|raw| {
+            if raw.bytes().any(|byte| byte.is_ascii_uppercase()) {
+                Cow::Owned(raw.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(raw)
+            }
+        })
 }
 
 /// Label-boundary suffix match; a leading-dot suffix is a pure string suffix.

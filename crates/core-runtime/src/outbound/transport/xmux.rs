@@ -312,9 +312,17 @@ impl Pool {
         })
     }
 
+    pub(crate) fn max_concurrency(&self) -> usize {
+        self.concurrency as usize
+    }
+
     pub(crate) fn max_connections(&self) -> usize {
         if self.connections > 0 {
             self.connections as usize
+        } else if self.concurrency > 0 {
+            // maxConcurrency selects a new connection once every existing
+            // one is busy; it is mutually exclusive with maxConnections.
+            usize::MAX
         } else {
             3
         }

@@ -176,6 +176,21 @@ impl Urltest {
     }
 
     /// Spawn the background probe loop (called once the router is shared).
+    pub(crate) fn apply_probe_results(
+        &self,
+        router: &Router,
+        results: &std::collections::HashMap<usize, Option<u16>>,
+    ) {
+        let Some(members) = self.shared.resolved.get() else {
+            return;
+        };
+        let values: Vec<_> = members
+            .iter()
+            .map(|member| results.get(member).copied().flatten().map(u64::from))
+            .collect();
+        apply_results(&self.shared, router, values);
+    }
+
     pub(crate) fn spawn(&self, router: Arc<Router>) -> tokio::task::JoinHandle<()> {
         let shared = Arc::clone(&self.shared);
         tokio::spawn(async move {
@@ -224,6 +239,10 @@ async fn probe_all(shared: &Arc<Shared>, router: &Arc<Router>) {
             results[pos] = ms;
         }
     }
+    apply_results(shared, router, results);
+}
+
+fn apply_results(shared: &Shared, router: &Router, results: Vec<Option<u64>>) {
     let mut latencies = shared.latencies.lock().expect("latencies lock");
     latencies.clone_from(&results);
 

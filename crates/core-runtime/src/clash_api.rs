@@ -302,7 +302,7 @@ async fn serve(listener: TcpListener, api: Arc<ClashApi>, router: Arc<Router>) {
 async fn handle_conn(
     mut stream: TcpStream,
     api: &ClashApi,
-    router: &Router,
+    router: &Arc<Router>,
 ) -> std::io::Result<()> {
     loop {
         let Some(head) = read_head(&mut stream).await? else {
@@ -318,7 +318,7 @@ async fn handle_conn(
 async fn handle_request(
     stream: &mut TcpStream,
     api: &ClashApi,
-    router: &Router,
+    router: &Arc<Router>,
     head: &[u8],
 ) -> std::io::Result<bool> {
     let Some((request_line, headers)) = split_head(head) else {
@@ -1144,7 +1144,7 @@ async fn write_chunk(stream: &mut TcpStream, body: &str) -> std::io::Result<()> 
 #[allow(clippy::too_many_arguments)]
 async fn handle_proxy_route(
     stream: &mut TcpStream,
-    router: &Router,
+    router: &Arc<Router>,
     method: &str,
     name: &str,
     delay: bool,
@@ -1376,7 +1376,7 @@ fn udp_capable(outbound: &Outbound) -> bool {
 /// connection establishment still counts against the overall timeout.
 async fn delay_test(
     stream: &mut TcpStream,
-    router: &Router,
+    router: &Arc<Router>,
     index: usize,
     url: &str,
     timeout: i16,
@@ -1384,68 +1384,103 @@ async fn delay_test(
 ) -> std::io::Result<()> {
     let deadline = Duration::from_millis(timeout.max(0) as u64);
     crate::logging::debug(format_args!("delay[{index}]: start probing {url}"));
+    let inner = router.inner();
+    fn visit(
+        inner: &crate::route::RouterInner,
+        index: usize,
+        seen: &mut std::collections::HashSet<usize>,
+        order: &mut Vec<usize>,
+    ) {
+        if !seen.insert(index) {
+            return;
+        }
+        let members: &[String] = match &inner.outbounds[index] {
+            Outbound::Selector(group) => group.all(),
+            Outbound::Urltest(group) => group.all(),
+            _ => &[],
+        };
+        for tag in members {
+            if let Some(child) = inner.index_of(tag) {
+                visit(inner, child, seen, order);
+            }
+        }
+        order.push(index);
+    }
+    let mut order = Vec::new();
+    visit(
+        &inner,
+        index,
+        &mut std::collections::HashSet::new(),
+        &mut order,
+    );
     let test = async {
-        let (tls, host, port, authority, path) = parse_link(url)?;
-        let target = Target::Domain(host.clone(), port);
-        let mut start = Instant::now();
-        let dialled = router.connect_index(index, &target).await;
-        let conn = match dialled {
-            Ok(crate::inbound::Conn::Plain(conn)) => conn,
-            Ok(_) => {
-                crate::logging::debug(format_args!(
-                    "delay[{index}]: dial {host}:{port}: non-plain connection"
-                ));
-                return None;
+        let expires = tokio::time::Instant::now() + deadline;
+        let sem = Arc::new(tokio::sync::Semaphore::new(8));
+        let mut tasks = tokio::task::JoinSet::new();
+        for &leaf in &order {
+            if matches!(
+                inner.outbounds[leaf],
+                Outbound::Selector(_) | Outbound::Urltest(_)
+            ) {
+                continue;
             }
-            Err(e) => {
-                crate::logging::debug(format_args!("delay[{index}]: dial {host}:{port}: {e}"));
-                return None;
+            let router = router.clone();
+            let url = url.to_string();
+            let sem = sem.clone();
+            tasks.spawn(async move {
+                let probe = async {
+                    let _permit = sem.acquire().await.ok()?;
+                    probe_delay(&router, leaf, &url).await
+                };
+                let result = tokio::time::timeout_at(expires, probe).await;
+                (
+                    leaf,
+                    result.as_ref().ok().copied().flatten().filter(|ms| *ms > 0),
+                    result.is_err(),
+                )
+            });
+        }
+        let mut results = std::collections::HashMap::new();
+        let mut timed_out = false;
+        while let Some(task) = tasks.join_next().await {
+            if let Ok((leaf, ms, timeout)) = task {
+                timed_out |= timeout;
+                results.insert(leaf, ms);
             }
-        };
-        let dial_ms = start.elapsed();
-        let mut stream: crate::inbound::AnyStream = if tls {
-            match tls_client::wrap_probe(conn, &host, &router.inner().probe_tls).await {
-                Ok(s) => s,
-                Err(e) => {
-                    crate::logging::debug(format_args!("delay[{index}]: tls {host}: {e}"));
-                    return None;
+        }
+        if !Arc::ptr_eq(&inner, &router.inner()) {
+            return Err(());
+        }
+        for &node in &order {
+            let ms = match &inner.outbounds[node] {
+                Outbound::Urltest(group) => {
+                    group.apply_probe_results(router, &results);
+                    inner
+                        .index_of(group.now())
+                        .and_then(|member| results.get(&member).copied().flatten())
                 }
-            }
-        } else {
-            conn
-        };
-        if tls {
-            start = Instant::now();
-        }
-        let request =
-            format!("HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
-        stream.write_all(request.as_bytes()).await.ok()?;
-        crate::logging::debug(format_args!("delay[{index}]: HEAD sent to {authority}"));
-        // One read per chunk, not one per byte: the status line crosses a
-        // boxed stream plus a TLS record layer, and the byte-at-a-time loop
-        // paid that round trip once per character on every UI ping click.
-        let mut status = Vec::with_capacity(128);
-        let mut buf = [0u8; 128];
-        loop {
-            if status.ends_with(b"\r\n") || status.len() >= 64 {
-                break;
-            }
-            match stream.read(&mut buf).await {
-                Ok(0) | Err(_) => return None,
-                Ok(n) => status.extend_from_slice(&buf[..n]),
+                Outbound::Selector(group) => inner
+                    .index_of(group.now())
+                    .and_then(|member| results.get(&member).copied().flatten()),
+                _ => results.get(&node).copied().flatten(),
+            };
+            results.insert(node, ms);
+            if let Some(ms) = ms {
+                inner.record_delay(node, ms.into());
+            } else {
+                inner.clear_delay(node);
             }
         }
-        let text = String::from_utf8_lossy(&status);
-        crate::logging::debug(format_args!(
-            "delay[{index}]: dial {}ms status line {text:?}",
-            dial_ms.as_millis()
-        ));
-        let _ = text.split_whitespace().nth(1)?;
-        u16::try_from(start.elapsed().as_millis()).ok()
+        match results.get(&index).copied().flatten() {
+            None if timed_out => Err(()),
+            ms => Ok(ms),
+        }
     };
-    match tokio::time::timeout(deadline, test).await {
+    match test.await {
         Err(_) => {
-            router.clear_delay(index);
+            for node in order {
+                inner.clear_delay(node);
+            }
             respond_json(stream, 504, "Gateway Timeout", &timeout_err(), cors).await
         }
         Ok(None) | Ok(Some(0)) => {
@@ -1457,6 +1492,65 @@ async fn delay_test(
             respond_json(stream, 200, "OK", &json!({"delay": delay}), cors).await
         }
     }
+}
+
+async fn probe_delay(router: &Router, index: usize, url: &str) -> Option<u16> {
+    let (tls, host, port, authority, path) = parse_link(url)?;
+    let target = Target::Domain(host.clone(), port);
+    let mut start = Instant::now();
+    let dialled = router.connect_index(index, &target).await;
+    let conn = match dialled {
+        Ok(crate::inbound::Conn::Plain(conn)) => conn,
+        Ok(_) => {
+            crate::logging::debug(format_args!(
+                "delay[{index}]: dial {host}:{port}: non-plain connection"
+            ));
+            return None;
+        }
+        Err(e) => {
+            crate::logging::debug(format_args!("delay[{index}]: dial {host}:{port}: {e}"));
+            return None;
+        }
+    };
+    let dial_ms = start.elapsed();
+    let mut stream: crate::inbound::AnyStream = if tls {
+        match tls_client::wrap_probe(conn, &host, &router.inner().probe_tls).await {
+            Ok(s) => s,
+            Err(e) => {
+                crate::logging::debug(format_args!("delay[{index}]: tls {host}: {e}"));
+                return None;
+            }
+        }
+    } else {
+        conn
+    };
+    if tls {
+        start = Instant::now();
+    }
+    let request = format!("HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.ok()?;
+    crate::logging::debug(format_args!("delay[{index}]: HEAD sent to {authority}"));
+    // One read per chunk, not one per byte: the status line crosses a
+    // boxed stream plus a TLS record layer, and the byte-at-a-time loop
+    // paid that round trip once per character on every UI ping click.
+    let mut status = Vec::with_capacity(128);
+    let mut buf = [0u8; 128];
+    loop {
+        if status.ends_with(b"\r\n") || status.len() >= 64 {
+            break;
+        }
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => status.extend_from_slice(&buf[..n]),
+        }
+    }
+    let text = String::from_utf8_lossy(&status);
+    crate::logging::debug(format_args!(
+        "delay[{index}]: dial {}ms status line {text:?}",
+        dial_ms.as_millis()
+    ));
+    let _ = text.split_whitespace().nth(1)?;
+    u16::try_from(start.elapsed().as_millis()).ok()
 }
 
 /// Minimal URL split: `(tls, host, port, authority, path-with-query)`.

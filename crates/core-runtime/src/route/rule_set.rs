@@ -284,10 +284,8 @@ fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bo
     let has_ip = rule.contains_key("ip_cidr");
     if has_domain || has_ip {
         let mut dest_matched = false;
-        if let Some(domain) = super::rule::domain_host(ctx)
-            && has_domain
-        {
-            dest_matched = list(rule.get("domain"))
+        for domain in super::rule::domain_hosts(ctx).filter(|_| has_domain) {
+            dest_matched |= list(rule.get("domain"))
                 .iter()
                 .any(|entry| entry == domain.as_ref())
                 || list(rule.get("domain_suffix"))

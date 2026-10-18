@@ -2,7 +2,7 @@
 
 use super::format::*;
 use crate::route::ConnContext;
-use crate::route::rule::domain_host;
+use crate::route::rule::domain_hosts;
 use std::net::IpAddr;
 
 #[derive(Clone, Copy, Debug)]
@@ -100,7 +100,7 @@ impl<'a> MmapView<'a> {
     /// Match a live connection context with 0 bytes heap allocation.
     pub fn matches(&self, ctx: &ConnContext) -> bool {
         // 1. Match destination domain
-        if let Some(host) = domain_host(ctx) {
+        for host in domain_hosts(ctx) {
             #[allow(clippy::collapsible_if)]
             if self.matches_domain(&host) {
                 return true;
