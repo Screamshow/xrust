@@ -69,15 +69,16 @@ impl Peer {
             .is_some_and(|t| t.elapsed() < Duration::from_secs(if self.busy() { 6 } else { 75 }))
     }
     fn fallback(&mut self) {
-        if matches!(self.active, Some(Path::Udp(_))) && !self.direct_fresh() {
-            if let Some(region) = self.derp_region {
-                self.active = Some(Path::Derp(region));
-                self.last_fallback = Some(Instant::now());
-                self.direct_rtt = None;
-                self.next_probe = None;
-                self.probe_failures = 0;
-                self.candidate = None;
-            }
+        if matches!(self.active, Some(Path::Udp(_)))
+            && !self.direct_fresh()
+            && let Some(region) = self.derp_region
+        {
+            self.active = Some(Path::Derp(region));
+            self.last_fallback = Some(Instant::now());
+            self.direct_rtt = None;
+            self.next_probe = None;
+            self.probe_failures = 0;
+            self.candidate = None;
         }
     }
     fn probe_delay(&self) -> Duration {
@@ -116,14 +117,13 @@ impl Peer {
             .last_fallback
             .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
             && !matches!(self.active, Some(Path::Udp(_)))
-        {
-            if !self.candidate.is_some_and(|(candidate, seen)| {
+            && !self.candidate.is_some_and(|(candidate, seen)| {
                 candidate == addr && seen.elapsed() >= Duration::from_millis(200)
-            }) {
-                self.candidate = Some((addr, Instant::now()));
-                self.next_probe = Some(Instant::now() + Duration::from_millis(500));
-                return;
-            }
+            })
+        {
+            self.candidate = Some((addr, Instant::now()));
+            self.next_probe = Some(Instant::now() + Duration::from_millis(500));
+            return;
         }
         self.note_path(Path::Udp(addr));
         self.direct_rtt = Some(rtt);
@@ -428,10 +428,10 @@ impl DirectMesh {
             peer.established = None;
         }
         peer.fallback();
-        if peer.busy() {
-            if let (Some(relay), Some(region)) = (relay.as_mut(), peer.derp_region) {
-                relay.prepare(region);
-            }
+        if peer.busy()
+            && let (Some(relay), Some(region)) = (relay.as_mut(), peer.derp_region)
+        {
+            relay.prepare(region);
         }
         // A responder cannot send application data until the initiator proves
         // possession of the new session key with its first transport packet.
@@ -639,7 +639,7 @@ impl DirectMesh {
                     && (plain.len() - 2) % 18 == 0
                     && plain.len() <= 2 + 32 * 18
                 {
-                    for entry in plain[2..].chunks_exact(18) {
+                    for entry in plain[2..].as_chunks::<18>().0 {
                         let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&entry[..16]).unwrap());
                         if let Some(ip) = ip.to_ipv4_mapped() {
                             peer.learn((ip, u16::from_be_bytes([entry[16], entry[17]])).into());
@@ -797,10 +797,10 @@ impl DirectMesh {
                     } else {
                         peer.endpoints.clone()
                     };
-                    if let Some(Path::Udp(addr)) = peer.active {
-                        if !endpoints.contains(&addr) {
-                            endpoints.push(addr);
-                        }
+                    if let Some(Path::Udp(addr)) = peer.active
+                        && !endpoints.contains(&addr)
+                    {
+                        endpoints.push(addr);
                     }
                     for addr in endpoints.into_iter().take(32) {
                         let mut tx = [0; 12];
@@ -809,29 +809,29 @@ impl DirectMesh {
                         let mut plain = vec![1, 0];
                         plain.extend(tx);
                         plain.extend(self.public);
-                        if let Ok(packet) = disco_packet(&self.disco, disco, &plain) {
-                            if self.socket.send_to(&packet, addr).await.is_ok() {
-                                if peer.probes.len() >= 64 {
-                                    peer.probes.pop_front();
-                                }
-                                peer.probes.push_back((tx, addr, Instant::now()));
+                        if let Ok(packet) = disco_packet(&self.disco, disco, &plain)
+                            && self.socket.send_to(&packet, addr).await.is_ok()
+                        {
+                            if peer.probes.len() >= 64 {
+                                peer.probes.pop_front();
                             }
+                            peer.probes.push_back((tx, addr, Instant::now()));
                         }
                     }
-                    if !matches!(peer.active, Some(Path::Udp(_))) {
-                        if let (Some(relay), Some(region)) = (&mut self.relay, peer.derp_region) {
-                            let mut plain = vec![3, 0];
-                            for addr in advertised.iter().take(32) {
-                                let ip = match addr.ip() {
-                                    IpAddr::V4(ip) => ip.to_ipv6_mapped(),
-                                    IpAddr::V6(ip) => ip,
-                                };
-                                plain.extend(ip.octets());
-                                plain.extend(addr.port().to_be_bytes());
-                            }
-                            if let Ok(packet) = disco_packet(&self.disco, disco, &plain) {
-                                relay.send(region, *key, &packet);
-                            }
+                    if !matches!(peer.active, Some(Path::Udp(_)))
+                        && let (Some(relay), Some(region)) = (&mut self.relay, peer.derp_region)
+                    {
+                        let mut plain = vec![3, 0];
+                        for addr in advertised.iter().take(32) {
+                            let ip = match addr.ip() {
+                                IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+                                IpAddr::V6(ip) => ip,
+                            };
+                            plain.extend(ip.octets());
+                            plain.extend(addr.port().to_be_bytes());
+                        }
+                        if let Ok(packet) = disco_packet(&self.disco, disco, &plain) {
+                            relay.send(region, *key, &packet);
                         }
                     }
                 }

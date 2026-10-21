@@ -166,10 +166,9 @@ async fn relay_scores(map: &DerpMap) -> Vec<(u16, u64)> {
                         false,
                     )
                     .await
+                        && let Ok(rtt) = client.ping().await
                     {
-                        if let Ok(rtt) = client.ping().await {
-                            return Some((id, rtt.as_millis().max(1) as u64));
-                        }
+                        return Some((id, rtt.as_millis().max(1) as u64));
                     }
                 }
                 None
@@ -418,14 +417,14 @@ impl Connectivity {
             return false;
         }
         let tx: [u8; 12] = bytes[8..20].try_into().unwrap();
-        if let Some(pending) = self.pending.get(&tx) {
-            if pending.target == source && pending.sent.elapsed() < Duration::from_secs(5) {
-                if let Some(mapped) = stun_response(bytes, &tx) {
-                    self.pending.remove(&tx);
-                    self.observations.insert(source, (mapped, Instant::now()));
-                    self.publish_endpoints();
-                }
-            }
+        if let Some(pending) = self.pending.get(&tx)
+            && pending.target == source
+            && pending.sent.elapsed() < Duration::from_secs(5)
+            && let Some(mapped) = stun_response(bytes, &tx)
+        {
+            self.pending.remove(&tx);
+            self.observations.insert(source, (mapped, Instant::now()));
+            self.publish_endpoints();
         }
         true
     }
