@@ -48,15 +48,29 @@ fn compatible() -> bool {
 fn cleanup_network() {
     // Embedded: an old incoming Forkop package removes the newer helper files.
     let script = r#"
+nft -a list chain inet fw4 input 2>/dev/null | sed -n '/comment "forkop-native-tailscale-udp"/s/.*# handle \([0-9][0-9]*\).*/\1/p' | while read -r handle; do
+ nft delete rule inet fw4 input handle "$handle" 2>/dev/null || true
+done
+rm -f /var/run/forkop/ui-state/tailscale-udp-owned
 for chain in forward input; do
  nft -a list chain inet fw4 "$chain" 2>/dev/null | sed -n '/comment "forkop-native-tailscale"/s/.*# handle \([0-9][0-9]*\).*/\1/p' | while read -r handle; do
   nft delete rule inet fw4 "$chain" handle "$handle" 2>/dev/null || true
  done
 done
+nft flush chain inet fw4 forkop_native_ts_input 2>/dev/null || true
+nft delete chain inet fw4 forkop_native_ts_input 2>/dev/null || true
 if [ -f /var/run/forkop/ui-state/tailscale-lan-owned ]; then
  nft delete table inet forkop_native_tailscale 2>/dev/null || true
  ip rule del priority 104 fwmark 0x880000/0xff0000 table 52743 2>/dev/null || true
  ip route flush table 52743 2>/dev/null || true
+ ip -6 rule del priority 104 fwmark 0x880000/0xff0000 table 52743 2>/dev/null || true
+ ip -6 route flush table 52743 2>/dev/null || true
+ table=$(ucode /usr/lib/forkop/core/constants.uc get NFT_TABLE_NAME 2>/dev/null)
+ interfaces=$(ucode /usr/lib/forkop/core/constants.uc get NFT_INTERFACE_SET_NAME 2>/dev/null)
+ configured=$(uci -q get forkop.settings.source_network_interfaces)
+ case " $configured " in *' forkop-tslan '*) ;; *)
+  nft delete element inet "${table:-ForkopTable}" "${interfaces:-forkop_interfaces}" '{ "forkop-tslan" }' 2>/dev/null || true;;
+ esac
  rm -f /var/run/forkop/ui-state/tailscale-lan-owned
 fi
 "#;
@@ -119,6 +133,11 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .map(|s| serde_json::from_str(&s))
             .transpose()?;
+    let exit_enabled = Path::new("/etc/forkop-tailscale/exit-enabled").exists();
+    config["advertise_exit_node"] = exit_enabled.into();
+    if exit_enabled {
+        config["system_interface"] = true.into();
+    }
     if let Some(lan) = &lan_config {
         config["system_interface"] = true.into();
         config["advertise_routes"] = lan["routes"].clone();
@@ -151,7 +170,16 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     loop {
-        let lan_ready = if lan_config.is_some() {
+        if Path::new("/var/run/forkop/ui-state/tailscale-stopping").exists() {
+            break;
+        }
+        let udp_ready = std::process::Command::new("/usr/lib/forkop/tailscale/transport.sh")
+            .arg("setup")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        let lan_ready = if lan_config.is_some() || exit_enabled {
             std::process::Command::new("/usr/lib/forkop/tailscale/lan.sh")
                 .arg("setup")
                 .stdout(std::process::Stdio::null())
@@ -161,10 +189,19 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             true
         };
+        if shared
+            .cmd_tx
+            .send(super::engine::Cmd::UpdateForwardingReady { ready: lan_ready })
+            .await
+            .is_err()
+        {
+            break;
+        }
         status(
             serde_json::json!({"state":if shared.control_connected.load(Ordering::Relaxed) {"connected"} else {"reconnecting"}, "ip":shared.local_ip().to_string(),
-            "lan_ready":lan_ready, "routes_approved":shared.routes_approved.load(Ordering::Relaxed),
-            "message":if lan_ready {None} else {Some("Не удалось настроить передачу трафика в LAN")},
+            "udp_ready":udp_ready,"transport":shared.transport.read().unwrap().clone(),
+            "lan_ready":lan_ready, "exit_ready":exit_enabled && lan_ready, "exit_approved":shared.exit_approved.load(Ordering::Relaxed), "routes_approved":shared.routes_approved.load(Ordering::Relaxed),
+            "message":if lan_ready {None} else {Some("Не удалось настроить передачу трафика Tailscale")},
             "updated_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()}),
         )?;
         // Service stop kills the process and closes every remote listener.

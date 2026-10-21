@@ -20,13 +20,14 @@ const GIVE_UP: Duration = Duration::from_secs(90);
 const REKEY: Duration = Duration::from_secs(120);
 const EXPIRE: Duration = Duration::from_secs(180);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Path {
     Udp(SocketAddr),
     Derp(u16),
 }
 
 struct Peer {
+    name: Option<String>,
     disco: Option<[u8; 32]>,
     addresses: Vec<IpAddr>,
     endpoints: Vec<SocketAddr>,
@@ -40,8 +41,146 @@ struct Peer {
     last_attempt: Option<Instant>,
     latest_timestamp: Option<[u8; 12]>,
     pending: VecDeque<Vec<u8>>,
+    direct_seen: Option<Instant>,
+    probe_at: Option<Instant>,
+    probes: VecDeque<([u8; 12], SocketAddr, Instant)>,
+    direct_rtt: Option<Duration>,
+    next_probe: Option<Instant>,
+    probe_failures: u8,
+    last_payload: Option<Instant>,
+    last_fallback: Option<Instant>,
+    candidate: Option<(SocketAddr, Instant)>,
 }
 
+impl Peer {
+    fn payload(&mut self) {
+        if !self.busy() {
+            self.next_probe = None;
+            self.probe_failures = 0;
+        }
+        self.last_payload = Some(Instant::now());
+    }
+    fn busy(&self) -> bool {
+        self.last_payload
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
+    }
+    fn direct_fresh(&self) -> bool {
+        self.direct_seen
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(if self.busy() { 6 } else { 75 }))
+    }
+    fn fallback(&mut self) {
+        if matches!(self.active, Some(Path::Udp(_))) && !self.direct_fresh() {
+            if let Some(region) = self.derp_region {
+                self.active = Some(Path::Derp(region));
+                self.last_fallback = Some(Instant::now());
+                self.direct_rtt = None;
+                self.next_probe = None;
+                self.probe_failures = 0;
+                self.candidate = None;
+            }
+        }
+    }
+    fn probe_delay(&self) -> Duration {
+        let seconds = if matches!(self.active, Some(Path::Udp(_))) {
+            if self.busy() { 15 } else { 60 }
+        } else if !self.busy() && self.probe_failures >= 3 {
+            180
+        } else {
+            [5, 15, 30, 60][usize::from(self.probe_failures.min(3))]
+        };
+        Duration::from_secs(seconds)
+    }
+    fn begin_probe(&mut self) -> bool {
+        if self.next_probe.is_some_and(|t| t > Instant::now()) {
+            return false;
+        }
+        if self
+            .probe_at
+            .is_some_and(|round| self.direct_seen.is_none_or(|seen| seen < round))
+        {
+            self.probe_failures = self.probe_failures.saturating_add(1);
+        }
+        let delay = self.probe_delay();
+        let mut random = [0; 1];
+        let _ = getrandom::fill(&mut random);
+        self.next_probe = Some(
+            Instant::now()
+                + delay
+                + Duration::from_millis(delay.as_millis() as u64 * u64::from(random[0]) / 2550),
+        );
+        self.probe_at = Some(Instant::now());
+        true
+    }
+    fn confirm_probe(&mut self, addr: SocketAddr, rtt: Duration) {
+        if self
+            .last_fallback
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(60))
+            && !matches!(self.active, Some(Path::Udp(_)))
+        {
+            if !self.candidate.is_some_and(|(candidate, seen)| {
+                candidate == addr && seen.elapsed() >= Duration::from_millis(200)
+            }) {
+                self.candidate = Some((addr, Instant::now()));
+                self.next_probe = Some(Instant::now() + Duration::from_millis(500));
+                return;
+            }
+        }
+        self.note_path(Path::Udp(addr));
+        self.direct_rtt = Some(rtt);
+        self.candidate = None;
+    }
+
+    fn learn(&mut self, addr: SocketAddr) {
+        if addr.is_ipv4()
+            && addr.port() != 0
+            && !addr.ip().is_unspecified()
+            && !addr.ip().is_multicast()
+            && addr.ip() != IpAddr::V4(Ipv4Addr::BROADCAST)
+            && !self.endpoints.contains(&addr)
+            && self.endpoints.len() < 32
+        {
+            self.endpoints.push(addr);
+        }
+    }
+    fn note_path(&mut self, path: Path) {
+        match path {
+            Path::Udp(addr) => {
+                self.direct_seen = Some(Instant::now());
+                self.probe_failures = 0;
+                self.active = Some(path);
+                self.learn(addr);
+            }
+            Path::Derp(region) => {
+                if !self.direct_fresh() {
+                    self.active = Some(Path::Derp(self.derp_region.unwrap_or(region)));
+                }
+            }
+        }
+    }
+}
+fn disco_packet(private: &StaticSecret, public: [u8; 32], plain: &[u8]) -> io::Result<Vec<u8>> {
+    use crypto_box::{SalsaBox, aead::Aead};
+    if !private
+        .diffie_hellman(&PublicKey::from(public))
+        .was_contributory()
+    {
+        return Err(io::Error::other("tailscale: invalid disco key"));
+    }
+    let cipher = SalsaBox::new(
+        &crypto_box::PublicKey::from(public),
+        &crypto_box::SecretKey::from(private.to_bytes()),
+    );
+    let mut nonce = [0; 24];
+    getrandom::fill(&mut nonce).map_err(|_| io::Error::other("tailscale: entropy unavailable"))?;
+    let encrypted = cipher
+        .encrypt((&nonce).into(), plain)
+        .map_err(|_| io::Error::other("tailscale: disco encrypt"))?;
+    let mut packet = b"TS\xf0\x9f\x92\xac".to_vec();
+    packet.extend(PublicKey::from(private).as_bytes());
+    packet.extend(nonce);
+    packet.extend(encrypted);
+    Ok(packet)
+}
 pub struct DirectMesh {
     disco: StaticSecret,
     socket: UdpSocket,
@@ -51,6 +190,9 @@ pub struct DirectMesh {
     local_routes: Vec<smoltcp::wire::IpCidr>,
     peers: HashMap<[u8; 32], Peer>,
     relay: Option<RelayManager>,
+    connectivity: Option<super::connectivity::Connectivity>,
+    more_work: bool,
+    network_endpoints: Vec<SocketAddr>,
 }
 
 impl DirectMesh {
@@ -70,9 +212,32 @@ impl DirectMesh {
             local_routes: vec![],
             peers: HashMap::new(),
             relay: None,
+            connectivity: None,
+            more_work: false,
+            network_endpoints: vec![],
         })
     }
 
+    pub fn more_work(&self) -> bool {
+        self.more_work
+    }
+    pub async fn readable(&self) -> io::Result<()> {
+        if let Some(relay) = &self.relay {
+            if !relay.rx.is_empty() {
+                return Ok(());
+            }
+            tokio::select! {ready=self.socket.readable()=>ready,_=relay.notify.notified()=>Ok(())}
+        } else {
+            self.socket.readable().await
+        }
+    }
+    pub fn diagnostics(&self) -> serde_json::Value {
+        let peers:Vec<_>=self.peers.values().filter(|p|p.active.is_some()).map(|p| {
+            let (path,region)=match p.active {Some(Path::Udp(_))=>("direct",None),Some(Path::Derp(id))=>("derp",Some(id)),None=>("pending",None)};
+            serde_json::json!({"name":p.name,"addresses":p.addresses,"path":path,"derp_region":region,"direct_rtt_ms":p.direct_rtt.map(|r|r.as_millis() as u64)})
+        }).collect();
+        serde_json::json!({"network":self.connectivity.as_ref().map(|c|c.info.borrow().clone()),"peers":peers})
+    }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
@@ -89,15 +254,30 @@ impl DirectMesh {
         PublicKey::from(&self.disco).to_bytes()
     }
 
+    pub async fn discover(
+        &mut self,
+        map: super::derp::DerpMap,
+    ) -> io::Result<tokio::sync::watch::Receiver<super::connectivity::NetworkInfo>> {
+        let connectivity = super::connectivity::Connectivity::start(&self.socket, map).await?;
+        let rx = connectivity.info.subscribe();
+        self.connectivity = Some(connectivity);
+        Ok(rx)
+    }
     pub fn set_relay(&mut self, relay: RelayManager) {
         self.relay = Some(relay);
     }
     pub fn update_relay_map(&mut self, map: super::derp::DerpMap) {
+        self.update_discovery_map(map.clone());
         if let Some(relay) = &mut self.relay {
-            relay.update_map(map);
+            relay.update_map(map.clone());
         }
     }
 
+    pub fn update_discovery_map(&mut self, map: super::derp::DerpMap) {
+        if let Some(c) = &mut self.connectivity {
+            c.update_map(map);
+        }
+    }
     pub fn update_peers(&mut self, nodes: &[PeerObj]) {
         let mut next = HashMap::new();
         for node in nodes.iter().take(MAX_PEERS) {
@@ -131,6 +311,7 @@ impl DirectMesh {
                 .take(16)
                 .collect();
             let mut peer = self.peers.remove(&key).unwrap_or(Peer {
+                name: None,
                 disco: None,
                 addresses: vec![],
                 endpoints: vec![],
@@ -144,8 +325,22 @@ impl DirectMesh {
                 last_attempt: None,
                 latest_timestamp: None,
                 pending: VecDeque::new(),
+                direct_seen: None,
+                probe_at: None,
+                probes: VecDeque::new(),
+                direct_rtt: None,
+                next_probe: None,
+                probe_failures: 0,
+                last_payload: None,
+                last_fallback: None,
+                candidate: None,
             });
+            if peer.endpoints != endpoints {
+                peer.next_probe = None;
+                peer.probe_failures = 0;
+            }
             peer.addresses = addresses;
+            peer.name = node.name.clone();
             peer.disco = node.disco_key.as_deref().and_then(|s| {
                 super::control::parse_key_hex(s.strip_prefix("discokey:").unwrap_or(s))
             });
@@ -200,6 +395,7 @@ impl DirectMesh {
                 "tailscale: no mapped peer",
             ));
         };
+        peer.payload();
         if peer.pending.len() >= MAX_PENDING {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -230,6 +426,12 @@ impl DirectMesh {
             peer.session = None;
             peer.confirmed = false;
             peer.established = None;
+        }
+        peer.fallback();
+        if peer.busy() {
+            if let (Some(relay), Some(region)) = (relay.as_mut(), peer.derp_region) {
+                relay.prepare(region);
+            }
         }
         // A responder cannot send application data until the initiator proves
         // possession of the new session key with its first transport packet.
@@ -303,29 +505,68 @@ impl DirectMesh {
 
     /// Drain a bounded number of UDP messages; called by the endpoint's stack task.
     pub async fn poll(&mut self) -> io::Result<Vec<Vec<u8>>> {
+        self.more_work = false;
+        if let Some(c) = &mut self.connectivity {
+            if let Some(relay) = &mut self.relay {
+                while let Ok(health) = relay.health_rx.try_recv() {
+                    c.relay_health(health);
+                }
+            }
+            c.tick(&self.socket).await;
+            let endpoints = c.info.borrow().endpoints.clone();
+            if endpoints != self.network_endpoints {
+                self.network_endpoints = endpoints;
+                for peer in self.peers.values_mut() {
+                    peer.next_probe = None;
+                    peer.probe_failures = 0;
+                }
+            }
+            if let Some(relay) = &mut self.relay {
+                relay.set_home(c.info.borrow().home_derp);
+            }
+        }
         let mut packets = Vec::new();
         let mut buffer = [0; 65536];
         let mut inbound = Vec::new();
-        for _ in 0..64 {
+        for index in 0..256 {
             let (length, endpoint) = match self.socket.try_recv_from(&mut buffer) {
                 Ok(value) => value,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             };
+            if index == 255 {
+                self.more_work = true;
+            }
+            if length > 2048 {
+                continue;
+            }
+            if self
+                .connectivity
+                .as_mut()
+                .is_some_and(|c| c.receive(&buffer[..length], endpoint))
+            {
+                continue;
+            }
             inbound.push((buffer[..length].to_vec(), Path::Udp(endpoint), None));
         }
         if let Some(relay) = &mut self.relay {
-            for _ in 0..64 {
+            for index in 0..256 {
                 let Ok((region, packet)) = relay.rx.try_recv() else {
                     break;
                 };
-                inbound.push((packet.packet, Path::Derp(region), Some(packet.source)));
+                if index == 255 {
+                    self.more_work = true;
+                }
+                if packet.packet.len() <= 2048 {
+                    inbound.push((packet.packet, Path::Derp(region), Some(packet.source)));
+                }
             }
         }
         for (bytes, endpoint, relay_source) in inbound {
             if bytes.starts_with(b"TS\xf0\x9f\x92\xac") && bytes.len() >= 78 {
                 let source: [u8; 32] = bytes[6..38].try_into().unwrap();
-                let Some((node, peer)) = self.peers.iter().find(|(_, p)| p.disco == Some(source))
+                let Some((node, peer)) =
+                    self.peers.iter_mut().find(|(_, p)| p.disco == Some(source))
                 else {
                     continue;
                 };
@@ -369,12 +610,47 @@ impl DirectMesh {
                         .encrypt((&nonce).into(), response.as_slice())
                         .map_err(|_| io::Error::other("tailscale: disco encrypt"))?;
                     let mut packet = b"TS\xf0\x9f\x92\xac".to_vec();
-                    packet.extend_from_slice(&self.disco_public());
+                    packet.extend_from_slice(PublicKey::from(&self.disco).as_bytes());
                     packet.extend_from_slice(&nonce);
                     packet.extend(encrypted);
                     let node = *node;
+                    if let Path::Udp(addr) = endpoint {
+                        peer.learn(addr);
+                    }
                     let _ = peer;
                     Self::transmit(&self.socket, &mut self.relay, endpoint, node, &packet).await?;
+                } else if plain.len() == 32 && plain[..2] == [2, 0] {
+                    if let Path::Udp(addr) = endpoint {
+                        let tx: [u8; 12] = plain[2..14].try_into().unwrap();
+                        if let Some(i) = peer.probes.iter().position(|(id, target, sent)| {
+                            *id == tx && *target == addr && sent.elapsed() < Duration::from_secs(10)
+                        }) {
+                            let (_, _, sent) = peer.probes.remove(i).unwrap();
+                            let rtt = sent.elapsed();
+                            if !matches!(peer.active,Some(Path::Udp(old)) if old!=addr && peer.direct_seen.is_some_and(|t|t.elapsed()<Duration::from_secs(20)) && peer.direct_rtt.is_some_and(|old|old<=rtt+Duration::from_millis(5)))
+                            {
+                                peer.confirm_probe(addr, rtt);
+                            }
+                        }
+                    }
+                } else if matches!(endpoint, Path::Derp(_))
+                    && plain.len() >= 2
+                    && plain[..2] == [3, 0]
+                    && (plain.len() - 2) % 18 == 0
+                    && plain.len() <= 2 + 32 * 18
+                {
+                    for entry in plain[2..].chunks_exact(18) {
+                        let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&entry[..16]).unwrap());
+                        if let Some(ip) = ip.to_ipv4_mapped() {
+                            peer.learn((ip, u16::from_be_bytes([entry[16], entry[17]])).into());
+                        }
+                    }
+                    if peer
+                        .probe_at
+                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+                    {
+                        peer.next_probe = None;
+                    }
                 }
                 continue;
             }
@@ -421,7 +697,7 @@ impl DirectMesh {
                     .await?;
                     peer.session = Some(session);
                     peer.established = Some(Instant::now());
-                    peer.active = Some(endpoint);
+                    peer.note_path(endpoint);
                     peer.confirmed = false;
                 }
                 Some(2) if length == noise::RESPONSE_LEN => {
@@ -449,7 +725,7 @@ impl DirectMesh {
                     Self::transmit(&self.socket, &mut self.relay, endpoint, *key, &confirm).await?;
                     peer.session = Some(session);
                     peer.established = Some(Instant::now());
-                    peer.active = Some(endpoint);
+                    peer.note_path(endpoint);
                     peer.confirmed = true;
                     peer.initiation = None;
                     peer.first_attempt = None;
@@ -469,7 +745,10 @@ impl DirectMesh {
                     let Some(mut plain) = peer.session.as_mut().unwrap().open(packet) else {
                         continue;
                     };
-                    peer.active = Some(endpoint);
+                    if !plain.is_empty() {
+                        peer.payload();
+                    }
+                    peer.note_path(endpoint);
                     peer.confirmed = true;
                     if plain.is_empty() {
                         continue;
@@ -502,7 +781,61 @@ impl DirectMesh {
                 _ => {}
             }
         }
+        let advertised = self
+            .connectivity
+            .as_ref()
+            .map(|c| c.info.borrow().endpoints.clone())
+            .unwrap_or_default();
         for (key, peer) in &mut self.peers {
+            peer.fallback();
+            if peer.begin_probe() {
+                peer.probes
+                    .retain(|(_, _, t)| t.elapsed() < Duration::from_secs(10));
+                if let Some(disco) = peer.disco {
+                    let mut endpoints = if matches!(peer.active, Some(Path::Udp(_))) {
+                        vec![]
+                    } else {
+                        peer.endpoints.clone()
+                    };
+                    if let Some(Path::Udp(addr)) = peer.active {
+                        if !endpoints.contains(&addr) {
+                            endpoints.push(addr);
+                        }
+                    }
+                    for addr in endpoints.into_iter().take(32) {
+                        let mut tx = [0; 12];
+                        getrandom::fill(&mut tx)
+                            .map_err(|_| io::Error::other("tailscale: entropy unavailable"))?;
+                        let mut plain = vec![1, 0];
+                        plain.extend(tx);
+                        plain.extend(self.public);
+                        if let Ok(packet) = disco_packet(&self.disco, disco, &plain) {
+                            if self.socket.send_to(&packet, addr).await.is_ok() {
+                                if peer.probes.len() >= 64 {
+                                    peer.probes.pop_front();
+                                }
+                                peer.probes.push_back((tx, addr, Instant::now()));
+                            }
+                        }
+                    }
+                    if !matches!(peer.active, Some(Path::Udp(_))) {
+                        if let (Some(relay), Some(region)) = (&mut self.relay, peer.derp_region) {
+                            let mut plain = vec![3, 0];
+                            for addr in advertised.iter().take(32) {
+                                let ip = match addr.ip() {
+                                    IpAddr::V4(ip) => ip.to_ipv6_mapped(),
+                                    IpAddr::V6(ip) => ip,
+                                };
+                                plain.extend(ip.octets());
+                                plain.extend(addr.port().to_be_bytes());
+                            }
+                            if let Ok(packet) = disco_packet(&self.disco, disco, &plain) {
+                                relay.send(region, *key, &packet);
+                            }
+                        }
+                    }
+                }
+            }
             Self::flush(
                 &self.socket,
                 &mut self.relay,
@@ -607,6 +940,93 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn disco_promotes_direct_without_wireguard_traffic_and_keeps_it_over_derp() {
+        let (mut a, mut b) = pair().await;
+        a.peers.get_mut(&b.public).unwrap().disco = Some(b.disco_public());
+        b.peers.get_mut(&a.public).unwrap().disco = Some(a.disco_public());
+        a.peers.get_mut(&b.public).unwrap().active = Some(Path::Derp(22));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                a.poll().await.unwrap();
+                b.poll().await.unwrap();
+                if matches!(a.peers[&b.public].active, Some(Path::Udp(_))) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let p = a.peers.get_mut(&b.public).unwrap();
+        assert!(p.direct_rtt.is_some());
+        p.note_path(Path::Derp(1));
+        assert!(matches!(p.active, Some(Path::Udp(_))));
+        p.direct_seen = Some(Instant::now() - Duration::from_secs(76));
+        p.derp_region = Some(22);
+        p.note_path(Path::Derp(1));
+        assert!(matches!(p.active, Some(Path::Derp(22))));
+    }
+
+    #[tokio::test]
+    async fn unsolicited_authenticated_pong_cannot_select_a_direct_path() {
+        let (mut a, b) = pair().await;
+        a.peers.get_mut(&b.public).unwrap().disco = Some(b.disco_public());
+        let mut plain = vec![2, 0];
+        plain.extend([9; 12]);
+        plain.extend([0; 18]);
+        let p = disco_packet(&b.disco, a.disco_public(), &plain).unwrap();
+        b.socket
+            .send_to(&p, (Ipv4Addr::LOCALHOST, a.local_addr().unwrap().port()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        a.poll().await.unwrap();
+        assert!(a.peers[&b.public].active.is_none());
+    }
+
+    #[tokio::test]
+    async fn probes_back_off_and_new_payload_wakes_an_idle_peer() {
+        let (mut mesh, other) = pair().await;
+        let peer = mesh.peers.get_mut(&other.public).unwrap();
+        peer.payload();
+        for seconds in [5, 15, 30, 60] {
+            peer.next_probe = None;
+            assert!(peer.begin_probe());
+            assert_eq!(peer.probe_delay(), Duration::from_secs(seconds));
+        }
+        peer.last_payload = Some(Instant::now() - Duration::from_secs(31));
+        assert_eq!(peer.probe_delay(), Duration::from_secs(180));
+        assert!(!peer.begin_probe());
+        peer.payload();
+        assert_eq!(peer.probe_failures, 0);
+        assert!(peer.next_probe.is_none());
+        assert!(peer.begin_probe());
+    }
+
+    #[tokio::test]
+    async fn fallback_preserves_wireguard_and_requires_two_probes_to_return() {
+        let (mut a, mut b) = pair().await;
+        a.send(packet([100, 64, 0, 1], [100, 64, 0, 2], 42))
+            .await
+            .unwrap();
+        receive(&mut a, &mut b).await;
+        let peer = a.peers.get_mut(&b.public).unwrap();
+        let Some(Path::Udp(address)) = peer.active else {
+            panic!("direct session required")
+        };
+        peer.derp_region = Some(22);
+        peer.direct_seen = Some(Instant::now() - Duration::from_secs(7));
+        peer.fallback();
+        assert_eq!(peer.active, Some(Path::Derp(22)));
+        assert!(peer.session.is_some() && peer.confirmed);
+        peer.confirm_probe(address, Duration::from_millis(10));
+        assert_eq!(peer.active, Some(Path::Derp(22)));
+        peer.candidate = Some((address, Instant::now() - Duration::from_millis(250)));
+        peer.confirm_probe(address, Duration::from_millis(10));
+        assert_eq!(peer.active, Some(Path::Udp(address)));
     }
 
     #[tokio::test]

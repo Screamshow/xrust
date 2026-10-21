@@ -29,6 +29,16 @@ pub struct Hostinfo {
     pub hostname: String,
     #[serde(rename = "RoutableIPs", default)]
     pub routable_ips: Vec<String>,
+    #[serde(rename = "Services", default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<Service>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Service {
+    #[serde(rename = "Proto")]
+    pub proto: String,
+    #[serde(rename = "Port")]
+    pub port: u16,
 }
 
 impl Hostinfo {
@@ -85,6 +95,24 @@ impl Hostinfo {
             distro_version,
             hostname: hostname.into(),
             routable_ips: routes.to_vec(),
+            services: if routes.iter().any(|r| r == "0.0.0.0/0") {
+                vec![
+                    Service {
+                        proto: "peerapi4".into(),
+                        port: super::peer_dns::PORT,
+                    },
+                    Service {
+                        proto: "peerapi6".into(),
+                        port: super::peer_dns::PORT,
+                    },
+                    Service {
+                        proto: "peerapi-dns-proxy".into(),
+                        port: 1,
+                    },
+                ]
+            } else {
+                vec![]
+            },
         }
     }
 }

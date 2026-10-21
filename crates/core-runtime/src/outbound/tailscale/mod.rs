@@ -6,6 +6,7 @@
 
 pub mod access;
 pub mod config;
+pub mod connectivity;
 pub mod control;
 pub mod derp;
 pub mod derp_client;
@@ -13,6 +14,7 @@ pub mod engine;
 pub mod lan;
 pub mod mesh;
 pub mod noise;
+pub mod peer_dns;
 pub mod service;
 pub mod session;
 pub mod web;
@@ -156,7 +158,7 @@ impl Tailscale {
                         self.cfg.hostname.as_deref().unwrap_or("rust-x"),
                         &self
                             .cfg
-                            .advertise_routes
+                            .offered_routes()
                             .iter()
                             .map(ToString::to_string)
                             .collect::<Vec<_>>(),
@@ -199,30 +201,29 @@ impl Tailscale {
         let (_cmd_tx, cmd_rx) = mpsc::channel(128);
         let mut mesh =
             mesh::DirectMesh::bind(node_key.clone(), local_ips, self.cfg.listen_port).await?;
+        let (network_tx, mut network_rx) =
+            tokio::sync::watch::channel(connectivity::NetworkInfo::default());
         let mut home = None;
         if let Some(derp_map) = map.as_ref().and_then(|m| m.derp_map.clone()) {
-            home = response
-                .node
-                .as_ref()
-                .and_then(|n| n.home_derp)
-                .filter(|id| derp_map.regions.contains_key(&id.to_string()))
-                .or_else(|| derp_map.regions.values().map(|r| r.region_id).min());
+            network_rx = mesh.discover(derp_map.clone()).await?;
+            home = network_rx.borrow().home_derp;
             mesh.set_relay(derp_client::RelayManager::new(
                 node_key.clone(),
                 derp_map,
                 home,
             ));
         }
+        let _network_tx = network_tx;
         mesh.update_peers(map.as_ref().and_then(|m| m.peers.as_deref()).unwrap_or(&[]));
         crate::logging::debug(format_args!("tailscale: selected home relay {:?}", home));
         let disco = mesh.disco_public();
-        let tun = if self.cfg.system_interface && !self.cfg.advertise_routes.is_empty() {
+        let tun = if self.cfg.system_interface && !self.cfg.offered_routes().is_empty() {
             Some(lan::LanTun::open()?)
         } else {
             None
         };
         if tun.is_some() {
-            mesh.set_local_routes(self.cfg.advertise_routes.clone());
+            mesh.set_local_routes(self.cfg.offered_routes());
         }
         let shared = engine::spawn_tailscale_engine_with_tun(
             self.cfg.clone(),
@@ -242,6 +243,7 @@ impl Tailscale {
             let mut rules = vec![];
             let mut named_rules = std::collections::HashMap::new();
             let mut addresses_valid = true;
+            let mut network = network_rx.borrow_and_update().clone();
             loop {
                 if weak.strong_count() == 0 {
                     break;
@@ -256,27 +258,42 @@ impl Tailscale {
                             session
                                 .as_mut()
                                 .unwrap()
-                                .map_stream_with_routes(
+                                .map_stream_with_network(
                                     &node,
                                     cfg.hostname.as_deref().unwrap_or("rust-x"),
-                                    home,
                                     disco,
-                                    &cfg.advertise_routes
+                                    &cfg.offered_routes()
                                         .iter()
                                         .map(ToString::to_string)
                                         .collect::<Vec<_>>(),
+                                    &network,
                                 )
                                 .await?,
                         );
                     }
-                    stream.as_mut().unwrap().next().await
+                    loop {
+                        tokio::select! {
+                            result=stream.as_mut().unwrap().next()=>break result,
+                            result=network_rx.changed()=>{
+                                if result.is_err() {return Err(io::Error::other("tailscale: connectivity monitor stopped"));}
+                                let next=network_rx.borrow_and_update().clone();
+                                let changed=next.home_derp!=network.home_derp || next.endpoints!=network.endpoints || next.udp_available!=network.udp_available || next.mapping_varies!=network.mapping_varies;
+                                network=next;
+                                if changed {return Ok(None);}
+                            }
+                        }
+                    }.map(Some)
                 }
                 .await;
                 let Some(shared) = weak.upgrade() else {
                     break;
                 };
                 match result {
-                    Ok(map) => {
+                    Ok(None) => {
+                        stream = None;
+                        continue;
+                    }
+                    Ok(Some(map)) => {
                         if let Some(filter) = map.packet_filter.clone() {
                             named_rules.insert("base".to_string(), filter);
                         }
@@ -347,16 +364,13 @@ impl Tailscale {
                                     addresses_valid = true;
                                 }
                             }
-                            shared.routes_approved.store(
-                                !cfg.advertise_routes.is_empty()
-                                    && cfg.advertise_routes.iter().all(|route| {
-                                        local.allowed_ips.iter().any(|a| {
-                                            a.parse::<smoltcp::wire::IpCidr>().ok().as_ref()
-                                                == Some(route)
-                                        })
-                                    }),
-                                Ordering::Relaxed,
-                            );
+                            let (lan, exit) = cfg.route_approvals(&local.allowed_ips);
+                            shared
+                                .exit_approved
+                                .store(addresses_valid && exit, Ordering::Relaxed);
+                            shared
+                                .routes_approved
+                                .store(addresses_valid && lan, Ordering::Relaxed);
                         }
                         let peers = if addresses_valid {
                             peers.values().cloned().collect()
@@ -368,6 +382,8 @@ impl Tailscale {
                             .send(Cmd::UpdateLanApproval {
                                 approved: addresses_valid
                                     && shared.routes_approved.load(Ordering::Relaxed),
+                                exit_approved: addresses_valid
+                                    && shared.exit_approved.load(Ordering::Relaxed),
                             })
                             .await;
                         if shared
@@ -388,9 +404,13 @@ impl Tailscale {
                     }
                     Err(error) => {
                         shared.routes_approved.store(false, Ordering::Relaxed);
+                        shared.exit_approved.store(false, Ordering::Relaxed);
                         let _ = shared
                             .cmd_tx
-                            .send(Cmd::UpdateLanApproval { approved: false })
+                            .send(Cmd::UpdateLanApproval {
+                                approved: false,
+                                exit_approved: false,
+                            })
                             .await;
                         shared
                             .control_connected

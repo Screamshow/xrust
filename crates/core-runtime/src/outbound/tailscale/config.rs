@@ -40,6 +40,35 @@ pub struct TailscaleConfig {
 }
 
 impl TailscaleConfig {
+    /// Routes offered to the control plane and accepted by the mesh. LAN and
+    /// exit approval are evaluated independently in the forwarding engine.
+    pub fn offered_routes(&self) -> Vec<IpCidr> {
+        let mut routes = self.advertise_routes.clone();
+        if self.advertise_exit_node {
+            for route in ["0.0.0.0/0", "::/0"] {
+                let route = route.parse().unwrap();
+                if !routes.contains(&route) {
+                    routes.push(route);
+                }
+            }
+        }
+        routes
+    }
+
+    pub fn route_approvals(&self, allowed: &[String]) -> (bool, bool) {
+        let contains = |route: &IpCidr| {
+            allowed
+                .iter()
+                .any(|a| a.parse::<IpCidr>().ok().as_ref() == Some(route))
+        };
+        let lan = !self.advertise_routes.is_empty() && self.advertise_routes.iter().all(contains);
+        let exit = self.advertise_exit_node
+            && ["0.0.0.0/0", "::/0"]
+                .iter()
+                .all(|r| contains(&r.parse().unwrap()));
+        (lan, exit)
+    }
+
     pub fn parse(obj: &Map<String, Value>, at: &str) -> anyhow::Result<Self> {
         let tag = obj
             .get("tag")
@@ -198,5 +227,27 @@ impl TailscaleConfig {
             udp_timeout,
             taildrop_directory,
         })
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+    #[test]
+    fn exit_and_subnet_approvals_are_independent() {
+        let value =
+            serde_json::json!({"advertise_exit_node":true,"advertise_routes":["192.168.1.0/24"]});
+        let cfg = TailscaleConfig::parse(value.as_object().unwrap(), "test").unwrap();
+        assert_eq!(cfg.offered_routes().len(), 3);
+        assert_eq!(
+            cfg.route_approvals(&["0.0.0.0/0".into(), "::/0".into()]),
+            (false, true)
+        );
+        assert_eq!(
+            cfg.route_approvals(&["192.168.1.0/24".into()]),
+            (true, false)
+        );
+        assert_eq!(cfg.route_approvals(&["0.0.0.0/0".into()]), (false, false));
+        assert_eq!(cfg.route_approvals(&[]), (false, false));
     }
 }

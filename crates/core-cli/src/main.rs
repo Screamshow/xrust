@@ -701,7 +701,7 @@ fn main() -> ExitCode {
         "reload-plan" => cmd_reload_plan(&cmd_args),
         "run" => cmd_run(&cmd_args),
         #[cfg(any(feature = "rust-x", feature = "full"))]
-        "tailscale-ssh-capability" => {
+        "tailscale-exit-capability" | "tailscale-ssh-capability" => {
             println!("1");
             Ok(())
         }

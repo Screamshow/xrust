@@ -34,14 +34,24 @@ pub struct WebBridge {
     connections: HashMap<SocketHandle, Connection>,
     rules: Vec<Rule>,
     ssh_access: bool,
+    exit_access: bool,
+    exit_approved: bool,
 }
 impl WebBridge {
     pub fn new(ssh_access: bool) -> Self {
+        Self::with_exit(ssh_access, false)
+    }
+    pub fn with_exit(ssh_access: bool, exit_access: bool) -> Self {
         Self {
             connections: HashMap::new(),
             rules: vec![],
             ssh_access,
+            exit_access,
+            exit_approved: false,
         }
+    }
+    pub fn set_exit_approved(&mut self, approved: bool) {
+        self.exit_approved = approved;
     }
     pub fn update_rules(&mut self, rules: Vec<Rule>) {
         self.rules = rules;
@@ -54,6 +64,10 @@ impl WebBridge {
                 continue;
             }
             let permitted = match (socket.remote_endpoint(), socket.local_endpoint()) {
+                (Some(src), Some(_)) if connection.port == super::peer_dns::PORT => {
+                    self.exit_approved
+                        && super::access::allows_exit_dns(&self.rules, src.addr.into())
+                }
                 (Some(src), Some(dst)) => allows(
                     &self.rules,
                     src.addr.into(),
@@ -72,6 +86,10 @@ impl WebBridge {
                 let (reply, replies) = mpsc::channel::<Vec<u8>>(16);
                 let port = connection.port;
                 connection.task = Some(tokio::spawn(async move {
+                    if port == super::peer_dns::PORT {
+                        super::peer_dns::serve(rx, reply).await;
+                        return;
+                    }
                     let stream = match tokio::time::timeout(
                         Duration::from_secs(5),
                         tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
@@ -147,7 +165,10 @@ impl WebBridge {
             self.connections.remove(&handle);
             sockets.remove(handle);
         }
-        for port in [80, 443, 22] {
+        for port in [80, 443, 22, super::peer_dns::PORT] {
+            if port == super::peer_dns::PORT && !self.exit_access {
+                continue;
+            }
             if port == 22 && !self.ssh_access {
                 continue;
             }

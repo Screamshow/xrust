@@ -30,12 +30,16 @@ use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSock};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum Cmd {
+    UpdateForwardingReady {
+        ready: bool,
+    },
     UpdateLocalAddresses {
         addresses: Vec<IpAddr>,
         resp: oneshot::Sender<io::Result<()>>,
     },
     UpdateLanApproval {
         approved: bool,
+        exit_approved: bool,
     },
     UpdateAccess {
         rules: Vec<super::access::Rule>,
@@ -75,11 +79,13 @@ pub enum Cmd {
 }
 
 pub struct TailscaleShared {
+    pub transport: std::sync::RwLock<serde_json::Value>,
     pub cmd_tx: mpsc::Sender<Cmd>,
     pub next_id: AtomicU32,
     local_ip: std::sync::RwLock<IpAddr>,
     pub control_connected: std::sync::atomic::AtomicBool,
     pub routes_approved: std::sync::atomic::AtomicBool,
+    pub exit_approved: std::sync::atomic::AtomicBool,
 }
 
 impl TailscaleShared {
@@ -223,9 +229,11 @@ pub fn spawn_tailscale_engine_with_tun(
     });
 
     let shared = Arc::new(TailscaleShared {
+        transport: std::sync::RwLock::new(serde_json::Value::Null),
         local_ip: std::sync::RwLock::new(local_ip),
         control_connected: std::sync::atomic::AtomicBool::new(false),
         routes_approved: std::sync::atomic::AtomicBool::new(false),
+        exit_approved: std::sync::atomic::AtomicBool::new(false),
         cmd_tx,
         next_id: AtomicU32::new(1),
     });
@@ -235,6 +243,8 @@ pub fn spawn_tailscale_engine_with_tun(
         let mtu = cfg.system_interface_mtu.unwrap_or(1280).min(1280) as usize;
         let mut lan_rules = vec![];
         let mut lan_approved = false;
+        let mut exit_approved = false;
+        let mut forwarding_ready = tun.is_none();
         let mut device = TailscaleDevice::new(mtu);
 
         let local_cidr = match local_ip {
@@ -268,7 +278,7 @@ pub fn spawn_tailscale_engine_with_tun(
         let mut sockets = SocketSet::new(vec![]);
         let mut web = cfg
             .luci_access
-            .then(|| super::web::WebBridge::new(cfg.ssh_access));
+            .then(|| super::web::WebBridge::with_exit(cfg.ssh_access, cfg.advertise_exit_node));
         let mut tcp_conns: HashMap<u32, TcpConn> = HashMap::new();
         type UdpSession = (SocketHandle, SocketAddr, mpsc::Sender<Vec<u8>>, Instant);
         let mut udp_sessions: HashMap<u16, UdpSession> = HashMap::new();
@@ -276,13 +286,21 @@ pub fn spawn_tailscale_engine_with_tun(
 
         let mut next_ephemeral_port: u16 = 40000;
         let poll_interval = Duration::from_millis(5);
+        let mut tun_read_packets = 0u64;
+        let mut tun_write_errors = 0u64;
+        let mut tun_send_errors = 0u64;
+        let mut busy_cycles = 0u64;
+        let mut transport_updated = Instant::now() - Duration::from_secs(2);
 
         loop {
             let now = SmolInstant::now();
+            let mut queued_work = false;
+            let mut tun_read_healthy = true;
 
             // 1. Drain commands
             while let Ok(cmd) = internal_cmd_rx.try_recv() {
                 match cmd {
+                    Cmd::UpdateForwardingReady { ready } => forwarding_ready = ready,
                     Cmd::UpdateLocalAddresses { addresses, resp } => {
                         if addresses.is_empty()
                             || addresses.len() > 2
@@ -326,8 +344,15 @@ pub fn spawn_tailscale_engine_with_tun(
                         }
                         let _ = resp.send(Ok(()));
                     }
-                    Cmd::UpdateLanApproval { approved } => {
+                    Cmd::UpdateLanApproval {
+                        approved,
+                        exit_approved: exit,
+                    } => {
                         lan_approved = approved;
+                        exit_approved = exit;
+                        if let Some(web) = &mut web {
+                            web.set_exit_approved(exit);
+                        }
                     }
                     Cmd::UpdateAccess { rules } => {
                         lan_rules = rules.clone();
@@ -483,13 +508,33 @@ pub fn spawn_tailscale_engine_with_tun(
             }
 
             if let Some(mesh) = &mut mesh {
+                if transport_updated.elapsed() >= Duration::from_secs(1) {
+                    if let Some(shared) = weak.upgrade() {
+                        let mut diagnostics = mesh.diagnostics();
+                        diagnostics["counters"] = serde_json::json!({"tun_read_packets":tun_read_packets,"tun_write_errors":tun_write_errors,"tun_send_errors":tun_send_errors,"busy_cycles":busy_cycles});
+                        *shared.transport.write().unwrap() = diagnostics;
+                    }
+                    transport_updated = Instant::now();
+                }
                 if let Ok(packets) = mesh.poll().await {
+                    queued_work |= mesh.more_work();
                     for packet in packets {
-                        if let Some(tun) = &tun
-                            && lan_approved
-                            && super::lan::permitted(&packet, &cfg.advertise_routes, &lan_rules)
+                        if forwarding_ready
+                            && let Some(tun) = &tun
+                            && !super::mesh::packet_ips(&packet)
+                                .is_some_and(|(_, dst, _)| mesh.local_ips().contains(&dst))
+                            && ((lan_approved
+                                && super::lan::permitted(
+                                    &packet,
+                                    &cfg.advertise_routes,
+                                    &lan_rules,
+                                ))
+                                || (exit_approved
+                                    && super::lan::exit_permitted(&packet, &lan_rules)))
                         {
-                            let _ = tun.write(&packet);
+                            if tun.write(&packet).is_err() {
+                                tun_write_errors += 1;
+                            }
                             continue;
                         }
                         if super::mesh::packet_ips(&packet)
@@ -499,13 +544,23 @@ pub fn spawn_tailscale_engine_with_tun(
                         }
                     }
                 }
-                if let Some(tun) = &tun {
-                    for _ in 0..64 {
+                if forwarding_ready && let Some(tun) = &tun {
+                    for index in 0..256 {
                         match tun.read() {
                             Ok(Some(packet)) => {
-                                let _ = mesh.send(packet).await;
+                                tun_read_packets += 1;
+                                if index == 255 {
+                                    queued_work = true;
+                                }
+                                if mesh.send(packet).await.is_err() {
+                                    tun_send_errors += 1;
+                                }
                             }
-                            _ => break,
+                            Ok(None) => break,
+                            Err(_) => {
+                                tun_read_healthy = false;
+                                break;
+                            }
                         }
                     }
                 }
@@ -586,7 +641,33 @@ pub fn spawn_tailscale_engine_with_tun(
                 break;
             }
 
-            tokio::time::sleep(poll_interval).await;
+            if queued_work {
+                busy_cycles += 1;
+                tokio::task::yield_now().await;
+            } else {
+                let network = async {
+                    if let Some(mesh) = &mesh {
+                        if mesh.readable().await.is_err() {
+                            tokio::time::sleep(poll_interval).await;
+                        }
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                let forwarding = async {
+                    if forwarding_ready
+                        && tun_read_healthy
+                        && let Some(tun) = &tun
+                    {
+                        if tun.readable().await.is_err() {
+                            tokio::time::sleep(poll_interval).await;
+                        }
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {_=tokio::time::sleep(poll_interval)=>{},_=network=>{},_=forwarding=>{}}
+            }
         }
     });
 

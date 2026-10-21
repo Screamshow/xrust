@@ -13,11 +13,30 @@ use x25519_dalek::{PublicKey, StaticSecret};
 pub const CAPABILITY_VERSION: u32 = 111;
 const LIMIT: usize = 1024 * 1024;
 fn map_hostinfo(hostname: &str, routes: &[String], home: Option<u16>) -> serde_json::Value {
+    map_network_hostinfo(
+        hostname,
+        routes,
+        &super::connectivity::NetworkInfo {
+            home_derp: home,
+            ..Default::default()
+        },
+    )
+}
+fn map_network_hostinfo(
+    hostname: &str,
+    routes: &[String],
+    network: &super::connectivity::NetworkInfo,
+) -> serde_json::Value {
+    let latencies: serde_json::Map<String, serde_json::Value> = network
+        .derp_latencies
+        .iter()
+        .map(|(id, ms)| (format!("{}-v4", id), serde_json::json!(*ms as f64 / 1000.0)))
+        .collect();
     let mut info = serde_json::to_value(super::control::Hostinfo::new(hostname, routes))
         .expect("Hostinfo serialization is infallible");
     info["Userspace"] = true.into();
     info["UserspaceRouter"] = true.into();
-    info["NetInfo"] = serde_json::json!({"PreferredDERP":home.unwrap_or(0),"WorkingUDP":false,"WorkingIPv6":false,"MappingVariesByDestIP":false});
+    info["NetInfo"] = serde_json::json!({"PreferredDERP":network.home_derp.unwrap_or(0),"WorkingUDP":network.udp_available,"WorkingIPv6":false,"MappingVariesByDestIP":network.mapping_varies,"DERPLatency":latencies});
     info
 }
 fn bad(message: &str) -> io::Error {
@@ -148,15 +167,35 @@ impl ControlSession {
         disco: [u8; 32],
         routes: &[String],
     ) -> io::Result<MapStream> {
+        self.map_stream_with_network(
+            node,
+            hostname,
+            disco,
+            routes,
+            &super::connectivity::NetworkInfo {
+                home_derp: home,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+    pub async fn map_stream_with_network(
+        &mut self,
+        node: &str,
+        hostname: &str,
+        disco: [u8; 32],
+        routes: &[String],
+        network: &super::connectivity::NetworkInfo,
+    ) -> io::Result<MapStream> {
         tokio::time::timeout(
             Duration::from_secs(30),
-            self.announce(node, hostname, home, disco, routes),
+            self.announce(node, hostname, disco, routes, network),
         )
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tailscale: announce timeout"))??;
         self.send = self.send.clone().ready().await.map_err(io::Error::other)?;
         let payload=serde_json::to_vec(&serde_json::json!({"Version":CAPABILITY_VERSION,"NodeKey":node,"DiscoKey":format!("discokey:{}",super::control::to_hex(&disco)),
-            "Stream":true,"KeepAlive":true,"Compress":"","Hostinfo":map_hostinfo(hostname,routes,home)})).map_err(io::Error::other)?;
+            "Stream":true,"KeepAlive":true,"Compress":"","Endpoints":network.endpoints.iter().map(ToString::to_string).collect::<Vec<_>>(),"Hostinfo":map_network_hostinfo(hostname,routes,network)})).map_err(io::Error::other)?;
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("{}/machine/map", self.origin))
@@ -184,13 +223,13 @@ impl ControlSession {
         &mut self,
         node: &str,
         hostname: &str,
-        home: Option<u16>,
         disco: [u8; 32],
         routes: &[String],
+        network: &super::connectivity::NetworkInfo,
     ) -> io::Result<()> {
         self.send = self.send.clone().ready().await.map_err(io::Error::other)?;
         let payload=serde_json::to_vec(&serde_json::json!({"Version":CAPABILITY_VERSION,"NodeKey":node,"DiscoKey":format!("discokey:{}",super::control::to_hex(&disco)),
-            "Stream":false,"OmitPeers":true,"Hostinfo":map_hostinfo(hostname,routes,home)})).map_err(io::Error::other)?;
+            "Stream":false,"OmitPeers":true,"Endpoints":network.endpoints.iter().map(ToString::to_string).collect::<Vec<_>>(),"Hostinfo":map_network_hostinfo(hostname,routes,network)})).map_err(io::Error::other)?;
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("{}/machine/map", self.origin))

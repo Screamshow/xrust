@@ -21,7 +21,7 @@ h2 = { path = "vendor/h2" }
 blake3 = { path = "vendor/blake3" }
 
 [workspace.package]
-version = "0.0.24"
+version = "0.0.25"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Dushnilin/tachyon-core"

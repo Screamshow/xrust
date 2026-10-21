@@ -68,6 +68,17 @@ fn matches(pattern: &str, ip: IpAddr, bits: Option<u8>) -> bool {
 pub fn allows(rules: &[Rule], source: IpAddr, destination: IpAddr, port: u16) -> bool {
     allows_protocol(rules, source, destination, port, 6)
 }
+
+/// Tailscale PeerAPI's Internet-access probe, not permission to an arbitrary
+/// public DNS server. See ipn/ipnlocal/peerapi.go replyToDNSQueries.
+pub fn allows_exit_dns(rules: &[Rule], source: IpAddr) -> bool {
+    let probe = if source.is_ipv4() {
+        "0.0.0.0"
+    } else {
+        "2000::"
+    };
+    allows_protocol(rules, source, probe.parse().unwrap(), 53, 6)
+}
 pub fn allows_protocol(
     rules: &[Rule],
     source: IpAddr,
@@ -94,6 +105,19 @@ pub fn allows_protocol(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exit_dns_requires_internet_grant_in_the_peers_address_family() {
+        let src = "100.64.1.2".parse().unwrap();
+        let limited: Vec<Rule> = serde_json::from_value(serde_json::json!([{"SrcIPs":["*"],"DstPorts":[{"IP":"1.1.1.1","Ports":{"First":53,"Last":53}}]}])).unwrap();
+        assert!(!allows_exit_dns(&limited, src));
+        let internet: Vec<Rule> = serde_json::from_value(serde_json::json!([{"SrcIPs":["*"],"DstPorts":[{"IP":"0.0.0.0/0","Ports":{"First":0,"Last":65535}},{"IP":"2000::/3","Ports":{"First":0,"Last":65535}}]}])).unwrap();
+        assert!(allows_exit_dns(&internet, src));
+        assert!(allows_exit_dns(
+            &internet,
+            "fd7a:115c:a1e0::2".parse().unwrap()
+        ));
+        assert!(!allows_exit_dns(&[], src));
+    }
     #[test]
     fn restrictive_web_grant() {
         let rules: Vec<Rule> = serde_json::from_value(serde_json::json!([{"SrcIPs":["100.64.0.0/10"],"IPProto":[6],"DstPorts":[{"IP":"*","Ports":{"First":443,"Last":443}}]}])).unwrap();

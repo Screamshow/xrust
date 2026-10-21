@@ -141,6 +141,10 @@ pub struct DerpRegion {
 
 #[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct DerpNode {
+    #[serde(rename = "STUNPort", default)]
+    pub stun_port: i32,
+    #[serde(rename = "STUNOnly", default)]
+    pub stun_only: bool,
     #[serde(rename = "Name")]
     pub name: String,
     #[serde(rename = "RegionID")]

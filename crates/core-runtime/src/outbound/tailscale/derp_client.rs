@@ -5,7 +5,7 @@ use crypto_box::{PublicKey as BoxPublicKey, SalsaBox, SecretKey as BoxSecretKey,
 use std::{io, time::Duration};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::mpsc,
+    sync::{mpsc, watch},
     task::JoinHandle,
 };
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -18,6 +18,7 @@ pub struct DerpClient {
     tx: mpsc::Sender<Vec<u8>>,
     pub rx: mpsc::Receiver<RelayPacket>,
     tasks: Vec<JoinHandle<()>>,
+    pong: watch::Receiver<Option<[u8; 8]>>,
 }
 impl Drop for DerpClient {
     fn drop(&mut self) {
@@ -156,6 +157,7 @@ impl DerpClient {
         let (tx, mut outbound) = mpsc::channel::<Vec<u8>>(64);
         let (to_client, rx) = mpsc::channel::<RelayPacket>(64);
         let control = tx.clone();
+        let (pong_tx, pong) = watch::channel(None);
         let (writer_stopped, mut writer_status) = tokio::sync::oneshot::channel::<()>();
         let reader = tokio::spawn(async move {
             loop {
@@ -177,6 +179,12 @@ impl DerpClient {
                         {
                             break;
                         }
+                    }
+                    DerpFrame::Other {
+                        frame_type: FRAME_PONG,
+                        data,
+                    } if data.len() == 8 => {
+                        pong_tx.send_replace(Some(data[..].try_into().unwrap()));
                     }
                     DerpFrame::Other {
                         frame_type: FRAME_PING,
@@ -212,9 +220,13 @@ impl DerpClient {
             tx,
             rx,
             tasks: vec![reader, writer],
+            pong,
         })
     }
 
+    pub async fn ping(&self) -> io::Result<Duration> {
+        ping_channel(self.tx.clone(), self.pong.clone(), Duration::ZERO).await
+    }
     pub fn send(&self, destination: [u8; 32], packet: &[u8]) -> io::Result<()> {
         if self.rx.is_closed() {
             return Err(io::Error::new(
@@ -240,9 +252,41 @@ impl DerpClient {
     }
 }
 
+async fn ping_channel(
+    tx: mpsc::Sender<Vec<u8>>,
+    mut pong: watch::Receiver<Option<[u8; 8]>>,
+    delay: Duration,
+) -> io::Result<Duration> {
+    tokio::time::sleep(delay).await;
+    let mut token = [0; 8];
+    getrandom::fill(&mut token).map_err(|_| bad("derp: entropy unavailable"))?;
+    pong.borrow_and_update();
+    let start = std::time::Instant::now();
+    tx.try_send(frame(FRAME_PING, &token))
+        .map_err(|_| io::Error::other("derp: ping queue unavailable"))?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            pong.changed()
+                .await
+                .map_err(|_| io::Error::other("derp: ping connection closed"))?;
+            if *pong.borrow_and_update() == Some(token) {
+                return Ok(start.elapsed());
+            }
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "derp: ping timed out"))?
+}
+#[derive(Clone, Copy)]
+pub struct RelayHealth {
+    pub region: u16,
+    pub latency_ms: Option<u64>,
+}
 struct RegionTask {
     tx: mpsc::Sender<([u8; 32], Vec<u8>)>,
     task: JoinHandle<()>,
+    preferred: watch::Sender<bool>,
+    last_used: std::time::Instant,
 }
 impl Drop for RegionTask {
     fn drop(&mut self) {
@@ -252,15 +296,30 @@ impl Drop for RegionTask {
 
 /// Nonblocking region connections. Reconnection happens off the stack task.
 pub struct RelayManager {
+    pub notify: std::sync::Arc<tokio::sync::Notify>,
     private: StaticSecret,
     map: DerpMap,
     home: Option<u16>,
     regions: std::collections::HashMap<u16, RegionTask>,
     to_mesh: mpsc::Sender<(u16, RelayPacket)>,
     pub rx: mpsc::Receiver<(u16, RelayPacket)>,
+    health_tx: mpsc::Sender<RelayHealth>,
+    pub health_rx: mpsc::Receiver<RelayHealth>,
 }
 
 impl RelayManager {
+    pub fn set_home(&mut self, home: Option<u16>) {
+        if self.home == home {
+            return;
+        }
+        for (id, task) in &self.regions {
+            task.preferred.send_replace(home == Some(*id));
+        }
+        self.home = home;
+        if let Some(home) = home {
+            self.ensure(home);
+        }
+    }
     pub fn update_map(&mut self, map: DerpMap) {
         self.regions.retain(|id, _| {
             let old = self.map.regions.get(&id.to_string());
@@ -273,14 +332,18 @@ impl RelayManager {
         }
     }
     pub fn new(private: StaticSecret, map: DerpMap, home: Option<u16>) -> Self {
-        let (to_mesh, rx) = mpsc::channel(128);
+        let (to_mesh, rx) = mpsc::channel(256);
+        let (health_tx, health_rx) = mpsc::channel(64);
         let mut manager = Self {
+            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             private,
             map,
             home,
             regions: Default::default(),
             to_mesh,
             rx,
+            health_tx,
+            health_rx,
         };
         if let Some(home) = home {
             manager.ensure(home);
@@ -288,15 +351,29 @@ impl RelayManager {
         manager
     }
     fn ensure(&mut self, region: u16) {
-        if self.regions.contains_key(&region) || self.regions.len() >= 8 {
+        if self.regions.contains_key(&region) {
             return;
         }
-        let Some(nodes) = self
-            .map
-            .regions
-            .get(&region.to_string())
-            .map(|r| r.nodes.clone())
-        else {
+        if self.regions.len() >= 8 {
+            if let Some(evict) = self
+                .regions
+                .iter()
+                .filter(|(id, _)| Some(**id) != self.home)
+                .min_by_key(|(_, task)| task.last_used)
+                .map(|(id, _)| *id)
+            {
+                self.regions.remove(&evict);
+            } else {
+                return;
+            }
+        }
+        let Some(nodes) = self.map.regions.get(&region.to_string()).map(|r| {
+            r.nodes
+                .iter()
+                .filter(|n| !n.stun_only)
+                .cloned()
+                .collect::<Vec<_>>()
+        }) else {
             return;
         };
         if nodes.is_empty() {
@@ -304,7 +381,10 @@ impl RelayManager {
         }
         let private = self.private.clone();
         let to_mesh = self.to_mesh.clone();
+        let notify = self.notify.clone();
         let preferred = self.home == Some(region);
+        let (preferred_tx, mut preferred_rx) = watch::channel(preferred);
+        let health_tx = self.health_tx.clone();
         let (tx, mut outbound) = mpsc::channel::<([u8; 32], Vec<u8>)>(64);
         let task = tokio::spawn(async move {
             let mut backoff = 1u64;
@@ -312,6 +392,7 @@ impl RelayManager {
                 if outbound.is_closed() || to_mesh.is_closed() {
                     break;
                 }
+                let preferred = *preferred_rx.borrow_and_update();
                 let mut connected = None;
                 for node in nodes.iter().take(3) {
                     match DerpClient::connect(node, private.clone(), preferred).await {
@@ -331,8 +412,27 @@ impl RelayManager {
                         region
                     ));
                     backoff = 1;
+                    let _ = client.tx.try_send(
+                        encode_note_preferred(*preferred_rx.borrow_and_update()).to_vec(),
+                    );
+                    let mut health = Box::pin(ping_channel(
+                        client.tx.clone(),
+                        client.pong.clone(),
+                        Duration::ZERO,
+                    ));
                     loop {
                         tokio::select! {
+                            result=preferred_rx.changed()=>{
+                                if result.is_err(){return;}
+                                if client.tx.try_send(encode_note_preferred(*preferred_rx.borrow_and_update()).to_vec()).is_err(){break;}
+                            }
+                            result=&mut health=>{
+                                match result {
+                                    Ok(rtt)=>{let _=health_tx.try_send(RelayHealth{region,latency_ms:Some(rtt.as_millis().max(1) as u64)});},
+                                    Err(_)=>break,
+                                }
+                                health=Box::pin(ping_channel(client.tx.clone(),client.pong.clone(),Duration::from_secs(30)));
+                            }
                             packet = outbound.recv() => {
                                 let Some((destination, packet)) = packet else { return; };
                                 if let Err(error) = client.send(destination, &packet)
@@ -342,20 +442,36 @@ impl RelayManager {
                             }
                             packet = client.rx.recv() => {
                                 let Some(packet) = packet else { break; };
-                                let _ = to_mesh.try_send((region, packet));
+                                if to_mesh.try_send((region, packet)).is_ok() {notify.notify_one();}
                             }
                         }
                     }
                 }
+                let _ = health_tx.try_send(RelayHealth {
+                    region,
+                    latency_ms: None,
+                });
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 backoff = (backoff * 2).min(30);
             }
         });
-        self.regions.insert(region, RegionTask { tx, task });
+        self.regions.insert(
+            region,
+            RegionTask {
+                tx,
+                task,
+                preferred: preferred_tx,
+                last_used: std::time::Instant::now(),
+            },
+        );
+    }
+    pub fn prepare(&mut self, region: u16) {
+        self.ensure(region);
     }
     pub fn send(&mut self, region: u16, destination: [u8; 32], packet: &[u8]) {
         self.ensure(region);
-        if let Some(task) = self.regions.get(&region) {
+        if let Some(task) = self.regions.get_mut(&region) {
+            task.last_used = std::time::Instant::now();
             let _ = task.tx.try_send((destination, packet.to_vec()));
         }
     }
@@ -364,6 +480,45 @@ impl RelayManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn home_change_preserves_existing_region_connections() {
+        let map = DerpMap::default();
+        let mut manager = RelayManager::new(StaticSecret::from([9; 32]), map, None);
+        let (tx, _) = mpsc::channel(1);
+        let (preferred, _) = watch::channel(false);
+        manager.regions.insert(
+            1,
+            RegionTask {
+                tx,
+                preferred,
+                task: tokio::spawn(std::future::pending()),
+                last_used: std::time::Instant::now(),
+            },
+        );
+        manager.set_home(Some(1));
+        assert!(*manager.regions[&1].preferred.borrow());
+        manager.set_home(Some(22));
+        assert_eq!(manager.home, Some(22));
+        assert!(manager.regions.contains_key(&1));
+        assert!(!*manager.regions[&1].preferred.borrow());
+        assert!(!manager.regions[&1].task.is_finished());
+    }
+
+    #[tokio::test]
+    async fn ping_requires_its_own_token_and_ignores_an_unrelated_pong() {
+        let (tx, mut packets) = mpsc::channel::<Vec<u8>>(4);
+        let (pongs, pong) = watch::channel(None);
+        let server = tokio::spawn(async move {
+            let packet = packets.recv().await.unwrap();
+            assert_eq!(packet[0], FRAME_PING);
+            pongs.send_replace(Some([0; 8]));
+            tokio::task::yield_now().await;
+            pongs.send_replace(Some(packet[5..13].try_into().unwrap()));
+        });
+        assert!(ping_channel(tx, pong, Duration::ZERO).await.is_ok());
+        server.await.unwrap();
+    }
 
     #[test]
     fn nacl_box_rejects_tampering_and_low_order_keys() {
