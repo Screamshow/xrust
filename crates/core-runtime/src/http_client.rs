@@ -371,7 +371,10 @@ async fn decode_chunked_limited(
     loop {
         let (size, start) = loop {
             let Some(at) = find_crlf(&buffer) else {
-                if buffer.len() > MAX_CHUNK_LINE {
+                // A line of MAX_CHUNK_LINE bytes may already have its CR
+                // buffered while the LF is still in flight; only a buffer
+                // longer than that can no longer hold a line within the limit.
+                if buffer.len() > MAX_CHUNK_LINE + 1 {
                     return Err(io::Error::other("chunk size line too long"));
                 }
                 let read = stream.read(&mut scratch).await?;
@@ -700,6 +703,51 @@ mod tests {
         let endless = vec![b'1'; 8 * 1024];
         let text = error_text(decode_open(&[&endless], MAX_BODY, true).await);
         assert!(text.contains("size line too long"), "{text}");
+    }
+
+    /// A size line of `len` bytes: "5;x=" padded with an extension value.
+    fn size_line(len: usize) -> Vec<u8> {
+        let mut line = b"5;x=".to_vec();
+        line.resize(len, b'a');
+        line
+    }
+
+    /// Decode `line` + CRLF + "hello" + the zero chunk. With `split`, the CR
+    /// is already buffered (as if read with the response head) and the LF
+    /// only arrives from the stream, so the line's end is seen in two reads.
+    async fn decode_line(len: usize, split: bool) -> io::Result<Vec<u8>> {
+        let mut initial = size_line(len);
+        let rest: &[u8] = b"hello\r\n0\r\n\r\n";
+        let mut pieces = Vec::new();
+        if split {
+            initial.push(b'\r');
+            pieces.push(b"\n".to_vec());
+        } else {
+            initial.extend_from_slice(b"\r\n");
+        }
+        pieces.push(rest.to_vec());
+        let mut stream = piecewise(pieces, true);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            decode_chunked_limited(initial, &mut stream, MAX_BODY),
+        )
+        .await
+        .expect("the decoder must answer, not wait for more data")
+    }
+
+    #[tokio::test]
+    async fn chunk_size_line_limit_is_the_same_whole_or_split() {
+        assert_eq!(MAX_CHUNK_LINE, 4096);
+        for split in [false, true] {
+            for len in [MAX_CHUNK_LINE - 1, MAX_CHUNK_LINE] {
+                let decoded = decode_line(len, split)
+                    .await
+                    .unwrap_or_else(|e| panic!("len {len}, split {split}: {e}"));
+                assert_eq!(decoded, b"hello", "len {len}, split {split}");
+            }
+            let text = error_text(decode_line(MAX_CHUNK_LINE + 1, split).await);
+            assert!(text.contains("size line too long"), "split {split}: {text}");
+        }
     }
 
     #[tokio::test]
