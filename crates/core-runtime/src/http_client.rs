@@ -347,14 +347,33 @@ async fn read_response(stream: &mut AnyStream) -> io::Result<Response> {
     })
 }
 
+/// Longest chunk-size line accepted, extensions included.
+const MAX_CHUNK_LINE: usize = 4 * 1024;
+
 /// `transfer-encoding: chunked`: size line, data, CRLF, until a zero chunk.
 async fn decode_chunked(initial: Vec<u8>, stream: &mut AnyStream) -> io::Result<Vec<u8>> {
+    decode_chunked_limited(initial, stream, MAX_BODY).await
+}
+
+/// The chunk sizes come from the peer, so every size is parsed strictly and
+/// checked against what is left of `limit` before any of its data is read.
+/// Release builds have no overflow checks and abort on panic: an unchecked
+/// `start + size` here once let one response stop the whole process.
+async fn decode_chunked_limited(
+    initial: Vec<u8>,
+    stream: &mut AnyStream,
+    limit: usize,
+) -> io::Result<Vec<u8>> {
+    let too_large = || io::Error::other("response body too large");
     let mut buffer = initial;
     let mut body = Vec::new();
     let mut scratch = [0u8; 8 * 1024];
     loop {
         let (size, start) = loop {
             let Some(at) = find_crlf(&buffer) else {
+                if buffer.len() > MAX_CHUNK_LINE {
+                    return Err(io::Error::other("chunk size line too long"));
+                }
                 let read = stream.read(&mut scratch).await?;
                 if read == 0 {
                     return Err(io::Error::other("truncated chunked body"));
@@ -362,16 +381,26 @@ async fn decode_chunked(initial: Vec<u8>, stream: &mut AnyStream) -> io::Result<
                 buffer.extend_from_slice(&scratch[..read]);
                 continue;
             };
-            let line = String::from_utf8_lossy(&buffer[..at]).to_string();
-            let token = line.split(';').next().unwrap_or("").trim().to_string();
-            let size = usize::from_str_radix(&token, 16)
-                .map_err(|_| io::Error::other(format!("bad chunk size {line:?}")))?;
+            if at > MAX_CHUNK_LINE {
+                return Err(io::Error::other("chunk size line too long"));
+            }
+            let size = parse_chunk_size(&buffer[..at]).ok_or_else(|| {
+                io::Error::other(format!(
+                    "bad chunk size {:?}",
+                    String::from_utf8_lossy(&buffer[..at])
+                ))
+            })?;
             break (size, at + 2);
         };
         if size == 0 {
             return Ok(body);
         }
-        let needed = start + size + 2;
+        // the limit counts what is already in `body`
+        if size > limit.saturating_sub(body.len()) {
+            return Err(too_large());
+        }
+        let data_end = start.checked_add(size).ok_or_else(too_large)?;
+        let needed = data_end.checked_add(2).ok_or_else(too_large)?;
         while buffer.len() < needed {
             let read = stream.read(&mut scratch).await?;
             if read == 0 {
@@ -379,12 +408,29 @@ async fn decode_chunked(initial: Vec<u8>, stream: &mut AnyStream) -> io::Result<
             }
             buffer.extend_from_slice(&scratch[..read]);
         }
-        body.extend_from_slice(&buffer[start..start + size]);
-        buffer.drain(..needed);
-        if body.len() > MAX_BODY {
-            return Err(io::Error::other("response body too large"));
+        if &buffer[data_end..needed] != b"\r\n" {
+            return Err(io::Error::other("chunk data not followed by CRLF"));
         }
+        body.extend_from_slice(&buffer[start..data_end]);
+        buffer.drain(..needed);
     }
+}
+
+/// `chunk-size [ chunk-ext ]` (RFC 9112 §7.1): one or more hex digits, then
+/// optional whitespace and extensions after `;`. A sign, a `0x` prefix or a
+/// value that does not fit in `usize` is refused.
+fn parse_chunk_size(line: &[u8]) -> Option<usize> {
+    let end = line.iter().position(|&b| b == b';').unwrap_or(line.len());
+    let digits = line[..end].trim_ascii();
+    if digits.is_empty() {
+        return None;
+    }
+    let mut size: usize = 0;
+    for &b in digits {
+        let digit = (b as char).to_digit(16)? as usize;
+        size = size.checked_mul(16)?.checked_add(digit)?;
+    }
+    Some(size)
 }
 
 fn find_crlf(buffer: &[u8]) -> Option<usize> {
@@ -526,6 +572,156 @@ mod tests {
             buffer.drain(..needed);
         }
         assert_eq!(body, b"hello world");
+    }
+
+    /// A stream that delivers `pieces` one write at a time, then either ends
+    /// or, with `hold_open`, stays open so a decoder that waits for more data
+    /// would hang instead of failing.
+    fn piecewise(pieces: Vec<Vec<u8>>, hold_open: bool) -> AnyStream {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            for piece in pieces {
+                if server.write_all(&piece).await.is_err() {
+                    return;
+                }
+                let _ = server.flush().await;
+                tokio::task::yield_now().await;
+            }
+            if hold_open {
+                std::future::pending::<()>().await;
+            }
+        });
+        Box::new(client)
+    }
+
+    async fn decode(pieces: &[&[u8]], limit: usize) -> io::Result<Vec<u8>> {
+        decode_open(pieces, limit, false).await
+    }
+
+    async fn decode_open(pieces: &[&[u8]], limit: usize, hold_open: bool) -> io::Result<Vec<u8>> {
+        let mut stream = piecewise(pieces.iter().map(|p| p.to_vec()).collect(), hold_open);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            decode_chunked_limited(Vec::new(), &mut stream, limit),
+        )
+        .await
+        .expect("the decoder must answer, not wait for more data")
+    }
+
+    fn error_text(result: io::Result<Vec<u8>>) -> String {
+        result
+            .expect_err("malformed body must be an error")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn chunked_valid_bodies_decode() {
+        // several chunks, an extension, uppercase hex, a trailer after the zero chunk
+        let body =
+            b"5\r\nhello\r\n6;name=value\r\n world\r\nA\r\n0123456789\r\n0\r\nX-T: 1\r\n\r\n";
+        assert_eq!(
+            decode(&[body], MAX_BODY).await.unwrap(),
+            b"hello world0123456789"
+        );
+        // the same bytes arriving one at a time
+        let bytes: Vec<&[u8]> = body.chunks(1).collect();
+        assert_eq!(
+            decode(&bytes, MAX_BODY).await.unwrap(),
+            b"hello world0123456789"
+        );
+        // a body that is only the zero chunk
+        assert_eq!(decode(&[b"0\r\n\r\n"], MAX_BODY).await.unwrap(), b"");
+        // exactly at the limit is allowed
+        assert_eq!(
+            decode(&[b"5\r\nhello\r\n0\r\n\r\n"], 5).await.unwrap(),
+            b"hello"
+        );
+        // data already read with the head is used first
+        let mut stream = piecewise(vec![b"lo\r\n0\r\n\r\n".to_vec()], false);
+        let decoded = decode_chunked_limited(b"5\r\nhel".to_vec(), &mut stream, MAX_BODY)
+            .await
+            .unwrap();
+        assert_eq!(decoded, b"hello");
+    }
+
+    #[tokio::test]
+    async fn chunked_huge_sizes_are_errors_not_panics() {
+        // usize::MAX: `start + size + 2` used to overflow and panic
+        let max = format!("{:x}\r\nabc", usize::MAX);
+        let text = error_text(decode(&[max.as_bytes()], MAX_BODY).await);
+        assert!(text.contains("too large"), "{text}");
+        // one hex digit more than fits in usize
+        let wider = format!("1{}\r\n", "0".repeat(usize::BITS as usize / 4));
+        let text = error_text(decode(&[wider.as_bytes()], MAX_BODY).await);
+        assert!(text.contains("bad chunk size"), "{text}");
+        // over the limit: refused before any data is read or buffered,
+        // even though the peer keeps the connection open
+        let text = error_text(decode_open(&[b"5\r\n"], 4, true).await);
+        assert!(text.contains("too large"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn chunked_total_over_the_limit_is_refused() {
+        // each chunk fits, the sum does not; the second one is refused
+        // before its data is read
+        let text = error_text(decode_open(&[b"5\r\nhello\r\n6\r\n"], 10, true).await);
+        assert!(text.contains("too large"), "{text}");
+        let text =
+            error_text(decode(&[b"5\r\nhello\r\n5\r\nworld\r\n1\r\n!\r\n0\r\n\r\n"], 10).await);
+        assert!(text.contains("too large"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn chunked_truncated_bodies_are_errors() {
+        for pieces in [
+            &[&b""[..]][..],
+            &[b"5"],
+            &[b"5\r\nhel"],
+            &[b"5\r\nhello"],
+            &[b"5\r\nhello\r\n"],
+        ] {
+            let text = error_text(decode(pieces, MAX_BODY).await);
+            assert!(text.contains("truncated"), "{pieces:?}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn chunked_malformed_sizes_are_errors() {
+        for line in [&b"zz"[..], b"", b"+5", b"-1", b"0x5", b"5 5", b";ext"] {
+            let mut body = line.to_vec();
+            body.extend_from_slice(b"\r\nhello\r\n0\r\n\r\n");
+            let text = error_text(decode(&[&body], MAX_BODY).await);
+            assert!(text.contains("bad chunk size"), "{line:?}: {text}");
+        }
+        // data not followed by CRLF
+        let text = error_text(decode(&[b"5\r\nhelloXY0\r\n\r\n"], MAX_BODY).await);
+        assert!(text.contains("chunk data"), "{text}");
+        // a size line that never ends
+        let endless = vec![b'1'; 8 * 1024];
+        let text = error_text(decode_open(&[&endless], MAX_BODY, true).await);
+        assert!(text.contains("size line too long"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn get_refuses_an_overflowing_chunk_size() {
+        let router = test_router().await;
+        let (url, server) = serve_once(
+            [
+                "HTTP/1.1 200 OK",
+                "Transfer-Encoding: chunked",
+                "",
+                &format!("{:x}", usize::MAX),
+                "abc",
+            ]
+            .join(CRLF),
+        )
+        .await;
+        let error = HttpClient::default()
+            .get(&router, &url, &[])
+            .await
+            .expect_err("overflowing chunk size");
+        server.await.ok();
+        assert!(error.to_string().contains("too large"), "{error}");
     }
 
     async fn serve_once(response: String) -> (String, tokio::task::JoinHandle<()>) {
