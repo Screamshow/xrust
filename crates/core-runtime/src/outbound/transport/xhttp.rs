@@ -1545,7 +1545,22 @@ impl AsyncWrite for XhttpConn {
                     }));
                 }
                 if let Some(fut) = &mut state.flush_wait {
-                    match fut.as_mut().poll(cx) {
+                    let notified = fut.as_mut().poll(cx);
+                    // The worker can complete (or fail) between the first
+                    // counter check and registration of this notification.
+                    // Recheck after polling, when the waiter is registered.
+                    if let Some(e) = state.failure.take() {
+                        return Poll::Ready(Err(e));
+                    }
+                    if state
+                        .bytes_flushed
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        >= written
+                    {
+                        state.flush_wait = None;
+                        return Pin::new(&mut state.io).poll_flush(cx);
+                    }
+                    match notified {
                         Poll::Ready(()) => {
                             state.flush_wait = None;
                             cx.waker().wake_by_ref();
@@ -1608,7 +1623,7 @@ async fn packet_upload_worker(
     let mut last_post: Option<std::time::Instant> = None;
 
     loop {
-        let n = match reader.read(&mut buf).await {
+        let mut n = match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
@@ -1620,10 +1635,27 @@ async fn packet_upload_worker(
         if let Some(last) = last_post
             && min_interval > std::time::Duration::ZERO
         {
-            let elapsed = std::time::Instant::now().saturating_duration_since(last);
-            if elapsed < min_interval {
-                tokio::time::sleep(min_interval - elapsed).await;
+            let deadline = tokio::time::Instant::from_std(last + min_interval);
+            // The configured interval already delays the next POST. Use that
+            // time to collect caller bytes, rather than freezing a tiny packet
+            // while the duplex pipe fills behind it. Keep the same size bound,
+            // interval and sequence ordering; the first packet is immediate.
+            while n < buf.len() && tokio::time::Instant::now() < deadline {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    next = reader.read(&mut buf[n..]) => match next {
+                        Ok(0) => break,
+                        Ok(got) => n += got,
+                        Err(e) => {
+                            failure.set(e);
+                            flush_notify.notify_waiters();
+                            return;
+                        }
+                    }
+                }
             }
+            tokio::time::sleep_until(deadline).await;
         }
         last_post = Some(std::time::Instant::now());
 
@@ -1874,6 +1906,112 @@ fn base64_url(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn packet_worker_batches_during_the_existing_post_interval() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (dial_tx, mut dial_rx) = mpsc::unbounded_channel();
+        let dialer: std::sync::Arc<Dialer> = std::sync::Arc::new(move || {
+            let tx = dial_tx.clone();
+            Box::pin(async move {
+                let (client, server) = tokio::io::duplex(65536);
+                tx.send(server).unwrap();
+                Ok(Box::new(client) as AnyStream)
+            })
+        });
+        let config = cfg(
+            json!({"mode":"packet-up", "sc_min_posts_interval_ms":"100", "sc_max_each_post_bytes":"65536"}),
+        );
+        let writer = PostWriter {
+            cfg: config,
+            scheme: "http".into(),
+            authority: "test".into(),
+            session_id: "batch-test".into(),
+            seq: 0,
+            dialer,
+            h2_client: None,
+        };
+        let (mut input, reader) = tokio::io::duplex(1024);
+        let flushed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let count = flushed.clone();
+        let worker = tokio::spawn(packet_upload_worker(
+            reader,
+            writer,
+            Failure::default(),
+            flushed,
+            std::sync::Arc::new(tokio::sync::Notify::new()),
+        ));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut io = dial_rx.recv().await.unwrap();
+            let head = read_request_head(&mut io).await.to_ascii_lowercase();
+            assert!(head.contains("content-length: 1\r\n"));
+            assert_eq!(io.read_u8().await.unwrap(), 0x5a);
+            io.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            let head = read_request_head(&mut io).await.to_ascii_lowercase();
+            assert!(head.contains("content-length: 49152\r\n"));
+            let mut body = vec![0; 48 * 1024];
+            io.read_exact(&mut body).await.unwrap();
+            assert!(body.iter().all(|byte| *byte == 0x5a));
+            io.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async move {
+            input.write_all(&[0x5a]).await.unwrap();
+            ready_rx.await.unwrap();
+            input.write_all(&vec![0x5a; 48 * 1024]).await.unwrap();
+            input.shutdown().await.unwrap();
+            worker.await.unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            count.load(std::sync::atomic::Ordering::Acquire),
+            48 * 1024 + 1
+        );
+    }
+    #[tokio::test]
+    async fn packet_flush_rechecks_completion_and_failure_after_wait_registration() {
+        use tokio::io::AsyncWriteExt;
+        for fail in [false, true] {
+            let config = cfg(serde_json::json!({"mode":"packet-up"}));
+            let mut split = SplitConn::new(&config);
+            let (io, _reader) = tokio::io::duplex(1);
+            let flushed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let completion = flushed.clone();
+            let failure = Failure::default();
+            let error = failure.clone();
+            split.up = Up::Packets(Box::new(PacketsUp {
+                io,
+                failure,
+                bytes_written: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                bytes_flushed: flushed,
+                flush_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+                // Complete between the first check and waiter registration;
+                // no later notification will arrive.
+                flush_wait: Some(Box::pin(async move {
+                    if fail {
+                        error.set(io::Error::other("upload failed"));
+                    } else {
+                        completion.store(1, std::sync::atomic::Ordering::Release);
+                    }
+                    std::future::pending::<()>().await;
+                })),
+                task: tokio::spawn(async {}),
+            }));
+            let mut conn = XhttpConn {
+                split: Box::new(split),
+            };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), conn.flush())
+                .await
+                .expect("flush must not wait for a notification already lost");
+            assert_eq!(result.is_err(), fail);
+        }
+    }
     #[tokio::test]
     async fn h2_xmux_capacity_waits_and_drop_wakes_next_stream() {
         let (client_io, server_io) = tokio::io::duplex(4096);

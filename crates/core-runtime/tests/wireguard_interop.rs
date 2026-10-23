@@ -189,6 +189,17 @@ async fn socks_roundtrip(proxy: SocketAddr, target: SocketAddr, label: &str) -> 
     if &buf != b"roundtrip" {
         return Err(format!("payload mismatch: {buf:?}"));
     }
+    // Exceed both virtual socket buffers while reading and writing together;
+    // this exercises stack scheduling and per-connection backpressure.
+    let payload: Vec<u8> = (0..2 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
+    let mut echoed = vec![0u8; payload.len()];
+    let (mut read, mut write) = stream.into_split();
+    let (sent, received) = tokio::join!(write.write_all(&payload), read.read_exact(&mut echoed));
+    sent.map_err(|e| format!("bulk upload: {e}"))?;
+    received.map_err(|e| format!("bulk echo: {e}"))?;
+    if echoed != payload {
+        return Err("bulk payload mismatch".to_string());
+    }
     Ok(())
 }
 

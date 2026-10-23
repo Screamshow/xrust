@@ -10,6 +10,7 @@ pub(crate) mod awg_masque;
 pub(crate) mod awg_quic;
 pub mod noise;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -170,6 +171,7 @@ enum Cmd {
     TcpData {
         id: u32,
         bytes: Vec<u8>,
+        consumed: oneshot::Sender<()>,
     },
     TcpClose {
         id: u32,
@@ -480,14 +482,21 @@ impl WireGuard {
                         break;
                     }
                     Ok(n) => {
+                        let (consumed, accepted) = oneshot::channel();
                         if cmd_tx
                             .send(Cmd::TcpData {
                                 id,
                                 bytes: buf[..n].to_vec(),
+                                consumed,
                             })
                             .await
                             .is_err()
                         {
+                            break;
+                        }
+                        // Do not keep draining the caller into an unbounded
+                        // per-socket queue while smoltcp's send buffer is full.
+                        if accepted.await.is_err() {
                             break;
                         }
                     }
@@ -592,7 +601,7 @@ struct TcpConn {
     dst: SocketAddr,
     to_caller: mpsc::Sender<Vec<u8>>,
     resp: Option<oneshot::Sender<Result<(), String>>>,
-    from_caller: VecDeque<Vec<u8>>,
+    from_caller: VecDeque<(Vec<u8>, oneshot::Sender<()>)>,
     stash: Option<Vec<u8>>,
     created: Instant,
     caller_eof: bool,
@@ -655,7 +664,7 @@ struct WgDevice {
     /// Recycled tx buffers: the pool behind `WgTxToken::consume`, so the
     /// per-packet `vec![0; len]` stops hitting the allocator on every IP
     /// packet the stack hands us.
-    free: Vec<Vec<u8>>,
+    free: RefCell<Vec<Vec<u8>>>,
     mtu: usize,
 }
 
@@ -664,28 +673,34 @@ impl WgDevice {
         Self {
             rx: VecDeque::new(),
             tx: VecDeque::new(),
-            free: Vec::new(),
+            free: RefCell::new(Vec::new()),
             mtu,
         }
     }
 }
 
-struct WgRxToken {
+struct WgRxToken<'a> {
     buffer: Vec<u8>,
+    free: &'a RefCell<Vec<Vec<u8>>>,
 }
 
-impl PhyRxToken for WgRxToken {
+impl PhyRxToken for WgRxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(&self.buffer)
+        let result = f(&self.buffer);
+        let mut free = self.free.borrow_mut();
+        if free.len() < 64 {
+            free.push(self.buffer);
+        }
+        result
     }
 }
 
 struct WgTxToken<'a> {
     queue: &'a mut VecDeque<Vec<u8>>,
-    free: &'a mut Vec<Vec<u8>>,
+    free: &'a RefCell<Vec<Vec<u8>>>,
 }
 
 impl PhyTxToken for WgTxToken<'_> {
@@ -693,7 +708,7 @@ impl PhyTxToken for WgTxToken<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = match self.free.pop() {
+        let mut buffer = match self.free.borrow_mut().pop() {
             Some(mut b) => {
                 b.resize(len, 0);
                 b
@@ -707,7 +722,7 @@ impl PhyTxToken for WgTxToken<'_> {
 }
 
 impl Device for WgDevice {
-    type RxToken<'a> = WgRxToken;
+    type RxToken<'a> = WgRxToken<'a>;
     type TxToken<'a> = WgTxToken<'a>;
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -723,10 +738,13 @@ impl Device for WgDevice {
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         self.rx.pop_front().map(move |buffer| {
-            let rx = WgRxToken { buffer };
+            let rx = WgRxToken {
+                buffer,
+                free: &self.free,
+            };
             let tx = WgTxToken {
                 queue: &mut self.tx,
-                free: &mut self.free,
+                free: &self.free,
             };
             (rx, tx)
         })
@@ -735,7 +753,7 @@ impl Device for WgDevice {
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
         Some(WgTxToken {
             queue: &mut self.tx,
-            free: &mut self.free,
+            free: &self.free,
         })
     }
 }
@@ -1053,6 +1071,7 @@ impl Stack {
                     TcpBuffer::new(vec![0; SOCKET_BUF]),
                     TcpBuffer::new(vec![0; SOCKET_BUF]),
                 );
+                socket.set_nagle_enabled(false);
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
                 )));
@@ -1081,9 +1100,13 @@ impl Stack {
                 );
                 self.peers[pi].kick = true;
             }
-            Cmd::TcpData { id, bytes } => {
+            Cmd::TcpData {
+                id,
+                bytes,
+                consumed,
+            } => {
                 let overflow = self.tcp.get(&id).is_some_and(|c| {
-                    c.from_caller.iter().map(|b| b.len()).sum::<usize>() + bytes.len()
+                    c.from_caller.iter().map(|b| b.0.len()).sum::<usize>() + bytes.len()
                         > EGRESS_BUF_MAX
                 });
                 if overflow {
@@ -1097,13 +1120,12 @@ impl Stack {
                     return;
                 }
                 if let Some(c) = self.tcp.get_mut(&id) {
-                    c.from_caller.push_back(bytes);
+                    c.from_caller.push_back((bytes, consumed));
                 }
             }
             Cmd::TcpClose { id } => {
                 if let Some(c) = self.tcp.get_mut(&id) {
                     c.caller_eof = true;
-                    c.from_caller.clear();
                 }
             }
             Cmd::UdpOpen { target, resp } => {
@@ -1349,7 +1371,7 @@ impl Stack {
         // caller channel or goes into device.rx, so a per-packet malloc here
         // would be pure churn — the pool behind device.free is the same one
         // the tx path refills.
-        let mut plain = self.device.free.pop().unwrap_or_default();
+        let mut plain = self.device.free.get_mut().pop().unwrap_or_default();
         let opened = self.peers[pi]
             .session
             .as_mut()
@@ -1361,6 +1383,7 @@ impl Stack {
         self.peers[pi].last_recv = Some(Instant::now());
         self.peers[pi].resolved = Some(src);
         if plain.is_empty() {
+            self.recycle(plain);
             return; // keepalive
         }
         let Some((src_ip, dst, proto, hdr_len)) = ip_info(&plain) else {
@@ -1436,8 +1459,8 @@ impl Stack {
 
     /// Return a buffer to the pool, capped like the tx path's refill.
     fn recycle(&mut self, buf: Vec<u8>) {
-        if self.device.free.len() < 64 {
-            self.device.free.push(buf);
+        if self.device.free.get_mut().len() < 64 {
+            self.device.free.get_mut().push(buf);
         }
     }
 
@@ -1448,9 +1471,9 @@ impl Stack {
                 None => Some(pkt),
             };
             if let Some(pkt) = pkt
-                && self.device.free.len() < 64
+                && self.device.free.get_mut().len() < 64
             {
-                self.device.free.push(pkt);
+                self.device.free.get_mut().push(pkt);
             }
         }
     }
@@ -1467,11 +1490,13 @@ impl Stack {
             let state = {
                 let sock = self.sockets.get_mut::<TcpSock<'static>>(conn.handle);
 
-                while let Some(front) = conn.from_caller.front_mut() {
+                while let Some((front, _)) = conn.from_caller.front_mut() {
                     match sock.send_slice(front) {
                         Ok(0) => break,
                         Ok(n) if n >= front.len() => {
-                            conn.from_caller.pop_front();
+                            if let Some((_, consumed)) = conn.from_caller.pop_front() {
+                                let _ = consumed.send(());
+                            }
                         }
                         Ok(n) => {
                             let rest = front.split_off(n);
@@ -1792,22 +1817,36 @@ async fn run(
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut buf_v6 = vec![0u8; MAX_DATAGRAM];
     loop {
-        while let Ok((n, src)) = stack.sock.try_recv_from(&mut buf) {
+        // Bound each producer's batch so sustained traffic cannot starve
+        // commands, TCP polling, or replies in this single-owner stack task.
+        for _ in 0..64 {
+            let Ok((n, src)) = stack.sock.try_recv_from(&mut buf) else {
+                break;
+            };
             stack.process_inbound(&buf[..n], src);
         }
         let s6_recv = stack.sock_v6.clone();
         if let Some(s6) = &s6_recv {
-            while let Ok((n, src)) = s6.try_recv_from(&mut buf_v6) {
+            for _ in 0..64 {
+                let Ok((n, src)) = s6.try_recv_from(&mut buf_v6) else {
+                    break;
+                };
                 stack.process_inbound(&buf_v6[..n], src);
             }
         }
-        while let Ok(cmd) = rx.try_recv() {
+        for _ in 0..64 {
+            let Ok(cmd) = rx.try_recv() else {
+                break;
+            };
             stack.process_cmd(cmd);
         }
         // Caller data must reach the sockets before the stack polls, or every
         // freshly written chunk waits a whole extra wake cycle on the wire.
         stack.maintain_tcp();
         stack.poll_stack();
+        // Deliver bytes processed by this poll now, rather than waiting for
+        // another UDP packet or a delayed-ACK timer to wake the task.
+        stack.maintain_tcp();
         stack.flush_device_tx().await;
         stack.maintain_peers().await;
         let deadline = stack.next_deadline();
@@ -2019,6 +2058,28 @@ fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receive_tokens_recycle_packet_buffers_without_exceeding_pool_bound() {
+        let mut device = WgDevice::new(1500);
+        device.rx.push_back(vec![0x5a; 1500]);
+        let pointer = device.rx.front().unwrap().as_ptr();
+        let (rx, tx) = device.receive(SmolInstant::now()).unwrap();
+        rx.consume(|packet| assert_eq!(packet, &[0x5a; 1500]));
+        // RX and TX tokens coexist; consuming RX returns its allocation before
+        // TX requests storage for the response packet.
+        tx.consume(1500, |packet| {
+            assert_eq!(packet.as_ptr(), pointer);
+            packet.fill(0x33);
+        });
+        assert_eq!(device.tx.pop_front().unwrap(), vec![0x33; 1500]);
+        for _ in 0..100 {
+            device.rx.push_back(vec![0; 100]);
+            let (rx, _) = device.receive(SmolInstant::now()).unwrap();
+            rx.consume(|_| ());
+        }
+        assert_eq!(device.free.get_mut().len(), 64);
+    }
     use serde_json::json;
 
     fn wg_obj(extra: Value) -> Map<String, Value> {

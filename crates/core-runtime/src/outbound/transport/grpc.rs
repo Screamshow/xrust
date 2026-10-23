@@ -40,6 +40,23 @@ fn path_escape(s: &str) -> String {
     out
 }
 
+/// Xray custom service names starting with `/` specify both the service
+/// path and method; ordinary names retain the escaped `/service/Tun` form.
+fn service_path(service: &str) -> String {
+    if !service.starts_with('/') {
+        return format!("/{}/Tun", path_escape(service));
+    }
+    let last = service.rfind('/').unwrap_or(0);
+    let body = &service[1..last.max(1)];
+    let method = service[last + 1..].split('|').next().unwrap_or("");
+    let body = body
+        .split('/')
+        .map(path_escape)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("/{body}/{}", path_escape(method))
+}
+
 pub(super) async fn connect(
     stream: AnyStream,
     service_name: &str,
@@ -59,11 +76,9 @@ pub(super) async fn connect(
         .map_err(|e| io::Error::other(format!("grpc: h2 ready: {e}")))?;
 
     let scheme = if secure { "https" } else { "http" };
-    // Reference client behaviour: the service name goes through Go's
-    // `url.PathEscape` before hitting `:path` — Xray's server matches the
-    // escaped form (`/api%2Ftest/Tun`) and rejects the raw slash, while
-    // servers that compare decoded paths accept both.
-    let path = format!("/{}/Tun", path_escape(service_name));
+    // Escape ordinary service names as one segment, but preserve Xray's
+    // explicit custom service/method path when the name starts with `/`.
+    let path = service_path(service_name);
     let request = http::Request::builder()
         .method("POST")
         .uri(format!("{scheme}://{authority}{path}"))
@@ -183,8 +198,10 @@ impl AsyncWrite for GrpcStream {
             // one owned frame per write — the borrowed AsyncWrite boundary
             // (the gRPC framing needs its own bytes, so unlike plain h2
             // there is not even a variant of this that copies less)
-            let frame = Self::encode_frame(buf);
-            self.io.h2.stage(frame, buf.len());
+            // Leave room for the gRPC prefix, protobuf tag and length varint.
+            let take = buf.len().min(super::h2io::WRITE_CHUNK - 16);
+            let frame = Self::encode_frame(&buf[..take]);
+            self.io.h2.stage(frame, take);
         }
         ready!(self.io.h2.poll_flush_out(cx))?;
         Poll::Ready(Ok(self.io.h2.take_report()))
@@ -355,6 +372,11 @@ mod tests {
         assert_eq!(path_escape("a b"), "a%20b");
         assert_eq!(path_escape("a?b,c;d"), "a%3Fb%2Cc%3Bd");
         assert_eq!(path_escape("k:v@w"), "k:v@w");
+        assert_eq!(service_path("api/test"), "/api%2Ftest/Tun");
+        assert_eq!(service_path("/20763/test"), "/20763/test");
+        assert_eq!(service_path("/a b/c?d|Multi"), "/a%20b/c%3Fd");
+        assert_eq!(service_path("/Tun"), "//Tun");
+        assert_eq!(service_path("/"), "//");
     }
 
     #[test]

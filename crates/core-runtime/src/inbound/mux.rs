@@ -2,7 +2,7 @@
 //!
 //! Clients that negotiate multiplexing open a tunnel to the magic destination
 //! `sp.mux.sing-box.arpa:444` (or send command byte `COMMAND_MUX`), run the
-//! session handshake `[version 0][protocol 2]`, and then multiplex individual
+//! session handshake `[version][protocol 2]` (version 1 adds padding metadata), and then multiplex individual
 //! proxy streams as HTTP/2 CONNECT requests carrying `[flags: u16][target_addr]`
 //! and receiving a 1-byte success response `0x00`.
 
@@ -43,7 +43,7 @@ pub async fn serve_mux(
     // 1. Read session handshake: [version, protocol]
     let mut session_head = [0u8; 2];
     stream.read_exact(&mut session_head).await?;
-    if session_head[0] != VERSION0 {
+    if session_head[0] > 1 {
         return Err(io::Error::other(format!(
             "mux: unsupported version {}",
             session_head[0]
@@ -56,23 +56,20 @@ pub async fn serve_mux(
         )));
     }
 
-    // Check optional padding byte: if 1, read pad length and skip
-    let mut check_pad = [0u8; 1];
-    // We do a peek or timed read; if next byte is 1, read pad length
-    // In sing-box: padding flag byte is present only when padding is configured
-    // For H2, H2 preface starts with "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n" which starts with 'P' (0x50).
-    // If the next byte is 1 (padding flag), it is followed by 2 bytes length.
-    stream.read_exact(&mut check_pad).await?;
-    if check_pad[0] == 1 {
-        let mut pad_len_buf = [0u8; 2];
-        stream.read_exact(&mut pad_len_buf).await?;
-        let pad_len = u16::from_be_bytes(pad_len_buf) as usize;
-        let mut skip_buf = vec![0u8; pad_len];
-        stream.read_exact(&mut skip_buf).await?;
-    } else {
-        // If not padding, `check_pad[0]` is the first byte of H2 client preface ('P')
-        // We prepend it back into the stream
-        stream = Box::new(PrefixedStream::new(vec![check_pad[0]], stream));
+    // Version 0 ends after the protocol byte. Version 1 carries an explicit
+    // padding flag and, when enabled, an initial random padding block.
+    if session_head[0] != VERSION0 {
+        let enabled = stream.read_u8().await? != 0;
+        if enabled {
+            let mut remaining = usize::from(stream.read_u16().await?);
+            let mut scratch = [0u8; 1024];
+            while remaining > 0 {
+                let take = remaining.min(scratch.len());
+                stream.read_exact(&mut scratch[..take]).await?;
+                remaining -= take;
+            }
+            stream = Box::new(crate::outbound::mux::PadStream::new(stream));
+        }
     }
 
     // 2. Perform HTTP/2 server handshake
@@ -243,63 +240,6 @@ where
             Ok(Target::Domain(s, u16::from_be_bytes(port)))
         }
         other => Err(io::Error::other(format!("unknown sing addr atyp: {other}"))),
-    }
-}
-
-/// Helper stream that yields prefixed bytes before reading from inner stream.
-struct PrefixedStream {
-    prefix: Vec<u8>,
-    pos: usize,
-    inner: crate::inbound::AnyStream,
-}
-
-impl PrefixedStream {
-    fn new(prefix: Vec<u8>, inner: crate::inbound::AnyStream) -> Self {
-        Self {
-            prefix,
-            pos: 0,
-            inner,
-        }
-    }
-}
-
-impl AsyncRead for PrefixedStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        if self.pos < self.prefix.len() {
-            let n = (self.prefix.len() - self.pos).min(buf.remaining());
-            buf.put_slice(&self.prefix[self.pos..self.pos + n]);
-            self.pos += n;
-            return std::task::Poll::Ready(Ok(()));
-        }
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for PrefixedStream {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 

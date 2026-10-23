@@ -24,6 +24,12 @@ const CONN_WINDOW: u32 = 32 << 20;
 /// Largest DATA frame we ask the peer to send.
 const MAX_FRAME: u32 = 256 * 1024;
 
+/// Bound each owned upload allocation, including gRPC framing overhead.
+/// Partial AsyncWrite writes preserve backpressure without retaining an
+/// arbitrarily large caller buffer while an H2 stream has no send capacity.
+/// 48 KiB also stays below musl's large-allocation threshold.
+pub(super) const WRITE_CHUNK: usize = 48 * 1024;
+
 /// The client handshake every h2-based transport shares, with windows sized
 /// for throughput.
 pub(crate) fn client_builder() -> h2::client::Builder {
@@ -244,14 +250,20 @@ impl H2Stream {
             };
             let remaining = self.out.len();
             send.reserve_capacity(remaining);
-            let cap = match send.poll_capacity(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(cap))) => cap,
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::other(format!("h2: capacity: {e}"))));
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(Err(io::Error::other("h2: stream closed for writing")));
+            // poll_capacity notifies about capacity *changes*, not every
+            // write. Spend already assigned credit before waiting for more.
+            let cap = if send.capacity() > 0 {
+                send.capacity()
+            } else {
+                match send.poll_capacity(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(cap))) => cap,
+                    Poll::Ready(Some(Err(e))) => {
+                        return Poll::Ready(Err(io::Error::other(format!("h2: capacity: {e}"))));
+                    }
+                    Poll::Ready(None) => {
+                        return Poll::Ready(Err(io::Error::other("h2: stream closed for writing")));
+                    }
                 }
             };
             if cap == 0 {
@@ -452,7 +464,9 @@ impl AsyncWrite for H2Io {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            self.h2.stage_bytes(Bytes::copy_from_slice(buf), buf.len());
+            let take = buf.len().min(WRITE_CHUNK);
+            self.h2
+                .stage_bytes(Bytes::copy_from_slice(&buf[..take]), take);
         }
         ready!(self.h2.poll_flush_out(cx))?;
         Poll::Ready(Ok(self.h2.take_report()))
@@ -482,6 +496,122 @@ mod backpressure_tests {
     };
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn assigned_capacity_does_not_require_another_window_update() {
+        use tokio::io::AsyncWriteExt;
+        let (client, server) = tokio::io::duplex(1024);
+        let server_task = tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server).await.unwrap();
+            let (request, mut respond) = conn.accept().await.unwrap().unwrap();
+            let _send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let _recv = request.into_body();
+            while conn.accept().await.is_some() {}
+        });
+        let (mut send, connection) = h2::client::handshake(client).await.unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let (_, mut stream) = send.send_request(http::Request::new(()), false).unwrap();
+        stream.reserve_capacity(8192);
+        let capacity = std::future::poll_fn(|cx| stream.poll_capacity(cx))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(capacity >= 3);
+        let mut writer = H2Io {
+            h2: H2Stream::upload_only(stream),
+        };
+        tokio::time::timeout(Duration::from_secs(1), writer.write_all(b"abc"))
+            .await
+            .expect("already assigned capacity must be spendable")
+            .unwrap();
+        drop(writer);
+        drop(send);
+        driver.abort();
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn large_uploads_use_bounded_writes_and_preserve_payload() {
+        use tokio::io::AsyncWriteExt;
+        for grpc in [false, true] {
+            let (client, server) = tokio::io::duplex(1024);
+            let server_task = tokio::spawn(async move {
+                let mut conn = h2::server::handshake(server).await.unwrap();
+                let (request, mut respond) = conn.accept().await.unwrap().unwrap();
+                let send = respond
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                let mut writer: crate::inbound::AnyStream = if grpc {
+                    super::super::grpc::server(request.into_body(), send)
+                } else {
+                    Box::new(H2Io {
+                        h2: H2Stream::server(request.into_body(), send),
+                    })
+                };
+                let upload = tokio::spawn(async move {
+                    let payload = vec![0x5a; 1024 * 1024];
+                    let n = writer.write(&payload).await.unwrap();
+                    assert!(n > 0 && n <= WRITE_CHUNK);
+                    writer.write_all(&payload[n..]).await.unwrap();
+                    writer.shutdown().await.unwrap();
+                });
+                while conn.accept().await.is_some() {}
+                upload.await.unwrap();
+            });
+            let (mut send, connection) = h2::client::handshake(client).await.unwrap();
+            let driver = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let (response, stream) = send.send_request(http::Request::new(()), true).unwrap();
+            let mut reader = H2Io {
+                h2: H2Stream::new(response, stream, driver),
+            };
+            let mut raw = Vec::new();
+            tokio::time::timeout(Duration::from_secs(10), reader.read_to_end(&mut raw))
+                .await
+                .unwrap()
+                .unwrap();
+            if grpc {
+                let mut payload_len = 0;
+                let mut wire = raw.as_slice();
+                while !wire.is_empty() {
+                    assert_eq!(wire[0], 0);
+                    let frame_len = u32::from_be_bytes(wire[1..5].try_into().unwrap()) as usize;
+                    assert!(frame_len + 5 <= WRITE_CHUNK);
+                    assert_eq!(wire[5], 0x0a);
+                    let mut at = 6;
+                    let mut len = 0usize;
+                    let mut shift = 0;
+                    loop {
+                        let b = wire[at];
+                        at += 1;
+                        len |= usize::from(b & 0x7f) << shift;
+                        if b & 0x80 == 0 {
+                            break;
+                        }
+                        shift += 7;
+                    }
+                    assert_eq!(at + len, frame_len + 5);
+                    assert!(wire[at..at + len].iter().all(|b| *b == 0x5a));
+                    payload_len += len;
+                    wire = &wire[frame_len + 5..];
+                }
+                assert_eq!(payload_len, 1024 * 1024);
+            } else {
+                assert_eq!(raw, vec![0x5a; 1024 * 1024]);
+            }
+            drop(reader);
+            drop(send);
+            tokio::time::timeout(Duration::from_secs(3), server_task)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn unread_body_stops_sender_and_drain_reopens_the_window() {

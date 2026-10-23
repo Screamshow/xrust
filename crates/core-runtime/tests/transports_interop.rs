@@ -316,4 +316,47 @@ async fn interop_transports() {
         )
     })
     .await;
+
+    // Independent sing-mux client -> our inbound, with both protocol versions.
+    for padding in [false, true] {
+        assert_transport(&ref_bin, "vless+h2mux", |port| (
+            json!({"type":"vless", "listen":"127.0.0.1", "listen_port":port,
+                "users":[{"uuid":VLESS_UUID}], "multiplex":{"enabled":true}}),
+            json!({"type":"vless", "tag":"up", "server":"127.0.0.1", "server_port":port,
+                "uuid":VLESS_UUID, "multiplex":{"enabled":true, "protocol":"h2mux", "padding":padding}})
+        )).await;
+        let echo = spawn_echo().await;
+        let instance = core_runtime::start(&json!({
+            "log": {"level":"error"},
+            "inbounds": [{"type":"vless", "listen":"127.0.0.1", "listen_port":0,
+                "users":[{"uuid":VLESS_UUID}], "multiplex":{"enabled":true}}],
+            "outbounds":[{"type":"direct", "tag":"direct"}], "route":{"final":"direct"}
+        }))
+        .await
+        .unwrap();
+        let port = free_port();
+        let _client = start_ref(
+            &ref_bin,
+            &json!({
+                "log":{"level":"error"},
+                "inbounds":[{"type":"mixed", "listen":"127.0.0.1", "listen_port":port}],
+                "outbounds":[{"type":"vless", "tag":"proxy", "server":"127.0.0.1",
+                    "server_port":instance.inbound_addrs()[0].1.port(), "uuid":VLESS_UUID,
+                    "multiplex":{"enabled":true, "protocol":"h2mux", "padding":padding}}],
+                "route":{"final":"proxy"}
+            }),
+        );
+        assert!(wait_listening(port).await);
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            socks_roundtrip(
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                echo,
+                "independent mux client",
+            ),
+        )
+        .await
+        .unwrap();
+        instance.shutdown();
+    }
 }

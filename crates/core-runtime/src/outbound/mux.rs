@@ -297,7 +297,7 @@ impl Session {
 
 /// `padConn`: the first [`FIRST_PADDINGS`] frames carry
 /// `[data_len:u16][pad_len:u16][data][pad]`, then the stream goes plain.
-struct PadStream {
+pub(crate) struct PadStream {
     inner: AnyStream,
     write_padding: u32,
     read_padding: u32,
@@ -305,22 +305,48 @@ struct PadStream {
     read_remaining: usize,
     /// padding bytes of the current frame still to skip
     padding_remaining: usize,
+    read_header: [u8; 4],
+    read_header_len: usize,
+    write_frame: Vec<u8>,
+    write_pos: usize,
+    write_report: usize,
 }
 
 impl PadStream {
-    fn new(inner: AnyStream) -> Self {
+    pub(crate) fn new(inner: AnyStream) -> Self {
         Self {
             inner,
             write_padding: 0,
             read_padding: 0,
             read_remaining: 0,
             padding_remaining: 0,
+            read_header: [0; 4],
+            read_header_len: 0,
+            write_frame: Vec::new(),
+            write_pos: 0,
+            write_report: 0,
         }
     }
 
     /// 256..=767 random bytes, like the reference.
     fn pad_len() -> usize {
         256 + random_below(512)
+    }
+
+    fn poll_drain(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        while self.write_pos < self.write_frame.len() {
+            let n = std::task::ready!(
+                std::pin::Pin::new(&mut self.inner)
+                    .poll_write(cx, &self.write_frame[self.write_pos..])
+            )?;
+            if n == 0 {
+                return std::task::Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            self.write_pos += n;
+        }
+        self.write_frame.clear();
+        self.write_pos = 0;
+        std::task::Poll::Ready(Ok(()))
     }
 }
 
@@ -331,35 +357,41 @@ impl AsyncRead for PadStream {
         out: &mut ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         let this = &mut *self;
+        if out.remaining() == 0 {
+            return std::task::Poll::Ready(Ok(()));
+        }
         loop {
             if this.read_remaining > 0 {
                 let n = out.remaining().min(this.read_remaining);
-                let mut scratch = vec![0u8; n];
-                let mut read = ReadBuf::new(&mut scratch);
+                let mut read = ReadBuf::new(out.initialize_unfilled_to(n));
                 match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read) {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                     std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                     std::task::Poll::Ready(Ok(())) => {
                         let filled = read.filled().len();
                         if filled == 0 {
-                            return std::task::Poll::Ready(Ok(()));
+                            return std::task::Poll::Ready(
+                                Err(io::ErrorKind::UnexpectedEof.into()),
+                            );
                         }
-                        out.put_slice(&scratch[..filled]);
+                        out.advance(filled);
                         this.read_remaining -= filled;
                         return std::task::Poll::Ready(Ok(()));
                     }
                 }
             }
             if this.padding_remaining > 0 {
-                let mut scratch = vec![0u8; this.padding_remaining.min(4096)];
-                let mut read = ReadBuf::new(&mut scratch);
+                let mut scratch = [0u8; 4096];
+                let mut read = ReadBuf::new(&mut scratch[..this.padding_remaining.min(4096)]);
                 match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read) {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                     std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                     std::task::Poll::Ready(Ok(())) => {
                         let filled = read.filled().len();
                         if filled == 0 {
-                            return std::task::Poll::Ready(Ok(()));
+                            return std::task::Poll::Ready(
+                                Err(io::ErrorKind::UnexpectedEof.into()),
+                            );
                         }
                         this.padding_remaining -= filled;
                     }
@@ -369,24 +401,28 @@ impl AsyncRead for PadStream {
             if this.read_padding >= FIRST_PADDINGS {
                 return std::pin::Pin::new(&mut this.inner).poll_read(cx, out);
             }
-            let mut header = [0u8; 4];
-            let mut filled = 0;
-            while filled < header.len() {
-                let mut scratch = [0u8; 1];
-                let mut read = ReadBuf::new(&mut scratch);
+            while this.read_header_len < this.read_header.len() {
+                let mut read = ReadBuf::new(&mut this.read_header[this.read_header_len..]);
                 match std::pin::Pin::new(&mut this.inner).poll_read(cx, &mut read) {
                     std::task::Poll::Pending => return std::task::Poll::Pending,
                     std::task::Poll::Ready(Err(e)) => return std::task::Poll::Ready(Err(e)),
                     std::task::Poll::Ready(Ok(())) => {
-                        if read.filled().is_empty() {
+                        let filled = read.filled().len();
+                        if filled == 0 && this.read_header_len > 0 {
+                            return std::task::Poll::Ready(
+                                Err(io::ErrorKind::UnexpectedEof.into()),
+                            );
+                        }
+                        if filled == 0 {
                             return std::task::Poll::Ready(Ok(()));
                         }
-                        header[filled] = scratch[0];
-                        filled += 1;
+                        this.read_header_len += filled;
                     }
                 }
             }
             this.read_padding += 1;
+            let header = this.read_header;
+            this.read_header_len = 0;
             this.read_remaining = usize::from(u16::from_be_bytes([header[0], header[1]]));
             this.padding_remaining = usize::from(u16::from_be_bytes([header[2], header[3]]));
         }
@@ -400,31 +436,35 @@ impl AsyncWrite for PadStream {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         let this = &mut *self;
+        std::task::ready!(this.poll_drain(cx))?;
+        if this.write_report > 0 {
+            return std::task::Poll::Ready(Ok(std::mem::take(&mut this.write_report)));
+        }
+        if buf.is_empty() {
+            return std::task::Poll::Ready(Ok(0));
+        }
         if this.write_padding >= FIRST_PADDINGS {
             return std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
         }
         let pad = Self::pad_len();
-        let mut frame = Vec::with_capacity(4 + buf.len() + pad);
-        frame.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-        frame.extend_from_slice(&(pad as u16).to_be_bytes());
-        frame.extend_from_slice(buf);
-        frame.resize(4 + buf.len() + pad, 0);
+        let take = buf.len().min(u16::MAX as usize);
+        this.write_frame
+            .extend_from_slice(&(take as u16).to_be_bytes());
+        this.write_frame
+            .extend_from_slice(&(pad as u16).to_be_bytes());
+        this.write_frame.extend_from_slice(&buf[..take]);
+        this.write_frame.resize(4 + take + pad, 0);
         this.write_padding += 1;
-        match std::pin::Pin::new(&mut this.inner).poll_write(cx, &frame) {
-            std::task::Poll::Ready(Ok(_)) => std::task::Poll::Ready(Ok(buf.len())),
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(e)),
-            std::task::Poll::Pending => {
-                // the frame is gone; the count stays advanced, like the
-                // reference, which also counts before the write lands
-                std::task::Poll::Pending
-            }
-        }
+        this.write_report = take;
+        std::task::ready!(this.poll_drain(cx))?;
+        std::task::Poll::Ready(Ok(std::mem::take(&mut this.write_report)))
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        std::task::ready!(self.poll_drain(cx))?;
         std::pin::Pin::new(&mut self.inner).poll_flush(cx)
     }
 
@@ -432,6 +472,7 @@ impl AsyncWrite for PadStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        std::task::ready!(self.poll_drain(cx))?;
         std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -501,11 +542,6 @@ impl Client {
         let stream: AnyStream = Box::new(crate::outbound::transport::h2io::H2Io {
             h2: crate::outbound::transport::h2io::H2Stream::shared(response, send),
         });
-        let stream = if self.options.padding {
-            Box::new(PadStream::new(stream)) as AnyStream
-        } else {
-            stream
-        };
         Ok(MuxStream::new(
             stream,
             encode_stream_request(target),
@@ -554,7 +590,7 @@ impl Client {
         let stream = dialer().await?;
         let mut stream: AnyStream = stream;
         // the session handshake rides in front of the h2 preface
-        let mut request = vec![VERSION0, PROTOCOL_H2MUX];
+        let mut request = vec![u8::from(self.options.padding), PROTOCOL_H2MUX];
         if self.options.padding {
             request.push(1);
             let pad = 256 + random_below(512);
@@ -562,6 +598,11 @@ impl Client {
             request.resize(request.len() + pad, 0);
         }
         stream.write_all(&request).await?;
+        // Padding wraps the session transport (including the H2 preface),
+        // not each individual multiplexed stream.
+        if self.options.padding {
+            stream = Box::new(PadStream::new(stream));
+        }
 
         let (send_request, connection) = tokio::time::timeout(
             TCP_TIMEOUT,
@@ -649,6 +690,54 @@ pub fn mux_target() -> Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn padded_stream_survives_fragmented_headers_backpressure_and_large_writes() {
+        use tokio::io::AsyncReadExt;
+        for capacity in [3, 127] {
+            let (left, right) = tokio::io::duplex(capacity);
+            let writer = tokio::spawn(async move {
+                let mut stream = PadStream::new(Box::new(left));
+                assert_eq!(stream.write(&[]).await.unwrap(), 0);
+                assert_eq!(stream.write_padding, 0);
+                // Exercise u16 length splitting, then cross the boundary from
+                // the sixteen padded frames to unframed bytes.
+                stream.write_all(&vec![0x5a; 70_000]).await.unwrap();
+                for _ in 0..20 {
+                    stream.write_all(b"tail").await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+                stream.shutdown().await.unwrap();
+            });
+            let mut reader = PadStream::new(Box::new(right));
+            let mut received = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                reader.read_to_end(&mut received),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            writer.await.unwrap();
+            let mut expected = vec![0x5a; 70_000];
+            expected.extend_from_slice(&b"tail".repeat(20));
+            assert_eq!(received, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn padded_stream_rejects_truncated_header() {
+        use tokio::io::AsyncReadExt;
+        let (mut left, right) = tokio::io::duplex(8);
+        left.write_all(&[0, 5]).await.unwrap();
+        left.shutdown().await.unwrap();
+        let mut stream = PadStream::new(Box::new(right));
+        let mut byte = [0];
+        assert_eq!(
+            stream.read(&mut byte).await.unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
 
     struct ShortWriter {
         steps: std::collections::VecDeque<Option<usize>>,
