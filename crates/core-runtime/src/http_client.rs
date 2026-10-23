@@ -265,6 +265,11 @@ impl HttpClient {
 }
 
 async fn read_response(stream: &mut AnyStream) -> io::Result<Response> {
+    read_response_limited(stream, MAX_BODY).await
+}
+
+/// Read one response; the body, however it is framed, is bounded by `limit`.
+async fn read_response_limited(stream: &mut AnyStream, limit: usize) -> io::Result<Response> {
     let mut buffer = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
     // head
@@ -308,36 +313,48 @@ async fn read_response(stream: &mut AnyStream) -> io::Result<Response> {
     };
     let chunked = find("transfer-encoding")
         .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"));
-    let length = find("content-length").and_then(|v| v.parse::<usize>().ok());
 
-    let body = if chunked {
-        decode_chunked(rest, stream).await?
+    // 204 and 304 never carry a body (RFC 9110 §15.3.5, §15.4.5); a 304 may
+    // still state the length of the representation it refers to.
+    let body = if status == 204 || status == 304 {
+        Vec::new()
+    } else if chunked {
+        decode_chunked_limited(rest, stream, limit).await?
+    } else if let Some(length) = content_length(&headers)? {
+        // The declared size is checked before any more of the body is read,
+        // so a peer cannot make us buffer past the limit, or wait for a body
+        // that would be refused anyway.
+        if length > limit {
+            return Err(io::Error::other("response body too large"));
+        }
+        let mut body = rest;
+        while body.len() < length {
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                return Err(io::Error::other(format!(
+                    "truncated body: {} of {length} bytes",
+                    body.len()
+                )));
+            }
+            body.extend_from_slice(&chunk[..read]);
+        }
+        body.truncate(length);
+        body
     } else {
         let mut body = rest;
-        if let Some(length) = length {
-            while body.len() < length {
-                let read = stream.read(&mut chunk).await?;
-                if read == 0 {
-                    break;
-                }
-                body.extend_from_slice(&chunk[..read]);
+        loop {
+            if body.len() > limit {
+                return Err(io::Error::other("response body too large"));
             }
-            body.truncate(length);
-        } else {
-            loop {
-                if body.len() > MAX_BODY {
-                    return Err(io::Error::other("response body too large"));
-                }
-                let read = stream.read(&mut chunk).await?;
-                if read == 0 {
-                    break;
-                }
-                body.extend_from_slice(&chunk[..read]);
+            let read = stream.read(&mut chunk).await?;
+            if read == 0 {
+                break;
             }
+            body.extend_from_slice(&chunk[..read]);
         }
         body
     };
-    if body.len() > MAX_BODY {
+    if body.len() > limit {
         return Err(io::Error::other("response body too large"));
     }
     Ok(Response {
@@ -350,11 +367,33 @@ async fn read_response(stream: &mut AnyStream) -> io::Result<Response> {
 /// Longest chunk-size line accepted, extensions included.
 const MAX_CHUNK_LINE: usize = 4 * 1024;
 
-/// `transfer-encoding: chunked`: size line, data, CRLF, until a zero chunk.
-async fn decode_chunked(initial: Vec<u8>, stream: &mut AnyStream) -> io::Result<Vec<u8>> {
-    decode_chunked_limited(initial, stream, MAX_BODY).await
+/// `Content-Length` (RFC 9112 §6.3): decimal digits only. Repeated values,
+/// in one header as a list or in several headers, must all be the same.
+/// `None` when the header is absent; an error when it is malformed or too
+/// large for `usize`.
+fn content_length(headers: &[(String, String)]) -> io::Result<Option<usize>> {
+    let mut length = None;
+    for (key, value) in headers {
+        if key != "content-length" {
+            continue;
+        }
+        for part in value.split(',') {
+            let part = part.trim();
+            let parsed = (!part.is_empty())
+                .then_some(part)
+                .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|p| p.parse::<usize>().ok());
+            match (parsed, length) {
+                (Some(n), None) => length = Some(n),
+                (Some(n), Some(seen)) if n == seen => {}
+                _ => return Err(io::Error::other(format!("bad content-length {value:?}"))),
+            }
+        }
+    }
+    Ok(length)
 }
 
+/// `transfer-encoding: chunked`: size line, data, CRLF, until a zero chunk.
 /// The chunk sizes come from the peer, so every size is parsed strictly and
 /// checked against what is left of `limit` before any of its data is read.
 /// Release builds have no overflow checks and abort on panic: an unchecked
@@ -748,6 +787,177 @@ mod tests {
             let text = error_text(decode_line(MAX_CHUNK_LINE + 1, split).await);
             assert!(text.contains("size line too long"), "split {split}: {text}");
         }
+    }
+
+    /// Read one response from `pieces` with a body limit of `limit`.
+    async fn respond(pieces: &[&[u8]], limit: usize, hold_open: bool) -> io::Result<Response> {
+        let mut stream = piecewise(pieces.iter().map(|p| p.to_vec()).collect(), hold_open);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            read_response_limited(&mut stream, limit),
+        )
+        .await
+        .expect("the reader must answer, not wait for more data")
+    }
+
+    fn with_length(value: &str, body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 200 OK\r\nContent-Length: {value}\r\n\r\n{body}").into_bytes()
+    }
+
+    fn response_error(result: io::Result<Response>) -> String {
+        result.expect_err("must be an error").to_string()
+    }
+
+    // Content-Length tests come in three groups:
+    // - valid responses: read the same before and after the SEC-07 fix;
+    // - SEC-07: a declared length over MAX_BODY is refused from the header;
+    // - deliberate changes that came with it: the limit boundary,
+    //   malformed and repeated values, truncated bodies, 204/304.
+
+    // --- valid responses -------------------------------------------------
+
+    #[tokio::test]
+    async fn content_length_valid_bodies_are_read() {
+        // zero length: no body to wait for, even with the connection open
+        let response = respond(&[&with_length("0", "")], MAX_BODY, true)
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"");
+        // the whole body arrives with the head
+        let response = respond(&[&with_length("5", "hello")], MAX_BODY, true)
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"hello");
+        // part of the body arrives with the head, the rest in later reads
+        let head = with_length("11", "hel");
+        let response = respond(&[&head, b"lo", b" ", b"world"], MAX_BODY, true)
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"hello world");
+        // the head itself split across reads, then the body byte by byte
+        let mut pieces: Vec<&[u8]> = vec![b"HTTP/1.1 200 OK\r\nConte", b"nt-Length: 5\r\n\r\n"];
+        pieces.extend(b"hello".chunks(1));
+        let response = respond(&pieces, MAX_BODY, true).await.unwrap();
+        assert_eq!(response.body, b"hello");
+        // bytes past the declared length are not part of the body
+        let response = respond(&[&with_length("5", "helloEXTRA")], MAX_BODY, false)
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn content_length_at_the_limit_is_read() {
+        let response = respond(&[&with_length("5", "hello")], 5, true)
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"hello");
+    }
+
+    // --- SEC-07 ----------------------------------------------------------
+
+    #[tokio::test]
+    async fn sec07_declared_length_over_max_body_is_refused_before_reading() {
+        // The declared size alone is enough: the server keeps the connection
+        // open and sends no body. Before the fix the client waited for the
+        // body (and buffered whatever came) up to the declared length.
+        let declared = (MAX_BODY + 1).to_string();
+        let text = response_error(respond(&[&with_length(&declared, "")], MAX_BODY, true).await);
+        assert!(text.contains("too large"), "{text}");
+        let text = response_error(
+            respond(
+                &[&with_length(&u64::MAX.to_string(), "abc")],
+                MAX_BODY,
+                true,
+            )
+            .await,
+        );
+        assert!(text.contains("too large"), "{text}");
+    }
+
+    // --- deliberate changes that came with the fix -----------------------
+
+    #[tokio::test]
+    async fn content_length_one_over_the_limit_is_refused() {
+        let text = response_error(respond(&[&with_length("6", "")], 5, true).await);
+        assert!(text.contains("too large"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn content_length_identical_list_is_one_length() {
+        // RFC 9112 §6.3: a list of identical values is one length. Before,
+        // such a header did not parse and was ignored.
+        let response = respond(&[&with_length("5, 5", "hello")], MAX_BODY, true)
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"hello");
+    }
+
+    #[tokio::test]
+    async fn content_length_malformed_values_are_errors() {
+        let overflow = format!("{}0", usize::MAX);
+        for value in [
+            "abc",
+            "-1",
+            "+5",
+            "5 5",
+            "0x5",
+            "",
+            "5, 6",
+            "5,",
+            overflow.as_str(),
+        ] {
+            let text =
+                response_error(respond(&[&with_length(value, "hello")], MAX_BODY, true).await);
+            assert!(text.contains("bad content-length"), "{value:?}: {text}");
+        }
+        // two headers that disagree
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello";
+        let text = response_error(respond(&[head], MAX_BODY, true).await);
+        assert!(text.contains("bad content-length"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn content_length_truncated_body_is_an_error() {
+        let text = response_error(respond(&[&with_length("10", "hell")], MAX_BODY, false).await);
+        assert!(text.contains("truncated"), "{text}");
+        let text = response_error(respond(&[&with_length("5", "")], MAX_BODY, false).await);
+        assert!(text.contains("truncated"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn bodiless_statuses_ignore_content_length() {
+        // a 304 may carry the length of the representation it refers to
+        // (RFC 9110 §8.6); there is no body to read or wait for
+        for status in ["304 Not Modified", "204 No Content"] {
+            let head = format!("HTTP/1.1 {status}\r\nContent-Length: 1000\r\n\r\n");
+            let response = respond(&[head.as_bytes()], MAX_BODY, true).await.unwrap();
+            assert!(response.body.is_empty(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sec07_get_refuses_a_content_length_over_the_limit() {
+        // SEC-07 end to end: before the fix the client read until the peer
+        // closed and returned the short body as a success
+        let router = test_router().await;
+        let declared = (MAX_BODY + 1).to_string();
+        let (url, server) = serve_once(
+            [
+                "HTTP/1.1 200 OK",
+                &format!("Content-Length: {declared}"),
+                "",
+                "abc",
+            ]
+            .join(CRLF),
+        )
+        .await;
+        let error = HttpClient::default()
+            .get(&router, &url, &[])
+            .await
+            .expect_err("declared body over the limit");
+        server.await.ok();
+        assert!(error.to_string().contains("too large"), "{error}");
     }
 
     #[tokio::test]
