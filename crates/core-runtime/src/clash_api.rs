@@ -1775,10 +1775,12 @@ fn decode_impl(input: &str, plus_as_space: bool) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
+            // Work on bytes: slicing `input` here could split a multi-byte
+            // character and panic before the request is authenticated.
             b'%' if i + 2 < bytes.len() => {
-                let hex = &input[i + 1..i + 3];
-                if let Ok(v) = u8::from_str_radix(hex, 16) {
-                    out.push(v);
+                if let (Some(high), Some(low)) = (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
+                {
+                    out.push(high << 4 | low);
                     i += 3;
                     continue;
                 }
@@ -1796,6 +1798,15 @@ fn decode_impl(input: &str, plus_as_space: bool) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn bad_request() -> Value {
@@ -2125,6 +2136,23 @@ mod tests {
         assert_eq!(percent_decode("plain"), "plain");
         assert_eq!(percent_decode_plus("a+b"), "a b");
         assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn percent_decoding_never_splits_a_character() {
+        // A hex pair cut short by a multi-byte character used to panic.
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("/%a\u{fffd}x"), "/%a\u{fffd}x");
+        assert_eq!(percent_decode("%é"), "%é");
+        assert_eq!(percent_decode_plus("%aé+x"), "%aé x");
+        // A sign is not a hex digit.
+        assert_eq!(percent_decode("%+1"), "%+1");
+        assert_eq!(percent_decode("%-1"), "%-1");
+        assert_eq!(percent_decode("%4a%4A"), "JJ");
+        assert_eq!(percent_decode("%d0%b9"), "й");
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%4"), "%4");
+        assert_eq!(percent_decode("ab%"), "ab%");
     }
 
     #[test]

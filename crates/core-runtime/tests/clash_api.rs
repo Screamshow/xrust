@@ -140,6 +140,70 @@ async fn encoded_slash_names_support_lookup_selection_and_delay() {
     instance.shutdown();
 }
 
+async fn request_raw(addr: std::net::SocketAddr, request: &[u8]) -> Response {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream.write_all(request).await.expect("write");
+    read_response(&mut stream).await
+}
+
+/// A truncated `%XX` escape followed by a multi-byte character used to panic
+/// in the percent decoder before authentication; with `panic = "abort"` one
+/// anonymous request took the whole core down.
+#[tokio::test]
+async fn malformed_percent_escapes_are_answered_not_panicked() {
+    let config = serde_json::json!({
+        "log": {"level": "error"},
+        "experimental": {"clash_api": {
+            "external_controller": "127.0.0.1:0",
+            "secret": SECRET
+        }},
+        "outbounds": [{"type": "direct", "tag": "direct-out"}],
+        "route": {"final": "direct-out"}
+    });
+    let instance = core_runtime::start(&config).await.expect("start");
+    let addr = instance.clash_api_addr().expect("clash-api bound");
+
+    let targets: [&[u8]; 6] = [
+        b"/%a\xc3\xa9",
+        b"/%a\xff",
+        b"/proxies/%a\xc3\xa9",
+        b"/version?x=%a\xc3\xa9",
+        b"/version?%a\xc3\xa9=1",
+        b"/%\xc3\xa9",
+    ];
+    for target in targets {
+        for auth in [false, true] {
+            let mut req = b"GET ".to_vec();
+            req.extend_from_slice(target);
+            req.extend_from_slice(b" HTTP/1.1\r\nHost: x\r\n");
+            if auth {
+                req.extend_from_slice(format!("Authorization: Bearer {SECRET}\r\n").as_bytes());
+            }
+            req.extend_from_slice(b"\r\n");
+            // Getting a response at all is the point: before the fix the
+            // connection task panicked and the stream closed without one.
+            let res = request_raw(addr, &req).await;
+            let shown = String::from_utf8_lossy(target);
+            if auth {
+                assert_ne!(res.status, 401, "{shown}: the secret was sent");
+            } else if target.starts_with(b"/version") {
+                assert_eq!(res.status, 401, "{shown}: no secret, still refused");
+            } else {
+                assert!(
+                    matches!(res.status, 401 | 404),
+                    "{shown}: anonymous request got {}",
+                    res.status
+                );
+            }
+        }
+    }
+
+    // The listener keeps serving after every malformed request.
+    let res = request(addr, &authed("/version")).await;
+    assert_eq!(res.status, 200);
+    instance.shutdown();
+}
+
 #[tokio::test]
 async fn clash_api_rest_surface() {
     let config = serde_json::json!({
