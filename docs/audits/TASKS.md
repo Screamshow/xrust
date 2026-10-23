@@ -18,6 +18,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | ID | Описание | Приоритет | Статус | Коммит |
 |---|---|---|---|---|
 | CQ-01 | Паника `percent_decode` в Clash API до проверки secret | P0 | исправлено, проверено | `49987e66b78e14fc4f57ff367ece1f2fd9d88569` |
+| SEC-04 | Переполнение размера чанка в HTTP-клиенте (`decode_chunked`) | P0 | исправлено, ожидает независимой проверки | `5de21230da8bf883f3616f7b7b952917646e9cdb` |
 
 ## Задачи
 
@@ -78,3 +79,69 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 - Установка пакета не проверялась.
 - Интерфейс LuCI не проверялся.
 - Полный набор тестов в профиле rust-x не запускался: там есть прежние падения legacy-тестов, не связанные с задачей (см. аудит, BLD-12).
+
+### SEC-04 — переполнение размера чанка в HTTP-клиенте
+
+- **Приоритет:** P0, удалённый отказ в обслуживании.
+- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Коммит:** [`5de21230da8bf883f3616f7b7b952917646e9cdb`](https://github.com/Screamshow/xrust/commit/5de21230da8bf883f3616f7b7b952917646e9cdb).
+- **Файл:** `crates/core-runtime/src/http_client.rs`.
+- **Суть:**
+  - `decode_chunked` складывал размер чанка от пира со смещением без проверок. Строка размера `ffffffffffffffff` в release (`overflow-checks = false`) давала переполнение `start + size + 2`, срез паниковал, и при `panic = "abort"` процесс завершался.
+  - Через этот клиент идут remote rule-set и загрузка external_ui.
+- **Исправление:**
+  - размер разбирается строго: только hex-цифры, checked-умножение и сложение, extensions после `;` игнорируются;
+  - до чтения и буферизации данных размер сравнивается с остатком лимита тела (64 МиБ) с учётом уже накопленного;
+  - смещения считаются checked-сложением;
+  - после данных обязателен CRLF;
+  - строка размера ограничена 4 КиБ.
+- **Изменение поведения:** раньше молча принимались размеры со знаком (`+5`) и данные без CRLF после чанка. Теперь это ошибка. Корректные chunked-ответы декодируются так же, как раньше.
+
+#### Проверки разработки
+
+Отрицательная проверка: новые тесты на исходном `decode_chunked` (`2de795e`, временная копия с обёрткой без лимита) — 4 из 14 падают:
+
+| Тест | Результат на исходном коде |
+|---|---|
+| `chunked_huge_sizes_are_errors_not_panics` | паника `attempt to add with overflow` на `start + size + 2` |
+| `get_refuses_an_overflowing_chunk_size` | та же паника |
+| `chunked_total_over_the_limit_is_refused` | декодер ждёт данные слишком большого чанка, таймаут 5 с |
+| `chunked_malformed_sizes_are_errors` | `+5` принят как размер |
+
+Профиль legacy:
+
+| Команда | Результат |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --features legacy-protocols -- -D warnings` | exit 0 |
+| `cargo test -p core-runtime --features legacy-protocols --lib http_client` | 14 passed, 0 failed (6 новых) |
+| `cargo test --workspace --features legacy-protocols` | 78 бинарников: 1501 passed, 0 failed, 19 ignored |
+
+Профиль rust-x:
+
+| Команда | Результат |
+|---|---|
+| `cargo check --workspace --no-default-features --features rust-x` | exit 0; 14 прежних предупреждений `dead_code`, новых нет |
+| `cargo test -p core-config --no-default-features --features rust-x --test rust_x_profile` | 3 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --lib http_client` | 14 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --lib rule_set_remote` | 9 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test clash_api` | 7 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test rule_set_compiled` | 13 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test hot_reload` | 9 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test dns_resolver` | 18 passed, 1 failed: `tcp_transport_uses_the_detour_outbound`. Тест прежний, падает так же и на `2de795e`: в его конфиге outbound `socks`, которого нет в rust-x |
+
+Сквозная проверка на release-бинарниках rust-x (x86_64-gnu, loopback): remote rule-set с локального HTTP-сервера, который отвечает `Transfer-Encoding: chunked` и строкой размера `ffffffffffffffff`.
+
+| Бинарник | Результат |
+|---|---|
+| до исправления (`49987e6`) | `panicked at http_client.rs:382:39`, abort, код выхода 134 |
+| после исправления | без паники; загрузка завершается ошибкой `initial rule-set: evil: response body too large`, код выхода 1 |
+
+#### Ограничения
+
+- Независимая проверка ещё не проводилась.
+- ARM, установка пакета и LuCI не проверялись.
+- Ошибка **начальной** загрузки remote rule-set по-прежнему завершает запуск — так же, как при 404 или таймауте. Это прежнее поведение, вне задачи. При обновлении после старта сохраняется старый набор: тест `failed_remote_download_keeps_previous_router`.
+- Связанные проблемы вне задачи, не исправлялись:
+  - путь с `Content-Length` (SEC-07): тело читается до заявленной длины, и лимит 64 МиБ проверяется только после чтения;
+  - загрузка rule-set и external_ui без проверки сертификата (SEC-05).
