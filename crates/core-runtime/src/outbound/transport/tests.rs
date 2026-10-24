@@ -39,20 +39,21 @@ async fn ws_server(listener: tokio::net::TcpListener) -> String {
     String::from_utf8_lossy(&head).into_owned()
 }
 
-fn ws_transport(max_early_data: usize) -> Transport {
+fn ws_transport(max_early_data: usize, header_name: &str) -> Transport {
     Transport {
         kind: Kind::Ws {
             path: "/t".into(),
             host: None,
             headers: vec![("X-Test".into(), "1".into())],
             max_early_data,
+            early_data_header_name: header_name.into(),
         },
     }
 }
 
-async fn connect_with(
+async fn connect_transport(
     listener: tokio::net::TcpListener,
-    max_early_data: usize,
+    transport: Transport,
     early: &[u8],
 ) -> (String, usize) {
     let port = listener.local_addr().expect("addr").port();
@@ -60,7 +61,7 @@ async fn connect_with(
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect");
-    let (stream, consumed) = ws_transport(max_early_data)
+    let (stream, consumed) = transport
         .connect(
             tcp,
             None,
@@ -75,86 +76,334 @@ async fn connect_with(
     (server.await.expect("join"), consumed)
 }
 
-#[tokio::test]
-async fn early_data_rides_in_the_upgrade_request() {
+async fn connect_with(max_early_data: usize, header_name: &str, early: &[u8]) -> (String, usize) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
+    connect_transport(listener, ws_transport(max_early_data, header_name), early).await
+}
+
+fn raw_url(data: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+const SWP: &str = "Sec-WebSocket-Protocol";
+
+#[tokio::test]
+async fn early_data_rides_in_the_named_header() {
     let payload = b"the first protocol write".to_vec();
-    let expected = base64_std(&payload);
-    let (head, consumed) = connect_with(listener, 2048, &payload).await;
+    let (head, consumed) = connect_with(2048, SWP, &payload).await;
     assert_eq!(consumed, payload.len(), "the whole write went early");
-    assert!(head.starts_with("GET /t HTTP/1.1\r\n"));
+    assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "got:\n{head}");
     assert!(head.contains("X-Test: 1\r\n"), "other headers survive");
     assert!(
-        head.contains(&format!("Sec-WebSocket-Protocol: {expected}\r\n")),
-        "the payload is base64'd into the protocol header, got:\n{head}"
+        head.contains(&format!(
+            "Sec-WebSocket-Protocol: {}\r\n",
+            raw_url(&payload)
+        )),
+        "got:\n{head}"
+    );
+}
+
+/// base64url without padding, as sing-box and Xray write it: these bytes are
+/// `+/8=` in standard base64.
+#[tokio::test]
+async fn early_data_is_base64url_without_padding() {
+    let (head, consumed) = connect_with(2048, SWP, &[0xfb, 0xff]).await;
+    assert_eq!(consumed, 2);
+    assert!(
+        head.contains("Sec-WebSocket-Protocol: -_8\r\n"),
+        "got:\n{head}"
+    );
+    // lengths 1 and 2 mod 3 are the ones standard base64 pads
+    for len in [1usize, 2, 4, 5, 26] {
+        let payload: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(97) | 0x80).collect();
+        let (head, _) = connect_with(2048, SWP, &payload).await;
+        let line = head
+            .lines()
+            .find_map(|l| l.strip_prefix("Sec-WebSocket-Protocol: "))
+            .expect("header");
+        assert_eq!(line, raw_url(&payload), "len {len}");
+        assert!(!line.contains(['=', '+', '/']), "len {len}: {line}");
+    }
+}
+
+#[tokio::test]
+async fn early_data_rides_in_a_custom_header() {
+    let (head, consumed) = connect_with(2048, "X-Early", b"abcd").await;
+    assert_eq!(consumed, 4);
+    assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "got:\n{head}");
+    assert!(head.contains(&format!("X-Early: {}\r\n", raw_url(b"abcd"))));
+    assert!(!head.contains(SWP), "got:\n{head}");
+}
+
+/// No header name means `Sec-WebSocket-Protocol`, as Xray sends it and as
+/// Forkop X's `ed=` configs expect -- not sing-box's path mode: the path is
+/// left alone.
+#[tokio::test]
+async fn without_a_header_name_early_data_rides_in_sec_websocket_protocol() {
+    let (head, consumed) = connect_with(2048, "", b"abcd").await;
+    assert_eq!(consumed, 4);
+    assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "got:\n{head}");
+    assert!(
+        head.contains(&format!("Sec-WebSocket-Protocol: {}\r\n", raw_url(b"abcd"))),
+        "got:\n{head}"
     );
 }
 
 #[tokio::test]
 async fn without_the_budget_nothing_rides_along() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
-    let (head, consumed) = connect_with(listener, 0, b"ignored").await;
-    assert_eq!(consumed, 0);
-    assert!(
-        !head.contains("Sec-WebSocket-Protocol"),
-        "a plain upgrade keeps the header out, got:\n{head}"
-    );
+    for name in [SWP, ""] {
+        let (head, consumed) = connect_with(0, name, b"ignored").await;
+        assert_eq!(consumed, 0);
+        assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "got:\n{head}");
+        assert!(!head.contains(SWP), "got:\n{head}");
+    }
 }
 
+#[tokio::test]
+async fn an_empty_first_write_sends_a_plain_upgrade() {
+    for name in [SWP, ""] {
+        let (head, consumed) = connect_with(2048, name, b"").await;
+        assert_eq!(consumed, 0);
+        assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "got:\n{head}");
+        assert!(!head.contains(SWP), "got:\n{head}");
+    }
+}
+
+/// Over the budget the first `max_early_data` bytes go early and the caller
+/// writes the rest as a frame (sing-box splits; it does not drop the lot).
 #[tokio::test]
 async fn only_the_budget_rides_along() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind");
     let payload = b"0123456789abcdef";
-    let (head, consumed) = connect_with(listener, 10, payload).await;
-    assert_eq!(consumed, 10, "the caller writes the rest itself");
-    assert!(head.contains(&format!(
-        "Sec-WebSocket-Protocol: {}\r\n",
-        base64_std(&payload[..10])
-    )));
+    for (max, carried) in [(10, 10), (15, 15), (16, 16), (17, 16)] {
+        let (head, consumed) = connect_with(max, SWP, payload).await;
+        assert_eq!(consumed, carried, "max {max}");
+        assert!(
+            head.contains(&format!(
+                "Sec-WebSocket-Protocol: {}\r\n",
+                raw_url(&payload[..carried])
+            )),
+            "max {max}, got:\n{head}"
+        );
+        let (head, consumed) = connect_with(max, "", payload).await;
+        assert_eq!(consumed, carried, "no name, max {max}");
+        assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "got:\n{head}");
+        assert!(
+            head.contains(&format!(
+                "Sec-WebSocket-Protocol: {}\r\n",
+                raw_url(&payload[..carried])
+            )),
+            "no name, max {max}, got:\n{head}"
+        );
+    }
 }
 
-#[tokio::test]
-async fn a_configured_protocol_header_is_replaced() {
+async fn connect_configured(header_name: &str, configured: &str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    let server = tokio::spawn(async move { ws_server(listener).await });
     let transport = Transport {
         kind: Kind::Ws {
             path: "/".into(),
             host: None,
-            headers: vec![("Sec-WebSocket-Protocol".into(), "chat".into())],
+            headers: vec![(configured.into(), "chat".into())],
             max_early_data: 2048,
+            early_data_header_name: header_name.into(),
         },
     };
-    let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .expect("connect");
-    drop(
-        transport
-            .connect(
-                tcp,
-                None,
-                "example.com",
-                port,
-                b"payload",
-                &crate::outbound::dial::DialOptions::default(),
-            )
-            .await
-            .expect("handshake"),
-    );
-    let head = server.await.expect("join");
+    connect_transport(listener, transport, b"payload").await.0
+}
+
+#[tokio::test]
+async fn a_configured_header_of_the_same_name_is_replaced() {
+    let head = connect_configured(SWP, "sec-websocket-protocol").await;
+    assert!(!head.contains(": chat"), "got:\n{head}");
+    assert_eq!(head.matches("ocket-Protocol:").count(), 1, "got:\n{head}");
+    let head = connect_configured("X-Early", "x-early").await;
+    assert!(!head.contains(": chat"), "got:\n{head}");
+    assert!(head.contains(&format!("X-Early: {}\r\n", raw_url(b"payload"))));
+    // with no name the early data takes Sec-WebSocket-Protocol over too
+    let head = connect_configured("", SWP).await;
+    assert!(!head.contains(": chat"), "got:\n{head}");
+    assert_eq!(head.matches("ocket-Protocol:").count(), 1, "got:\n{head}");
+    // a different header stays when the early data goes elsewhere
+    let head = connect_configured("X-Early", SWP).await;
     assert!(
-        !head.contains("Sec-WebSocket-Protocol: chat"),
-        "a subprotocol the user configured would collide with the early data"
+        head.contains("Sec-WebSocket-Protocol: chat\r\n"),
+        "got:\n{head}"
     );
+}
+
+/// Our client against our server over a pipe: every budget and placement must
+/// hand the server the exact bytes, early part first, and carry bytes back.
+#[tokio::test]
+async fn early_data_reaches_our_server_intact() {
+    use crate::inbound::transport::{Accepted, Transport as Inbound};
+    let payload: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37) ^ 0xa5).collect();
+    for name in [SWP, "X-Early", ""] {
+        for max in [0usize, 1, 2, 3, 26, 63, 64, 65, 2048] {
+            for len in [0usize, 1, 2, 26, 64] {
+                let label = format!("header {name:?} max {max} len {len}");
+                let mut config = serde_json::json!({"type": "ws", "path": "/t"});
+                if max > 0 {
+                    config["max_early_data"] = max.into();
+                }
+                if !name.is_empty() {
+                    config["early_data_header_name"] = name.into();
+                }
+                let inbound =
+                    Inbound::from_inbound(&serde_json::json!({"transport": config}), "in")
+                        .expect("parse")
+                        .expect("present");
+                let (client, server) = tokio::io::duplex(1 << 16);
+                let accept = tokio::spawn(async move {
+                    let Accepted::Once(mut stream) =
+                        inbound.accept(Box::new(server)).await.expect("accept")
+                    else {
+                        panic!("expected one session");
+                    };
+                    let mut got = vec![0u8; len];
+                    stream.read_exact(&mut got).await.expect("server read");
+                    stream.write_all(&got).await.expect("server write");
+                    stream.flush().await.expect("flush");
+                    got
+                });
+                let first = &payload[..len];
+                let (mut stream, consumed) = ws_handshake(
+                    Box::new(client),
+                    "/t",
+                    "example.com",
+                    &[],
+                    first,
+                    EarlyData {
+                        max,
+                        header_name: name,
+                    },
+                )
+                .await
+                .expect("handshake");
+                assert_eq!(consumed, len.min(max), "{label}");
+                stream.write_all(&first[consumed..]).await.expect("rest");
+                stream.flush().await.expect("flush");
+                let mut back = vec![0u8; len];
+                stream.read_exact(&mut back).await.expect("client read");
+                assert_eq!(accept.await.expect("join"), first, "{label}: upstream");
+                assert_eq!(back, first, "{label}: downstream");
+            }
+        }
+    }
+}
+
+/// What our server makes of a raw upgrade request: the early data it hands
+/// the protocol, or the refusal.
+async fn server_takes(config: serde_json::Value, request: &str) -> Result<Vec<u8>, String> {
+    use crate::inbound::transport::{Accepted, Transport as Inbound};
+    let inbound = Inbound::from_inbound(&serde_json::json!({"transport": config}), "in")
+        .expect("parse")
+        .expect("present");
+    let (mut client, server) = tokio::io::duplex(1 << 16);
+    client.write_all(request.as_bytes()).await.expect("write");
+    // closing the client side ends the session right after the early data
+    client.shutdown().await.expect("shutdown");
+    let accepted = inbound.accept(Box::new(server)).await;
+    let Accepted::Once(mut stream) = accepted.map_err(|e| e.to_string())? else {
+        panic!("expected one session");
+    };
+    drop(client);
+    let mut got = Vec::new();
+    let _ = stream.read_to_end(&mut got).await;
+    Ok(got)
+}
+
+fn upgrade(target: &str, extra: &str) -> String {
+    format!(
+        "GET {target} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n"
+    )
+}
+
+#[tokio::test]
+async fn our_server_reads_early_data_where_it_was_configured() {
+    let header = serde_json::json!({"type": "ws", "path": "/t",
+        "max_early_data": 2048, "early_data_header_name": SWP});
+    let custom = serde_json::json!({"type": "ws", "path": "/t",
+        "max_early_data": 2048, "early_data_header_name": "X-Early"});
+    // the shape Forkop X writes: a budget and no header name
+    let unnamed = serde_json::json!({"type": "ws", "path": "/t", "max_early_data": 2048});
+    let plain = serde_json::json!({"type": "ws", "path": "/t"});
+    let ed = raw_url(&[0xfb, 0xff, 0x00, 0x01]);
+    let swp = format!("Sec-WebSocket-Protocol: {ed}\r\n");
+
+    let got = server_takes(header.clone(), &upgrade("/t", &swp)).await;
+    assert_eq!(got.as_deref(), Ok(&[0xfb, 0xff, 0x00, 0x01][..]));
+    let got = server_takes(
+        custom.clone(),
+        &upgrade("/t", &format!("x-early: {ed}\r\n")),
+    )
+    .await;
+    assert_eq!(got.as_deref(), Ok(&[0xfb, 0xff, 0x00, 0x01][..]));
+    let got = server_takes(unnamed.clone(), &upgrade("/t", &swp)).await;
+    assert_eq!(got.as_deref(), Ok(&[0xfb, 0xff, 0x00, 0x01][..]));
+    // no early data at all is fine everywhere
+    for config in [&header, &custom, &unnamed, &plain] {
+        let got = server_takes(config.clone(), &upgrade("/t", "")).await;
+        assert_eq!(got.as_deref(), Ok(&[][..]), "{config}");
+    }
+    // the header is only read when it is the configured one
+    let got = server_takes(custom.clone(), &upgrade("/t", &swp)).await;
+    assert_eq!(got.as_deref(), Ok(&[][..]));
+    let got = server_takes(unnamed.clone(), &upgrade("/t", "x-early: AAAA\r\n")).await;
+    assert_eq!(got.as_deref(), Ok(&[][..]));
+    // a plain inbound leaves a real subprotocol alone
+    let got = server_takes(plain.clone(), &upgrade("/t", &swp)).await;
+    assert_eq!(got.as_deref(), Ok(&[][..]));
+    // no path mode: early data after the path is a wrong path everywhere
+    for config in [&header, &custom, &unnamed, &plain] {
+        let got = server_takes(config.clone(), &upgrade(&format!("/t{ed}"), "")).await;
+        assert!(got.is_err(), "{config}: {got:?}");
+    }
+}
+
+/// The reference decodes strictly (`base64.RawURLEncoding`): padding and the
+/// standard alphabet are refused, which is what used to break our client.
+#[tokio::test]
+async fn our_server_refuses_early_data_that_is_not_base64url() {
+    let header = serde_json::json!({"type": "ws", "path": "/t",
+        "max_early_data": 2048, "early_data_header_name": SWP});
+    let unnamed = serde_json::json!({"type": "ws", "path": "/t", "max_early_data": 2048});
+    for bad in ["+/8=", "-_8=", "+/8", "a"] {
+        let got = server_takes(
+            header.clone(),
+            &upgrade("/t", &format!("Sec-WebSocket-Protocol: {bad}\r\n")),
+        )
+        .await;
+        assert!(got.is_err(), "header {bad:?}: {got:?}");
+        let got = server_takes(
+            unnamed.clone(),
+            &upgrade("/t", &format!("Sec-WebSocket-Protocol: {bad}\r\n")),
+        )
+        .await;
+        assert!(got.is_err(), "no name {bad:?}: {got:?}");
+    }
+}
+
+#[test]
+fn our_server_refuses_mistyped_early_data_options() {
+    use crate::inbound::transport::Transport as Inbound;
+    for bad in [
+        serde_json::json!({"type": "ws", "max_early_data": -1}),
+        serde_json::json!({"type": "ws", "max_early_data": 4294967296u64}),
+        serde_json::json!({"type": "ws", "max_early_data": "2048"}),
+        serde_json::json!({"type": "ws", "early_data_header_name": 1}),
+    ] {
+        let parsed = Inbound::from_inbound(&serde_json::json!({"transport": bad}), "in");
+        assert!(parsed.is_err(), "{bad} must be refused");
+    }
+    let ok = serde_json::json!({"transport": {"type": "ws", "max_early_data": 4294967295u64,
+        "early_data_header_name": ""}});
+    assert!(Inbound::from_inbound(&ok, "in").is_ok());
 }
 
 /// The reference leaves a single Host line on the wire (Go write-excludes
@@ -173,6 +422,7 @@ async fn a_host_header_is_written_once() {
             host: None,
             headers: vec![("Host".into(), "cdn.example.com".into())],
             max_early_data: 0,
+            early_data_header_name: String::new(),
         },
     };
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))

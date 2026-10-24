@@ -51,6 +51,9 @@ enum Kind {
         /// `max_early_data`: bytes of the first write that ride in the upgrade
         /// request instead of a websocket frame
         max_early_data: usize,
+        /// `early_data_header_name`: the header that carries the early data;
+        /// empty means `Sec-WebSocket-Protocol` (not sing-box's path mode)
+        early_data_header_name: String,
     },
     HttpUpgrade {
         path: String,
@@ -174,6 +177,11 @@ impl Transport {
                     .get("max_early_data")
                     .and_then(Value::as_u64)
                     .unwrap_or(0) as usize,
+                early_data_header_name: transport
+                    .get("early_data_header_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
             },
             "httpupgrade" => Kind::HttpUpgrade {
                 path: transport
@@ -332,12 +340,17 @@ impl Transport {
                 host,
                 headers,
                 max_early_data,
+                early_data_header_name,
             } => {
                 let host = host
                     .as_deref()
                     .or_else(|| headers_host(headers))
                     .unwrap_or(server);
-                ws_handshake(stream, path, host, headers, early, *max_early_data).await?
+                let early_data = EarlyData {
+                    max: *max_early_data,
+                    header_name: early_data_header_name,
+                };
+                ws_handshake(stream, path, host, headers, early, early_data).await?
             }
             Kind::HttpUpgrade {
                 path,
@@ -486,25 +499,58 @@ fn append_headers(request: &mut String, headers: &[(String, String)]) {
     }
 }
 
+/// The ws early data settings of one outbound.
+struct EarlyData<'a> {
+    max: usize,
+    header_name: &'a str,
+}
+
 /// Websocket upgrade. When `max_early_data` is set the first bytes of the
-/// tunnel ride along in `Sec-WebSocket-Protocol` (base64), which saves a round
-/// trip; the server still answers 101 and everything after it is normal
-/// framing. Returns how many bytes of `early` were consumed.
+/// tunnel ride along in the upgrade request, which saves a round trip; the
+/// server still answers 101 and everything after it is normal framing.
+/// Returns how many bytes of `early` were consumed.
+///
+/// Up to `max_early_data` bytes go base64url without padding (what both
+/// sing-box and Xray decode) in the header named by `early_data_header_name`,
+/// or in `Sec-WebSocket-Protocol` when that is empty, as Xray sends it.
+/// This differs from sing-box on purpose: there an empty name appends the
+/// early data to the path, which an Xray server rejects as a wrong path, and
+/// Forkop X writes `ed=` links with no header name for Xray servers.
+///
+/// A longer first write is split, as sing-box's client does: the first
+/// `max_early_data` bytes go early and the caller sends the rest as a normal
+/// frame. Xray's client sends nothing early then, but both servers simply
+/// put whatever the header decodes to in front of the frames that follow,
+/// with no length check (sing-box `server.go`, Xray `hub.go`), so the split
+/// works against both and still saves the round trip.
 async fn ws_handshake(
     mut stream: AnyStream,
     path: &str,
     host: &str,
     headers: &[(String, String)],
     early: &[u8],
-    max_early_data: usize,
+    early_data: EarlyData<'_>,
 ) -> io::Result<(AnyStream, usize)> {
+    use base64::Engine as _;
     let mut key_bytes = [0u8; 16];
     random_bytes(&mut key_bytes)?;
     let key = base64_std(&key_bytes);
     // one reserved String, pushed into: format! starts empty and doubles its
     // way to a ~150 byte head, which is seven allocations for one handshake
-    let mut request =
-        String::with_capacity(160 + path.len() + host.len() + key.len() + headers.len() * 48);
+    let carried = early.len().min(early_data.max);
+    let encoded = if carried > 0 {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&early[..carried])
+    } else {
+        String::new()
+    };
+    let header_name = if early_data.header_name.is_empty() {
+        "Sec-WebSocket-Protocol"
+    } else {
+        early_data.header_name
+    };
+    let mut request = String::with_capacity(
+        160 + path.len() + host.len() + key.len() + headers.len() * 48 + encoded.len(),
+    );
     request.push_str("GET ");
     request.push_str(path);
     request.push_str(" HTTP/1.1\r\nHost: ");
@@ -512,13 +558,13 @@ async fn ws_handshake(
     request.push_str("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
     request.push_str(&key);
     request.push_str("\r\nSec-WebSocket-Version: 13\r\n");
-    // the early data owns the protocol header, so a configured one is dropped
-    let carried = early.len().min(max_early_data);
+    // the early data replaces a configured header of the same name
+    let in_header = carried > 0;
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("host") {
             continue;
         }
-        if carried > 0 && name.eq_ignore_ascii_case("sec-websocket-protocol") {
+        if in_header && name.eq_ignore_ascii_case(header_name) {
             continue;
         }
         request.push_str(name);
@@ -526,9 +572,10 @@ async fn ws_handshake(
         request.push_str(value);
         request.push_str("\r\n");
     }
-    if carried > 0 {
-        request.push_str("Sec-WebSocket-Protocol: ");
-        request.push_str(&base64_std(&early[..carried]));
+    if in_header {
+        request.push_str(header_name);
+        request.push_str(": ");
+        request.push_str(&encoded);
         request.push_str("\r\n");
     }
     request.push_str("\r\n");

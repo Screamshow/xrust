@@ -88,6 +88,10 @@ pub(crate) struct Transport {
     seq_key: String,
     /// Every live XHTTP session of this listener, keyed by session id.
     sessions: SessionTable,
+    /// ws only: `max_early_data` and `early_data_header_name`; see
+    /// [`Transport::ws_early_data`].
+    max_early_data: u64,
+    early_data_header_name: String,
 }
 
 impl Transport {
@@ -154,6 +158,28 @@ impl Transport {
                  only the payload in the body"
             );
         }
+        // ws only; the other transports have no such fields
+        let ws_field = |key: &str| {
+            transport
+                .get(key)
+                .filter(|v| kind == Kind::Ws && !v.is_null())
+        };
+        let max_early_data = match ws_field("max_early_data") {
+            None => 0,
+            Some(v) => v
+                .as_u64()
+                .filter(|&n| n <= u32::MAX as u64)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{at}.transport.max_early_data: must be a uint32, got {v}")
+                })?,
+        };
+        let early_data_header_name = match ws_field("early_data_header_name") {
+            None => String::new(),
+            Some(Value::String(name)) => name.clone(),
+            Some(v) => {
+                anyhow::bail!("{at}.transport.early_data_header_name: must be a string, got {v}")
+            }
+        };
         Ok(Some(Self {
             kind,
             path,
@@ -163,6 +189,8 @@ impl Transport {
             seq,
             seq_key,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            max_early_data,
+            early_data_header_name,
         }))
     }
 
@@ -221,6 +249,11 @@ impl Transport {
         if !path_matches(&target, &self.path) {
             anyhow::bail!("ws: path {target:?} does not match {:?}", self.path);
         }
+        let early_data = if self.kind == Kind::Ws {
+            self.ws_early_data(&headers)?
+        } else {
+            Vec::new()
+        };
         let mut stream: AnyStream = if leftover.is_empty() {
             stream
         } else {
@@ -245,7 +278,15 @@ impl Transport {
                 };
                 let _ = method;
                 crate::ws::accept(&mut stream, &key).await?;
-                Ok(Accepted::Once(Box::new(WsStream::server(stream))))
+                let ws: AnyStream = Box::new(WsStream::server(stream));
+                if early_data.is_empty() {
+                    return Ok(Accepted::Once(ws));
+                }
+                Ok(Accepted::Once(Box::new(PrefixStream {
+                    prefix: early_data,
+                    prefix_pos: 0,
+                    inner: ws,
+                })))
             }
             Kind::HttpUpgrade => {
                 use tokio::io::AsyncWriteExt as _;
@@ -267,6 +308,53 @@ impl Transport {
             Kind::Xhttp => unreachable!("xhttp returns before the request head"),
         }
     }
+}
+
+impl Transport {
+    /// Take the early data off a ws upgrade request: base64url without
+    /// padding, in the `early_data_header_name` header, or in
+    /// `Sec-WebSocket-Protocol` when that is empty or absent (Xray's place for
+    /// it, and where Forkop X's `ed=` configs put it). Unlike sing-box, an
+    /// empty name never means "at the end of the path": the path always has
+    /// to match exactly. Nothing is read unless `max_early_data` or a header
+    /// name is set, so a plain inbound keeps real subprotocols untouched. A
+    /// value that does not decode refuses the request, as sing-box does. The
+    /// decoded size is not checked against `max_early_data`; neither
+    /// reference checks it.
+    fn ws_early_data(&self, headers: &[(String, String)]) -> anyhow::Result<Vec<u8>> {
+        if self.max_early_data == 0 && self.early_data_header_name.is_empty() {
+            return Ok(Vec::new());
+        }
+        let name = if self.early_data_header_name.is_empty() {
+            "Sec-WebSocket-Protocol"
+        } else {
+            self.early_data_header_name.as_str()
+        };
+        let encoded = headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+            .unwrap_or("");
+        if encoded.is_empty() {
+            return Ok(Vec::new());
+        }
+        decode_early_data(encoded).map_err(|e| anyhow::anyhow!("ws: decode early data: {e}"))
+    }
+}
+
+/// Go's `base64.RawURLEncoding`: url alphabet, no padding, stray low bits of
+/// the last character ignored.
+fn decode_early_data(encoded: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    use base64::Engine as _;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
+    const RAW_URL: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::URL_SAFE,
+        GeneralPurposeConfig::new()
+            .with_encode_padding(false)
+            .with_decode_padding_mode(DecodePaddingMode::RequireNone)
+            .with_decode_allow_trailing_bits(true),
+    );
+    RAW_URL.decode(encoded)
 }
 
 /// Read up to the end of the request head, inclusive of the blank line,
