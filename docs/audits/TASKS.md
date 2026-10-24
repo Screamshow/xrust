@@ -25,6 +25,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | FX-01 | Forkop X: legacy-протоколы в подписке или ручной ссылке валят весь конфиг на rust-x | P0 | исправлено, проверено | forkop-x `7acb5411814dc247629116be8b35962b57db0801`, `589f659aca7d15cc308c3741126140a757310e5e` |
 | FX-02 | Forkop X: ByeDPI генерирует outbound `socks`, запрещённый в rust-x — решено удалением ByeDPI | P0 | исправлено, проверено | forkop-x `f6d10ef6cf5628cf7e9b34673a677dd970cbe1cb` |
 | CQ-03 | SRS-декодер: недоверенные счётчики и индексы, zlib без лимита | P0 | исправлено, ожидает независимой проверки | `fced50992b3ac7f12fb7136286b8c08d05dc9b32` |
+| CN-02 / MEM-01 | XHTTP packet-up не завершает сессию после закрытия клиентом: утечка fd и памяти | P0 | исправлено, ожидает независимой проверки | `9af27fd0f702c8fbc851ce1285c163f9d31224f5` |
 
 ## Задачи
 
@@ -628,3 +629,57 @@ PID основной службы и контрольные суммы `/etc/con
 - Не исправлено (вне задачи): `read_domain_matcher` вызывает `contains` и `retain` в цикле — O(n²) по CPU на списках v1 или специально собранных файлах. Это зависание CPU, не паника и не выделение памяти.
 - CQ-04 (TSRS) не затронут.
 - Текст части ошибок для усечённых данных изменился («element count … exceeds» вместо «unexpected end of rule-set»); на этот текст никто не опирается.
+
+### CN-02 / MEM-01 — XHTTP packet-up не завершает сессию после закрытия клиентом
+
+- **Приоритет:** P0 (в сводке аудита — №11): режим `auto` в Forkop X всегда даёт packet-up; по аудиту fd 114 → 908 и RSS 37 → 229 МБ за 6 минут.
+- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Коммит:** [`9af27fd0f702c8fbc851ce1285c163f9d31224f5`](https://github.com/Screamshow/xrust/commit/9af27fd0f702c8fbc851ce1285c163f9d31224f5).
+- **Файлы:** `crates/core-runtime/src/outbound/transport/xhttp.rs`, `crates/core-runtime/src/inbound/transport.rs`, новый `crates/core-runtime/tests/xhttp_packet_up_sessions.rs`.
+
+#### Причина
+
+- **Клиент** (`xhttp.rs`, `poll_shutdown` для `Up::Packets`): закрывается только upload. В packet-up нет сигнала об окончании upload, сервер не передаёт FIN апстриму, апстрим, ждущий EOF, не отвечает и не закрывается. Relay ждёт обе стороны, поэтому соединение не освобождается, `Drop` не срабатывает: download-GET, локальный сокет (CLOSE_WAIT), апстрим и серверная сессия живут бесконечно.
+- **Сервер** (`inbound/transport.rs`): отмену GET клиентом (закрытое H1-соединение, RST_STREAM в H2) сессия считала обычным half-close. Апстрим, не закрывающийся по EOF, держал relay, сокет и запись в таблице сессий.
+
+#### Исправление
+
+- **Клиент — лимит тишины после half-close, только packet-up.** `poll_shutdown` ничего не прерывает и только запускает таймер; каждый фрагмент download перезапускает его. Если 10 с после half-close нет download-трафика, сессия завершается: download-запрос отменяется (H1 — закрытие соединения, H2 — сброс потока), upload и подтверждения останавливаются, чтение возвращает EOF. Значение — константа `HALF_CLOSE_IDLE` в `xhttp.rs`, переопределяется переменной `TACHYON_XHTTP_HALF_CLOSE_IDLE_MS`. До half-close лимита нет; stream-up и stream-one не менялись.
+- **Как выполнено требование half-close:** EOF отправки не считается концом приёма, безусловного прерывания download в `poll_shutdown` нет. Ответ, который идёт после half-close без пауз дольше лимита, дочитывается до конца, даже если в сумме дольше 10 с.
+- **Сервер — отмена download — это отмена, а не half-close.** При закрытии GET клиентом или ошибке записи сессия помечается отменённой: чтение протокола получает `ConnectionAborted`, запись — ошибку, relay останавливается, апстрим и запись в таблице освобождаются. Нормальное завершение download работает как раньше. Формат на проводе не менялся.
+- **Сервер — сопутствующее исправление (за пределами аудита, но без него проверка повторных соединений через H1 невозможна).** Каждый следующий запрос на переиспользованном POST-соединении шёл в первую сессию этого соединения, а клиент через пул xmux переиспользует POST-соединения между сессиями. На старом коде 27 из 40 последовательных H1-сессий и 14 из 20 в режиме `auto` не получали ответа. Теперь запрос направляется в сессию, указанную в нём; если её GET ещё не зарегистрирован, сервер ждёт до 1 с, затем отвечает 404.
+
+#### Воспроизведение до исправления
+
+Те же тесты на копии `HEAD`; измеряются открытые fd процесса (`/proc/self/fd`) и живые соединения тестового апстрима, не RSS.
+
+| Сценарий | До | После |
+|---|---|---|
+| packet-up H2, 40 закрытых сессий | fd 26 → 150 и не возвращаются; 41 соединение апстрима открыто | fd 35 → 126 (пик) → 39; апстрим 0 |
+| packet-up H1, 40 сессий | 27 из 40 без ответа; fd 24 → 61 и не возвращаются | все с ответом; fd 47 → 197 (пик) → 47 |
+| `auto` H1, 20 сессий | 14 из 20 без ответа; fd 48 → 62 и не возвращаются | все с ответом; fd возвращаются к исходным |
+| H2, 30 сбросов к молчащему апстриму | после окна освобождения осталось +66 fd | +32: 30 соединений тестовый апстрим держит намеренно, плюс 2 |
+
+#### Проверки разработки
+
+- **Новые тесты:** 5 модульных в `xhttp.rs`, 3 в `inbound/transport.rs`, 10 интеграционных в `xhttp_packet_up_sessions.rs` (клиент и сервер xrust в одном процессе, H1, H2 и `auto`).
+- **Падают на старом коде (8):** `packet_up_half_close_with_a_silent_download_ends_the_session`, `h2_packet_up_half_close_with_a_silent_download_resets_the_get`, `a_cancelled_xhttp_download_fails_the_protocol_and_frees_the_session`, `a_reused_upload_connection_feeds_the_session_each_request_names`, `closed_packet_up_sessions_leave_no_fds_or_upstreams_h1` / `_h2`, `closed_auto_sessions_leave_no_fds_or_upstreams`, `client_reset_frees_the_session_on_both_sides_h2`.
+- **Охраняют требования и проходят до и после:** ответ после half-close, идущий дольше лимита (`packet_up_half_close_still_reads_the_whole_response`, `half_closed_packet_up_client_still_gets_the_whole_response_h1` / `_h2`); отсутствие лимита без half-close; закрытие download при drop; нормальное завершение download — не отмена; сброс клиентом через H1; ошибки сервера (500 на POST, оборванный download, 404 на сессию).
+
+| Команда (оба профиля: `--features legacy-protocols` и `--no-default-features --features rust-x`) | Результат |
+|---|---|
+| `cargo fmt --all -- --check` | чисто |
+| `cargo clippy --locked -p core-runtime --all-targets --features legacy-protocols -- -D warnings` | чисто |
+| `--test xhttp_packet_up_sessions` | 10/10 в обоих профилях |
+| `--lib -- xhttp inbound::transport` | 44/44 в обоих профилях |
+| `--test hot_reload` / `--test transports_interop` / `--test connection_recovery` | 9 / 1 / 6 passed в обоих профилях |
+| `cargo test -p core-config --test xhttp_compat` | 1/1 |
+
+- Полный `--lib` (по отчёту исполнителя): legacy 839 passed, 9 ignored; rust-x 673 passed, 1 failed — `chain_golden_lx_loads_in_router`, падает так же на `HEAD`. `--test server_inbounds` в rust-x: 18 тестов trojan, vmess и shadowsocks падают так же на `HEAD`.
+
+#### Ограничения
+
+- В `main` не слито, не выпущено.
+- OpenWrt, musl-сборка, реальные серверы Xray и sing-box, REALITY и TLS-отпечатки не проверялись: только сервер xrust и тестовые H1/H2-пиры на loopback. Полный CI не запускался.
+- **Компромисс лимита:** half-closed клиент, который ждёт ответа дольше 10 с полной тишины download, теперь получает EOF. Значение выбрано как удвоенный `downlinkOnly` Xray (5 с по аудиту CN-06; по исходникам Xray не сверялось); меняется константой или переменной окружения.
+- **Не исправлено (вне задачи):** сервер xrust не передаёт half-close для stream-up (H1 и H2 upload-задачи не вызывают `close_up` по окончании тела POST) — закрытые stream-up-сессии со своим сервером по-прежнему висят; у packet-up-сессии, получившей только POST без GET, нет очистки на сервере; общий таймер half-close в relay (CN-06) не добавлялся.
