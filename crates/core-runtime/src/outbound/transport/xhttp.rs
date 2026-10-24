@@ -1275,6 +1275,10 @@ struct SplitConn {
     /// Armed when a packet-up upload is shut down; see [`HALF_CLOSE_IDLE`].
     half_closed: Option<HalfClosed>,
     half_close_limit: std::time::Duration,
+    /// The read that last returned Pending without a limit armed. Shutdown
+    /// may run in another task; arming the limit wakes this read so that it
+    /// starts polling the timer.
+    read_waker: Option<std::task::Waker>,
 }
 
 /// The idle limit of a half-closed packet-up session. The timer is re-armed
@@ -1339,6 +1343,7 @@ impl SplitConn {
             session_id,
             half_closed: None,
             half_close_limit: cfg.half_close_idle,
+            read_waker: None,
         }
     }
 
@@ -1560,6 +1565,13 @@ impl AsyncRead for XhttpConn {
                 Poll::Ready(None) => return Poll::Ready(Ok(())), // EOF
                 Poll::Pending => {
                     let Some(idle) = &mut split.half_closed else {
+                        if !split
+                            .read_waker
+                            .as_ref()
+                            .is_some_and(|waker| waker.will_wake(cx.waker()))
+                        {
+                            split.read_waker = Some(cx.waker().clone());
+                        }
                         return Poll::Pending;
                     };
                     ready!(idle.poll_expired(cx));
@@ -1688,6 +1700,9 @@ impl AsyncWrite for XhttpConn {
                 // may never end by itself. Keep reading it while it moves.
                 if split.half_closed.is_none() {
                     split.half_closed = Some(HalfClosed::new(split.half_close_limit));
+                    if let Some(waker) = split.read_waker.take() {
+                        waker.wake();
+                    }
                 }
             }
             Up::None => {}
@@ -3005,6 +3020,65 @@ mod tests {
         .await
         .expect("the download connection stays open")
         .expect("read GET connection");
+    }
+
+    /// The relay reads and writes from different tasks: the read is already
+    /// pending when the writer half-closes. The limit must still end a silent
+    /// session, so arming it has to wake the pending read.
+    #[tokio::test]
+    async fn split_half_close_with_a_pending_read_ends_a_silent_session() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut conn, mut peer) = packet_up_over_fake_h1().await;
+        conn.write_all(b"request").await.unwrap();
+        conn.flush().await.unwrap();
+        assert_eq!(peer.bodies.recv().await.unwrap(), b"request");
+        let (mut reader, mut writer) = tokio::io::split(conn);
+        let read = tokio::spawn(async move {
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).await.map(|_| got)
+        });
+        // let the read reach Pending before the shutdown arms the limit
+        tokio::time::sleep(TEST_IDLE / 3).await;
+        let started = tokio::time::Instant::now();
+        writer.shutdown().await.expect("half-close");
+        let got = tokio::time::timeout(TEST_IDLE * 5, read)
+            .await
+            .expect("the pending read was not woken by the half-close")
+            .unwrap()
+            .expect("read");
+        assert!(got.is_empty());
+        assert!(started.elapsed() >= TEST_IDLE);
+        drop(peer);
+    }
+
+    /// Same split, but the response arrives after the half-close: it is
+    /// still read to its end.
+    #[tokio::test]
+    async fn split_half_close_with_a_pending_read_still_gets_the_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut conn, mut peer) = packet_up_over_fake_h1().await;
+        conn.write_all(b"request").await.unwrap();
+        conn.flush().await.unwrap();
+        assert_eq!(peer.bodies.recv().await.unwrap(), b"request");
+        let (mut reader, mut writer) = tokio::io::split(conn);
+        let read = tokio::spawn(async move {
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).await.map(|_| got)
+        });
+        tokio::time::sleep(TEST_IDLE / 3).await;
+        writer.shutdown().await.expect("half-close");
+        let gap = TEST_IDLE / 3;
+        for i in 0..5u8 {
+            tokio::time::sleep(gap).await;
+            send_chunk(&mut peer.get_io, &[b'0' + i]).await;
+        }
+        peer.get_io.write_all(b"0\r\n\r\n").await.unwrap();
+        let got = tokio::time::timeout(TEST_IDLE * 10, read)
+            .await
+            .expect("the response never ended")
+            .unwrap()
+            .expect("read");
+        assert_eq!(got, b"01234");
     }
 
     /// Without a half-close there is no idle limit: a quiet tunnel is not a
