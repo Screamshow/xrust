@@ -7,6 +7,10 @@ rustflags = [
     "--cfg", "aes_armv8",
     "--cfg", "polyval_armv8",
     "--cfg", "chacha20_force_neon",
+    # panic = "abort" and strip = "symbols": nothing unwinds and backtraces
+    # have no names, so the unwind tables are dead weight (-280 KiB, mostly
+    # .eh_frame). Not on x86_64: there LLVM emits them anyway, size unchanged.
+    "-C", "force-unwind-tables=no",
     # Linker flags live here, not in the environment, for the reason at the top
     # of this file: `RUSTFLAGS=-C linker=rust-lld ...` on the command line is
     # what silently dropped this array. That build is what measured 0.03 GiB/s

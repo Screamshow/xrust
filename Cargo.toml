@@ -91,10 +91,13 @@ panic = "abort"
 strip = "symbols"
 overflow-checks = false
 
-# The size-first profile above is the right call for the control plane, and the
-# wrong one for the loops that touch every byte of every packet: AEAD, GHASH,
-# ChaCha, the hashes, the stream ciphers. Those crates get speed instead; the
-# binary grows by a few hundred KiB, not by a multiple.
+# With opt-level = 3 above these overrides change nothing. They are kept for a
+# size-first profile, but they are not enough for one: with opt-level = "s"
+# (plus core-crypto = 3) the binary loses ~28 %, yet the generic RustCrypto
+# AEADs are instantiated and LTO-optimized outside these crates and run ~3x
+# slower, and TLS ChaCha20-Poly1305 end to end loses ~22 % on x86_64. ChaCha on
+# aarch64 goes through the same RustCrypto path, so do not switch to "s"
+# without a Cortex-A53 measurement.
 [profile.release.package.aes]
 opt-level = 3
 [profile.release.package.aes-gcm]
