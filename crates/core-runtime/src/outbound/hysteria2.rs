@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::inbound::udp::DEFAULT_UDP_TIMEOUT;
 use crate::inbound::{AnyStream, Target, network_includes_tcp, network_includes_udp};
 use crate::logging;
-use crate::outbound::proxy::server_endpoint;
+use crate::outbound::proxy::{server_endpoint, server_host};
 use crate::outbound::quic::{
     CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN,
     PoolLease, QuicStream, QuicTunnelDefaults, QuicTunnelOptions, SalamanderRelay, VarintReader,
@@ -55,7 +55,13 @@ pub struct Hysteria2 {
 
 impl Hysteria2 {
     pub fn build(obj: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Self> {
-        let (server, port) = server_endpoint(obj, at)?;
+        // server_port is ignored when server_ports is set, as in the reference
+        let mut server_port_ranges =
+            core_config::validate::hysteria2_server_ports(obj.get("server_ports"));
+        let (server, port) = match server_port_ranges.first() {
+            Some(&(start, _)) => (server_host(obj, at)?, start),
+            None => server_endpoint(obj, at)?,
+        };
 
         if obj
             .get("realm")
@@ -103,36 +109,6 @@ impl Hysteria2 {
                 }
             }
             Some(_) => anyhow::bail!("{at}: obfs must be an object"),
-        };
-
-        let (mut server_port_ranges, port) = if let Some(ports) = obj.get("server_ports") {
-            let mut ranges = Vec::new();
-            let list = match ports {
-                Value::String(s) => vec![s.as_str()],
-                Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
-                _ => Vec::new(),
-            };
-            for r in list {
-                let (start, end) =
-                    if let Some((a, b)) = r.split_once(':').or_else(|| r.split_once('-')) {
-                        if let (Ok(s), Ok(e)) = (a.trim().parse::<u16>(), b.trim().parse::<u16>()) {
-                            (s, e)
-                        } else {
-                            continue;
-                        }
-                    } else if let Ok(p) = r.trim().parse::<u16>() {
-                        (p, p)
-                    } else {
-                        continue;
-                    };
-                if start > 0 && end >= start {
-                    ranges.push((start, end));
-                }
-            }
-            let first_port = ranges.first().map(|&(s, _)| s).unwrap_or(port);
-            (ranges, first_port)
-        } else {
-            (Vec::new(), port)
         };
 
         // A singleton (including duplicate singleton entries) cannot hop.
@@ -230,29 +206,10 @@ impl Hysteria2 {
         }
     }
 
-    fn next_hop_interval(&self) -> Duration {
-        match self.hop_interval_max {
-            Some(max) if max > self.hop_interval => {
-                let range_ms = (max - self.hop_interval).as_millis() as u64;
-                if range_ms > 0 {
-                    let mut b = [0u8; 8];
-                    let _ = getrandom::fill(&mut b);
-                    let add_ms = u64::from_le_bytes(b) % range_ms;
-                    self.hop_interval + Duration::from_millis(add_ms)
-                } else {
-                    self.hop_interval
-                }
-            }
-            _ => self.hop_interval,
-        }
-    }
-
     async fn shared(&self) -> io::Result<Arc<Hy2Shared>> {
         let mut pool = self.shared.lock().await;
-        let now = std::time::Instant::now();
-        pool.retain(|s| {
-            s.conn.close_reason().is_none() && s.hop_deadline.is_none_or(|dl| now < dl)
-        });
+        // hopping happens inside the connection (relay), so only closed ones go
+        pool.retain(|s| s.conn.close_reason().is_none());
         let best = pool
             .iter()
             .enumerate()
@@ -355,11 +312,6 @@ impl Hysteria2 {
         };
 
         let udp_enabled = server_udp && self.want_udp;
-        let hop_deadline = if !self.server_port_ranges.is_empty() {
-            Some(std::time::Instant::now() + self.next_hop_interval())
-        } else {
-            None
-        };
 
         Ok(Arc::new(Hy2Shared {
             endpoint,
@@ -367,7 +319,6 @@ impl Hysteria2 {
             _send_request: send_request,
             _h3_driver: driver,
             _relay: relay,
-            hop_deadline,
             udp_enabled,
             next_session: AtomicU32::new(0),
             sessions: std::sync::Mutex::new(HashMap::new()),
@@ -436,7 +387,9 @@ impl Hysteria2 {
             .expect("sessions")
             .insert(sid, Arc::clone(&session));
 
-        let shared_f = Arc::clone(&shared);
+        // weak, so a live session does not keep a dropped outbound's connection
+        let shared_f = Arc::downgrade(&shared);
+        let conn_f = shared.conn.clone();
         let dest_f = dest.clone();
         let sess_f = Arc::clone(&session);
         let peer_f = Arc::clone(&peer);
@@ -450,8 +403,7 @@ impl Hysteria2 {
                         sess_f
                             .last_activity
                             .store(crate::inbound::udp::now_ms(), Ordering::Relaxed);
-                        if let Err(e) =
-                            send_hy2_datagram(&shared_f.conn, sid, &dest_f, &buf[..n], &sess_f)
+                        if let Err(e) = send_hy2_datagram(&conn_f, sid, &dest_f, &buf[..n], &sess_f)
                         {
                             logging::debug(format_args!("hysteria2 udp send {sid}: {e}"));
                             break;
@@ -470,12 +422,14 @@ impl Hysteria2 {
                     }
                 }
             }
-            shared_f.sessions.lock().expect("sessions").remove(&sid);
+            if let Some(shared) = shared_f.upgrade() {
+                shared.sessions.lock().expect("sessions").remove(&sid);
+            }
             let mut out = Vec::with_capacity(4);
             out.push(5);
             out.push(3);
             out.extend_from_slice(&sid.to_be_bytes());
-            let _ = shared_f.conn.send_datagram(out.into());
+            let _ = conn_f.send_datagram(out.into());
         });
         shared.handles.lock().expect("handles").push(handle);
         Ok(local)
@@ -488,7 +442,6 @@ struct Hy2Shared {
     _send_request: H3SendRequest,
     _h3_driver: tokio::task::JoinHandle<()>,
     _relay: Option<SalamanderRelay>,
-    hop_deadline: Option<std::time::Instant>,
     udp_enabled: bool,
     next_session: AtomicU32,
     sessions: std::sync::Mutex<HashMap<u32, Arc<UdpSession>>>,
@@ -502,16 +455,22 @@ impl Hy2Shared {
         if !self.udp_enabled {
             return;
         }
-        let shared = Arc::clone(self);
+        // weak: the demux must not keep the connection alive (Drop closes it)
+        let shared = Arc::downgrade(self);
+        let conn = self.conn.clone();
         let handle = tokio::spawn(async move {
             loop {
-                let Ok(data) = shared.conn.read_datagram().await else {
+                let Ok(data) = conn.read_datagram().await else {
                     break;
                 };
                 let Some((sid, pid, fid, ftot, _dest, payload)) = parse_hy2_packet(&data) else {
                     continue;
                 };
+                let Some(shared) = shared.upgrade() else {
+                    break;
+                };
                 let session = shared.sessions.lock().expect("sessions").get(&sid).cloned();
+                drop(shared);
                 let Some(session) = session else {
                     continue;
                 };
@@ -818,6 +777,32 @@ mod tests {
                 outbound.obfs_password.as_deref(),
                 Some(b"obfs-test".as_slice())
             );
+        }
+    }
+
+    #[test]
+    fn server_ports_without_server_port() {
+        let build = |ports: Value| {
+            let cfg = serde_json::json!({
+                "server": "127.0.0.1", "server_ports": ports, "password": "test",
+                "tls": {"enabled": true, "insecure": true}
+            });
+            Hysteria2::build(cfg.as_object().unwrap(), "test")
+        };
+        let out = build(serde_json::json!("20000:30000")).unwrap();
+        assert_eq!(out.port, 20000);
+        assert_eq!(out.server_port_ranges, vec![(20000, 30000)]);
+        let out = build(serde_json::json!(["20000:20010", "30000:30010"])).unwrap();
+        assert_eq!(out.port, 20000);
+        assert_eq!(out.server_port_ranges.len(), 2);
+        // a single port needs no hopping
+        let out = build(serde_json::json!(["8443:8443"])).unwrap();
+        assert_eq!(out.port, 8443);
+        assert!(out.server_port_ranges.is_empty());
+        // nothing usable: the port is still required
+        for ports in [serde_json::json!([]), serde_json::json!(["30000:20000"])] {
+            let err = build(ports).err().expect("must fail").to_string();
+            assert!(err.contains("missing server_port"), "{err}");
         }
     }
 

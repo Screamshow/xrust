@@ -9,15 +9,21 @@ use tokio::net::TcpStream;
 use crate::inbound::{AnyStream, Conn, Target};
 use crate::route::Router;
 
+pub(crate) fn server_host(
+    obj: &serde_json::Map<String, Value>,
+    at: &str,
+) -> anyhow::Result<String> {
+    obj.get("server")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("{at}: missing server"))
+}
+
 pub(crate) fn server_endpoint(
     obj: &serde_json::Map<String, Value>,
     at: &str,
 ) -> anyhow::Result<(String, u16)> {
-    let server = obj
-        .get("server")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("{at}: missing server"))?
-        .to_string();
+    let server = server_host(obj, at)?;
     let port = obj
         .get("server_port")
         .and_then(Value::as_u64)

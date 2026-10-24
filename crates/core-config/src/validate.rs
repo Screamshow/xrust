@@ -1981,6 +1981,38 @@ fn check_port_range(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// hysteria2 `server_ports` as the outbound dials them: "a:b" (empty start
+/// is 1, empty end 65535), also "a-b" or a bare port. Reversed or malformed
+/// entries are skipped. Empty means `server_port` is needed.
+pub fn hysteria2_server_ports(value: Option<&Value>) -> Vec<(u16, u16)> {
+    let list: Vec<&str> = match value {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    let part = |s: &str, empty: u16| {
+        let s = s.trim();
+        if s.is_empty() {
+            Some(empty)
+        } else {
+            s.parse::<u16>().ok()
+        }
+    };
+    list.into_iter()
+        .filter_map(|r| {
+            let (start, end) = match r.split_once(':').or_else(|| r.split_once('-')) {
+                Some((a, b)) => (part(a, 1)?, part(b, u16::MAX)?),
+                None => {
+                    let p = r.trim().parse::<u16>().ok()?;
+                    (p, p)
+                }
+            };
+            let start = start.max(1);
+            (end >= start).then_some((start, end))
+        })
+        .collect()
+}
+
 /// reference: realm present ⇔ object with ≥1 key (empty object behaves as nil).
 fn realm_present(value: Option<&Value>) -> bool {
     value.is_some_and(|v| v.as_object().is_some_and(|m| !m.is_empty()))
@@ -7771,6 +7803,13 @@ fn validate_outbound(
                     check_port_range(r).map_err(|m| format!("{at}: {m}"))?;
                 }
             }
+            // the outbound needs a port to dial: server_ports, else server_port
+            if !realm_present(realm)
+                && matches!(obj.get("server_port"), None | Some(Value::Null))
+                && hysteria2_server_ports(obj.get("server_ports")).is_empty()
+            {
+                return Err(format!("{at}: missing server_port"));
+            }
             if let Some(bbr) = obj.get("bbr_profile").and_then(Value::as_str)
                 && !bbr.is_empty()
                 && !BBR_PROFILES.contains(&bbr)
@@ -10902,6 +10941,46 @@ mod tests {
             err.contains("unknown field \"congestion_control\""),
             "{err}"
         );
+    }
+
+    #[test]
+    fn hy2_out_needs_a_port() {
+        let out = |extra: Value| {
+            let mut o = json!({"type": "hysteria2", "tag": "t", "server": "1.2.3.4",
+                "password": "p", "tls": {"enabled": true, "insecure": true}});
+            for (k, v) in extra.as_object().unwrap() {
+                o[k] = v.clone();
+            }
+            validate(&json!({"outbounds": [o]}))
+        };
+        // server_port is ignored when server_ports is set
+        for ok in [
+            json!({"server_ports": "20000:30000"}),
+            json!({"server_ports": ["20000:20010", "30000:"]}),
+            json!({"server_port": 443}),
+            json!({"server_port": 443, "server_ports": []}),
+        ] {
+            out(ok.clone()).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            json!({}),
+            json!({"server_ports": []}),
+            json!({"server_ports": ["30000:20000"]}),
+        ] {
+            let err = out(bad.clone()).unwrap_err();
+            assert!(err.contains("missing server_port"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn hy2_server_ports_ranges() {
+        let p = |v: Value| hysteria2_server_ports(Some(&v));
+        assert_eq!(p(json!("20000:30000")), vec![(20000, 30000)]);
+        assert_eq!(
+            p(json!(["1:2", ":5", "60000:", "7-8", "9", "4:3", "x:1"])),
+            vec![(1, 2), (1, 5), (60000, 65535), (7, 8), (9, 9)]
+        );
+        assert!(p(json!(null)).is_empty());
     }
 
     #[test]
