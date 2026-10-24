@@ -46,10 +46,46 @@ const MAX_LOGICAL_DEPTH: usize = 100;
 const PREFIX_LABEL: u8 = b'\r';
 const ROOT_LABEL: u8 = b'\n';
 
+/// Upper bound of the inflated payload. Real lists inflate about 1.7x
+/// (300k domain suffixes: 4.0 MB file, 6.9 MB payload), so 64 MiB holds
+/// roughly 2.9M domains and matches the rule-set download cap.
+pub const MAX_PAYLOAD_SIZE: usize = 64 << 20;
+/// Upper bound of the decoded rules, estimated as string bytes plus
+/// [`VALUE_COST`] per produced value: about 3M domains of typical length
+/// (300k suffixes cost 26 MB), so a real list at [`MAX_PAYLOAD_SIZE`] fits.
+/// Without it a payload of empty strings or a chain-shaped trie expands
+/// 50x or quadratically.
+pub const MAX_DECODED_SIZE: usize = 256 << 20;
+/// Rough heap cost of one decoded value (`Value` + `String` headers).
+const VALUE_COST: usize = 64;
+/// Smallest encoded sizes, used to reject counts the data cannot hold.
+const MIN_RULE_SIZE: usize = 3;
+const MIN_PREFIX_SIZE: usize = 6;
+const MIN_RANGE_SIZE: usize = 10;
+const MIN_INTERFACE_ENTRY_SIZE: usize = 2;
+/// Initial capacity cap for vectors sized from the file.
+const MAX_PREALLOC: usize = 4096;
+
+/// Decoder limits; tests shrink them to probe the boundaries.
+#[derive(Clone, Copy)]
+struct Limits {
+    payload: usize,
+    decoded: usize,
+}
+
+const DEFAULT_LIMITS: Limits = Limits {
+    payload: MAX_PAYLOAD_SIZE,
+    decoded: MAX_DECODED_SIZE,
+};
+
 // ------------------------------------------------------------------ reading
 
 /// Parse an SRS container into its rules (`Vec<Value>` of headless rules).
 pub fn read(data: &[u8]) -> Result<Vec<Value>, String> {
+    read_limited(data, DEFAULT_LIMITS)
+}
+
+fn read_limited(data: &[u8], limits: Limits) -> Result<Vec<Value>, String> {
     if data.len() < 4 || data[..3] != MAGIC {
         return Err("invalid sing-box rule-set file".to_string());
     }
@@ -57,21 +93,46 @@ pub fn read(data: &[u8]) -> Result<Vec<Value>, String> {
     if version > VERSION_CURRENT {
         return Err(format!("unsupported version: {version}"));
     }
-    let mut decoder = flate2::read::ZlibDecoder::new(&data[4..]);
-    let mut payload = Vec::new();
-    decoder
-        .read_to_end(&mut payload)
-        .map_err(|err| format!("decompress rule-set: {err}"))?;
-    let mut reader = Reader::new(&payload);
-    let count = reader.uvarint()?;
-    let mut rules = Vec::with_capacity(count as usize);
+    let payload = inflate(&data[4..], limits.payload)?;
+    let mut reader = Reader::new(&payload, limits.decoded);
+    let count = reader.count(MIN_RULE_SIZE)?;
+    let mut rules = Vec::with_capacity(count.min(MAX_PREALLOC));
     for index in 0..count {
+        reader.budget.charge(0)?;
         rules.push(
             read_rule(&mut reader, version, 0)
                 .map_err(|err| format!("read rule[{index}]: {err}"))?,
         );
     }
     Ok(rules)
+}
+
+/// Inflate the zlib stream, failing once it exceeds `limit` bytes. The
+/// first pass only counts, so an oversized stream allocates nothing; the
+/// second fills a buffer of the exact size.
+fn inflate(compressed: &[u8], limit: usize) -> Result<Vec<u8>, String> {
+    let error = |err: std::io::Error| format!("decompress rule-set: {err}");
+    let mut decoder = flate2::read::ZlibDecoder::new(compressed);
+    let mut chunk = [0u8; 16 * 1024];
+    let mut size = 0usize;
+    loop {
+        let read = decoder.read(&mut chunk).map_err(error)?;
+        if read == 0 {
+            break;
+        }
+        size += read;
+        if size > limit {
+            return Err(format!(
+                "decompress rule-set: payload exceeds {limit} bytes"
+            ));
+        }
+    }
+    let mut payload = Vec::with_capacity(size);
+    flate2::read::ZlibDecoder::new(compressed)
+        .take(size as u64)
+        .read_to_end(&mut payload)
+        .map_err(error)?;
+    Ok(payload)
 }
 
 /// Read an SRS container and report the version it was written with.
@@ -103,9 +164,10 @@ fn read_rule(reader: &mut Reader<'_>, version: u8, depth: usize) -> Result<Value
                     other => return Err(format!("unknown logical mode: {other}")),
                 }),
             );
-            let count = reader.uvarint()?;
-            let mut rules = Vec::with_capacity(count as usize);
+            let count = reader.count(MIN_RULE_SIZE)?;
+            let mut rules = Vec::with_capacity(count.min(MAX_PREALLOC));
             for index in 0..count {
+                reader.budget.charge(0)?;
                 rules.push(read_rule(reader, version, depth + 1)?);
                 let _ = index;
             }
@@ -223,7 +285,7 @@ fn read_default_rule(
                 rule.insert("network_is_constrained".into(), Value::Bool(true));
             }
             ITEM_NETWORK_INTERFACE_ADDRESS => {
-                let count = reader.uvarint()?;
+                let count = reader.count(MIN_INTERFACE_ENTRY_SIZE)?;
                 let mut map = Map::new();
                 for _ in 0..count {
                     let key = reader.u8()?;
@@ -583,7 +645,7 @@ fn read_domain_matcher(
     };
     let mut domains: Vec<String> = Vec::new();
     let mut prefixes: Vec<String> = Vec::new();
-    for key in set.keys()? {
+    for key in set.keys(&mut reader.budget)? {
         let key = reverse_domain(&key);
         let Some(label) = key.as_bytes().first().copied() else {
             continue;
@@ -686,59 +748,91 @@ impl SuccinctSet {
         }
     }
 
-    /// `succinctSet.keys()`: walk the set back into its keys.
-    fn keys(&self) -> Result<Vec<String>, String> {
+    /// `succinctSet.keys()`: walk the set back into its keys. The walk keeps
+    /// its own stack: a crafted trie can be one chain as deep as the payload.
+    fn keys(&self, budget: &mut Budget) -> Result<Vec<String>, String> {
+        struct Frame {
+            node_id: usize,
+            cursor: usize,
+        }
+        let inconsistent = || "invalid domain matcher: inconsistent succinct set".to_string();
         let mut result = Vec::new();
         let mut current: Vec<u8> = Vec::new();
-        self.traverse(0, 0, &mut current, &mut result);
+        self.emit_leaf(0, &current, &mut result, budget)?;
+        let mut stack = vec![Frame {
+            node_id: 0,
+            cursor: 0,
+        }];
+        while let Some(frame) = stack.last() {
+            let (node_id, cursor) = (frame.node_id, frame.cursor);
+            if get_bit(&self.label_bitmap, cursor) == 0 {
+                // the reference indexes these unchecked: a valid set always
+                // has the label, the bitmap word and the child's block
+                let label = self
+                    .labels
+                    .get(cursor.saturating_sub(node_id))
+                    .copied()
+                    .ok_or_else(inconsistent)?;
+                let next_node = self.count_zeros(cursor + 1).ok_or_else(inconsistent)?;
+                let index = self
+                    .select_ith_one(next_node.saturating_sub(1))
+                    .ok_or_else(inconsistent)?;
+                current.push(label);
+                self.emit_leaf(next_node, &current, &mut result, budget)?;
+                stack.push(Frame {
+                    node_id: next_node,
+                    cursor: index + 1,
+                });
+                continue;
+            }
+            // this node is done: back to the parent's next edge
+            stack.pop();
+            if let Some(parent) = stack.last_mut() {
+                current.pop();
+                parent.cursor += 1;
+            }
+        }
         Ok(result)
     }
 
-    fn traverse(
+    fn emit_leaf(
         &self,
         node_id: usize,
-        bitmap_index: usize,
-        current: &mut Vec<u8>,
+        current: &[u8],
         result: &mut Vec<String>,
-    ) {
+        budget: &mut Budget,
+    ) -> Result<(), String> {
         if get_bit(&self.leaves, node_id) != 0 {
-            result.push(String::from_utf8_lossy(current).to_string());
+            let key = String::from_utf8_lossy(current).to_string();
+            budget.charge(key.len())?;
+            result.push(key);
         }
-        let mut cursor = bitmap_index;
-        while get_bit(&self.label_bitmap, cursor) == 0 {
-            let Some(label) = self.labels.get(cursor.saturating_sub(node_id)).copied() else {
-                return;
-            };
-            current.push(label);
-            let next_node = self.count_zeros(cursor + 1);
-            let next_bitmap = match self.select_ith_one(next_node.saturating_sub(1)) {
-                Some(index) => index + 1,
-                None => {
-                    current.pop();
-                    return;
-                }
-            };
-            self.traverse(next_node, next_bitmap, current, result);
-            current.pop();
-            cursor += 1;
-        }
+        Ok(())
     }
 
-    /// The rank index: ones before each word, plus the total.
-    fn count_zeros(&self, index: usize) -> usize {
+    /// Zeros before `index`, from the rank table; `None` past the bitmap.
+    fn count_zeros(&self, index: usize) -> Option<usize> {
         let word = index >> 6;
         let bit = index & 63;
-        let mask = if bit == 0 { 0 } else { u64::MAX >> (64 - bit) };
-        let ones = self.ranks[word] + (self.label_bitmap[word] & mask).count_ones() as u64;
-        index - ones as usize
+        let partial = if bit == 0 {
+            0
+        } else {
+            let mask = u64::MAX >> (64 - bit);
+            (self.label_bitmap.get(word)? & mask).count_ones() as u64
+        };
+        let ones = self.ranks.get(word)? + partial;
+        index.checked_sub(usize::try_from(ones).ok()?)
     }
 
     /// The position of the `index`-th set bit: the rank table turns the
     /// word walk into a binary search.
     fn select_ith_one(&self, index: usize) -> Option<usize> {
-        let word = self.ranks.partition_point(|rank| *rank <= index as u64) - 1;
-        let mut rest = index - self.ranks[word] as usize;
-        let mut bits = self.label_bitmap[word];
+        let word = self
+            .ranks
+            .partition_point(|rank| *rank <= index as u64)
+            .checked_sub(1)?;
+        let mut rest = index.checked_sub(usize::try_from(self.ranks[word]).ok()?)?;
+        let mut bits = *self.label_bitmap.get(word)?;
         while bits != 0 {
             if rest == 0 {
                 return Some((word << 6) + bits.trailing_zeros() as usize);
@@ -801,7 +895,8 @@ fn read_ip_set(reader: &mut Reader<'_>) -> Result<Value, String> {
         return Err("invalid IP set version".to_string());
     }
     let count = reader.u64()?;
-    let mut ranges = Vec::with_capacity(count as usize);
+    let count = reader.check_count(count, MIN_RANGE_SIZE)?;
+    let mut ranges = Vec::with_capacity(count.min(MAX_PREALLOC));
     for _ in 0..count {
         let from = read_addr(reader)?;
         let to = read_addr(reader)?;
@@ -810,7 +905,10 @@ fn read_ip_set(reader: &mut Reader<'_>) -> Result<Value, String> {
     // the reference stores merged ranges; rebuild the covered prefixes
     let mut prefixes: Vec<String> = Vec::new();
     for (from, to) in ranges {
-        prefixes.extend(range_to_prefixes(&from, &to));
+        for prefix in range_to_prefixes(&from, &to) {
+            reader.budget.charge(prefix.len())?;
+            prefixes.push(prefix);
+        }
     }
     Ok(Value::Array(
         prefixes.into_iter().map(Value::String).collect(),
@@ -897,7 +995,9 @@ fn split_prefix(prefix: &str) -> Result<(std::net::IpAddr, u8), String> {
 fn read_prefix(reader: &mut Reader<'_>) -> Result<String, String> {
     let addr = read_addr(reader)?;
     let bits = reader.u8()?;
-    Ok(format!("{addr}/{bits}"))
+    let prefix = format!("{addr}/{bits}");
+    reader.budget.charge(prefix.len())?;
+    Ok(prefix)
 }
 
 // ------------------------------------------------------------------ helpers
@@ -1147,14 +1247,56 @@ fn merge_prefixes(prefixes: &[String]) -> Vec<(std::net::IpAddr, std::net::IpAdd
     out
 }
 
+/// What is left of the decoded-size allowance of one file.
+struct Budget(usize);
+
+impl Budget {
+    /// Account for one decoded value carrying `len` bytes of data.
+    fn charge(&mut self, len: usize) -> Result<(), String> {
+        let cost = len.saturating_add(VALUE_COST);
+        self.0 = self
+            .0
+            .checked_sub(cost)
+            .ok_or_else(|| "rule-set decodes to too many values".to_string())?;
+        Ok(())
+    }
+}
+
 struct Reader<'a> {
     data: &'a [u8],
     offset: usize,
+    budget: Budget,
 }
 
 impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, offset: 0 }
+    fn new(data: &'a [u8], budget: usize) -> Self {
+        Self {
+            data,
+            offset: 0,
+            budget: Budget(budget),
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len() - self.offset
+    }
+
+    /// An element count: every element takes at least `min_size` bytes, so a
+    /// count the rest of the payload cannot hold is rejected up front.
+    fn count(&mut self, min_size: usize) -> Result<usize, String> {
+        let count = self.uvarint()?;
+        self.check_count(count, min_size)
+    }
+
+    fn check_count(&self, count: u64, min_size: usize) -> Result<usize, String> {
+        let room = self.remaining() / min_size;
+        match usize::try_from(count) {
+            Ok(count) if count <= room => Ok(count),
+            _ => Err(format!(
+                "rule-set element count {count} exceeds the remaining {} bytes",
+                self.remaining()
+            )),
+        }
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8], String> {
@@ -1198,13 +1340,15 @@ impl<'a> Reader<'a> {
     }
 
     fn bytes(&mut self) -> Result<Vec<u8>, String> {
-        let len = self.uvarint()? as usize;
+        let len = self.count(1)?;
         Ok(self.take(len)?.to_vec())
     }
 
     fn str(&mut self) -> Result<String, String> {
-        let bytes = self.bytes()?;
-        String::from_utf8(bytes).map_err(|_| "invalid utf-8 in rule-set".to_string())
+        let len = self.count(1)?;
+        let bytes = self.take(len)?;
+        self.budget.charge(len)?;
+        String::from_utf8(bytes.to_vec()).map_err(|_| "invalid utf-8 in rule-set".to_string())
     }
 
     fn str_values(&mut self) -> Result<Vec<Value>, String> {
@@ -1212,8 +1356,8 @@ impl<'a> Reader<'a> {
     }
 
     fn str_vec(&mut self) -> Result<Vec<String>, String> {
-        let count = self.uvarint()? as usize;
-        let mut out = Vec::with_capacity(count.min(4096));
+        let count = self.count(1)?;
+        let mut out = Vec::with_capacity(count.min(MAX_PREALLOC));
         for _ in 0..count {
             out.push(self.str()?);
         }
@@ -1221,14 +1365,18 @@ impl<'a> Reader<'a> {
     }
 
     fn u8_vec(&mut self) -> Result<Vec<u8>, String> {
-        let count = self.uvarint()? as usize;
+        let count = self.count(1)?;
+        for _ in 0..count {
+            self.budget.charge(0)?;
+        }
         Ok(self.take(count)?.to_vec())
     }
 
     fn u16_vec(&mut self) -> Result<Vec<u16>, String> {
-        let count = self.uvarint()? as usize;
-        let mut out = Vec::with_capacity(count.min(4096));
+        let count = self.count(2)?;
+        let mut out = Vec::with_capacity(count.min(MAX_PREALLOC));
         for _ in 0..count {
+            self.budget.charge(0)?;
             let bytes = self.take(2)?;
             out.push(u16::from_be_bytes([bytes[0], bytes[1]]));
         }
@@ -1236,8 +1384,8 @@ impl<'a> Reader<'a> {
     }
 
     fn u64_slice(&mut self) -> Result<Vec<u64>, String> {
-        let count = self.uvarint()? as usize;
-        let mut out = Vec::with_capacity(count.min(4096));
+        let count = self.count(8)?;
+        let mut out = Vec::with_capacity(count.min(MAX_PREALLOC));
         for _ in 0..count {
             out.push(self.u64()?);
         }
@@ -1245,8 +1393,8 @@ impl<'a> Reader<'a> {
     }
 
     fn prefix_vec(&mut self) -> Result<Vec<Value>, String> {
-        let count = self.uvarint()? as usize;
-        let mut out = Vec::with_capacity(count.min(4096));
+        let count = self.count(MIN_PREFIX_SIZE)?;
+        let mut out = Vec::with_capacity(count.min(MAX_PREALLOC));
         for _ in 0..count {
             out.push(Value::String(read_prefix(self)?));
         }
@@ -1411,5 +1559,307 @@ mod tests {
             .and_then(|v| v.as_array())
             .cloned();
         assert!(suffix.is_some_and(|list| list.contains(&json!("legacy.com"))));
+    }
+
+    // ------------------------------------------------- untrusted input
+
+    fn uvarint(out: &mut Vec<u8>, value: u64) {
+        let mut writer = Writer::default();
+        writer.uvarint(value);
+        out.extend_from_slice(&writer.out);
+    }
+
+    /// Wrap a raw payload into an SRS container.
+    fn container(payload: &[u8], version: u8) -> Vec<u8> {
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(payload).expect("compress");
+        let mut out = MAGIC.to_vec();
+        out.push(version);
+        out.extend(encoder.finish().expect("compress"));
+        out
+    }
+
+    fn payload_of(compiled: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        flate2::read::ZlibDecoder::new(&compiled[4..])
+            .read_to_end(&mut payload)
+            .expect("inflate");
+        payload
+    }
+
+    /// One default rule holding `item` followed by `body`.
+    fn one_item(item: u8, body: &[u8]) -> Vec<u8> {
+        let mut payload = vec![1, 0, item];
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(&[ITEM_FINAL, 0]);
+        payload
+    }
+
+    fn read_err(payload: &[u8]) -> String {
+        read(&container(payload, 4)).expect_err("corrupted payload must fail")
+    }
+
+    #[test]
+    fn huge_counts_are_rejected_without_allocating() {
+        // rule count: 2^60 overflowed the capacity, 2e8 asked for 6.4 GB
+        for count in [1u64 << 60, 200_000_000, u64::MAX] {
+            let mut payload = Vec::new();
+            uvarint(&mut payload, count);
+            assert!(read_err(&payload).contains("element count"), "{count}");
+        }
+        // logical rule count
+        let mut payload = vec![1, 1, 0];
+        uvarint(&mut payload, 1 << 59);
+        assert!(read_err(&payload).contains("element count"));
+        // IP set range count is a fixed u64
+        let mut body = vec![1];
+        body.extend_from_slice(&(1u64 << 58).to_be_bytes());
+        assert!(read_err(&one_item(ITEM_IP_CIDR, &body)).contains("element count"));
+        // every counted list inside a rule
+        for item in [
+            ITEM_QUERY_TYPE,
+            ITEM_NETWORK,
+            ITEM_DOMAIN_KEYWORD,
+            ITEM_PORT,
+            ITEM_NETWORK_TYPE,
+            ITEM_NETWORK_INTERFACE_ADDRESS,
+            ITEM_DEFAULT_INTERFACE_ADDRESS,
+            ITEM_ADGUARD_DOMAIN,
+        ] {
+            let mut body = Vec::new();
+            uvarint(&mut body, 1 << 62);
+            assert!(
+                read_err(&one_item(item, &body)).contains("element count"),
+                "item {item}"
+            );
+        }
+        // trie arrays: leaves, bitmap, labels
+        for position in 0..3 {
+            let mut body = vec![1];
+            for index in 0..3 {
+                uvarint(&mut body, if index == position { 1 << 61 } else { 0 });
+            }
+            assert!(read_err(&one_item(ITEM_DOMAIN, &body)).contains("element count"));
+        }
+    }
+
+    #[test]
+    fn element_count_boundary() {
+        // three one-byte strings fit in three bytes, four do not
+        let mut reader = Reader::new(&[3, 0, 0, 0], MAX_DECODED_SIZE);
+        assert_eq!(reader.str_vec().expect("fits").len(), 3);
+        let mut reader = Reader::new(&[4, 0, 0, 0], MAX_DECODED_SIZE);
+        assert!(reader.str_vec().is_err());
+        // u64 words are 8 bytes each
+        let mut data = vec![1];
+        data.extend_from_slice(&[0; 8]);
+        assert_eq!(
+            Reader::new(&data, MAX_DECODED_SIZE).u64_slice(),
+            Ok(vec![0])
+        );
+        data[0] = 2;
+        assert!(Reader::new(&data, MAX_DECODED_SIZE).u64_slice().is_err());
+    }
+
+    #[test]
+    fn inconsistent_domain_trie_is_an_error() {
+        // empty bitmap with one label: indexed past the bitmap
+        let body = [1, 0, 0, 1, b'a'];
+        assert!(read_err(&one_item(ITEM_DOMAIN, &body)).contains("inconsistent"));
+        // a bitmap without the child's terminating one: select past the end
+        let mut body = vec![1, 0, 1];
+        body.extend_from_slice(&0u64.to_be_bytes());
+        body.extend_from_slice(&[1, b'a']);
+        assert!(read_err(&one_item(ITEM_DOMAIN, &body)).contains("inconsistent"));
+        // an edge without its label
+        let mut body = vec![1, 0, 1];
+        body.extend_from_slice(&0b10u64.to_be_bytes());
+        body.push(0);
+        assert!(read_err(&one_item(ITEM_DOMAIN, &body)).contains("inconsistent"));
+    }
+
+    #[test]
+    fn deep_trie_does_not_overflow_the_stack() {
+        // one key is one chain of nodes; the walk used to recurse per node
+        let long = "a".repeat(200_000);
+        let compiled = compile(&json!({"rules": [{"domain": [long.clone()]}]}), 2).unwrap();
+        let rules = read(&compiled).expect("read");
+        assert_eq!(rules[0]["domain"], json!([long]));
+    }
+
+    #[test]
+    fn decoded_size_is_bounded() {
+        // "a", "aa", ...: the keys grow quadratically with the payload
+        let keys: Vec<String> = (1..=2000).map(|len| "a".repeat(len)).collect();
+        let compiled = compile(&json!({"rules": [{"domain": keys}]}), 2).unwrap();
+        assert!(compiled.len() < 4096);
+        assert_eq!(
+            read(&compiled).expect("within the default limit")[0]["domain"]
+                .as_array()
+                .map(Vec::len),
+            Some(2000)
+        );
+        let limits = Limits {
+            payload: MAX_PAYLOAD_SIZE,
+            decoded: 1 << 20,
+        };
+        let error = read_limited(&compiled, limits).unwrap_err();
+        assert!(error.contains("too many values"), "{error}");
+
+        // empty strings: one payload byte per value
+        let mut body = Vec::new();
+        uvarint(&mut body, 8_000_000);
+        body.resize(body.len() + 8_000_000, 0);
+        let error = read_err(&one_item(ITEM_DOMAIN_KEYWORD, &body));
+        assert!(error.contains("too many values"), "{error}");
+    }
+
+    #[test]
+    fn decoded_size_boundary() {
+        // one rule plus ten three-byte strings
+        let mut body = vec![10];
+        for _ in 0..10 {
+            body.extend_from_slice(&[3, b'a', b'b', b'c']);
+        }
+        let data = container(&one_item(ITEM_DOMAIN_KEYWORD, &body), 2);
+        let cost = VALUE_COST + 10 * (3 + VALUE_COST);
+        let limits = |decoded| Limits {
+            payload: MAX_PAYLOAD_SIZE,
+            decoded,
+        };
+        let rules = read_limited(&data, limits(cost)).expect("exactly at the limit");
+        assert_eq!(
+            rules[0]["domain_keyword"].as_array().map(Vec::len),
+            Some(10)
+        );
+        assert!(read_limited(&data, limits(cost - 1)).is_err());
+    }
+
+    #[test]
+    fn payload_size_boundary() {
+        // a zero rule count followed by padding the reader ignores
+        let limits = Limits {
+            payload: 4096,
+            decoded: MAX_DECODED_SIZE,
+        };
+        let at_limit = container(&[0; 4096], 2);
+        assert_eq!(read_limited(&at_limit, limits), Ok(Vec::new()));
+        let over = container(&[0; 4097], 2);
+        let error = read_limited(&over, limits).unwrap_err();
+        assert!(error.contains("exceeds 4096 bytes"), "{error}");
+    }
+
+    #[test]
+    fn zip_bomb_is_rejected() {
+        // ~65 KB that inflate past the default limit
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        let chunk = vec![0u8; 1 << 20];
+        for _ in 0..MAX_PAYLOAD_SIZE / chunk.len() {
+            encoder.write_all(&chunk).unwrap();
+        }
+        encoder.write_all(&[0]).unwrap();
+        let mut bomb = MAGIC.to_vec();
+        bomb.push(3);
+        bomb.extend(encoder.finish().unwrap());
+        assert!(bomb.len() < 256 << 10);
+        let error = read(&bomb).unwrap_err();
+        assert!(error.contains("payload exceeds"), "{error}");
+    }
+
+    #[test]
+    fn reference_container_decodes() {
+        // a small list compiled by the reference (stored deflate block)
+        const LOCAL: &[u8] = &[
+            0x53, 0x52, 0x53, 0x02, 0x78, 0xda, 0x01, 0x58, 0x00, 0xa7, 0xff, 0x02, 0x00, 0x02,
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x20, 0x00, 0x00, 0x00, 0x02, 0xad, 0x55, 0x55,
+            0x55, 0x55, 0x54, 0xaa, 0xaa, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x20,
+            0x65, 0x6c, 0x70, 0x6d, 0x61, 0x78, 0x65, 0x2e, 0x74, 0xd0, 0x73, 0xb9, 0x69, 0xd0,
+            0x6c, 0xbe, 0x2d, 0xd0, 0x6c, 0xb3, 0x61, 0xd1, 0x63, 0x83, 0x6f, 0xd1, 0x6c, 0x80,
+            0x0a, 0xd0, 0xb4, 0x0a, 0xff, 0x00, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x01, 0x04, 0xcb, 0x00, 0x71, 0x00, 0x04, 0xcb, 0x00, 0x71, 0xff, 0xff,
+            0x00, 0xd7, 0x0b, 0x19, 0x5d,
+        ];
+        assert_eq!(
+            read(LOCAL).expect("read"),
+            vec![
+                json!({"domain_suffix": ["local-list.example", "другой.example"]}),
+                json!({"ip_cidr": ["203.0.113.0/24"]}),
+            ]
+        );
+    }
+
+    #[test]
+    fn larger_list_round_trip() {
+        let domains: Vec<String> = (0..3000).map(|i| format!("host{i}.example.com")).collect();
+        let suffixes: Vec<String> = (0..3000).map(|i| format!("site{i}.example.net")).collect();
+        let source = json!({
+            "rules": [
+                {"domain": domains, "domain_suffix": suffixes},
+                {"ip_cidr": ["10.0.0.0/8", "2001:db8::/32"], "port": [53, 443]},
+                {"type": "logical", "mode": "and", "rules": [
+                    {"domain_keyword": ["ads"]}, {"network": ["udp"]}
+                ]},
+            ]
+        });
+        let out = round_trip(source.clone(), 2);
+        let mut expected_domains = domains.clone();
+        expected_domains.sort();
+        let mut expected_suffixes = suffixes.clone();
+        expected_suffixes.sort();
+        assert_eq!(out["rules"][0]["domain"], json!(expected_domains));
+        assert_eq!(out["rules"][0]["domain_suffix"], json!(expected_suffixes));
+        assert_eq!(out["rules"][1], source["rules"][1]);
+        assert_eq!(out["rules"][2], source["rules"][2]);
+    }
+
+    #[test]
+    fn mutated_inputs_never_panic() {
+        let seeds: Vec<Vec<u8>> = [
+            json!({"rules": [{
+                "domain": ["a.com", "b.org", "cc.net"],
+                "domain_suffix": ["x.com", ".y.com"],
+                "domain_keyword": ["k"],
+                "ip_cidr": ["1.2.3.0/24", "::1/128"],
+                "port": [80, 443],
+                "query_type": ["A"],
+            }]}),
+            json!({"rules": [{"type": "logical", "mode": "or", "rules": [
+                {"domain": ["q.com"]}, {"port_range": ["1:5"]}
+            ]}]}),
+            json!({"rules": [{
+                "network_type": ["wifi"],
+                "network_interface_address": {"wifi": ["192.168.1.0/24"]},
+                "default_interface_address": ["10.0.0.0/8"],
+            }]}),
+        ]
+        .iter()
+        .map(|source| payload_of(&compile(source, 4).unwrap()))
+        .collect();
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..4000 {
+            let mut payload = seeds[(next() % seeds.len() as u64) as usize].clone();
+            for _ in 0..1 + next() % 4 {
+                let position = (next() as usize) % payload.len();
+                match next() % 4 {
+                    0 => payload[position] = next() as u8,
+                    1 => payload[position] ^= 1 << (next() % 8),
+                    2 => payload.truncate(position.max(1)),
+                    _ => payload.insert(position, next() as u8),
+                }
+            }
+            let mut data = container(&payload, 4);
+            if next() % 8 == 0 {
+                // damage the zlib stream itself
+                let position = 4 + (next() as usize) % (data.len() - 4);
+                data[position] ^= next() as u8 | 1;
+            }
+            let _ = read(&data);
+        }
     }
 }
