@@ -22,6 +22,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | SEC-07 | Тело по `Content-Length` не ограничено до чтения | P1 | исправлено, проверено | `48c70f91e32a30a2f2a281a66a46703891604bb5` |
 | SEC-05 | HTTPS-загрузки rule-set и external_ui без проверки сертификата | P1 | исправлено, проверено | `11ada8206da3ccdd5cbb54c6758133c7c290d362` |
 | BLD-02 | `rustls-webpki` и `webpki-roots`: доверие к скомпрометированным промежуточным emSign | P0 | исправлено, проверено | `e0404da672defc885295297a8e4cf3c2087f2d44` |
+| FX-01 | Forkop X: legacy-протоколы в подписке или ручной ссылке валят весь конфиг на rust-x | P0 | исправлено | forkop-x `7acb5411814dc247629116be8b35962b57db0801`, `589f659aca7d15cc308c3741126140a757310e5e` |
 
 ## Задачи
 
@@ -446,3 +447,56 @@ cargo update -p webpki-roots@1.0.9 --precise 1.0.10
 | RUSTSEC-2025-0134 | `rustls-pemfile` | 2.2.0 | не поддерживается | — |
 
 Также `cargo audit` сообщает, что `yoke-derive` отозван (yanked).
+
+### FX-01 — legacy-протоколы в подписке или ручной ссылке валят весь конфиг на rust-x
+
+- **Приоритет:** P0.
+- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Репозиторий:** Screamshow/forkop-x, ветка `dev`. Xrust, XHTTP и ByeDPI не менялись.
+- **Коммиты:**
+  - [`7acb5411814dc247629116be8b35962b57db0801`](https://github.com/Screamshow/forkop-x/commit/7acb5411814dc247629116be8b35962b57db0801) — генератор, `forkop/files/usr/lib/singbox/generator.uc`;
+  - [`589f659aca7d15cc308c3741126140a757310e5e`](https://github.com/Screamshow/forkop-x/commit/589f659aca7d15cc308c3741126140a757310e5e) — тесты `tests/subscription_protocol_compatibility.{sh,uc}` и разрешение их в `.gitignore`.
+
+#### Проблема
+
+Профиль rust-x собран без `legacy-protocols`, и `check` отвергает весь конфиг, если в нём есть outbound `vmess`, `trojan`, `shadowsocks`, `socks` и другие исключённые типы. Forkop пропускал узлы подписки только из-за пинов и XHTTP. Один trojan- или ss-узел в смешанной подписке останавливал старт или любой reload.
+
+#### Исправление и контракт
+
+- **Определение ядра.** Ядро считается rust-x, если версия содержит `-rust-x.` (обёртка пакета) или `-tachyon.` (бинарник без обёртки). Так же уже определялась поддержка пинов. Список исключённых типов повторяет `core-config` `validate()`: `naive`, `vmess`, `trojan`, `shadowsocks`, `tuic`, `anytls`, `snell`, `shadowtls`, `fptn`, `openvpn`, `openvpn-client`, `socks`.
+- **Подписка.** Такие узлы пропускаются с предупреждением в журнале: `skipped incompatible subscription outbound for rule '<секция>': <имя> (protocol trojan is not included in Xrust)`. Действующий механизм удаляет вслед за ними узлы с `detour` на пропущенный узел и группы без оставшихся участников. Участники и `default` групп переписываются только на сохранённые теги. Кэш подписки не меняется: при смене ядра узлы вернутся.
+- **Нет совместимых узлов.** Генерация завершается ошибкой `connection section '<секция>' has no outbounds compatible with Xrust; skipped subscription outbounds with unsupported protocols: shadowsocks (1), trojan (1). Settings were not applied`. Переключения в Direct нет. Временный файл удаляется, рабочий конфиг остаётся прежним.
+- **Ручные ссылки и JSON-outbound.** Отклоняются явно: `manual outbound '<имя>' uses protocol trojan, which is not included in Xrust; remove it or use a VLESS or Hysteria2 connection`, для JSON — `JSON outbound '<имя>' …`.
+- **Другие ядра** (Go X, Extended, upstream) получают все узлы, как раньше.
+
+#### Проверки разработки
+
+`tests/subscription_protocol_compatibility.sh` (ucode, генератор в режиме fixture; с `RUST_X_BINARY` и `LEGACY_BINARY` вывод дополнительно проверяется реальным `check`):
+
+| Сценарий | Результат |
+|---|---|
+| Смешанная подписка (vless, hysteria2, trojan, ss, vmess, socks, vless с `detour` на trojan, смешанная группа, группа и вложенная группа только из legacy), версии `1.14.2-rust-x.0.0.26` и `v0.0.26-tachyon.0` | остались vless и hysteria2; смешанная группа сокращена до `vless-a` с `default` `vless-a`; legacy-группы и узел с `detour` удалены; все ссылки на outbound (группы, `detour`, `default`, `route`, DNS) указывают на существующие теги; предупреждения по каждому узлу; кэш не изменён; `check` релизного rust-x — exit 0 |
+| Та же подписка, `1.14.2-x-1.0.4` | все 4 legacy-узла на месте, предупреждений о Xrust нет; `check` профиля legacy — exit 0 |
+| Подписка только из trojan, ss и legacy-группы на rust-x | ненулевой код, понятная ошибка с перечнем протоколов, прежний конфиг не тронут |
+| Ручные ссылки vless + trojan на rust-x; ss и socks5 на tachyon | явная ошибка с именем узла и протоколом, прежний конфиг не тронут |
+| Ручная ссылка trojan на Go X | генерация успешна |
+| JSON-outbound vmess на rust-x | явная ошибка, прежний конфиг не тронут |
+
+- **Регрессия.** На генераторе до исправления тест падает на первом же сценарии: `unsupported protocol generated`.
+- **Соседние тесты** проходят: `subscription_pin_compatibility.uc` с реальным rust-x, `subscription_certificate_pins`, `json_outbound_connection`, `subscription_filter_selection`, `xhttp_capabilities`, `urltest_groups`, `urltest_empty_groups`, `urltest_name_filter`, `filtered_outbound_runtime`.
+- **Весь набор без VM** (100 скриптов `tests/*.sh` без `*_vm.sh`) на исходном `dev` и после изменений даёт одинаковые коды возврата; добавился только новый тест. Около 30 скриптов падают в обоих случаях: им нужны пути OpenWrt (`/usr/lib/forkop`), VM или утилиты, которых нет в среде разработки. Среди них `sing_box_runtime.sh` (`provider group removes XHTTP member`), `rust_x_hot_reload.sh` и `tachyon_improvements.sh`.
+
+#### Что проверить на OpenWrt
+
+- rust-x с реальной смешанной подпиской: cold start, подписочный reload и hot reload применяют совместимые узлы; предупреждения видны в журнале Forkop.
+- Подписка без совместимых узлов: при работающем ядре reload отклоняется, прежний рантайм и трафик сохраняются; при cold start ядро не стартует с понятной ошибкой, трафик не уходит молча в Direct.
+- Ручная trojan/ss-ссылка: сохранение и применение в LuCI показывают ошибку, прежний конфиг работает.
+- Переключение rust-x → Go X: пропущенные узлы возвращаются из кэша.
+
+#### Ограничения
+
+- В `main` не слито, не выпущено.
+- Версия `-tachyon.` у бинарника без обёртки одинакова для профилей с legacy-протоколами и без них. Такое ядро всегда считается rust-x, и legacy-узлы пропускаются даже там, где ядро их поддерживает. Пакет Forkop ставит только rust-x с обёрткой. Точное определение требует нативного списка протоколов в `version` (FX-04).
+- Предупреждения о пропуске пишутся в журнал, отдельного показа в UI нет.
+- ByeDPI (outbound `socks`, FX-02) не менялся и на rust-x по-прежнему не работает.
+- Сценарии выполнены только на уровне генератора; живые старт, reload и LuCI не проверялись.
