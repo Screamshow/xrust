@@ -520,6 +520,180 @@ impl H2Pool {
     }
 }
 
+/// How long a pooled HTTP/2 connection waits for a PING answer. Xray takes
+/// the `http2.Transport` default, 15 s.
+const H2_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// When anything was last read from a pooled HTTP/2 connection.
+struct ReadClock {
+    base: tokio::time::Instant,
+    /// milliseconds since `base`
+    last: std::sync::atomic::AtomicU64,
+}
+
+impl ReadClock {
+    fn new() -> Self {
+        Self {
+            base: tokio::time::Instant::now(),
+            last: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let ms = self.base.elapsed().as_millis() as u64;
+        self.last.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn last(&self) -> u64 {
+        self.last.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn idle(&self) -> std::time::Duration {
+        self.base
+            .elapsed()
+            .saturating_sub(std::time::Duration::from_millis(self.last()))
+    }
+}
+
+/// The socket under a pooled HTTP/2 connection, stamping every read.
+struct ReadActivity<S> {
+    inner: S,
+    clock: std::sync::Arc<ReadClock>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ReadActivity<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(res, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.clock.touch();
+        }
+        res
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ReadActivity<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+type H2Connection = h2::client::Connection<ReadActivity<AnyStream>, Bytes>;
+
+type H2Fresh = (
+    h2::client::SendRequest<Bytes>,
+    H2Connection,
+    std::sync::Arc<ReadClock>,
+);
+
+/// HTTP/2 handshake on a fresh connection whose reads are tracked for the
+/// keep-alive.
+async fn h2_handshake(stream: AnyStream) -> io::Result<H2Fresh> {
+    let clock = std::sync::Arc::new(ReadClock::new());
+    let io = ReadActivity {
+        inner: stream,
+        clock: clock.clone(),
+    };
+    let (send_request, connection) = super::h2io::client_builder()
+        .handshake(io)
+        .await
+        .map_err(|e| io::Error::other(format!("xhttp: h2 handshake: {e}")))?;
+    Ok((send_request, connection, clock))
+}
+
+/// Returns once the connection fails its liveness check, as Xray's
+/// `ReadIdleTimeout` does: after `period` with nothing read, send a PING and
+/// give it `ping_timeout` ([`H2_PING_TIMEOUT`]). A connection that keeps delivering frames is
+/// never pinged, and one that delivers anything while a PING is out is given
+/// another timeout, so only a peer that is silent for the whole timeout fails.
+async fn h2_keep_alive(
+    ping_pong: &mut h2::PingPong,
+    clock: &ReadClock,
+    period: std::time::Duration,
+    ping_timeout: std::time::Duration,
+) -> &'static str {
+    loop {
+        let idle = clock.idle();
+        if idle < period {
+            tokio::time::sleep(period - idle).await;
+            continue;
+        }
+        let mut seen = clock.last();
+        let ping = ping_pong.ping(h2::Ping::opaque());
+        tokio::pin!(ping);
+        loop {
+            match tokio::time::timeout(ping_timeout, ping.as_mut()).await {
+                Ok(Ok(_)) => break,
+                Ok(Err(_)) => return "ping failed",
+                Err(_) if clock.last() != seen => seen = clock.last(),
+                Err(_) => return "no PING answer",
+            }
+        }
+    }
+}
+
+/// Drives one pooled HTTP/2 connection. When it ends or stops answering
+/// PINGs it leaves the pool; dropping it fails the streams still on it.
+async fn drive_h2_connection(
+    mut connection: H2Connection,
+    clock: std::sync::Arc<ReadClock>,
+    keep_alive: Option<(std::time::Duration, std::time::Duration)>,
+    pool: std::sync::Weak<H2Pool>,
+    counter: std::sync::Arc<H2Counter>,
+) {
+    let ping_pong = keep_alive.and_then(|times| Some((connection.ping_pong()?, times)));
+    match ping_pong {
+        Some((mut ping_pong, (period, ping_timeout))) => {
+            tokio::select! {
+                res = &mut connection => {
+                    if let Err(e) = res {
+                        crate::logging::debug(format_args!("xhttp h2 connection: {e}"));
+                    }
+                }
+                why = h2_keep_alive(&mut ping_pong, &clock, period, ping_timeout) => {
+                    crate::logging::debug(format_args!("xhttp h2 connection: {why}, closing"));
+                }
+            }
+        }
+        None => {
+            if let Err(e) = connection.await {
+                crate::logging::debug(format_args!("xhttp h2 connection: {e}"));
+            }
+        }
+    }
+    if let Some(pool) = pool.upgrade() {
+        pool.evict(&counter).await;
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct XhttpConfig {
     host: Option<String>,
@@ -765,44 +939,29 @@ impl XhttpConfig {
                     result.map(H2Connect::Stream)
                 }
                 H2Acquire::NeedDial(dial_guard) => {
-                    let dialed: io::Result<Result<h2::client::SendRequest<Bytes>, AnyStream>> =
-                        async {
-                            let tcp =
-                                crate::outbound::dial::connect_tcp(server, port, dial).await?;
-                            let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
-                            let stream = tls.wrap_with_defaults(tcp, alpn).await?;
-                            let negotiated = crate::inbound::stream_alpn(&stream);
-                            // Xray REALITY sets NextProtos = nil on the server (so EncryptedExtensions
-                            // carries no ALPN, logged as alpn=[]) while serving HTTP/2 (SetUnencryptedHTTP2)
-                            // on the inner listener. Standard TLS servers without h2 ALPN fall back to
-                            // the HTTP/1.1 xhttp::connect path on the already-established stream.
-                            let is_h2 = negotiated == Some(b"h2")
-                                || (has_reality && negotiated != Some(b"http/1.1"));
-                            if !is_h2 {
-                                return Ok(Err(stream));
-                            }
-                            let (send_request, connection) = super::h2io::client_builder()
-                                .handshake(stream)
-                                .await
-                                .map_err(|e| {
-                                    io::Error::other(format!("xhttp: h2 handshake: {e}"))
-                                })?;
-                            tokio::spawn(async move {
-                                if let Err(e) = connection.await {
-                                    crate::logging::debug(format_args!("xhttp h2 connection: {e}"));
-                                }
-                            });
-                            Ok(Ok(send_request))
+                    let dialed: io::Result<Result<H2Fresh, AnyStream>> = async {
+                        let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
+                        let alpn: &[&[u8]] = &[b"h2", b"http/1.1"];
+                        let stream = tls.wrap_with_defaults(tcp, alpn).await?;
+                        let negotiated = crate::inbound::stream_alpn(&stream);
+                        // Xray REALITY sets NextProtos = nil on the server (so EncryptedExtensions
+                        // carries no ALPN, logged as alpn=[]) while serving HTTP/2 (SetUnencryptedHTTP2)
+                        // on the inner listener. Standard TLS servers without h2 ALPN fall back to
+                        // the HTTP/1.1 xhttp::connect path on the already-established stream.
+                        let is_h2 = negotiated == Some(b"h2")
+                            || (has_reality && negotiated != Some(b"http/1.1"));
+                        if !is_h2 {
+                            return Ok(Err(stream));
                         }
-                        .await;
+                        Ok(Ok(h2_handshake(stream).await?))
+                    }
+                    .await;
 
                     match dialed {
-                        Ok(Ok(send_request)) => {
+                        Ok(Ok((send_request, connection, clock))) => {
                             let counter = self
-                                .h2_pool
-                                .finish_dial(Some(send_request.clone()), max_conns)
-                                .await
-                                .expect("counter present");
+                                .register_h2(send_request.clone(), connection, clock, max_conns)
+                                .await;
                             drop(dial_guard);
                             let guard = CounterGuard::new(counter.clone());
                             let send_req = match send_request.ready().await {
@@ -836,6 +995,32 @@ impl XhttpConfig {
                 }
             }
         }
+    }
+
+    /// Put a fresh HTTP/2 connection into the pool and start driving it,
+    /// with the xmux keep-alive.
+    async fn register_h2(
+        &self,
+        send_request: h2::client::SendRequest<Bytes>,
+        connection: H2Connection,
+        clock: std::sync::Arc<ReadClock>,
+        max_conns: usize,
+    ) -> std::sync::Arc<H2Counter> {
+        let counter = self
+            .h2_pool
+            .finish_dial(Some(send_request), max_conns)
+            .await
+            .expect("counter present");
+        tokio::spawn(drive_h2_connection(
+            connection,
+            clock,
+            self.pool
+                .h2_keep_alive()
+                .map(|period| (period, H2_PING_TIMEOUT)),
+            std::sync::Arc::downgrade(&self.h2_pool),
+            counter.clone(),
+        ));
+        counter
     }
 
     fn resolved_mode(&self, tls: bool, is_h2: bool) -> Mode {
@@ -887,22 +1072,11 @@ pub(crate) async fn connect(
     // Over HTTP/2, stream-one, stream-up, and packet-up all multiplex streams
     // over the pooled HTTP/2 connection.
     if is_h2 {
-        let (send_request, connection) = super::h2io::client_builder()
-            .handshake(stream)
-            .await
-            .map_err(|e| io::Error::other(format!("xhttp: h2 handshake: {e}")))?;
-        tokio::spawn(async move {
-            if let Err(e) = connection.await {
-                crate::logging::debug(format_args!("xhttp h2 connection: {e}"));
-            }
-        });
-
+        let (send_request, connection, clock) = h2_handshake(stream).await?;
         let max_conns = cfg.pool.max_connections();
         let counter = cfg
-            .h2_pool
-            .finish_dial(Some(send_request.clone()), max_conns)
-            .await
-            .expect("counter present");
+            .register_h2(send_request.clone(), connection, clock, max_conns)
+            .await;
         let guard = CounterGuard::new(counter.clone());
         let send_req = match send_request.ready().await {
             Ok(req) => req,
@@ -2126,6 +2300,90 @@ mod tests {
             assert_eq!(result.is_err(), fail);
         }
     }
+    const TEST_PERIOD: std::time::Duration = std::time::Duration::from_millis(200);
+    const TEST_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+
+    /// A pooled connection on a keep-alive, as the dial path sets it up,
+    /// with short test timings.
+    async fn pooled_with_keep_alive(
+        client_io: tokio::io::DuplexStream,
+    ) -> (
+        std::sync::Arc<super::H2Pool>,
+        h2::client::SendRequest<Bytes>,
+        JoinHandle<()>,
+    ) {
+        let (client, connection, clock) = super::h2_handshake(Box::new(client_io)).await.unwrap();
+        let pool = std::sync::Arc::new(super::H2Pool::new());
+        let counter = pool.finish_dial(Some(client.clone()), 1).await.unwrap();
+        drop(super::CounterGuard::new(counter.clone()));
+        let driver = tokio::spawn(super::drive_h2_connection(
+            connection,
+            clock,
+            Some((TEST_PERIOD, TEST_PING_TIMEOUT)),
+            std::sync::Arc::downgrade(&pool),
+            counter,
+        ));
+        (pool, client, driver)
+    }
+
+    #[tokio::test]
+    async fn h2_keep_alive_evicts_a_silent_connection() {
+        // the peer holds its end and never reads or writes
+        let (client_io, _silent) = tokio::io::duplex(64 * 1024);
+        let started = std::time::Instant::now();
+        let (pool, client, driver) = pooled_with_keep_alive(client_io).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), driver)
+            .await
+            .expect("silent connection kept past period + PING timeout")
+            .unwrap();
+        let took = started.elapsed();
+        assert!(
+            took >= TEST_PERIOD + TEST_PING_TIMEOUT,
+            "evicted before the PING timeout: {took:?}"
+        );
+        assert!(
+            matches!(pool.acquire(1, 0).await, super::H2Acquire::NeedDial(_)),
+            "dead connection still pooled"
+        );
+        assert!(
+            client.ready().await.is_err(),
+            "dead connection still usable"
+        );
+    }
+
+    #[tokio::test]
+    async fn h2_keep_alive_keeps_a_connection_that_answers() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let (pool, _client, driver) = pooled_with_keep_alive(client_io).await;
+        // many periods and PING timeouts of idling
+        tokio::time::sleep(5 * (TEST_PERIOD + TEST_PING_TIMEOUT)).await;
+        assert!(!driver.is_finished(), "healthy idle connection dropped");
+        assert!(
+            matches!(pool.acquire(1, 0).await, super::H2Acquire::Ready(..)),
+            "healthy idle connection left the pool"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn h2_connection_that_ends_leaves_the_pool() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (pool, _client, driver) = pooled_with_keep_alive(client_io).await;
+        drop(server_io);
+        tokio::time::timeout(TEST_PERIOD, driver)
+            .await
+            .expect("closed connection not noticed")
+            .unwrap();
+        assert!(matches!(
+            pool.acquire(1, 0).await,
+            super::H2Acquire::NeedDial(_)
+        ));
+    }
+
     #[tokio::test]
     async fn h2_xmux_capacity_waits_and_drop_wakes_next_stream() {
         let (client_io, server_io) = tokio::io::duplex(4096);

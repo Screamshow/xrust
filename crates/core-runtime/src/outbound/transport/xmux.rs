@@ -21,6 +21,9 @@ use tokio::sync::Mutex;
 
 use crate::inbound::AnyStream;
 
+/// Xray `net.ChromeH2KeepAlivePeriod`.
+const H2_KEEP_ALIVE_DEFAULT: Duration = Duration::from_secs(45);
+
 /// `max_concurrency` bounds the streams one connection may carry,
 /// `max_connections` the pool size; both zero mean unlimited. A zero
 /// `c_max_reuse_times` / `h_max_request_times` / `h_max_reusable_secs` is
@@ -85,8 +88,8 @@ pub(crate) struct XmuxConfig {
     pub c_max_reuse_times: IntRange,
     pub h_max_request_times: IntRange,
     pub h_max_reusable_secs: IntRange,
-    /// `h_keep_alive_period`: Xray's HTTP/2 keep-alive ping. An HTTP/1.1
-    /// connection has no ping to send, so the value is parsed and reported.
+    /// `h_keep_alive_period`, seconds: the HTTP/2 keep-alive ping, as in
+    /// Xray (0 is 45 s, negative is off). HTTP/1.1 has no ping.
     pub keep_alive_period: i64,
 }
 
@@ -153,11 +156,6 @@ impl XmuxConfig {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0),
         };
-        if config.keep_alive_period != 0 {
-            crate::logging::warn(format_args!(
-                "{at}.h_keep_alive_period: HTTP/1.1 has no keep-alive ping (ignored)"
-            ));
-        }
         Ok(config)
     }
 }
@@ -316,6 +314,17 @@ impl Pool {
         self.concurrency as usize
     }
 
+    /// How long a pooled HTTP/2 connection may read nothing before it is
+    /// pinged, or `None` for no pings. Xray's `hKeepAlivePeriod` rules: 0
+    /// takes Chrome's 45 s, a negative value turns the ping off.
+    pub(crate) fn h2_keep_alive(&self) -> Option<Duration> {
+        match self.config.keep_alive_period {
+            0 => Some(H2_KEEP_ALIVE_DEFAULT),
+            secs if secs < 0 => None,
+            secs => Some(Duration::from_secs(secs as u64)),
+        }
+    }
+
     pub(crate) fn max_connections(&self) -> usize {
         if self.connections > 0 {
             self.connections as usize
@@ -398,6 +407,22 @@ fn pick(len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn h2_keep_alive_follows_xray() {
+        let period = |v: serde_json::Value| {
+            Pool::new(XmuxConfig::parse(Some(&v), "xmux").unwrap()).h2_keep_alive()
+        };
+        assert_eq!(
+            Pool::new(XmuxConfig::default()).h2_keep_alive(),
+            Some(Duration::from_secs(45))
+        );
+        let at = serde_json::json!({"h_keep_alive_period": 0, "max_connections": 2});
+        assert_eq!(period(at), Some(Duration::from_secs(45)));
+        let at = serde_json::json!({"h_keep_alive_period": 20});
+        assert_eq!(period(at), Some(Duration::from_secs(20)));
+        assert_eq!(period(serde_json::json!({"h_keep_alive_period": -1})), None);
+    }
+
     #[tokio::test]
     async fn cancelled_request_releases_usage_and_removes_incomplete_connection() {
         let pool = Pool::new(XmuxConfig::parse(None, "pool").unwrap());
