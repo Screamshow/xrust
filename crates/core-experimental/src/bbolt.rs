@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -14,6 +15,13 @@ const META_BODY: usize = 64;
 const LEAF_ELEM: usize = 16;
 const BRANCH_ELEM: usize = 16;
 const BUCKET_HEADER: usize = 16;
+/// Pages 0 and 1 hold the meta pages.
+const FIRST_DATA_PAGE: u64 = 2;
+/// Deepest branch nesting accepted inside one bucket. bbolt splits nodes so
+/// that every branch keeps at least two children, so depth grows as log2 of
+/// the page count; real cache files are 1-3 levels deep. The bound keeps a
+/// long chain of single-child pages from exhausting the stack.
+const MAX_DEPTH: usize = 64;
 
 fn err(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
@@ -34,24 +42,26 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn u16(&self, off: usize) -> io::Result<u16> {
-        let b = self.buf.get(off..off + 2).ok_or_else(|| err("u16 oob"))?;
+        let b = self.bytes(off, 2).map_err(|_| err("u16 oob"))?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
     }
 
     fn u32(&self, off: usize) -> io::Result<u32> {
-        let b = self.buf.get(off..off + 4).ok_or_else(|| err("u32 oob"))?;
+        let b = self.bytes(off, 4).map_err(|_| err("u32 oob"))?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
     fn u64(&self, off: usize) -> io::Result<u64> {
-        let b = self.buf.get(off..off + 8).ok_or_else(|| err("u64 oob"))?;
+        let b = self.bytes(off, 8).map_err(|_| err("u64 oob"))?;
         let mut a = [0u8; 8];
         a.copy_from_slice(b);
         Ok(u64::from_le_bytes(a))
     }
 
     fn bytes(&self, off: usize, len: usize) -> io::Result<&'a [u8]> {
-        self.buf.get(off..off + len).ok_or_else(|| err("bytes oob"))
+        off.checked_add(len)
+            .and_then(|end| self.buf.get(off..end))
+            .ok_or_else(|| err("bytes oob"))
     }
 }
 
@@ -89,10 +99,12 @@ enum PageKind {
     Branch,
 }
 
-struct Elem {
+/// One element, borrowing its key and value from the file image.
+#[derive(Clone, Copy)]
+struct Elem<'a> {
     flags: u32,
-    key: Vec<u8>,
-    value: Vec<u8>,
+    key: &'a [u8],
+    value: &'a [u8],
     child: u64,
 }
 
@@ -104,45 +116,80 @@ fn page_kind(page: &[u8]) -> io::Result<PageKind> {
     }
 }
 
-fn leaf_elems(page: &[u8]) -> io::Result<Vec<Elem>> {
+/// The element count, checked against the page so a bad count cannot
+/// reserve memory the page does not have.
+fn elem_count(page: &[u8], elem_size: usize) -> io::Result<usize> {
+    let count = (Reader { buf: page }).u16(10)? as usize;
+    if PAGE_HEADER + count * elem_size > page.len() {
+        return Err(err("element table oob"));
+    }
+    Ok(count)
+}
+
+/// Keys and values of one page never overlap, so together they fit in it.
+/// This bounds what one page can hand out.
+fn add_payload(total: &mut usize, len: usize, page: &[u8]) -> io::Result<()> {
+    *total = total.saturating_add(len);
+    if *total > page.len() {
+        return Err(err("page elements overlap"));
+    }
+    Ok(())
+}
+
+fn leaf_elems(page: &[u8]) -> io::Result<Vec<Elem<'_>>> {
     let r = Reader { buf: page };
-    let count = r.u16(10)? as usize;
+    let count = elem_count(page, LEAF_ELEM)?;
     let mut out = Vec::with_capacity(count);
+    let mut payload = 0usize;
     for i in 0..count {
         let e = PAGE_HEADER + i * LEAF_ELEM;
         let flags = r.u32(e)?;
         let pos = r.u32(e + 4)? as usize;
         let ksize = r.u32(e + 8)? as usize;
         let vsize = r.u32(e + 12)? as usize;
-        let data = e + pos;
+        let data = e.checked_add(pos).ok_or_else(|| err("bytes oob"))?;
+        let key = r.bytes(data, ksize)?;
+        let value = r.bytes(data + ksize, vsize)?;
+        add_payload(&mut payload, ksize.saturating_add(vsize), page)?;
         out.push(Elem {
             flags,
-            key: r.bytes(data, ksize)?.to_vec(),
-            value: r.bytes(data + ksize, vsize)?.to_vec(),
+            key,
+            value,
             child: 0,
         });
     }
     Ok(out)
 }
 
-fn branch_elems(page: &[u8]) -> io::Result<Vec<Elem>> {
+fn branch_elems(page: &[u8]) -> io::Result<Vec<Elem<'_>>> {
     let r = Reader { buf: page };
-    let count = r.u16(10)? as usize;
+    let count = elem_count(page, BRANCH_ELEM)?;
     let mut out = Vec::with_capacity(count);
+    let mut payload = 0usize;
     for i in 0..count {
         let e = PAGE_HEADER + i * BRANCH_ELEM;
         let pos = r.u32(e)? as usize;
         let ksize = r.u32(e + 4)? as usize;
         let pgid = r.u64(e + 8)?;
-        let data = e + pos;
+        let data = e.checked_add(pos).ok_or_else(|| err("bytes oob"))?;
+        let key = r.bytes(data, ksize)?;
+        add_payload(&mut payload, ksize, page)?;
         out.push(Elem {
             flags: 0,
-            key: r.bytes(data, ksize)?.to_vec(),
-            value: Vec::new(),
+            key,
+            value: &[],
             child: pgid,
         });
     }
     Ok(out)
+}
+
+/// Pages already read by one lookup. In a valid file every page belongs to
+/// exactly one node, so a page reached twice means a cycle or a shared
+/// subtree, and each lookup reads each page at most once.
+#[derive(Default)]
+struct Visited {
+    pages: HashSet<u64>,
 }
 
 /// A bucket's key/value pairs, in key order.
@@ -185,6 +232,9 @@ impl Db {
         if meta.root >= meta.pgid {
             return Err(err("root above high water mark"));
         }
+        if meta.root < FIRST_DATA_PAGE {
+            return Err(err("root points at a meta page"));
+        }
         Ok(Db {
             data,
             page_size,
@@ -196,29 +246,49 @@ impl Db {
         &self.meta
     }
 
-    pub fn get(&self, path: &[&str], key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        let mut page = self.load_page(self.meta.root)?;
+    /// The root page of the bucket at `path`, or `None` if a segment is missing.
+    fn bucket_at<'s>(
+        &'s self,
+        path: &[&str],
+        visited: &mut Visited,
+    ) -> io::Result<Option<&'s [u8]>> {
+        let mut page = self.load_page(self.meta.root, visited)?;
         for segment in path {
-            let entry = self
-                .find_bucket_in(&page, segment.as_bytes())?
-                .ok_or_else(|| err("bucket not found"))?;
-            page = self.bucket_root_bytes(&entry)?;
+            match self.find_bucket_in(page, segment.as_bytes(), visited, 0)? {
+                Some(entry) => page = self.bucket_root_bytes(&entry, visited)?,
+                None => return Ok(None),
+            }
         }
+        Ok(Some(page))
+    }
+
+    pub fn get(&self, path: &[&str], key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let mut visited = Visited::default();
+        let page = self
+            .bucket_at(path, &mut visited)?
+            .ok_or_else(|| err("bucket not found"))?;
         // the bucket root may be a branch page when the bucket is wide
-        match self.find_in_page(&page, key)? {
-            Some(e) if e.flags & BUCKET_LEAF_FLAG == 0 => Ok(Some(e.value)),
+        match self.find_in_page(page, key, &mut visited, 0)? {
+            Some(e) if e.flags & BUCKET_LEAF_FLAG == 0 => Ok(Some(e.value.to_vec())),
             _ => Ok(None),
         }
     }
 
     /// Depth-first lookup of a key in a node, descending branch pages.
-    fn find_in_page(&self, page: &[u8], key: &[u8]) -> io::Result<Option<Elem>> {
+    fn find_in_page<'s>(
+        &'s self,
+        page: &'s [u8],
+        key: &[u8],
+        visited: &mut Visited,
+        depth: usize,
+    ) -> io::Result<Option<Elem<'s>>> {
         match page_kind(page)? {
-            PageKind::Leaf => find_in_bytes(page, key),
+            PageKind::Leaf => Ok(leaf_elems(page)?.into_iter().find(|e| e.key == key)),
             PageKind::Branch => {
+                let depth = deeper(depth)?;
                 for e in branch_elems(page)? {
-                    let child = self.load_page(e.child)?;
-                    if let Some(found) = self.find_in_page(&child, key)? {
+                    let child = self.load_page(e.child, visited)?;
+                    if let Some(found) = self.find_in_page(child, key, visited, depth)? {
                         return Ok(Some(found));
                     }
                 }
@@ -229,9 +299,15 @@ impl Db {
 
     /// Every top-level bucket name, in key order.
     pub fn bucket_names(&self) -> io::Result<Vec<String>> {
-        let mut out = Vec::new();
-        self.collect_buckets(self.meta.root, &mut out)?;
-        Ok(out)
+        let mut visited = Visited::default();
+        let root = self.load_page(self.meta.root, &mut visited)?;
+        let mut elems = Vec::new();
+        self.all_elems(root, &mut visited, 0, &mut elems)?;
+        Ok(elems
+            .into_iter()
+            .filter(|elem| elem.flags & BUCKET_LEAF_FLAG != 0)
+            .map(|elem| String::from_utf8_lossy(elem.key).to_string())
+            .collect())
     }
 
     /// Every key/value of a bucket (depth first, in key order).
@@ -246,121 +322,127 @@ impl Db {
 
     /// Preserve binary keys such as sing-box's packed FakeIP addresses.
     pub fn bucket_page_raw(&self, path: &[&str]) -> io::Result<Option<RawBucketEntries>> {
-        let mut page = self.load_page(self.meta.root)?;
-        for segment in path {
-            let entry = self
-                .find_bucket_in(&page, segment.as_bytes())?
-                .ok_or_else(|| err("bucket not found"))?;
-            page = self.bucket_root_bytes(&entry)?;
-        }
-        let mut out = Vec::new();
-        self.collect_pairs(&page, &mut out)?;
-        Ok(Some(out))
-    }
-
-    fn collect_buckets(&self, pgid: u64, out: &mut Vec<String>) -> io::Result<()> {
-        let page = self.load_page(pgid)?;
-        for elem in self.all_elems(&page)? {
-            if elem.flags & BUCKET_LEAF_FLAG != 0 {
-                out.push(String::from_utf8_lossy(&elem.key).to_string());
-            }
-        }
-        Ok(())
-    }
-
-    fn collect_pairs(&self, page: &[u8], out: &mut RawBucketEntries) -> io::Result<()> {
-        for elem in self.all_elems(page)? {
-            if elem.flags & BUCKET_LEAF_FLAG != 0 {
-                continue;
-            }
-            out.push((elem.key, elem.value));
-        }
-        Ok(())
+        let mut visited = Visited::default();
+        let page = self
+            .bucket_at(path, &mut visited)?
+            .ok_or_else(|| err("bucket not found"))?;
+        let mut elems = Vec::new();
+        self.all_elems(page, &mut visited, 0, &mut elems)?;
+        Ok(Some(
+            elems
+                .into_iter()
+                .filter(|elem| elem.flags & BUCKET_LEAF_FLAG == 0)
+                .map(|elem| (elem.key.to_vec(), elem.value.to_vec()))
+                .collect(),
+        ))
     }
 
     /// All elements of a node, descending branch pages (keys stay sorted).
-    fn all_elems(&self, page: &[u8]) -> io::Result<Vec<Elem>> {
+    fn all_elems<'s>(
+        &'s self,
+        page: &'s [u8],
+        visited: &mut Visited,
+        depth: usize,
+        out: &mut Vec<Elem<'s>>,
+    ) -> io::Result<()> {
         match page_kind(page)? {
-            PageKind::Leaf => leaf_elems(page),
+            PageKind::Leaf => out.extend(leaf_elems(page)?),
             PageKind::Branch => {
-                let mut out = Vec::new();
+                let depth = deeper(depth)?;
                 for elem in branch_elems(page)? {
-                    let child = self.load_page(elem.child)?;
-                    out.extend(self.all_elems(&child)?);
+                    let child = self.load_page(elem.child, visited)?;
+                    self.all_elems(child, visited, depth, out)?;
                 }
-                Ok(out)
             }
         }
+        Ok(())
     }
 
     pub fn has_bucket(&self, path: &[&str]) -> io::Result<bool> {
-        let mut page = self.load_page(self.meta.root)?;
-        for segment in path {
-            match self.find_bucket_in(&page, segment.as_bytes())? {
-                Some(entry) => page = self.bucket_root_bytes(&entry)?,
-                None => return Ok(false),
-            }
-        }
-        Ok(true)
+        let mut visited = Visited::default();
+        Ok(self.bucket_at(path, &mut visited)?.is_some())
     }
 
     /// A page plus its overflow continuation pages, so a leaf whose value
-    /// spans several physical pages parses in one buffer.
-    fn load_page(&self, pgid: u64) -> io::Result<Vec<u8>> {
-        let start = pgid
-            .checked_mul(self.page_size as u64)
-            .ok_or_else(|| err("pgid overflow"))? as usize;
-        let first = self
-            .data
-            .get(start..start + self.page_size)
-            .ok_or_else(|| err("page oob"))?;
+    /// spans several physical pages parses in one buffer. Every page id is
+    /// checked against the meta high water mark and claimed in `visited`.
+    fn load_page<'s>(&'s self, pgid: u64, visited: &mut Visited) -> io::Result<&'s [u8]> {
+        if pgid < FIRST_DATA_PAGE {
+            return Err(err("page id points at a meta page"));
+        }
+        if pgid >= self.meta.pgid {
+            return Err(err("page id above high water mark"));
+        }
+        let page_size = self.page_size as u64;
+        let data: &'s [u8] = &self.data;
+        let span = |pages: u64| -> io::Result<&'s [u8]> {
+            pgid.checked_mul(page_size)
+                .zip(pages.checked_mul(page_size))
+                .and_then(|(start, len)| {
+                    Some((usize::try_from(start).ok()?, usize::try_from(len).ok()?))
+                })
+                .and_then(|(start, len)| data.get(start..start.checked_add(len)?))
+                .ok_or_else(|| err("page oob"))
+        };
+        let first = span(1)?;
         if (Reader { buf: first }).u64(0)? != pgid {
             return Err(err("page id mismatch"));
         }
-        let overflow = (Reader { buf: first }).u32(12)? as usize;
-        let total = (overflow + 1) * self.page_size;
-        let full = self
-            .data
-            .get(start..start + total)
-            .ok_or_else(|| err("overflow page oob"))?;
+        let overflow = u64::from((Reader { buf: first }).u32(12)?);
+        let last = pgid
+            .checked_add(overflow)
+            .filter(|last| *last < self.meta.pgid)
+            .ok_or_else(|| err("overflow above high water mark"))?;
+        let full = span(overflow + 1).map_err(|_| err("overflow page oob"))?;
+        for id in pgid..=last {
+            if !visited.pages.insert(id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("page {id} reached twice (page cycle or shared subtree)"),
+                ));
+            }
+        }
         page_kind(full)?;
-        Ok(full.to_vec())
+        Ok(full)
     }
 
-    fn bucket_root_bytes(&self, entry: &Elem) -> io::Result<Vec<u8>> {
+    fn bucket_root_bytes<'s>(
+        &'s self,
+        entry: &Elem<'s>,
+        visited: &mut Visited,
+    ) -> io::Result<&'s [u8]> {
         if entry.value.len() < BUCKET_HEADER {
             return Err(err("short bucket header"));
         }
-        let root = Reader { buf: &entry.value }.u64(0)?;
+        let root = Reader { buf: entry.value }.u64(0)?;
         if root == NO_FREELIST {
             return Err(err("invalid bucket root"));
         }
         if root == 0 {
-            let inline = entry
-                .value
-                .get(BUCKET_HEADER..)
-                .ok_or_else(|| err("short inline"))?;
+            let inline = &entry.value[BUCKET_HEADER..];
             page_kind(inline)?;
-            Ok(inline.to_vec())
+            Ok(inline)
         } else {
-            self.load_page(root)
+            self.load_page(root, visited)
         }
     }
 
-    fn find_bucket_in(&self, page: &[u8], name: &[u8]) -> io::Result<Option<Elem>> {
+    fn find_bucket_in<'s>(
+        &'s self,
+        page: &'s [u8],
+        name: &[u8],
+        visited: &mut Visited,
+        depth: usize,
+    ) -> io::Result<Option<Elem<'s>>> {
         match page_kind(page)? {
-            PageKind::Leaf => {
-                for e in leaf_elems(page)? {
-                    if e.key == name && e.flags & BUCKET_LEAF_FLAG != 0 {
-                        return Ok(Some(e));
-                    }
-                }
-                Ok(None)
-            }
+            PageKind::Leaf => Ok(leaf_elems(page)?
+                .into_iter()
+                .find(|e| e.key == name && e.flags & BUCKET_LEAF_FLAG != 0)),
             PageKind::Branch => {
+                let depth = deeper(depth)?;
                 for e in branch_elems(page)? {
-                    let child = self.load_page(e.child)?;
-                    if let Some(found) = self.find_bucket_in(&child, name)? {
+                    let child = self.load_page(e.child, visited)?;
+                    if let Some(found) = self.find_bucket_in(child, name, visited, depth)? {
                         return Ok(Some(found));
                     }
                 }
@@ -370,18 +452,12 @@ impl Db {
     }
 }
 
-fn find_in_bytes(page: &[u8], key: &[u8]) -> io::Result<Option<Elem>> {
-    match page_kind(page)? {
-        PageKind::Leaf => {
-            for e in leaf_elems(page)? {
-                if e.key == key {
-                    return Ok(Some(e));
-                }
-            }
-            Ok(None)
-        }
-        PageKind::Branch => Err(err("unexpected branch at value level")),
+/// One branch level down, refusing trees deeper than `MAX_DEPTH`.
+fn deeper(depth: usize) -> io::Result<usize> {
+    if depth >= MAX_DEPTH {
+        return Err(err("page tree too deep"));
     }
+    Ok(depth + 1)
 }
 
 #[derive(Clone)]

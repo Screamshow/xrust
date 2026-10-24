@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -145,8 +145,9 @@ impl CacheFile {
         }
         let mut buckets = BTreeMap::new();
         if path.exists() {
-            match Db::open(&path) {
-                Ok(db) => buckets = read_all(&db),
+            // A damaged file is left in place; only a later flush replaces it.
+            match Db::open(&path).and_then(|db| read_all(&db, &path)) {
+                Ok(read) => buckets = read,
                 Err(error) => logging::warn(format_args!(
                     "cache file {}: read failed ({error}); starting empty",
                     path.display()
@@ -407,62 +408,29 @@ pub mod saved_binary {
     }
 }
 
-fn read_all(db: &Db) -> CacheBuckets {
+/// Every top-level bucket, including ones this build does not model, so they
+/// survive a rewrite. An unreadable root tree fails the whole read; a damaged
+/// bucket is skipped with a warning and the others still load.
+fn read_all(db: &Db, path: &Path) -> io::Result<CacheBuckets> {
     let mut buckets = BTreeMap::new();
-    let mut load = |name: &str| {
-        if !db.has_bucket(&[name]).unwrap_or(false) {
-            return;
-        }
+    for name in db.bucket_names()? {
         let mut entries = BTreeMap::new();
-        collect(db, &[name], &mut entries);
-        buckets.insert(name.to_string(), entries);
-    };
-    load(BUCKET_SELECTED);
-    load(BUCKET_EXPAND);
-    load(BUCKET_MODE);
-    load(BUCKET_RULE_SET);
-    load(BUCKET_RDRC);
-    load(BUCKET_DNS_CACHE);
-    load(BUCKET_FAKEIP);
-    load(BUCKET_CHAIN_DISABLED);
-    load(ID_BUCKET);
-    // buckets we do not model must survive a rewrite
-    for extra in extra_buckets(db) {
-        let mut entries = BTreeMap::new();
-        collect(db, &[extra.as_str()], &mut entries);
-        buckets.insert(extra, entries);
-    }
-    buckets
-}
-
-/// Bucket names present in the file that this build does not model.
-fn extra_buckets(db: &Db) -> Vec<String> {
-    const KNOWN: &[&str] = &[
-        BUCKET_SELECTED,
-        BUCKET_EXPAND,
-        BUCKET_MODE,
-        BUCKET_RULE_SET,
-        BUCKET_RDRC,
-        BUCKET_DNS_CACHE,
-        BUCKET_FAKEIP,
-        BUCKET_CHAIN_DISABLED,
-        ID_BUCKET,
-    ];
-    let mut out = Vec::new();
-    if let Ok(buckets) = db.bucket_names() {
-        for name in buckets {
-            if !KNOWN.contains(&name.as_str()) {
-                out.push(name);
-            }
+        if let Err(error) = collect(db, &[name.as_str()], &mut entries) {
+            logging::warn(format_args!(
+                "cache file {}: bucket {name} unreadable ({error}); skipped",
+                path.display()
+            ));
+            continue;
         }
+        buckets.insert(name, entries);
     }
-    out
+    Ok(buckets)
 }
 
 /// Walk every key of a bucket through the page tree.
-fn collect(db: &Db, path: &[&str], out: &mut BucketValues) {
-    let Ok(Some(page)) = db.bucket_page_raw(path) else {
-        return;
+fn collect(db: &Db, path: &[&str], out: &mut BucketValues) -> io::Result<()> {
+    let Some(page) = db.bucket_page_raw(path)? else {
+        return Ok(());
     };
     for (key, value) in page {
         if value.is_empty() {
@@ -470,6 +438,7 @@ fn collect(db: &Db, path: &[&str], out: &mut BucketValues) {
         }
         out.insert(key, value);
     }
+    Ok(())
 }
 
 /// Borrow the buckets for the writer; nothing is copied before the file image.
