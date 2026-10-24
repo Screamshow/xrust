@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
 
-use core_experimental::bbolt::{Db, EntrySpec, NodeSpec};
+use core_experimental::bbolt::{Db, EntryRef, NodeRef};
 use serde_json::Value;
 
 use crate::logging;
@@ -316,9 +316,8 @@ impl CacheFile {
         if !self.dirty {
             return Ok(());
         }
-        let root = build_tree(&self.buckets);
         let tmp = self.path.with_extension("db.tmp");
-        core_experimental::bbolt::write(&tmp, &root)?;
+        core_experimental::bbolt::write_ref(&tmp, build_tree(&self.buckets))?;
         std::fs::rename(&tmp, &self.path)?;
         self.dirty = false;
         self.pending = 0;
@@ -473,22 +472,22 @@ fn collect(db: &Db, path: &[&str], out: &mut BucketValues) {
     }
 }
 
-fn build_tree(buckets: &CacheBuckets) -> NodeSpec {
-    let mut entries = Vec::with_capacity(buckets.len());
-    for (name, kv) in buckets {
-        let node = NodeSpec {
-            entries: kv
-                .iter()
-                .map(|(key, value)| EntrySpec::RawKv(key.clone(), value.clone()))
-                .collect(),
-        };
-        entries.push(EntrySpec::Bucket {
-            name: name.clone(),
+/// Borrow the buckets for the writer; nothing is copied before the file image.
+fn build_tree(buckets: &CacheBuckets) -> NodeRef<'_> {
+    let entries = buckets
+        .iter()
+        .map(|(name, kv)| EntryRef::Bucket {
+            name: name.as_bytes(),
             seq: 0,
-            node,
-        });
-    }
-    NodeSpec { entries }
+            node: NodeRef {
+                entries: kv
+                    .iter()
+                    .map(|(key, value)| EntryRef::Kv(key, value))
+                    .collect(),
+            },
+        })
+        .collect();
+    NodeRef { entries }
 }
 
 #[cfg(test)]

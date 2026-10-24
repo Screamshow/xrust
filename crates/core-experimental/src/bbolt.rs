@@ -400,40 +400,71 @@ pub struct NodeSpec {
     pub entries: Vec<EntrySpec>,
 }
 
-impl EntrySpec {
-    fn key(&self) -> &[u8] {
-        match self {
-            EntrySpec::Kv(k, _) => k.as_bytes(),
-            EntrySpec::RawKv(k, _) => k,
-            EntrySpec::Bucket { name, .. } => name.as_bytes(),
+impl NodeSpec {
+    /// The same tree, borrowing every key and value.
+    pub fn borrowed(&self) -> NodeRef<'_> {
+        NodeRef {
+            entries: self
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    EntrySpec::Kv(key, value) => EntryRef::Kv(key.as_bytes(), value),
+                    EntrySpec::RawKv(key, value) => EntryRef::Kv(key, value),
+                    EntrySpec::Bucket { name, seq, node } => EntryRef::Bucket {
+                        name: name.as_bytes(),
+                        seq: *seq,
+                        node: node.borrowed(),
+                    },
+                })
+                .collect(),
         }
     }
 }
 
-fn sorted_tree(node: &NodeSpec) -> NodeSpec {
-    let mut entries: Vec<EntrySpec> = node
-        .entries
-        .iter()
-        .map(|e| match e {
-            EntrySpec::Kv(k, v) => EntrySpec::Kv(k.clone(), v.clone()),
-            EntrySpec::RawKv(k, v) => EntrySpec::RawKv(k.clone(), v.clone()),
-            EntrySpec::Bucket { name, seq, node } => EntrySpec::Bucket {
-                name: name.clone(),
-                seq: *seq,
-                node: sorted_tree(node),
-            },
-        })
-        .collect();
-    entries.sort_by_key(|e| e.key().to_vec());
-    NodeSpec { entries }
+/// A tree that borrows its keys and values, so writing it copies each byte
+/// once, straight into the file image.
+pub enum EntryRef<'a> {
+    Kv(&'a [u8], &'a [u8]),
+    Bucket {
+        name: &'a [u8],
+        seq: u64,
+        node: NodeRef<'a>,
+    },
+}
+
+pub struct NodeRef<'a> {
+    pub entries: Vec<EntryRef<'a>>,
+}
+
+impl<'a> EntryRef<'a> {
+    fn key(&self) -> &'a [u8] {
+        match self {
+            EntryRef::Kv(key, _) => key,
+            EntryRef::Bucket { name, .. } => name,
+        }
+    }
+}
+
+/// A leaf value: borrowed bytes, or the bucket header built for a child.
+enum InodeValue<'a> {
+    Data(&'a [u8]),
+    Bucket([u8; BUCKET_HEADER]),
 }
 
 /// One leaf element of a B+tree node.
-#[derive(Clone)]
-struct Inode {
-    key: Vec<u8>,
+struct Inode<'a> {
+    key: &'a [u8],
     flags: u32,
-    value: Vec<u8>,
+    value: InodeValue<'a>,
+}
+
+impl Inode<'_> {
+    fn value(&self) -> &[u8] {
+        match &self.value {
+            InodeValue::Data(value) => value,
+            InodeValue::Bucket(header) => header,
+        }
+    }
 }
 
 /// A bbolt writer: builds the tree bottom-up, spilling large nodes across
@@ -464,86 +495,79 @@ impl Writer {
         pgid
     }
 
-    /// Materialize a node and everything under it; returns (root pgid, first
-    /// key) so a parent branch can reference it.
-    fn materialize(&mut self, node: &NodeSpec) -> io::Result<(u64, Vec<u8>)> {
+    /// Materialize a node and everything under it; returns its root pgid.
+    /// Entries are sorted first, so child buckets get pages in key order.
+    fn materialize(&mut self, mut node: NodeRef<'_>) -> io::Result<u64> {
+        node.entries.sort_by(|a, b| a.key().cmp(b.key()));
         let mut inodes = Vec::with_capacity(node.entries.len());
-        for entry in &node.entries {
+        for entry in node.entries {
             match entry {
-                EntrySpec::Kv(key, value) => inodes.push(Inode {
-                    key: key.as_bytes().to_vec(),
+                EntryRef::Kv(key, value) => inodes.push(Inode {
+                    key,
                     flags: 0,
-                    value: value.clone(),
+                    value: InodeValue::Data(value),
                 }),
-                EntrySpec::RawKv(key, value) => inodes.push(Inode {
-                    key: key.clone(),
-                    flags: 0,
-                    value: value.clone(),
-                }),
-                EntrySpec::Bucket { name, seq, node } => {
-                    let (child_pgid, _) = self.materialize(node)?;
-                    let mut value = vec![0u8; BUCKET_HEADER];
-                    value[0..8].copy_from_slice(&child_pgid.to_le_bytes());
-                    value[8..16].copy_from_slice(&seq.to_le_bytes());
+                EntryRef::Bucket { name, seq, node } => {
+                    let child_pgid = self.materialize(node)?;
+                    let mut header = [0u8; BUCKET_HEADER];
+                    header[0..8].copy_from_slice(&child_pgid.to_le_bytes());
+                    header[8..16].copy_from_slice(&seq.to_le_bytes());
                     inodes.push(Inode {
-                        key: name.as_bytes().to_vec(),
+                        key: name,
                         flags: BUCKET_LEAF_FLAG,
-                        value,
+                        value: InodeValue::Bucket(header),
                     });
                 }
             }
         }
-        self.spill(inodes)
+        Ok(self.spill(&inodes))
     }
 
-    fn spill(&mut self, inodes: Vec<Inode>) -> io::Result<(u64, Vec<u8>)> {
+    fn spill(&mut self, inodes: &[Inode<'_>]) -> u64 {
         if inodes.is_empty() {
-            let pgid = self.write_leaf(&[]);
-            return Ok((pgid, Vec::new()));
+            return self.write_leaf(&[]);
         }
-        let first_key = inodes[0].key.clone();
-        let leaves = self.partition(&inodes);
+        let leaves = self.partition(inodes);
         if leaves.len() == 1 {
             // one logical node: overflow pages if a value is large
-            let pgid = self.write_leaf(&leaves[0]);
-            return Ok((pgid, first_key));
+            return self.write_leaf(inodes);
         }
         let mut refs = Vec::with_capacity(leaves.len());
-        for leaf in &leaves {
+        for range in leaves {
+            let leaf = &inodes[range];
             let pgid = self.write_leaf(leaf);
-            refs.push((leaf[0].key.clone(), pgid));
+            refs.push((leaf[0].key, pgid));
         }
-        let branch_pgid = self.build_branch(refs);
-        Ok((branch_pgid, first_key))
+        self.build_branch(refs)
     }
 
     /// Greedy split into leaves that fit a page; a single oversized inode gets
     /// its own leaf and spills over.
-    fn partition(&self, inodes: &[Inode]) -> Vec<Vec<Inode>> {
-        let mut leaves: Vec<Vec<Inode>> = Vec::new();
-        let mut current: Vec<Inode> = Vec::new();
+    fn partition(&self, inodes: &[Inode<'_>]) -> Vec<std::ops::Range<usize>> {
+        let mut leaves = Vec::new();
+        let mut start = 0;
         let mut size = PAGE_HEADER;
-        for inode in inodes {
-            let elem = LEAF_ELEM + inode.key.len() + inode.value.len();
-            if !current.is_empty() && size + elem > self.page_size {
-                leaves.push(std::mem::take(&mut current));
+        for (i, inode) in inodes.iter().enumerate() {
+            let elem = LEAF_ELEM + inode.key.len() + inode.value().len();
+            if i > start && size + elem > self.page_size {
+                leaves.push(start..i);
+                start = i;
                 size = PAGE_HEADER;
             }
-            current.push(inode.clone());
             size += elem;
         }
-        if !current.is_empty() {
-            leaves.push(current);
+        if start < inodes.len() {
+            leaves.push(start..inodes.len());
         }
         leaves
     }
 
-    fn write_leaf(&mut self, inodes: &[Inode]) -> u64 {
+    fn write_leaf(&mut self, inodes: &[Inode<'_>]) -> u64 {
         let total = PAGE_HEADER
             + LEAF_ELEM * inodes.len()
             + inodes
                 .iter()
-                .map(|inode| inode.key.len() + inode.value.len())
+                .map(|inode| inode.key.len() + inode.value().len())
                 .sum::<usize>();
         let npages = total.div_ceil(self.page_size).max(1);
         let pgid = self.alloc(npages);
@@ -554,28 +578,28 @@ impl Writer {
         self.file[base + 12..base + 16].copy_from_slice(&((npages - 1) as u32).to_le_bytes());
         let mut data_off = base + PAGE_HEADER + LEAF_ELEM * inodes.len();
         for (i, inode) in inodes.iter().enumerate() {
+            let value = inode.value();
             let elem = base + PAGE_HEADER + i * LEAF_ELEM;
             let pos = (data_off - elem) as u32;
             self.file[elem..elem + 4].copy_from_slice(&inode.flags.to_le_bytes());
             self.file[elem + 4..elem + 8].copy_from_slice(&pos.to_le_bytes());
             self.file[elem + 8..elem + 12].copy_from_slice(&(inode.key.len() as u32).to_le_bytes());
-            self.file[elem + 12..elem + 16]
-                .copy_from_slice(&(inode.value.len() as u32).to_le_bytes());
-            self.file[data_off..data_off + inode.key.len()].copy_from_slice(&inode.key);
+            self.file[elem + 12..elem + 16].copy_from_slice(&(value.len() as u32).to_le_bytes());
+            self.file[data_off..data_off + inode.key.len()].copy_from_slice(inode.key);
             data_off += inode.key.len();
-            self.file[data_off..data_off + inode.value.len()].copy_from_slice(&inode.value);
-            data_off += inode.value.len();
+            self.file[data_off..data_off + value.len()].copy_from_slice(value);
+            data_off += value.len();
         }
         pgid
     }
 
     /// Branch pages, recursing into branch-of-branches when the index is wide.
-    fn build_branch(&mut self, refs: Vec<(Vec<u8>, u64)>) -> u64 {
+    fn build_branch(&mut self, refs: Vec<(&[u8], u64)>) -> u64 {
         if branch_size(&refs) <= self.page_size {
             return self.write_branch_page(&refs);
         }
-        let mut groups: Vec<Vec<(Vec<u8>, u64)>> = Vec::new();
-        let mut current: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut groups: Vec<Vec<(&[u8], u64)>> = Vec::new();
+        let mut current: Vec<(&[u8], u64)> = Vec::new();
         let mut size = PAGE_HEADER;
         for item in refs {
             let elem = BRANCH_ELEM + item.0.len();
@@ -591,14 +615,14 @@ impl Writer {
         }
         let mut child_refs = Vec::with_capacity(groups.len());
         for group in groups {
-            let first = group[0].0.clone();
+            let first = group[0].0;
             let pgid = self.write_branch_page(&group);
             child_refs.push((first, pgid));
         }
         self.build_branch(child_refs)
     }
 
-    fn write_branch_page(&mut self, refs: &[(Vec<u8>, u64)]) -> u64 {
+    fn write_branch_page(&mut self, refs: &[(&[u8], u64)]) -> u64 {
         let pgid = self.alloc(1);
         let base = pgid as usize * self.page_size;
         self.file[base..base + 8].copy_from_slice(&pgid.to_le_bytes());
@@ -641,14 +665,63 @@ impl Writer {
     }
 }
 
-fn branch_size(refs: &[(Vec<u8>, u64)]) -> usize {
+fn branch_size(refs: &[(&[u8], u64)]) -> usize {
     PAGE_HEADER + BRANCH_ELEM * refs.len() + refs.iter().map(|r| r.0.len()).sum::<usize>()
 }
 
 pub fn write(path: &Path, root: &NodeSpec) -> io::Result<()> {
-    let root = sorted_tree(root);
+    write_ref(path, root.borrowed())
+}
+
+/// Write a borrowed tree; the output is the same as `write` for the same
+/// content.
+pub fn write_ref(path: &Path, root: NodeRef<'_>) -> io::Result<()> {
     let mut writer = Writer::new(4096);
-    let (root_pgid, _) = writer.materialize(&root)?;
+    let root_pgid = writer.materialize(root)?;
     writer.write_meta(root_pgid);
     fs::write(path, &writer.file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn borrowed_tree_writes_the_same_bytes() {
+        let owned: Vec<(Vec<u8>, Vec<u8>)> = (0..300u32)
+            .rev()
+            .map(|i| (format!("key-{i:04}").into_bytes(), vec![i as u8; 40]))
+            .collect();
+        let spec = NodeSpec {
+            entries: vec![EntrySpec::Bucket {
+                name: "b".into(),
+                seq: 3,
+                node: NodeSpec {
+                    entries: owned
+                        .iter()
+                        .map(|(k, v)| EntrySpec::RawKv(k.clone(), v.clone()))
+                        .collect(),
+                },
+            }],
+        };
+        let borrowed = NodeRef {
+            entries: vec![EntryRef::Bucket {
+                name: b"b",
+                seq: 3,
+                node: NodeRef {
+                    entries: owned.iter().map(|(k, v)| EntryRef::Kv(k, v)).collect(),
+                },
+            }],
+        };
+        let dir = std::env::temp_dir();
+        let a = dir.join(format!("bbolt-owned-{}.db", std::process::id()));
+        let b = dir.join(format!("bbolt-borrowed-{}.db", std::process::id()));
+        write(&a, &spec).unwrap();
+        write_ref(&b, borrowed).unwrap();
+        assert_eq!(fs::read(&a).unwrap(), fs::read(&b).unwrap());
+        let db = Db::open(&b).unwrap();
+        assert_eq!(db.get(&["b"], b"key-0007").unwrap(), Some(vec![7; 40]));
+        fs::remove_file(a).unwrap();
+        fs::remove_file(b).unwrap();
+    }
 }
