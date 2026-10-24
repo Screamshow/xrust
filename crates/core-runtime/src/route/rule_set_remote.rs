@@ -217,7 +217,10 @@ impl RemoteRuleSet {
                                 )),
                             }
                         } else {
-                            match parse_payload(&data, self.spec.format.as_deref()) {
+                            let parsed = parse_payload(&data, self.spec.format.as_deref());
+                            // the file is not needed once decoded
+                            drop(data);
+                            match parsed {
                                 Ok(rules) => {
                                     #[allow(clippy::collapsible_if)]
                                     if use_mmap {
@@ -272,15 +275,19 @@ impl RemoteRuleSet {
         let Some(raw) = raw else {
             return Ok(false);
         };
-        let saved = saved_binary::unmarshal(&raw)
+        let mut saved = saved_binary::unmarshal(&raw)
             .ok_or_else(|| io::Error::other("malformed cached rule-set"))?;
+        // `saved` owns a copy of the content; neither is kept past decoding
+        drop(raw);
         if !saved.url_hash.is_empty() && saved.url_hash != url_hash(&self.spec.url) {
             logging::info(format_args!(
                 "cached rule-set was downloaded from another URL, will refetch"
             ));
             return Ok(false);
         }
-        let rules = parse_payload(&saved.content, self.spec.format.as_deref())?;
+        let content = std::mem::take(&mut saved.content);
+        let rules = parse_payload(&content, self.spec.format.as_deref())?;
+        drop(content);
         self.set.replace_rules(rules);
         self.etag = if saved.last_etag.is_empty() {
             None
@@ -647,12 +654,7 @@ pub fn parse_payload(data: &[u8], format: Option<&str>) -> io::Result<Vec<Value>
 fn parse_source(data: &[u8]) -> io::Result<Vec<Value>> {
     let value: Value = serde_json::from_slice(data)
         .map_err(|error| io::Error::other(format!("decode rule-set source: {error}")))?;
-    let rules = value
-        .get("rules")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok(rules)
+    Ok(crate::route::rule_set::source_rules(value))
 }
 
 fn parse_binary(data: &[u8]) -> io::Result<Vec<Value>> {

@@ -83,7 +83,7 @@ use serde_json::Value;
 use crate::inbound::Target;
 use crate::route::ConnContext;
 use crate::route::rule::{domain_hosts, domain_suffix_match};
-use crate::route::rule_set::{list, ports};
+use crate::route::rule_set::{ports, take_list};
 
 /// Masking, without pulling `num_traits` in for two shifts.
 trait Network: Ord + Copy {
@@ -272,21 +272,19 @@ enum FallbackRule {
 }
 
 impl FallbackRule {
-    fn compile(object: &serde_json::Map<String, Value>) -> Self {
+    fn compile(mut object: serde_json::Map<String, Value>) -> Self {
         if object.get("type").and_then(Value::as_str) == Some("logical") {
-            let subs = object
-                .get("rules")
-                .and_then(Value::as_array)
-                .map(|subs| {
-                    subs.iter()
-                        .map(|sub| match sub.as_object() {
-                            Some(object) => FallbackRule::compile(object),
-                            // Preserve match_rule's rejection of non-objects.
-                            None => FallbackRule::Never,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let subs = match object.remove("rules") {
+                Some(Value::Array(subs)) => subs
+                    .into_iter()
+                    .map(|sub| match sub {
+                        Value::Object(object) => FallbackRule::compile(object),
+                        // Preserve match_rule's rejection of non-objects.
+                        _ => FallbackRule::Never,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             return FallbackRule::Logical {
                 all: object.get("mode").and_then(Value::as_str) != Some("or"),
                 inverted: object.get("invert") == Some(&Value::Bool(true)),
@@ -347,57 +345,50 @@ struct PlainRule {
 }
 
 impl PlainRule {
-    fn compile(object: &serde_json::Map<String, Value>) -> Self {
+    /// Takes the rule by value: its strings move into the rule, not copied.
+    fn compile(mut object: serde_json::Map<String, Value>) -> Self {
         let mut rule = PlainRule {
             inverted: object.get("invert") == Some(&Value::Bool(true)),
+            has_domains: object.contains_key("domain")
+                || object.contains_key("domain_suffix")
+                || object.contains_key("domain_keyword"),
+            has_dest_ip: object.contains_key("ip_cidr"),
+            has_source_ip: object.contains_key("source_ip_cidr"),
+            has_dest_ports: object.contains_key("port") || object.contains_key("port_range"),
+            has_source_ports: object.contains_key("source_port")
+                || object.contains_key("source_port_range"),
+            has_network: object.contains_key("network"),
             ..PlainRule::default()
         };
-        for entry in list(object.get("domain")) {
+        for entry in take_list(object.remove("domain")) {
             rule.domains.insert(entry.into_boxed_str());
         }
-        rule.suffixes.extend(
-            list(object.get("domain_suffix"))
-                .into_iter()
-                .map(String::into_boxed_str),
-        );
-        rule.keywords.extend(
-            list(object.get("domain_keyword"))
-                .into_iter()
-                .map(String::into_boxed_str),
-        );
-        rule.has_domains = object.contains_key("domain")
-            || object.contains_key("domain_suffix")
-            || object.contains_key("domain_keyword");
+        rule.suffixes
+            .extend(take_list(object.remove("domain_suffix")).map(String::into_boxed_str));
+        rule.keywords
+            .extend(take_list(object.remove("domain_keyword")).map(String::into_boxed_str));
 
-        for entry in list(object.get("ip_cidr")) {
+        for entry in take_list(object.remove("ip_cidr")) {
             insert_prefix(&mut rule.dest_v4, &mut rule.dest_v6, &entry);
         }
-        rule.has_dest_ip = object.contains_key("ip_cidr");
-
-        for entry in list(object.get("source_ip_cidr")) {
+        for entry in take_list(object.remove("source_ip_cidr")) {
             insert_prefix(&mut rule.source_v4, &mut rule.source_v6, &entry);
         }
-        rule.has_source_ip = object.contains_key("source_ip_cidr");
 
         rule.dest_ports.extend(ports(object.get("port")));
         rule.dest_port_ranges
             .0
-            .extend(parse_ranges(list(object.get("port_range"))));
-        rule.has_dest_ports = object.contains_key("port") || object.contains_key("port_range");
-
+            .extend(parse_ranges(take_list(object.remove("port_range"))));
         rule.source_ports.extend(ports(object.get("source_port")));
         rule.source_port_ranges
             .0
-            .extend(parse_ranges(list(object.get("source_port_range"))));
-        rule.has_source_ports =
-            object.contains_key("source_port") || object.contains_key("source_port_range");
+            .extend(parse_ranges(take_list(object.remove("source_port_range"))));
 
-        for entry in list(object.get("network")) {
+        for entry in take_list(object.remove("network")) {
             if !rule.networks.iter().any(|known| **known == *entry) {
                 rule.networks.push(entry.into_boxed_str());
             }
         }
-        rule.has_network = object.contains_key("network");
 
         rule.dest_ports.sort_unstable();
         rule.dest_ports.dedup();
@@ -509,19 +500,23 @@ impl RuleSetIndex {
     /// This is meant to run *outside* the set's lock, so a remote update never
     /// blocks matching on a geo list: the work happens first and the finished
     /// index is swapped in under the write lock.
-    pub fn compile(rules: &[Value]) -> (Self, Fallbacks) {
+    ///
+    /// The rules are consumed one by one and their strings move into the
+    /// index, so the decoded tree and the index never hold the same entries
+    /// twice.
+    pub fn compile(rules: Vec<Value>) -> (Self, Fallbacks) {
         let mut index = RuleSetIndex::default();
         let mut fallbacks = Fallbacks::default();
 
         for rule in rules {
-            let Some(object) = rule.as_object() else {
+            let Value::Object(object) = rule else {
                 // `match_rule` returned false for a non-object; dropping it is
                 // the same answer without evaluating it again.
                 continue;
             };
             let inverted = object.get("invert") == Some(&Value::Bool(true));
             let logical = object.get("type").and_then(Value::as_str) == Some("logical");
-            if inverted || logical || !poolable(object) {
+            if inverted || logical || !poolable(&object) {
                 fallbacks.rules.push(FallbackRule::compile(object));
                 continue;
             }
@@ -534,36 +529,37 @@ impl RuleSetIndex {
     }
 
     /// `match_default`, with every list folded into a shared pool.
-    fn add_rule(&mut self, object: &serde_json::Map<String, Value>) {
-        for entry in list(object.get("domain")) {
+    fn add_rule(&mut self, mut object: serde_json::Map<String, Value>) {
+        for entry in take_list(object.remove("domain")) {
             self.domains.insert(entry.into_boxed_str());
         }
-        for entry in list(object.get("domain_suffix")) {
+        for entry in take_list(object.remove("domain_suffix")) {
             if entry.starts_with('.') {
                 self.dot_suffixes.push(entry.into_boxed_str());
             } else if !entry.is_empty() {
                 self.suffixes.insert(entry.into_boxed_str());
             }
         }
-        self.keywords_raw.extend(list(object.get("domain_keyword")));
+        self.keywords_raw
+            .extend(take_list(object.remove("domain_keyword")));
 
-        for entry in list(object.get("ip_cidr")) {
+        for entry in take_list(object.remove("ip_cidr")) {
             insert_prefix(&mut self.dest_v4, &mut self.dest_v6, &entry);
         }
-        for entry in list(object.get("source_ip_cidr")) {
+        for entry in take_list(object.remove("source_ip_cidr")) {
             insert_prefix(&mut self.source_v4, &mut self.source_v6, &entry);
         }
 
         self.dest_ports.extend(ports(object.get("port")));
         self.dest_port_ranges
             .0
-            .extend(parse_ranges(list(object.get("port_range"))));
+            .extend(parse_ranges(take_list(object.remove("port_range"))));
         self.source_ports.extend(ports(object.get("source_port")));
         self.source_port_ranges
             .0
-            .extend(parse_ranges(list(object.get("source_port_range"))));
+            .extend(parse_ranges(take_list(object.remove("source_port_range"))));
 
-        for entry in list(object.get("network")) {
+        for entry in take_list(object.remove("network")) {
             if !self.networks.iter().any(|known| **known == *entry) {
                 self.networks.push(entry.into_boxed_str());
             }
@@ -748,10 +744,9 @@ fn insert_prefix(v4: &mut PrefixSet<u32>, v6: &mut PrefixSet<u128>, prefix: &str
 }
 
 /// `port_range_contains` acceptance rules, applied once instead of per lookup.
-fn parse_ranges(entries: Vec<String>) -> Vec<(u16, u16)> {
+fn parse_ranges(entries: impl Iterator<Item = String>) -> Vec<(u16, u16)> {
     entries
-        .iter()
-        .filter_map(|entry| super::rule_set::parse_port_range(entry))
+        .filter_map(|entry| super::rule_set::parse_port_range(&entry))
         .collect()
 }
 

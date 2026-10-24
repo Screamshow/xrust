@@ -555,6 +555,8 @@ pub(crate) fn build_rule_sets(
                     )));
                 } else {
                     let rules = parse_rule_set_payload(&data, entry, &at)?;
+                    // the file is not needed once decoded
+                    drop(data);
                     if use_mmap {
                         let mut compiler = mmap_set::RuleSetCompiler::new();
                         let tsrs_bytes = compiler.compile(&rules)?;
@@ -725,11 +727,7 @@ fn parse_rule_set_payload(
     let text = std::str::from_utf8(data).map_err(|_| anyhow::anyhow!("{at}: not utf-8"))?;
     let value: Value =
         serde_json::from_str(text).map_err(|err| anyhow::anyhow!("{at}: parse source: {err}"))?;
-    Ok(value
-        .get("rules")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default())
+    Ok(rule_set::source_rules(value))
 }
 
 const ROUTE_UNIMPL_FIELDS: &[&str] = &[

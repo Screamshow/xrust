@@ -670,3 +670,84 @@ async fn discord_packet_routes_to_proxy_and_fallback_overwrites_sniff_metadata()
         }
     }
 }
+
+/// The SRS load path: decode the container and compile the decoded rules
+/// (which `RuleSet::new` consumes). The set must answer what the
+/// interpreter answers on a kept copy of the same decoded rules.
+fn assert_srs_agrees(srs: &[u8], extra: &[ConnContext]) {
+    let rules = core_config::srs::read(srs).expect("decode srs");
+    let set = RuleSet::new(vec!["srs".into()], rules.clone());
+    assert_eq!(set.rule_count(), rules.len());
+    for ctx in contexts().iter().chain(extra) {
+        assert_eq!(
+            set.matches(ctx),
+            rules.iter().any(|rule| match_rule(rule, ctx)),
+            "srs set disagrees on {:?} {:?} {:?}",
+            ctx.destination,
+            ctx.network,
+            ctx.source
+        );
+    }
+}
+
+#[test]
+fn srs_decoded_set_agrees_with_the_interpreter() {
+    let source = json!({"version": 3, "rules": [
+        {"domain": ["a.com", "exact.org"], "domain_suffix": ["example.com", ".com", "a.com"]},
+        {"domain_suffix": ["cdn.example.net"]},
+        {"domain_keyword": ["ads", "tracker"]},
+        {"domain_regex": ["^re[0-9]+\\.test$"]},
+        {"ip_cidr": ["10.0.0.0/8", "192.168.1.0/24", "2001:db8::/32"]},
+        {"source_ip_cidr": ["10.0.0.0/8"]},
+        {"port": [80, 443]},
+        {"port_range": ["8000:9000"]},
+        {"source_port": [1234]},
+        {"source_port_range": ["1000:2000"]},
+        {"network": ["udp"]},
+        {"domain": ["multi.com"], "port": [443], "network": ["tcp"]},
+        {"invert": true, "domain": ["inverted.com"], "domain_suffix": ["inv.net"]},
+        {"type": "logical", "mode": "or", "rules": [
+            {"domain": ["logical-or.com"]},
+            {"port": [8080]}
+        ]},
+        {"type": "logical", "mode": "and", "invert": true, "rules": [
+            {"domain_suffix": ["nested.com"]},
+            {"type": "logical", "mode": "or", "rules": [
+                {"port": [8443]},
+                {"invert": true, "ip_cidr": ["203.0.113.0/24"]}
+            ]}
+        ]}
+    ]});
+    let srs = core_config::srs::compile(&source, 3).expect("compile srs");
+    let extra: Vec<ConnContext> = [
+        "exact.org",
+        "x.exact.org",
+        "cdn.example.net",
+        "a.cdn.example.net",
+        "example.net",
+        "re42.test",
+        "inv.net",
+        "x.inv.net",
+        "nested.com",
+        "a.nested.com",
+    ]
+    .iter()
+    .flat_map(|host| {
+        [
+            context(Some(host), None, 443, "10.0.0.2:1234", "tcp"),
+            context(Some(host), None, 8443, "203.0.113.5:1500", "udp"),
+        ]
+    })
+    .collect();
+    assert_srs_agrees(&srs, &extra);
+}
+
+#[test]
+fn srs_golden_file_agrees_with_the_interpreter() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/golden/rule-set/local.srs"
+    );
+    let srs = std::fs::read(path).expect("golden local.srs");
+    assert_srs_agrees(&srs, &[]);
+}

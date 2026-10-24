@@ -650,10 +650,11 @@ fn read_domain_matcher(
     };
     let mut domains: Vec<String> = Vec::new();
     let mut prefixes: Vec<String> = Vec::new();
-    for key in set.keys(&mut reader.budget)? {
-        let key = reverse_domain(&key);
+    // each key is classified as the walk yields it; the keys are not collected first
+    set.keys(&mut reader.budget, |key| {
+        let key = reverse_domain(key);
         let Some(label) = key.as_bytes().first().copied() else {
-            continue;
+            return;
         };
         match label {
             PREFIX_LABEL => {
@@ -664,7 +665,7 @@ fn read_domain_matcher(
                     if domains.contains(&root) {
                         domains.retain(|domain| *domain != root);
                         prefixes.push(root);
-                        continue;
+                        return;
                     }
                 }
                 prefixes.push(raw);
@@ -672,7 +673,11 @@ fn read_domain_matcher(
             ROOT_LABEL => prefixes.push(key[1..].to_string()),
             _ => domains.push(key),
         }
-    }
+    })?;
+    drop(set);
+    // the lists are converted below; spare capacity would sit next to that copy
+    domains.shrink_to_fit();
+    prefixes.shrink_to_fit();
     domains.sort();
     prefixes.sort();
     Ok((
@@ -755,15 +760,15 @@ impl SuccinctSet {
 
     /// `succinctSet.keys()`: walk the set back into its keys. The walk keeps
     /// its own stack: a crafted trie can be one chain as deep as the payload.
-    fn keys(&self, budget: &mut Budget) -> Result<Vec<String>, String> {
+    /// Each key goes to `emit` in walk order.
+    fn keys(&self, budget: &mut Budget, mut emit: impl FnMut(&str)) -> Result<(), String> {
         struct Frame {
             node_id: usize,
             cursor: usize,
         }
         let inconsistent = || "invalid domain matcher: inconsistent succinct set".to_string();
-        let mut result = Vec::new();
         let mut current: Vec<u8> = Vec::new();
-        self.emit_leaf(0, &current, &mut result, budget)?;
+        self.emit_leaf(0, &current, &mut emit, budget)?;
         let mut stack = vec![Frame {
             node_id: 0,
             cursor: 0,
@@ -788,7 +793,7 @@ impl SuccinctSet {
                     ));
                 }
                 current.push(label);
-                self.emit_leaf(next_node, &current, &mut result, budget)?;
+                self.emit_leaf(next_node, &current, &mut emit, budget)?;
                 stack.push(Frame {
                     node_id: next_node,
                     cursor: index + 1,
@@ -802,20 +807,20 @@ impl SuccinctSet {
                 parent.cursor += 1;
             }
         }
-        Ok(result)
+        Ok(())
     }
 
     fn emit_leaf(
         &self,
         node_id: usize,
         current: &[u8],
-        result: &mut Vec<String>,
+        emit: &mut impl FnMut(&str),
         budget: &mut Budget,
     ) -> Result<(), String> {
         if get_bit(&self.leaves, node_id) != 0 {
-            let key = String::from_utf8_lossy(current).to_string();
+            let key = String::from_utf8_lossy(current);
             budget.charge(key.len())?;
-            result.push(key);
+            emit(&key);
         }
         Ok(())
     }
@@ -1091,7 +1096,10 @@ fn network_type_code(name: &str) -> Result<u8, String> {
 }
 
 fn reverse_domain(domain: &str) -> String {
-    domain.chars().rev().collect()
+    // exact capacity: these strings are kept as decoded rule values
+    let mut reversed = String::with_capacity(domain.len());
+    reversed.extend(domain.chars().rev());
+    reversed
 }
 
 // ------------------------------------------------------------------ codecs

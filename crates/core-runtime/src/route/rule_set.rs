@@ -38,7 +38,7 @@ struct RuleSetBody {
 impl RuleSet {
     pub fn new(tags: Vec<String>, rules: Vec<Value>) -> Self {
         let count = rules.len();
-        let (index, fallbacks) = RuleSetIndex::compile(&rules);
+        let (index, fallbacks) = RuleSetIndex::compile(rules);
         Self {
             tags,
             body: RwLock::new(RuleSetBody {
@@ -102,7 +102,7 @@ impl RuleSet {
     /// matching connection behind an HTTP update.
     pub fn replace_rules(&self, rules: Vec<Value>) {
         let count = rules.len();
-        let (index, fallbacks) = RuleSetIndex::compile(&rules);
+        let (index, fallbacks) = RuleSetIndex::compile(rules);
         let body = RuleSetBody {
             index,
             fallbacks,
@@ -389,6 +389,29 @@ pub(crate) fn list(value: Option<&Value>) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// The `rules` array of a source rule-set, moved out rather than cloned.
+pub(crate) fn source_rules(mut source: Value) -> Vec<Value> {
+    match source.get_mut("rules").map(Value::take) {
+        Some(Value::Array(rules)) => rules,
+        _ => Vec::new(),
+    }
+}
+
+/// `list`, taking the value: the strings are moved out, not cloned.
+pub(crate) fn take_list(value: Option<Value>) -> impl Iterator<Item = String> {
+    let (single, items) = match value {
+        Some(Value::String(text)) => (Some(text), Vec::new()),
+        Some(Value::Array(items)) => (None, items),
+        _ => (None, Vec::new()),
+    };
+    single
+        .into_iter()
+        .chain(items.into_iter().filter_map(|item| match item {
+            Value::String(text) => Some(text),
+            _ => None,
+        }))
 }
 
 fn prefix_contains(prefix: &str, address: std::net::IpAddr) -> bool {
