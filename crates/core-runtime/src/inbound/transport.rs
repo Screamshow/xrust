@@ -19,8 +19,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
 use serde_json::Value;
@@ -692,6 +693,7 @@ impl XhttpH2Accept {
                         let protocol = Box::new(XhttpStream {
                             inner: xhttp_bridge(up_rx, down_tx),
                             listed: Some((Arc::clone(&self.transport.sessions), sid.clone())),
+                            session: Arc::clone(&session),
                         }) as AnyStream;
                         table.insert(sid, Arc::clone(&session));
                         (session, Some(protocol))
@@ -748,10 +750,13 @@ async fn xhttp_h2_download_task(
     mut down: mpsc::Receiver<Vec<u8>>,
     session: Arc<XhttpSession>,
 ) {
-    let _ = async {
+    let ended = async {
         loop {
             let chunk = tokio::select! {
-                _ = std::future::poll_fn(|cx|send.poll_reset(cx)) => break,
+                // the client reset the GET: the session has nowhere to go
+                _ = std::future::poll_fn(|cx|send.poll_reset(cx)) => {
+                    return Err(io::Error::other("xhttp: h2 download reset"));
+                }
                 chunk = down.recv() => match chunk {Some(chunk)=>chunk,None=>break},
             };
             let mut chunk = Bytes::from(chunk);
@@ -772,7 +777,11 @@ async fn xhttp_h2_download_task(
         send.send_data(Bytes::new(), true).map_err(io::Error::other)
     }
     .await;
-    session.close_up();
+    if ended.is_err() {
+        session.cancel();
+    } else {
+        session.close_up();
+    }
 }
 
 async fn xhttp_h2_upload_task(
@@ -990,6 +999,11 @@ struct XhttpSession {
     /// handed to the download (or stream-one) connection when it takes the
     /// session; a second one finds it already taken.
     down: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    /// Set when the download went away before the session ended it: the
+    /// client cancelled its GET or its connection died. Nothing can reach
+    /// the client any more, so the protocol's reads and writes fail instead
+    /// of seeing a half-close.
+    cancelled: AtomicBool,
 }
 
 impl XhttpSession {
@@ -1002,6 +1016,7 @@ impl XhttpSession {
             Arc::new(Self {
                 up: Mutex::new(Some(up_tx)),
                 down: Mutex::new(Some(down_rx)),
+                cancelled: AtomicBool::new(false),
             }),
             up_rx,
             down_tx,
@@ -1025,6 +1040,16 @@ impl XhttpSession {
         *self.up.lock().expect("xhttp session poisoned") = None;
     }
 
+    /// The download is gone: end the session for the protocol as well.
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.close_up();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
     fn take_down(&self) -> Option<mpsc::Receiver<Vec<u8>>> {
         self.down.lock().expect("xhttp session poisoned").take()
     }
@@ -1038,6 +1063,14 @@ struct XhttpStream {
     /// the table entry to drop when this ends. `None` for a session nothing
     /// can attach to (stream-one), which never enters the table.
     listed: Option<(SessionTable, String)>,
+    session: Arc<XhttpSession>,
+}
+
+fn download_cancelled() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::ConnectionAborted,
+        "xhttp: the client cancelled the download",
+    )
 }
 
 impl AsyncRead for XhttpStream {
@@ -1046,7 +1079,13 @@ impl AsyncRead for XhttpStream {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, out)
+        let before = out.filled().len();
+        ready!(Pin::new(&mut self.inner).poll_read(cx, out))?;
+        // EOF on a cancelled session is not the client's half-close
+        if out.filled().len() == before && self.session.is_cancelled() {
+            return Poll::Ready(Err(download_cancelled()));
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -1056,6 +1095,9 @@ impl AsyncWrite for XhttpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if self.session.is_cancelled() {
+            return Poll::Ready(Err(download_cancelled()));
+        }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
@@ -1126,18 +1168,58 @@ impl Transport {
             (_, None) if segments.is_empty() => {
                 let (session, up_rx, down_tx) = XhttpSession::new();
                 let protocol_end = xhttp_bridge(up_rx, down_tx);
-                tokio::spawn(xhttp_stream_one_task(stream, pending, headers, session));
+                tokio::spawn(xhttp_stream_one_task(
+                    stream,
+                    pending,
+                    headers,
+                    Arc::clone(&session),
+                ));
                 // never listed: a stream-one session lives on this one
                 // connection and nothing can attach to it
                 Ok(Box::new(XhttpStream {
                     inner: protocol_end,
                     listed: None,
+                    session,
                 }))
             }
             // an upload: attach to the session, or birth it when the client
             // sent its POST before its GET
             (_, Some(sid)) => self.xhttp_upload(stream, pending, headers, sid).await,
             _ => xhttp_reject(stream, format!("no XHTTP session at {path:?}")).await,
+        }
+    }
+
+    /// The session id a request names, when its path is under this
+    /// listener's.
+    fn request_session_id(&self, target: &str, headers: &[(String, String)]) -> Option<String> {
+        let (path, query) = match target.split_once('?') {
+            Some((path, query)) => (path, Some(query)),
+            None => (target, None),
+        };
+        let rest = path
+            .strip_prefix(self.path.as_str())
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'))?;
+        let trimmed = rest.trim_matches('/');
+        let segments: Vec<&str> = if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            trimmed.split('/').collect()
+        };
+        self.session_id(&segments, query, headers)
+    }
+
+    /// The live session `sid`. A request on a reused upload connection can
+    /// beat its session's download to the table, so wait for it briefly.
+    async fn find_session(&self, sid: &str) -> Option<Arc<XhttpSession>> {
+        let deadline = tokio::time::Instant::now() + REUSED_UPLOAD_WAIT;
+        loop {
+            if let Some(session) = self.sessions.lock().expect("xhttp table poisoned").get(sid) {
+                return Some(Arc::clone(session));
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
@@ -1191,10 +1273,11 @@ impl Transport {
         let bridge = xhttp_bridge(up_rx, down_tx);
         table.insert(sid.clone(), Arc::clone(&session));
         drop(table);
-        tokio::spawn(xhttp_download_task(conn, session));
+        tokio::spawn(xhttp_download_task(conn, Arc::clone(&session)));
         Ok(Box::new(XhttpStream {
             inner: bridge,
             listed: Some((Arc::clone(&self.sessions), sid)),
+            session,
         }))
     }
 
@@ -1213,7 +1296,13 @@ impl Transport {
         if let Some(existing) = table.get(&sid) {
             let session = Arc::clone(existing);
             drop(table);
-            tokio::spawn(xhttp_upload_task(conn, pending, headers, session));
+            tokio::spawn(xhttp_upload_task(
+                conn,
+                pending,
+                headers,
+                session,
+                self.clone(),
+            ));
             // the tunnel lives on the connection that returned the stream;
             // this one only carries bytes into it
             anyhow::bail!("xhttp: an upload attached to session {sid:?}");
@@ -1222,10 +1311,17 @@ impl Transport {
         let bridge = xhttp_bridge(up_rx, down_tx);
         table.insert(sid.clone(), Arc::clone(&session));
         drop(table);
-        tokio::spawn(xhttp_upload_task(conn, pending, headers, session));
+        tokio::spawn(xhttp_upload_task(
+            conn,
+            pending,
+            headers,
+            Arc::clone(&session),
+            self.clone(),
+        ));
         Ok(Box::new(XhttpStream {
             inner: bridge,
             listed: Some((Arc::clone(&self.sessions), sid)),
+            session,
         }))
     }
 }
@@ -1302,44 +1398,53 @@ async fn xhttp_download_task(conn: AnyStream, session: Arc<XhttpSession>) {
         return;
     };
     let (mut rd, mut wr) = tokio::io::split(conn);
-    if wr.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.is_err() {
-        session.close_up();
+    if wr.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.is_err() || wr.flush().await.is_err() {
+        session.cancel();
         return;
     }
-    if wr.flush().await.is_err() {
-        session.close_up();
-        return;
-    }
-    tokio::select! {
-        _ = async {
+    // `true` when the client side ended the download rather than the session
+    let cancelled = tokio::select! {
+        cancelled = async {
             while let Some(chunk) = down.recv().await {
                 if wr.write_all(&chunk).await.is_err() || wr.flush().await.is_err() {
-                    break;
+                    return true;
                 }
             }
             let _ = wr.shutdown().await;
-        } => {}
+            false
+        } => cancelled,
         _ = async {
             // the client should send nothing on a download connection; what
             // it does send is stray, and the EOF at the end is the session's
             // lifeline ending
             let mut scratch = [0u8; 1];
             while let Ok(n) = rd.read(&mut scratch).await && n > 0 {}
-        } => {}
-    }
+        } => true,
+    };
     drop(down);
-    session.close_up();
+    if cancelled {
+        session.cancel();
+    } else {
+        session.close_up();
+    }
     let _ = wr.shutdown().await;
 }
 
+/// How long a request on a reused upload connection waits for the session it
+/// names to appear.
+const REUSED_UPLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// One upload connection's life: answer, deliver the body, answer the next
 /// request, until the connection closes. A pooled packet-up connection ends
-/// like this every time the reference closes it, which is not an error.
+/// like this every time the reference closes it, which is not an error. A
+/// pooled connection is shared by every session of the client, so each
+/// request is delivered to the session it names, not the first one.
 async fn xhttp_upload_task(
     mut conn: AnyStream,
     mut pending: Vec<u8>,
     mut headers: Vec<(String, String)>,
-    session: Arc<XhttpSession>,
+    mut session: Arc<XhttpSession>,
+    transport: Transport,
 ) {
     loop {
         let framing = match request_framing(&headers) {
@@ -1374,7 +1479,24 @@ async fn xhttp_upload_task(
                     None => return,
                 };
                 match parse_head(&head[..end]) {
-                    Ok((_method, _target, parsed)) => headers = parsed,
+                    Ok((_method, target, parsed)) => {
+                        let found = match transport.request_session_id(&target, &parsed) {
+                            Some(sid) => transport.find_session(&sid).await,
+                            None => None,
+                        };
+                        let Some(found) = found else {
+                            crate::logging::debug(format_args!(
+                                "xhttp upload: no session for {target:?}"
+                            ));
+                            let _ = conn
+                                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                            let _ = conn.flush().await;
+                            return;
+                        };
+                        session = found;
+                        headers = parsed;
+                    }
                     Err(err) => {
                         crate::logging::debug(format_args!("xhttp upload: {err}"));
                         return;
@@ -2051,5 +2173,104 @@ mod tests {
         drop(recv);
         drop(send_request);
         let _ = accept_task.await;
+    }
+    fn xhttp_transport() -> Transport {
+        let obj = serde_json::json!({"transport": {"type": "xhttp", "path": "/bench"}});
+        Transport::from_inbound(&obj, "inbounds[0]")
+            .expect("read")
+            .expect("present")
+    }
+
+    /// Open a download GET for `sid` and return the protocol's stream with
+    /// the client end of the GET connection, past its response head.
+    async fn xhttp_download_session(
+        t: &Transport,
+        sid: &str,
+    ) -> (AnyStream, tokio::io::DuplexStream) {
+        let (mut client, server) = tokio::io::duplex(1 << 16);
+        client
+            .write_all(format!("GET /bench/{sid} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let stream = match t.accept(Box::new(server)).await.expect("accept") {
+            Accepted::Once(stream) => stream,
+            _ => panic!("expected Accepted::Once"),
+        };
+        let mut head = [0u8; 19];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(&head, b"HTTP/1.1 200 OK\r\n\r\n");
+        (stream, client)
+    }
+
+    /// A client that cancels its download (closes the GET connection) ends
+    /// the session: the protocol's read fails rather than looking like a
+    /// half-close, so its relay stops instead of waiting on the upstream,
+    /// and the session leaves the table.
+    #[tokio::test]
+    async fn a_cancelled_xhttp_download_fails_the_protocol_and_frees_the_session() {
+        let t = xhttp_transport();
+        let (mut stream, get) = xhttp_download_session(&t, "s1").await;
+        assert_eq!(t.sessions.lock().unwrap().len(), 1);
+        drop(get);
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("the protocol never heard of the cancel");
+        let err = read.expect_err("a cancelled session is not a clean EOF");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(stream.write_all(b"late").await.is_err());
+        drop(stream);
+        assert!(t.sessions.lock().unwrap().is_empty());
+    }
+
+    /// The download finishing on the session's own terms is not a cancel:
+    /// the protocol shut its write side down, and its read side still works.
+    #[tokio::test]
+    async fn a_finished_xhttp_download_is_not_a_cancel() {
+        let t = xhttp_transport();
+        let (mut stream, mut get) = xhttp_download_session(&t, "s1").await;
+        stream.write_all(b"bye").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut body = Vec::new();
+        get.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"bye");
+        let mut buf = [0u8; 8];
+        let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("read");
+        assert_eq!(read.expect("a finished download is a clean EOF"), 0);
+    }
+
+    /// A pooled keep-alive upload connection carries packets of different
+    /// sessions; each request goes to the session it names.
+    #[tokio::test]
+    async fn a_reused_upload_connection_feeds_the_session_each_request_names() {
+        let t = xhttp_transport();
+        let (mut a, _get_a) = xhttp_download_session(&t, "sa").await;
+        let (mut b, _get_b) = xhttp_download_session(&t, "sb").await;
+        let (mut up, server) = tokio::io::duplex(1 << 16);
+        up.write_all(b"POST /bench/sa/0 HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\na0")
+            .await
+            .unwrap();
+        // an upload that attaches hands out no stream of its own
+        assert!(t.accept(Box::new(server)).await.is_err());
+        let mut got = [0u8; 2];
+        a.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"a0");
+        up.write_all(b"POST /bench/sb/0 HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\nb0")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), b.read_exact(&mut got))
+            .await
+            .expect("the second session never got its packet")
+            .unwrap();
+        assert_eq!(&got, b"b0");
+        // ...and none of it went to the first one
+        let mut extra = [0u8; 2];
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), a.read(&mut extra))
+                .await
+                .is_err()
+        );
     }
 }

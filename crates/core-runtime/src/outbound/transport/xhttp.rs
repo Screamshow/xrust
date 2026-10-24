@@ -35,6 +35,29 @@ use crate::inbound::AnyStream;
 pub(crate) type Dialer =
     dyn Fn() -> Pin<Box<dyn Future<Output = io::Result<AnyStream>> + Send>> + Send + Sync;
 
+/// How long a packet-up session may go without download traffic once the
+/// local side has half-closed it. Packet-up cannot tell the server that the
+/// upload ended, so an upstream that waits for EOF never answers and never
+/// closes; without a limit the session, its download request and the local
+/// socket live until the server gives up. Every download chunk restarts the
+/// limit, so a response that keeps moving is read to its end. Xray ends the
+/// same case with its `downlinkOnly` policy timer (5 s by default); this is
+/// twice that. `TACHYON_XHTTP_HALF_CLOSE_IDLE_MS` overrides it.
+const HALF_CLOSE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn half_close_idle() -> std::time::Duration {
+    static IDLE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *IDLE.get_or_init(|| {
+        if let Ok(val) = std::env::var("TACHYON_XHTTP_HALF_CLOSE_IDLE_MS")
+            && let Ok(ms) = val.parse::<u64>()
+            && ms > 0
+        {
+            return std::time::Duration::from_millis(ms);
+        }
+        HALF_CLOSE_IDLE
+    })
+}
+
 /// Hop-by-hop headers: connection-scoped in HTTP/2 and HTTP/1.1 alike, so none
 /// of them may be copied from the config onto the wire.
 const HOP_BY_HOP: &[&str] = &[
@@ -510,6 +533,8 @@ pub(crate) struct XhttpConfig {
     /// transport
     pool: std::sync::Arc<super::xmux::Pool>,
     h2_pool: std::sync::Arc<H2Pool>,
+    /// see [`HALF_CLOSE_IDLE`]
+    half_close_idle: std::time::Duration,
 }
 
 impl XhttpConfig {
@@ -561,6 +586,7 @@ impl XhttpConfig {
                 "v2ray-xhttp.xmux",
             )?),
             h2_pool: std::sync::Arc::new(H2Pool::new()),
+            half_close_idle: half_close_idle(),
         })
     }
 }
@@ -1246,6 +1272,40 @@ struct SplitConn {
     ack_task: Option<tokio::task::JoinHandle<()>>,
     up: Up,
     session_id: String,
+    /// Armed when a packet-up upload is shut down; see [`HALF_CLOSE_IDLE`].
+    half_closed: Option<HalfClosed>,
+    half_close_limit: std::time::Duration,
+}
+
+/// The idle limit of a half-closed packet-up session. The timer is re-armed
+/// lazily from `last_rx` when it fires, not on every chunk.
+struct HalfClosed {
+    timer: Pin<Box<tokio::time::Sleep>>,
+    last_rx: tokio::time::Instant,
+    limit: std::time::Duration,
+}
+
+impl HalfClosed {
+    fn new(limit: std::time::Duration) -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            timer: Box::pin(tokio::time::sleep_until(now + limit)),
+            last_rx: now,
+            limit,
+        }
+    }
+
+    /// Ready once `limit` has passed with no download traffic.
+    fn poll_expired(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            ready!(self.timer.as_mut().poll(cx));
+            let due = self.last_rx + self.limit;
+            if due <= tokio::time::Instant::now() {
+                return Poll::Ready(());
+            }
+            self.timer.as_mut().reset(due);
+        }
+    }
 }
 
 /// One packet-up upload stream: pipe into background upload worker.
@@ -1277,7 +1337,24 @@ impl SplitConn {
             ack_task: None,
             up: Up::None,
             session_id,
+            half_closed: None,
+            half_close_limit: cfg.half_close_idle,
         }
+    }
+
+    /// End the whole session: cancel the download request (an HTTP/1.1
+    /// download connection is closed, an HTTP/2 stream is reset) and stop
+    /// the upload. Reads see EOF from here on.
+    fn finish(&mut self) {
+        self.dl_task.abort();
+        if let Some(ack) = self.ack_task.take() {
+            ack.abort();
+        }
+        if let Up::Packets(state) = &mut self.up {
+            state.task.abort();
+        }
+        self.dl.close();
+        self.half_closed = None;
     }
 
     /// Read GET headers concurrently with upload; a server may await the
@@ -1472,10 +1549,27 @@ impl AsyncRead for XhttpConn {
                 let _ = split.pending.split_to(n);
                 return Poll::Ready(Ok(()));
             }
-            match ready!(split.dl.poll_recv(cx)) {
-                Some(Ok(chunk)) => split.pending.extend_from_slice(&chunk),
-                Some(Err(e)) => return Poll::Ready(Err(e)),
-                None => return Poll::Ready(Ok(())), // EOF
+            match split.dl.poll_recv(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    if let Some(idle) = &mut split.half_closed {
+                        idle.last_rx = tokio::time::Instant::now();
+                    }
+                    split.pending.extend_from_slice(&chunk)
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())), // EOF
+                Poll::Pending => {
+                    let Some(idle) = &mut split.half_closed else {
+                        return Poll::Pending;
+                    };
+                    ready!(idle.poll_expired(cx));
+                    crate::logging::debug(format_args!(
+                        "xhttp: session {} half-closed and idle for {:?}, closing",
+                        split.session_id, idle.limit
+                    ));
+                    split.finish();
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
@@ -1590,6 +1684,11 @@ impl AsyncWrite for XhttpConn {
             }
             Up::Packets(state) => {
                 ready!(Pin::new(&mut state.io).poll_shutdown(cx))?;
+                // Nothing on the wire says the upload ended, so the download
+                // may never end by itself. Keep reading it while it moves.
+                if split.half_closed.is_none() {
+                    split.half_closed = Some(HalfClosed::new(split.half_close_limit));
+                }
             }
             Up::None => {}
         }
@@ -2771,6 +2870,239 @@ mod tests {
             assert!(p0.starts_with("/xhttp/"), "got {p0}");
             assert_eq!(b0, b"pingpong");
         }
+        drop(conn);
+        server.abort();
+    }
+
+    /// The half-close idle limit the tests below run with.
+    const TEST_IDLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// A plain HTTP/1.1 split peer for the half-close tests: the download
+    /// connection is handed back raw, every dialled upload connection is
+    /// served in the background (200 to each POST, bodies collected).
+    struct FakeSplit {
+        get_io: tokio::io::DuplexStream,
+        bodies: mpsc::UnboundedReceiver<Vec<u8>>,
+    }
+
+    async fn packet_up_over_fake_h1() -> (AnyStream, FakeSplit) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client_io, mut get_io) = tokio::io::duplex(1 << 16);
+        let (body_tx, bodies) = mpsc::unbounded_channel::<Vec<u8>>();
+        let dialer: std::sync::Arc<super::Dialer> = std::sync::Arc::new(move || {
+            let body_tx = body_tx.clone();
+            Box::pin(async move {
+                let (client, mut server) = tokio::io::duplex(1 << 16);
+                tokio::spawn(async move {
+                    loop {
+                        let mut raw = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !raw.ends_with(b"\r\n\r\n") {
+                            match server.read(&mut byte).await {
+                                Ok(1) => raw.push(byte[0]),
+                                _ => return,
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        let mut body = vec![0u8; len];
+                        if server.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        let _ = body_tx.send(body);
+                        if server
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+                Ok(Box::new(client) as AnyStream)
+            })
+        });
+        let mut c = cfg(json!({"mode": "packet-up", "path": "/xhttp"}));
+        c.half_close_idle = TEST_IDLE;
+        let conn = tokio::spawn(async move {
+            super::connect(Box::new(client_io), false, false, "srv", 443, &c, dialer).await
+        });
+        let _ = read_request_head(&mut get_io).await;
+        get_io
+            .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        let conn = conn.await.unwrap().expect("connect");
+        (conn, FakeSplit { get_io, bodies })
+    }
+
+    async fn send_chunk(io: &mut tokio::io::DuplexStream, data: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        let mut framed = format!("{:x}\r\n", data.len()).into_bytes();
+        framed.extend_from_slice(data);
+        framed.extend_from_slice(b"\r\n");
+        io.write_all(&framed).await.unwrap();
+    }
+
+    /// Half-close is not the end of the download: a response that starts
+    /// after the shutdown and takes longer than the idle limit in total, but
+    /// never pauses that long, is read to its end.
+    #[tokio::test]
+    async fn packet_up_half_close_still_reads_the_whole_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut conn, mut peer) = packet_up_over_fake_h1().await;
+        conn.write_all(b"request").await.unwrap();
+        conn.shutdown().await.expect("half-close");
+        assert_eq!(peer.bodies.recv().await.unwrap(), b"request");
+
+        let gap = TEST_IDLE / 3;
+        let server = tokio::spawn(async move {
+            for i in 0..5u8 {
+                tokio::time::sleep(gap).await;
+                send_chunk(&mut peer.get_io, &[b'0' + i]).await;
+            }
+            peer.get_io.write_all(b"0\r\n\r\n").await.unwrap();
+            peer.get_io
+        });
+        let mut got = Vec::new();
+        tokio::time::timeout(TEST_IDLE * 10, conn.read_to_end(&mut got))
+            .await
+            .expect("the response never ended")
+            .expect("read");
+        assert_eq!(got, b"01234");
+        drop(server.await.unwrap());
+    }
+
+    /// Half-closed and then nothing from the server for the idle limit: the
+    /// session ends, the read sees EOF and the download connection is
+    /// closed. Without the limit this waits for the server forever.
+    #[tokio::test]
+    async fn packet_up_half_close_with_a_silent_download_ends_the_session() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut conn, mut peer) = packet_up_over_fake_h1().await;
+        conn.write_all(b"request").await.unwrap();
+        conn.shutdown().await.expect("half-close");
+        assert_eq!(peer.bodies.recv().await.unwrap(), b"request");
+
+        let started = tokio::time::Instant::now();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut buf))
+            .await
+            .expect("a half-closed, silent session must end")
+            .expect("read");
+        assert_eq!(n, 0, "EOF");
+        assert!(started.elapsed() >= TEST_IDLE);
+        // the download GET is cancelled: its connection is closed
+        let mut rest = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            peer.get_io.read_to_end(&mut rest),
+        )
+        .await
+        .expect("the download connection stays open")
+        .expect("read GET connection");
+    }
+
+    /// Without a half-close there is no idle limit: a quiet tunnel is not a
+    /// finished one.
+    #[tokio::test]
+    async fn packet_up_without_half_close_has_no_idle_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut conn, mut peer) = packet_up_over_fake_h1().await;
+        conn.write_all(b"request").await.unwrap();
+        conn.flush().await.unwrap();
+        assert_eq!(peer.bodies.recv().await.unwrap(), b"request");
+        let mut buf = [0u8; 16];
+        assert!(
+            tokio::time::timeout(TEST_IDLE * 6, conn.read(&mut buf))
+                .await
+                .is_err(),
+            "an idle session that was not half-closed must stay up"
+        );
+        send_chunk(&mut peer.get_io, b"late").await;
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"late");
+    }
+
+    /// Dropping the connection object cancels the download GET.
+    #[tokio::test]
+    async fn dropping_a_packet_up_conn_closes_the_download() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut conn, mut peer) = packet_up_over_fake_h1().await;
+        conn.write_all(b"request").await.unwrap();
+        conn.flush().await.unwrap();
+        assert_eq!(peer.bodies.recv().await.unwrap(), b"request");
+        drop(conn);
+        let mut rest = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.get_io.read_to_end(&mut rest),
+        )
+        .await
+        .expect("the download connection outlives the session")
+        .expect("read GET connection");
+    }
+
+    /// Over HTTP/2 the cancelled download is a reset of the GET stream.
+    #[tokio::test]
+    async fn h2_packet_up_half_close_with_a_silent_download_resets_the_get() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let mut c = cfg(json!({"mode": "packet-up", "path": "/xhttp"}));
+        c.half_close_idle = TEST_IDLE;
+        let (reset_tx, mut reset_rx) = mpsc::unbounded_channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut h2_srv = crate::outbound::transport::h2io::server_builder()
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .expect("server h2 handshake");
+            while let Some(Ok((mut req, mut respond))) = h2_srv.accept().await {
+                let reset_tx = reset_tx.clone();
+                tokio::spawn(async move {
+                    if req.method() == http::Method::GET {
+                        let mut send = respond
+                            .send_response(
+                                http::Response::builder().status(200).body(()).unwrap(),
+                                false,
+                            )
+                            .unwrap();
+                        // silent: only a reset from the client ends this
+                        let _ = std::future::poll_fn(|cx| send.poll_reset(cx)).await;
+                        let _ = reset_tx.send(());
+                    } else {
+                        while let Some(Ok(chunk)) = req.body_mut().data().await {
+                            let _ = req.body_mut().flow_control().release_capacity(chunk.len());
+                        }
+                        let _ = respond.send_response(
+                            http::Response::builder().status(200).body(()).unwrap(),
+                            true,
+                        );
+                    }
+                });
+            }
+        });
+        let dialer: std::sync::Arc<super::Dialer> = std::sync::Arc::new(|| {
+            Box::pin(async { Err(io::Error::other("no h1 dial in h2 mode")) })
+        });
+        let mut conn = super::connect(Box::new(client_io), true, true, "srv", 443, &c, dialer)
+            .await
+            .expect("connect");
+        conn.write_all(b"request").await.unwrap();
+        conn.shutdown().await.expect("half-close");
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut buf))
+            .await
+            .expect("a half-closed, silent session must end")
+            .expect("read");
+        assert_eq!(n, 0);
+        tokio::time::timeout(std::time::Duration::from_secs(5), reset_rx.recv())
+            .await
+            .expect("the GET stream was never reset")
+            .expect("reset");
         drop(conn);
         server.abort();
     }
