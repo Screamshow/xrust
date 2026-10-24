@@ -127,22 +127,13 @@ impl RemoteRuleSet {
     }
 
     /// `None` when TSRS cannot keep these rules: the caller loads them into
-    /// memory, and an older `.tsrs` of this set is removed so a restart does
-    /// not restore it.
+    /// memory and, once that has succeeded, calls `remove_stale_tsrs`.
     fn compile_and_cache_mmap(
         &self,
         rules: &[Value],
         cache_path: &std::path::Path,
     ) -> io::Result<Option<crate::route::mmap_set::MmapRuleSet>> {
         if !crate::route::mmap_keeps(rules, &self.tags) {
-            if cache_path.exists() {
-                std::fs::remove_file(cache_path)?;
-                logging::info(format_args!(
-                    "removed mmap cache {} of rule-set {}",
-                    cache_path.display(),
-                    self.tag()
-                ));
-            }
             return Ok(None);
         }
         let mut compiler = crate::route::mmap_set::RuleSetCompiler::new();
@@ -161,6 +152,27 @@ impl RemoteRuleSet {
         crate::route::mmap_set::MmapRuleSet::open_with_mode(cache_path, self.spec.mode)
             .map(Some)
             .map_err(|e| io::Error::other(format!("open tsrs: {e}")))
+    }
+
+    /// After the set has moved from mmap to memory rules, drop its `.tsrs` so
+    /// a restart does not restore the old rules. Only call this once the new
+    /// rules are in place: a failed update must keep the working file.
+    fn remove_stale_tsrs(&self, cache_path: &std::path::Path) {
+        if !cache_path.exists() {
+            return;
+        }
+        match std::fs::remove_file(cache_path) {
+            Ok(()) => logging::info(format_args!(
+                "removed mmap cache {} of rule-set {}",
+                cache_path.display(),
+                self.tag()
+            )),
+            Err(error) => logging::warn(format_args!(
+                "remove mmap cache {} of rule-set {}: {error}",
+                cache_path.display(),
+                self.tag()
+            )),
+        }
     }
 
     /// `RemoteRuleSet.StartContext`: cache file, then initial path, then the
@@ -237,23 +249,29 @@ impl RemoteRuleSet {
                             drop(data);
                             match parsed {
                                 Ok(rules) => {
+                                    let mut leaves_mmap = false;
                                     #[allow(clippy::collapsible_if)]
                                     if use_mmap {
-                                        if let Ok(Some(mmap_set)) =
-                                            self.compile_and_cache_mmap(&rules, &tsrs_path)
-                                        {
-                                            self.set.replace_mmap(Arc::new(mmap_set));
-                                            loaded = true;
-                                            logging::info(format_args!(
-                                                "loaded rule-set {} (compiled to mmap) from {}",
-                                                self.tag(),
-                                                path
-                                            ));
+                                        match self.compile_and_cache_mmap(&rules, &tsrs_path) {
+                                            Ok(Some(mmap_set)) => {
+                                                self.set.replace_mmap(Arc::new(mmap_set));
+                                                loaded = true;
+                                                logging::info(format_args!(
+                                                    "loaded rule-set {} (compiled to mmap) from {}",
+                                                    self.tag(),
+                                                    path
+                                                ));
+                                            }
+                                            Ok(None) => leaves_mmap = true,
+                                            Err(_) => {}
                                         }
                                     }
                                     if !loaded {
                                         match self.set.replace_rules(rules) {
                                             Ok(()) => {
+                                                if leaves_mmap {
+                                                    self.remove_stale_tsrs(&tsrs_path);
+                                                }
                                                 loaded = true;
                                                 logging::info(format_args!(
                                                     "loaded rule-set {} from {}",
@@ -485,7 +503,12 @@ impl RemoteRuleSet {
                             rules.len()
                         ));
                     }
-                    Ok(None) => self.set.replace_rules(rules).map_err(io::Error::other)?,
+                    Ok(None) => {
+                        // compile the memory rules first: a failed update keeps
+                        // the current rules and the working TSRS file
+                        self.set.replace_rules(rules).map_err(io::Error::other)?;
+                        self.remove_stale_tsrs(&tsrs_path);
+                    }
                     Err(e) => {
                         logging::warn(format_args!(
                             "failed to compile mmap: {e}, falling back to memory rules"

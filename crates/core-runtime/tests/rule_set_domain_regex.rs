@@ -838,3 +838,67 @@ async fn remote_mmap_set_with_regex_stays_in_memory() {
     assert!(first.set.matches(&domain("foo.example", 443)));
     assert!(!first.set.matches(&domain("bar.test", 443)));
 }
+
+/// A remote mmap set whose next update cannot compile: the update fails,
+/// and the current rules, the working TSRS file and the update metadata
+/// stay as they were. A later good update still leaves mmap and removes
+/// the stale TSRS.
+#[tokio::test]
+async fn failed_move_from_mmap_to_memory_keeps_the_tsrs() {
+    let plain_rules = json!({"version": 3, "rules": [{"domain": ["plain.com"]}]});
+    let bad_rules = json!({"version": 3, "rules": [{"domain_regex": ["(unclosed"]}]});
+    let regex_rules = json!({"version": 3, "rules": [{"domain_regex": [REGEX]}]});
+    let (url, server) = serve_in_order(vec![
+        plain_rules.to_string().into_bytes(),
+        bad_rules.to_string().into_bytes(),
+        regex_rules.to_string().into_bytes(),
+    ])
+    .await;
+    let router = Router::new(&json!({
+        "log": {"level": "error"},
+        "outbounds": [{"type": "direct", "tag": "direct"}]
+    }))
+    .expect("router");
+    let tsrs = TempFile::new("failed-move.tsrs", b"");
+    let _ = std::fs::remove_file(&tsrs.0);
+
+    let mut remote = remote_set(url, &tsrs, None);
+    remote
+        .fetch(&router, true, None)
+        .await
+        .expect("plain fetch");
+    assert!(remote.set.mmap().is_some(), "plain set not mmapped");
+    let working = std::fs::read(&tsrs.0).expect("tsrs written");
+    let updated = remote.last_updated;
+    let etag = remote.etag.clone();
+
+    let error = remote
+        .fetch(&router, false, None)
+        .await
+        .expect_err("a bad regex must fail the update");
+    assert!(error.to_string().contains("domain_regex"), "{error}");
+    assert!(
+        remote.set.mmap().is_some(),
+        "the working mmap set was dropped"
+    );
+    assert!(remote.set.matches(&domain("plain.com", 443)));
+    assert!(!remote.set.matches(&domain("foo.example", 443)));
+    assert_eq!(
+        std::fs::read(&tsrs.0).ok().as_deref(),
+        Some(working.as_slice()),
+        "failed update deleted or changed the working TSRS cache"
+    );
+    assert_eq!(remote.last_updated, updated);
+    assert_eq!(remote.etag, etag);
+
+    // a good update that TSRS cannot hold still moves to memory
+    remote
+        .fetch(&router, false, None)
+        .await
+        .expect("regex fetch");
+    assert!(remote.set.mmap().is_none());
+    assert!(!tsrs.0.exists(), "stale TSRS left after moving to memory");
+    assert!(remote.set.matches(&domain("foo.example", 443)));
+    assert!(!remote.set.matches(&domain("plain.com", 443)));
+    server.abort();
+}
