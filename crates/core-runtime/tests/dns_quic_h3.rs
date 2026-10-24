@@ -22,6 +22,8 @@ type Seen = Arc<std::sync::Mutex<Option<String>>>;
 /// Build an A answer for a raw query, the way the test responders do.
 fn answer_to(raw: &[u8]) -> Vec<u8> {
     let query = Message::from_vec(raw).expect("parse query");
+    // the reference sends `Id = 0` for https / h3 / quic
+    assert_eq!(query.metadata.id, 0, "wire query id must be 0");
     codec::synth_address(&query, ANSWER.into(), 60).expect("encode answer")
 }
 
@@ -82,8 +84,8 @@ async fn spawn_quic(alpn: &'static [u8], mode: &'static str) -> (SocketAddr, See
                         return None;
                     }
                 };
-                if mode == "doq" {
-                    serve_doq(connection).await
+                if mode == "doq" || mode == "doq-forged" {
+                    serve_doq(connection, mode == "doq-forged").await
                 } else {
                     serve_h3(connection, seen).await
                 }
@@ -94,7 +96,8 @@ async fn spawn_quic(alpn: &'static [u8], mode: &'static str) -> (SocketAddr, See
 }
 
 /// DoQ: one bidi stream, two-octet length prefix, exactly as the client sends.
-async fn serve_doq(connection: quinn::Connection) -> Option<()> {
+/// `forged` answers a different name than the one asked.
+async fn serve_doq(connection: quinn::Connection, forged: bool) -> Option<()> {
     let (mut send, mut recv) = match connection.accept_bi().await {
         Ok(v) => v,
         Err(e) => {
@@ -112,7 +115,11 @@ async fn serve_doq(connection: quinn::Connection) -> Option<()> {
         eprintln!("doq server: read query: {e}");
         return None;
     }
-    let answer = answer_to(&query);
+    let mut answer = answer_to(&query);
+    if forged {
+        // first letter of the question name
+        answer[13] ^= 0x01;
+    }
     if let Err(e) = send.write_all(&(answer.len() as u16).to_be_bytes()).await {
         eprintln!("doq server: write len: {e}");
         return None;
@@ -195,9 +202,8 @@ async fn roundtrip(kind: &'static str, alpn: &'static [u8], mode: &'static str, 
     assert_eq!(message.queries.len(), 1, "question echoed");
     assert_eq!(message.answers.len(), 1, "one answer");
     assert_eq!(message.answers[0].data.to_string(), ANSWER.to_string());
-    // the responder echoes the id it saw on the wire, and the reference sends
-    // `Id = 0` for https / h3 / quic
-    assert_eq!(message.metadata.id, 0, "wire query id must be 0");
+    // the responder saw ID 0; the caller gets its own ID back
+    assert_eq!(message.metadata.id, 0x1234, "caller id restored");
     if mode == "h3" {
         let seen = seen.lock().expect("seen lock").clone().expect("h3 ran");
         assert_eq!(seen, "yes|application/dns-message", "headers on the wire");
@@ -220,4 +226,16 @@ async fn h3_transport_queries_a_local_server() {
         json!({PROBE: "yes", "content-type": "text/plain"}),
     )
     .await;
+}
+
+#[tokio::test]
+async fn doq_answer_to_another_question_is_refused() {
+    let (addr, _) = spawn_quic(b"doq", "doq-forged").await;
+    let server = client("quic", addr, json!(null));
+    let dialer = Dialer { router: None };
+    let query = codec::build_query(0x1234, "quic.test", RecordType::A).expect("query");
+    let error = exchange(&server, addr, &query, &dialer)
+        .await
+        .expect_err("an answer to another name must not be accepted");
+    assert!(error.to_string().contains("does not match"), "{error}");
 }

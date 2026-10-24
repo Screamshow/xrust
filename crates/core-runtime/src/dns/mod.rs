@@ -1302,10 +1302,10 @@ fn pick_address(addrs: Vec<IpAddr>, strategy: Strategy) -> Option<IpAddr> {
     order_addresses(addrs, strategy).into_iter().next()
 }
 
+/// The ID of an internal query. Unicast transports replace it on the wire
+/// (`transport::exchange`); it only has to be unpredictable for the rest.
 fn rand_id() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static COUNTER: AtomicU16 = AtomicU16::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+    transport::random_id().unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,7 +1405,12 @@ mod tests {
                 let query = codec::parse_message(&buf[..n]).unwrap();
                 let qtype = query.queries[0].query_type();
                 let response = if fail == Some(qtype) {
-                    vec![0] // malformed response fails promptly, without a timeout
+                    // a reply to this query that claims an answer it lacks:
+                    // it matches, then fails to decode, promptly
+                    let mut bad = buf[..n].to_vec();
+                    bad[2] |= 0x80;
+                    bad[7] = 1;
+                    bad
                 } else {
                     codec::synth_address(
                         &query,

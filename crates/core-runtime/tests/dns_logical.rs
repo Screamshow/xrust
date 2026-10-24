@@ -28,7 +28,10 @@ async fn logical_dns_rule_routes_by_composition() {
         let mut buf = [0u8; 512];
         while let Ok((n, from)) = listener.recv_from(&mut buf).await {
             counter.fetch_add(1, Ordering::SeqCst);
-            let _ = listener.send_to(&buf[..n], from).await;
+            // the query back as an empty reply: same ID and question, QR set
+            let mut reply = buf[..n].to_vec();
+            reply[2] |= 0x80;
+            let _ = listener.send_to(&reply, from).await;
         }
     });
 

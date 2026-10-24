@@ -625,7 +625,8 @@ async fn without_client_subnet_no_opt_is_added() {
 
     exchange_ok(&svc, &sent).await;
     let raw = seen.lock().expect("captured").clone();
-    assert_eq!(raw, sent, "the query goes out untouched");
+    // the transport puts its own random ID on the wire
+    assert_eq!(raw[2..], sent[2..], "the query goes out untouched");
 }
 
 #[tokio::test]

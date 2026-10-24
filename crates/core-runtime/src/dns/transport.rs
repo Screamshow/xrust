@@ -1119,12 +1119,26 @@ impl Dialer {
 }
 
 /// Run one query against a resolved server address.
+///
+/// Plain udp / tcp / tls go out under a fresh random ID; https / quic / h3
+/// send ID 0. The answer must be a reply to the same question (and to the
+/// same ID where one was sent), and it comes back with the caller's ID.
 pub async fn exchange(
     cfg: &ServerConfig,
     addr: SocketAddr,
     query: &[u8],
     dialer: &Dialer,
 ) -> io::Result<Vec<u8>> {
+    if query.len() < DNS_HEADER_LEN {
+        return Err(io::Error::other("dns: short query"));
+    }
+    let caller_id = [query[0], query[1]];
+    let check_id = matches!(cfg.kind, Kind::Udp | Kind::Tcp | Kind::Tls);
+    let mut wire = query.to_vec();
+    if check_id {
+        wire[..2].copy_from_slice(&random_id()?.to_be_bytes());
+    }
+    let query = wire.as_slice();
     let fut = async {
         match cfg.kind {
             // mdns has no server address: the router runs it before it gets here
@@ -1155,9 +1169,77 @@ pub async fn exchange(
             )),
         }
     };
-    tokio::time::timeout(cfg.timeout, fut)
+    let mut response = tokio::time::timeout(cfg.timeout, fut)
         .await
-        .map_err(|_| io::Error::other(format!("dns: timeout after {:?}", cfg.timeout)))?
+        .map_err(|_| io::Error::other(format!("dns: timeout after {:?}", cfg.timeout)))??;
+    // udp and tcp/tls already skip strangers; this gates the one-shot streams
+    if !response_matches(query, &response, check_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "dns: response does not match the query",
+        ));
+    }
+    response[..2].copy_from_slice(&caller_id);
+    Ok(response)
+}
+
+const DNS_HEADER_LEN: usize = 12;
+
+/// A random DNS ID for one upstream query.
+pub(crate) fn random_id() -> io::Result<u16> {
+    let mut id = [0u8; 2];
+    getrandom::fill(&mut id).map_err(|e| io::Error::other(format!("dns: rng: {e}")))?;
+    Ok(u16::from_be_bytes(id))
+}
+
+/// The first question of a message: wire name, type and class.
+fn first_question(msg: &[u8]) -> Option<(&[u8], u16, u16)> {
+    if msg.len() < DNS_HEADER_LEN || u16::from_be_bytes([msg[4], msg[5]]) == 0 {
+        return None;
+    }
+    let mut pos = DNS_HEADER_LEN;
+    loop {
+        let len = *msg.get(pos)? as usize;
+        pos += 1;
+        if len == 0 {
+            break;
+        }
+        // nothing precedes the first name, so a pointer here is bogus
+        if len > 63 {
+            return None;
+        }
+        pos += len;
+        if pos - DNS_HEADER_LEN > 255 {
+            return None;
+        }
+    }
+    let name = msg.get(DNS_HEADER_LEN..pos)?;
+    let tail = msg.get(pos..pos + 4)?;
+    Some((
+        name,
+        u16::from_be_bytes([tail[0], tail[1]]),
+        u16::from_be_bytes([tail[2], tail[3]]),
+    ))
+}
+
+/// Whether `response` is a reply to `query`: QR set, the same first question
+/// (name compared ASCII case-insensitively, so 0x20 randomisation passes) and,
+/// with `check_id`, the same ID.
+fn response_matches(query: &[u8], response: &[u8], check_id: bool) -> bool {
+    if response.len() < DNS_HEADER_LEN || response[2] & 0x80 == 0 {
+        return false;
+    }
+    if check_id && query.get(..2) != response.get(..2) {
+        return false;
+    }
+    match (first_question(query), first_question(response)) {
+        (Some((q_name, q_type, q_class)), Some((r_name, r_type, r_class))) => {
+            q_type == r_type && q_class == r_class && q_name.eq_ignore_ascii_case(r_name)
+        }
+        // a query without a readable question leaves only the ID to compare
+        (None, _) => true,
+        (Some(_), None) => false,
+    }
 }
 
 async fn exchange_udp(
@@ -1182,6 +1264,8 @@ async fn exchange_udp(
     let retransmit_interval = Duration::from_millis(1500);
     const MAX_UDP_RETRIES: usize = 2; // 1 initial + 2 retries = 3 attempts total (~4.5s)
     let mut retries = 0;
+    // a dropped datagram must not push the next retransmit back
+    let mut retransmit_at = tokio::time::Instant::now() + retransmit_interval;
     loop {
         let recv_fut = async {
             match socket.recv(&mut buf).await {
@@ -1193,8 +1277,17 @@ async fn exchange_udp(
                 Err(e) => Err(e),
             }
         };
-        match tokio::time::timeout(retransmit_interval, recv_fut).await {
+        match tokio::time::timeout_at(retransmit_at, recv_fut).await {
             Ok(Ok(n)) => {
+                // anyone who knows the port can send here: keep waiting for
+                // the reply to this ID and question
+                if !response_matches(query, &buf[..n], true) {
+                    crate::logging::debug(format_args!(
+                        "dns: dropped a udp datagram that does not answer the query to {:?}",
+                        cfg.tag
+                    ));
+                    continue;
+                }
                 buf.truncate(n);
                 return Ok(buf);
             }
@@ -1208,6 +1301,7 @@ async fn exchange_udp(
                     ));
                 }
                 let _ = send_query().await;
+                retransmit_at = tokio::time::Instant::now() + retransmit_interval;
             }
         }
     }
@@ -1224,12 +1318,18 @@ async fn exchange_stream(
     framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
     framed.extend_from_slice(query);
     stream.write_all(&framed).await?;
-    let mut len = [0u8; 2];
-    stream.read_exact(&mut len).await?;
-    let len = u16::from_be_bytes(len) as usize;
-    let mut resp = vec![0u8; len];
-    stream.read_exact(&mut resp).await?;
-    Ok(resp)
+    // skip messages that answer something else, as the reference multiplexer
+    // drops unknown IDs; the exchange timeout bounds the wait
+    loop {
+        let mut len = [0u8; 2];
+        stream.read_exact(&mut len).await?;
+        let len = u16::from_be_bytes(len) as usize;
+        let mut resp = vec![0u8; len];
+        stream.read_exact(&mut resp).await?;
+        if response_matches(query, &resp, true) {
+            return Ok(resp);
+        }
+    }
 }
 
 async fn exchange_doh(
@@ -1564,8 +1664,8 @@ async fn exchange_doq(
 }
 
 /// The DNS ID the reference sends over https / h3 / quic: always 0
-/// (`exMessage.Id = 0` in `dns/transport`); `exchange_inner` restamps the
-/// client's own ID on the response on the way out.
+/// (`exMessage.Id = 0` in `dns/transport`); [`exchange`] restamps the
+/// caller's own ID on the response on the way out.
 fn wire_query(query: &[u8]) -> Vec<u8> {
     let mut wire = query.to_vec();
     if wire.len() >= 2 {
@@ -1794,6 +1894,57 @@ mod tests {
         assert_eq!(cfg.doh_h2.lock().unwrap().as_ref().unwrap().id, new_id);
         old_server.abort();
         new_server.abort();
+    }
+
+    #[test]
+    fn response_matching_checks_reply_bit_id_and_question() {
+        let query =
+            crate::dns::codec::build_query(0x0102, "Ex.test", hickory_proto::rr::RecordType::A)
+                .unwrap();
+        let msg = crate::dns::codec::parse_message(&query).unwrap();
+        let reply =
+            crate::dns::codec::synth_address(&msg, "192.0.2.1".parse().unwrap(), 60).unwrap();
+        assert!(response_matches(&query, &reply, true));
+        let end = DNS_HEADER_LEN + 9; // \x02ex\x04test\x00
+
+        let mut upper = reply.clone();
+        upper[DNS_HEADER_LEN..end].make_ascii_uppercase();
+        assert!(response_matches(&query, &upper, true), "0x20 case");
+
+        let mut other_id = reply.clone();
+        other_id[1] ^= 1;
+        assert!(!response_matches(&query, &other_id, true));
+        assert!(response_matches(&query, &other_id, false), "id not checked");
+
+        // the query itself echoed back is not a reply
+        assert!(!response_matches(&query, &query, true));
+
+        let mut no_question = reply.clone();
+        no_question[4..6].copy_from_slice(&[0, 0]);
+        assert!(!response_matches(&query, &no_question, true));
+
+        let mut pointer = reply.clone();
+        pointer[DNS_HEADER_LEN] = 0xc0;
+        assert!(!response_matches(&query, &pointer, true));
+
+        assert!(
+            !response_matches(&query, &reply[..end + 3], true),
+            "cut short"
+        );
+        assert!(!response_matches(
+            &query,
+            &reply[..DNS_HEADER_LEN - 1],
+            false
+        ));
+    }
+
+    #[test]
+    fn random_ids_are_not_a_counter() {
+        let ids: Vec<u16> = (0..16).map(|_| random_id().unwrap()).collect();
+        assert!(
+            !ids.windows(2).all(|w| w[1] == w[0].wrapping_add(1)),
+            "{ids:?}"
+        );
     }
 
     #[test]
