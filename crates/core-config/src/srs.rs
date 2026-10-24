@@ -65,6 +65,11 @@ const MIN_RANGE_SIZE: usize = 10;
 const MIN_INTERFACE_ENTRY_SIZE: usize = 2;
 /// Initial capacity cap for vectors sized from the file.
 const MAX_PREALLOC: usize = 4096;
+/// Longest domain matcher key, which is also the depth of the trie walk.
+/// DNS names are at most 253 bytes; the bound keeps the walk's stack and
+/// key buffer small even when a crafted trie is one long chain with few
+/// leaves, which the decoded-size budget alone does not see.
+const MAX_DOMAIN_KEY_LEN: usize = 4096;
 
 /// Decoder limits; tests shrink them to probe the boundaries.
 #[derive(Clone, Copy)]
@@ -777,6 +782,11 @@ impl SuccinctSet {
                 let index = self
                     .select_ith_one(next_node.saturating_sub(1))
                     .ok_or_else(inconsistent)?;
+                if current.len() >= MAX_DOMAIN_KEY_LEN {
+                    return Err(format!(
+                        "invalid domain matcher: key longer than {MAX_DOMAIN_KEY_LEN} bytes"
+                    ));
+                }
                 current.push(label);
                 self.emit_leaf(next_node, &current, &mut result, budget)?;
                 stack.push(Frame {
@@ -1681,10 +1691,41 @@ mod tests {
     #[test]
     fn deep_trie_does_not_overflow_the_stack() {
         // one key is one chain of nodes; the walk used to recurse per node
+        // and then kept a stack frame per node
         let long = "a".repeat(200_000);
-        let compiled = compile(&json!({"rules": [{"domain": [long.clone()]}]}), 2).unwrap();
-        let rules = read(&compiled).expect("read");
-        assert_eq!(rules[0]["domain"], json!([long]));
+        let compiled = compile(&json!({"rules": [{"domain": [long]}]}), 2).unwrap();
+        let error = read(&compiled).unwrap_err();
+        assert!(error.contains("key longer than"), "{error}");
+    }
+
+    #[test]
+    fn domain_key_length_boundary() {
+        for (len, ok) in [(MAX_DOMAIN_KEY_LEN, true), (MAX_DOMAIN_KEY_LEN + 1, false)] {
+            let key = "a".repeat(len);
+            let compiled = compile(&json!({"rules": [{"domain": [key.clone()]}]}), 2).unwrap();
+            match read(&compiled) {
+                Ok(rules) => {
+                    assert!(ok, "{len}");
+                    assert_eq!(rules[0]["domain"], json!([key]));
+                }
+                Err(error) => {
+                    assert!(!ok, "{len}: {error}");
+                    assert!(error.contains("key longer than"), "{error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deep_trie_with_rare_leaves_is_rejected() {
+        // a 2M-node chain with a single leaf at the end: within the payload
+        // and decoded-size limits, but the walk would hold a frame and a key
+        // byte per node; it must stop at the key length bound instead
+        let deep = "b".repeat(2_000_000);
+        let compiled = compile(&json!({"rules": [{"domain": [deep, "a.example"]}]}), 2).unwrap();
+        assert!(compiled.len() < MAX_PAYLOAD_SIZE);
+        let error = read(&compiled).unwrap_err();
+        assert!(error.contains("key longer than"), "{error}");
     }
 
     #[test]
