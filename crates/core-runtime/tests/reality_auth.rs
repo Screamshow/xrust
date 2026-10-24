@@ -293,6 +293,37 @@ async fn a_reality_server_that_recognises_us_is_accepted() {
     }
 }
 
+/// Every browser profile reaches our REALITY server, with ECH GREASE drawn
+/// fresh in the sealed hello for chrome and firefox.
+#[tokio::test]
+async fn every_browser_profile_reaches_our_reality_server() {
+    for fingerprint in ["chrome", "firefox", "safari", "edge"] {
+        for _ in 0..3 {
+            let private = [7u8; 32];
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let upstream = listener.local_addr().unwrap();
+            let server = core_server(listener, reality_server_config(private));
+            let outbound = client(
+                &reality_public(&private),
+                SHORT_ID,
+                "example.com",
+                json!({"utls": {"enabled": true, "fingerprint": fingerprint}}),
+            );
+            let outcome = run_client(outbound, server, upstream).await;
+            assert!(
+                outcome.connected.is_ok(),
+                "{fingerprint}: {:?}",
+                outcome.connected
+            );
+            assert_eq!(
+                outcome.server_plaintext.as_deref(),
+                Some(USER_DATA),
+                "{fingerprint}: the data arrived"
+            );
+        }
+    }
+}
+
 /// A REALITY server that does not recognise us -- wrong key, wrong short id --
 /// does not answer as the node.
 #[tokio::test]

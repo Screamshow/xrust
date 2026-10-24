@@ -16,6 +16,7 @@ fn ext_id(e: &Ext) -> u16 {
         Ext::Sni => 0,
         Ext::Alpn => 0x10,
         Ext::KeyShare(_) => 0x33,
+        Ext::EchGrease(_) => 0xfe0d,
     }
 }
 

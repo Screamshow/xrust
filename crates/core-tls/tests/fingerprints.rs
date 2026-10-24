@@ -1,4 +1,5 @@
-//! Every vendored fingerprint rebuilds its own capture byte-for-byte.
+//! Every vendored fingerprint rebuilds its own capture byte-for-byte, apart
+//! from GREASE values and the GREASE ECH body, which is checked by structure.
 //!
 //! The captures are what the reference sent as a uTLS client
 //! (tests/spikes/clienthello/captures, taken on sing-box-lx 1.14.2-lx.3). A
@@ -8,7 +9,7 @@
 use std::path::PathBuf;
 
 use core_tls::fingerprints;
-use core_tls::hello::{build, parse_record};
+use core_tls::hello::{EchGrease, build, parse_record};
 
 fn capture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -75,8 +76,12 @@ fn every_table_rebuilds_its_capture() {
             None,
         )
         .expect("build");
+        let ech = template.extensions.iter().find_map(|e| match e {
+            core_tls::hello::Ext::EchGrease(ech) => Some(*ech),
+            _ => None,
+        });
         assert!(
-            same_except_grease(&rebuilt, &data),
+            same_except_grease(&rebuilt, &data, ech),
             "{name}: the rebuilt hello differs from the capture outside GREASE"
         );
     }
@@ -226,8 +231,10 @@ fn mask_body(id: u16, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The two hellos agree once GREASE is set aside.
-fn same_except_grease(rebuilt: &[u8], capture: &[u8]) -> bool {
+/// The two hellos agree once GREASE is set aside. GREASE ECH is drawn per
+/// hello, so both sides only have to be a well-formed outer ECH the profile's
+/// parameters allow.
+fn same_except_grease(rebuilt: &[u8], capture: &[u8], ech: Option<EchGrease>) -> bool {
     let (Ok(left), Ok(right)) = (parse_record(rebuilt), parse_record(capture)) else {
         return false;
     };
@@ -261,7 +268,7 @@ fn same_except_grease(rebuilt: &[u8], capture: &[u8]) -> bool {
         .zip(right.template.extensions.iter())
         .enumerate()
     {
-        if !same_extension(a, b) {
+        if !same_extension(a, b, ech) {
             diffs.push(format!("#{i} rebuilt={a:?} capture={b:?}"));
         }
     }
@@ -272,9 +279,16 @@ fn same_except_grease(rebuilt: &[u8], capture: &[u8]) -> bool {
     true
 }
 
-fn same_extension(a: &core_tls::hello::Ext, b: &core_tls::hello::Ext) -> bool {
+fn same_extension(
+    a: &core_tls::hello::Ext,
+    b: &core_tls::hello::Ext,
+    ech: Option<EchGrease>,
+) -> bool {
     use core_tls::hello::Ext;
     match (a, b) {
+        (Ext::Static(0xfe0d, body_a), Ext::Static(0xfe0d, body_b)) => {
+            ech.is_some_and(|ech| allowed_ech(body_a, ech) && allowed_ech(body_b, ech))
+        }
         (Ext::Static(id_a, body_a), Ext::Static(id_b, body_b)) => {
             (is_grease(*id_a) && is_grease(*id_b))
                 || (id_a == id_b && mask_body(*id_a, body_a) == mask_body(*id_b, body_b))
@@ -283,4 +297,24 @@ fn same_extension(a: &core_tls::hello::Ext, b: &core_tls::hello::Ext) -> bool {
         (Ext::KeyShare(a), Ext::KeyShare(b)) => mask_body(0x0033, a) == mask_body(0x0033, b),
         _ => false,
     }
+}
+
+/// An outer ECHClientHello whose suite and payload length the profile allows,
+/// with a 32-byte enc and nothing after the payload.
+fn allowed_ech(body: &[u8], ech: EchGrease) -> bool {
+    let u16_at = |off: usize| {
+        body.get(off..off + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]))
+    };
+    let (Some(kdf), Some(aead), Some(enc_len)) = (u16_at(1), u16_at(3), u16_at(6)) else {
+        return false;
+    };
+    let Some(payload_len) = u16_at(8 + enc_len as usize) else {
+        return false;
+    };
+    body[0] == 0
+        && ech.cipher_suites.contains(&(kdf, aead))
+        && enc_len == 32
+        && ech.payload_lens.iter().any(|n| n + 16 == payload_len)
+        && body.len() == 10 + enc_len as usize + payload_len as usize
 }

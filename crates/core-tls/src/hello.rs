@@ -13,6 +13,81 @@ pub enum Ext {
     /// The protocol list the caller configured, in the fingerprint's own order.
     Alpn,
     KeyShare(Vec<u8>),
+    /// GREASE `encrypted_client_hello` (0xfe0d), drawn fresh per hello.
+    EchGrease(EchGrease),
+}
+
+/// What a profile fixes about its GREASE ECH; config_id, enc and the payload
+/// are drawn per hello, as uTLS's `GREASEEncryptedClientHelloExtension` does
+/// (utls aa6edf4b11af, u_ech.go:65-143).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EchGrease {
+    /// HPKE (kdf, aead) pairs, one picked per hello (u_ech.go:95-109).
+    pub cipher_suites: &'static [(u16, u16)],
+    /// Plaintext lengths, one picked per hello; the payload is 16 bytes longer,
+    /// the AEAD tag (u_ech.go:130-160, u_hpke.go:28-35).
+    pub payload_lens: &'static [u16],
+}
+
+const HKDF_SHA256: u16 = 0x0001;
+const AES_128_GCM: u16 = 0x0001;
+const CHACHA20_POLY1305: u16 = 0x0003;
+
+impl EchGrease {
+    /// BoringSSL's defaults, used by uTLS Chrome (u_ech.go:296-306,
+    /// u_parrots.go:963).
+    pub const CHROME: EchGrease = EchGrease {
+        cipher_suites: &[(HKDF_SHA256, AES_128_GCM)],
+        payload_lens: &[128, 160, 192, 224],
+    };
+    /// uTLS Firefox 148 (u_parrots.go:1577-1589).
+    pub const FIREFOX: EchGrease = EchGrease {
+        cipher_suites: &[(HKDF_SHA256, AES_128_GCM), (HKDF_SHA256, CHACHA20_POLY1305)],
+        payload_lens: &[223],
+    };
+
+    /// The extension body (RFC 9849 §5, outer variant): type 0, cipher suite,
+    /// config_id, enc, payload (u_ech.go:177-200).
+    fn body(&self) -> io::Result<Vec<u8>> {
+        let mut draw = [0u8; 32 + 1];
+        getrandom::fill(&mut draw).map_err(|e| err(&format!("no entropy: {e}")))?;
+        let (kdf, aead) = self.cipher_suites[pick(self.cipher_suites.len())?];
+        // config_id is a random byte (u_ech.go:73-80)
+        let config_id = draw[32];
+        // enc is the public half of a fresh X25519 key, a real curve point:
+        // HPKE SetupSender with DHKEM(X25519) (u_ech.go:111-128,
+        // internal/hpke/hpke.go:88-108)
+        let secret: [u8; 32] = draw[..32].try_into().expect("32 bytes");
+        let enc = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret));
+        let mut payload =
+            vec![0u8; self.payload_lens[pick(self.payload_lens.len())?] as usize + 16];
+        getrandom::fill(&mut payload).map_err(|e| err(&format!("no entropy: {e}")))?;
+
+        let mut b = Vec::with_capacity(10 + 32 + payload.len());
+        b.push(0x00);
+        b.extend_from_slice(&kdf.to_be_bytes());
+        b.extend_from_slice(&aead.to_be_bytes());
+        b.push(config_id);
+        b.extend_from_slice(&32u16.to_be_bytes());
+        b.extend_from_slice(enc.as_bytes());
+        b.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        b.extend_from_slice(&payload);
+        Ok(b)
+    }
+}
+
+/// A uniform index below `n` (n > 0).
+fn pick(n: usize) -> io::Result<usize> {
+    let n = n as u32;
+    let limit = u32::MAX - u32::MAX % n;
+    loop {
+        let mut b = [0u8; 4];
+        getrandom::fill(&mut b).map_err(|e| err(&format!("no entropy: {e}")))?;
+        let v = u32::from_be_bytes(b);
+        if v < limit {
+            return Ok((v % n) as usize);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +283,7 @@ pub fn build(
                     None => raw.clone(),
                 },
             ),
+            Ext::EchGrease(ech) => (0xfe0d, ech.body()?),
         };
         exts.extend_from_slice(&id.to_be_bytes());
         exts.extend_from_slice(&(body.len() as u16).to_be_bytes());

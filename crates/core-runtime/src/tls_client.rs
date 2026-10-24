@@ -1287,6 +1287,52 @@ tKRtIBbVNqzAuojxmi55s2+rAP2MkmRaA4dJ5cDEEsVBbwnQkkEKHOPK
         stolen_task.abort();
     }
 
+    /// Browser profiles on our own stack still verify the chain and the name.
+    #[tokio::test]
+    async fn fingerprinted_tls_verifies_the_certificate() {
+        use tokio::net::TcpListener;
+        let valid = golden_cert(include_bytes!(
+            "../../../tests/golden/certs/urltest-valid.crt"
+        ));
+        let wrong_name = golden_cert(include_bytes!(
+            "../../../tests/golden/certs/urltest-wrong-name.crt"
+        ));
+        let ca = golden_cert(include_bytes!("../../../tests/golden/certs/urltest-ca.crt"));
+        for fingerprint in ["chrome", "firefox", "safari", "edge"] {
+            for (cert, expected) in [(&valid, true), (&valid, true), (&wrong_name, false)] {
+                let cfg = server_config(cert.clone(), true, Arc::new(core_crypto::provider()));
+                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let task = tokio::spawn(async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let _ = acceptor.accept(socket).await;
+                });
+                let mut tls = options(json!({"tls": {
+                    "enabled": true,
+                    "server_name": "localhost",
+                    "utls": {"enabled": true, "fingerprint": fingerprint}
+                }}))
+                .unwrap()
+                .unwrap();
+                tls.ca_certs = vec![ca.clone()];
+                assert!(tls.own_stack(), "{fingerprint}");
+                let socket = TcpStream::connect(addr).await.unwrap();
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), tls.wrap(socket))
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "{fingerprint}: {:?}",
+                    result.err()
+                );
+                task.abort();
+            }
+        }
+    }
+
     /// The whole point of the change: a fingerprint in the config is a table we
     /// resolve now, and the hello it produces is ours.
     #[test]

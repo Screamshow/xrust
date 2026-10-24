@@ -343,6 +343,27 @@ async fn the_server_may_pick_a_later_group_from_our_share() {
         .expect("safari");
 }
 
+/// Every browser profile, ECH GREASE drawn fresh each time, completes a
+/// verified handshake repeatedly, and a wrong name still fails.
+#[tokio::test]
+async fn browser_profiles_complete_verified_handshakes() {
+    let (certs, _) = fixture();
+    let verifier = WebpkiVerifier::new(Arc::new(roots_trusting(&certs[0]))).expect("a verifier");
+    for name in ["chrome", "firefox", "safari", "edge"] {
+        for _ in 0..8 {
+            let done = shake(&verifier, name, "localhost")
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(done.leaf.as_ref(), Some(&certs[0]), "{name}");
+            assert_eq!(done.server_alpn, Some(b"h2".to_vec()), "{name}");
+        }
+        let err = shake(&verifier, name, "not-localhost.example")
+            .await
+            .expect_err("a name outside the certificate must not pass");
+        assert!(err.contains("certificate chain rejected"), "{name}: {err}");
+    }
+}
+
 /// The handshake is only half of it: after it, application data has to flow
 /// through the same record layer, with the record sequence numbers carrying on
 /// from the handshake and the two directions on their own keys.

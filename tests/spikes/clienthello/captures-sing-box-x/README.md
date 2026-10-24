@@ -17,7 +17,9 @@ Firefox's classical X25519 share reuses the hybrid X25519 key; Chrome and Safari
 use independent keys. REALITY's existing client version remains 26.3.27.
 
 Legacy Edge/iOS/Android/360/QQ tables remain unchanged and do not gain modern
-hybrid REALITY compatibility through these changes. Captured ECH GREASE payloads
-remain templates; this work does not implement real ECH or TLS session resumption.
+hybrid REALITY compatibility through these changes. The captured ECH GREASE
+bodies are not replayed: the tables keep only the profile's HPKE suites and
+payload lengths, and config_id, enc and payload are drawn per hello. Real ECH and
+TLS session resumption are not implemented.
 
 Regenerate tables with `python3 tools/fingerprint_tables.py`, then `cargo fmt`.
