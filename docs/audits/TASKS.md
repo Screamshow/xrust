@@ -20,6 +20,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | CQ-01 | Паника `percent_decode` в Clash API до проверки secret | P0 | исправлено, проверено | `49987e66b78e14fc4f57ff367ece1f2fd9d88569` |
 | SEC-04 | Переполнение размера чанка в HTTP-клиенте (`decode_chunked`) | P0 | исправлено, проверено | `5de21230da8bf883f3616f7b7b952917646e9cdb`, `2b49308ed8af6fa4fe1cce16fe1b290b9e4aa325` |
 | SEC-07 | Тело по `Content-Length` не ограничено до чтения | P1 | исправлено, проверено | `48c70f91e32a30a2f2a281a66a46703891604bb5` |
+| SEC-05 | HTTPS-загрузки rule-set и external_ui без проверки сертификата | P1 | исправлено, ожидает независимой проверки | `11ada8206da3ccdd5cbb54c6758133c7c290d362` |
 
 ## Задачи
 
@@ -219,7 +220,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | `cargo fmt --all -- --check` | exit 0 |
 | `cargo clippy --workspace --all-targets --features legacy-protocols -- -D warnings` | exit 0 |
 | `cargo test -p core-runtime --features legacy-protocols --lib http_client` | 24 passed, 0 failed |
-| `cargo test --workspace --features legacy-protocols` | 78 бинарников: 1510 passed, 0 failed, 19 ignored |
+| `cargo test --workspace --features legacy-protocols` | 78 бинарников: 1511 passed, 0 failed, 19 ignored. Исправлено 2026-10-24: раньше было указано 1510 — в логе вывод одного бинарника (1 тест) склеился с соседним и не попал в подсчёт |
 
 Профиль rust-x:
 
@@ -252,3 +253,86 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
   - путь без `Content-Length` и без chunked (чтение до EOF): лимит проверяется перед каждым чтением, поэтому тело может превысить его не более чем на один буфер 8 КиБ до отказа;
   - строка состояния и заголовки ограничены 64 КиБ, но таймаут на них общий (60 с) — медленный сервер может держать загрузку до таймаута;
   - загрузка rule-set и external_ui без проверки сертификата (SEC-05).
+
+### SEC-05 — HTTPS-загрузки rule-set и external_ui без проверки сертификата
+
+- **Приоритет:** P1. В сводном отчёте аудита повышен до P0: вместе с SEC-04 и CQ-03 давал удалённый отказ в обслуживании через MITM.
+- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Коммит:** [`11ada8206da3ccdd5cbb54c6758133c7c290d362`](https://github.com/Screamshow/xrust/commit/11ada8206da3ccdd5cbb54c6758133c7c290d362).
+- **Файлы:**
+  - `crates/core-runtime/src/http_client.rs`, `crates/core-runtime/src/tls_client.rs` — исправление;
+  - `crates/core-runtime/src/route/rule_set_remote.rs` — модульные тесты;
+  - `crates/core-runtime/tests/fetch_tls.rs`, `crates/core-runtime/tests/support/https_fixture.rs` — интеграционные тесты и локальный HTTPS-сервер.
+- **Суть.** HTTPS-загрузки HTTP-клиента без явного блока `tls` шли через `wrap_probe_stream`, а он принимал любой сертификат. Посредник на пути мог:
+  - подменить remote rule-set;
+  - подменить архив external_ui — то есть выполнить свой скрипт на origin Clash API;
+  - подать произвольные данные в парсеры ответа.
+
+#### Затронутые потребители
+
+`wrap_probe_stream` вызывался только из `HttpClient::request` (`http_client.rs`). `HttpClient` используют:
+- remote rule-set маршрутизации (`route/mod.rs`, `build_rule_sets`), включая rule-set, на которые ссылаются DNS-правила (`dns/mod.rs`);
+- реестр `http_clients`, `route.default_http_client` и устаревший `download_detour`;
+- загрузку external_ui (`clash_api.rs`, `ensure_external_ui`).
+
+URLTest и delay-пробы Clash API уже проверяли сертификат через тот же `probe_tls` — их поведение не изменилось.
+
+#### Исправление и контракт
+
+- **Без явного `tls` у HTTP-клиента:** сервер проверяется через `probe_tls` роутера — тот же коннектор, что у URLTest. Проверяются цепочка, имя сервера (DNS-имя или IP из URL) и срок действия.
+- **Доверенные корни:** встроенный набор Mozilla плюс верхнеуровневая опция `certificate` (`certificate`, `certificate_path`). Это существующая настройка проекта.
+- **Detour.** Detour-outbound только переносит соединение. Его собственные TLS-настройки, включая `insecure`, к серверу загрузки не применяются.
+- **Нового отключения проверки и fallback на AcceptAny нет.** `wrap_probe_stream` удалён.
+- **Явный блок `tls` у HTTP-клиента** (`http_clients[].tls` с `enabled: true`) используется как прежде, через разбор TLS-опций outbound:
+  - его поля, включая явно заданный `insecure`, `certificate` и pins, действуют как написано;
+  - `server_name` берётся из `tls.server_name`, затем из `server_name` клиента, иначе по умолчанию `localhost` (см. ограничения).
+- **Без изменений:** обычный HTTP, редиректы, маршрутизация и detour.
+- **Изменение поведения.** Серверы rule-set и UI с самоподписанным или частным сертификатом без доверенного CA теперь отклоняются. Чтобы такой сервер снова работал, его CA добавляется в верхнеуровневый `certificate`.
+
+#### Проверки разработки
+
+Тесты используют существующие тестовые сертификаты (`tests/golden/certs/urltest-*`) и локальный HTTPS-сервер. Результаты на старом коде получены во временной копии (`6b34832`): исходные `http_client.rs` и `tls_client.rs`, новые тесты.
+
+| Тест | Что проверяет | Старый код | Новый код |
+|---|---|---|---|
+| `https_fetch_with_a_trusted_ca_and_the_right_name_fills_the_set` | доверенный CA и правильное имя, напрямую и через detour | проходит | проходит |
+| `https_fetch_refuses_an_unverified_server` | неизвестный CA, чужая подпись, неправильное имя, просроченный | падает: сертификат принят | проходит |
+| `failed_https_update_keeps_the_previous_set` | обновление с непроверяемым сертификатом сохраняет старый набор | падает: набор заменён | проходит |
+| `remote_rule_set_over_https_is_verified` | rule-set через конфиг (`certificate` → роутер → загрузка), 1 успех и 4 отказа | падает: rule-set загружен с неизвестным CA | проходит |
+| `external_ui_over_https_is_verified` | external_ui, 1 успех и 4 отказа; ядро запускается, каталог пуст | падает: UI установлен с неизвестным CA | проходит |
+| `external_ui_tls_failure_keeps_an_existing_ui` | ошибка TLS не трогает установленный UI | проходит: при непустом каталоге загрузка не выполняется и в старом коде | проходит |
+
+Ожидаемые ошибки: `UnknownIssuer`, `BadSignature`, `certificate not valid for name "127.0.0.1"`, `certificate expired`. Во всех случаях отказа сервер не получает запрос — проверяется счётчиком.
+
+Профиль legacy:
+
+| Команда | Результат |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --features legacy-protocols -- -D warnings` | exit 0 |
+| `cargo test --workspace --features legacy-protocols` | 79 бинарников: 1517 passed, 0 failed, 19 ignored |
+
+Профиль rust-x:
+
+| Команда | Результат |
+|---|---|
+| `cargo check --workspace --no-default-features --features rust-x` | exit 0; 14 прежних предупреждений `dead_code` |
+| `cargo test -p core-config --no-default-features --features rust-x --test rust_x_profile` | 3 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --lib http_client` | 24 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --lib rule_set_remote` | 12 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test fetch_tls` | 3 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test clash_api` | 7 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test urltest_tls` | 1 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test rule_set_compiled` | 13 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test hot_reload` | 9 passed |
+| `cargo test -p core-runtime --no-default-features --features rust-x --test dns_resolver` | 18 passed, 1 failed: прежний `tcp_transport_uses_the_detour_outbound`, в его конфиге outbound `socks`, которого нет в rust-x |
+
+#### Ограничения
+
+- Независимая проверка ещё не проводилась.
+- ARM, установка пакета и LuCI не проверялись.
+- Связанные проблемы вне задачи, не исправлялись:
+  - при явном `tls` у HTTP-клиента без `server_name` проверка идёт по имени `localhost`, а не по хосту из URL — для обычных серверов это отказ;
+  - доверенные корни берутся из `webpki-roots 1.0.9` и `rustls-webpki 0.103.15` с известными advisory (BLD-02);
+  - ошибка **начальной** загрузки remote rule-set по-прежнему завершает запуск — как при 404 или таймауте;
+  - REALITY, pins при `insecure`, MASQUE и прочие находки TLS (SEC-01…03) не затрагивались.
