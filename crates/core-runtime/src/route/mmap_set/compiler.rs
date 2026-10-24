@@ -7,6 +7,49 @@ use std::net::IpAddr;
 use super::format::*;
 use crate::route::rule_set::{list, ports};
 
+/// Why `rules` cannot be compiled to TSRS without changing what they match,
+/// or `None` when they can.
+///
+/// TSRS holds one OR over domain, suffix, keyword, destination CIDR and
+/// destination port per set. Anything else would be dropped or turned from
+/// AND into OR, so such a set stays on the in-memory matcher.
+pub fn tsrs_unsupported(rules: &[Value]) -> Option<&'static str> {
+    const NOT_HELD: [&str; 5] = [
+        "domain_regex",
+        "source_ip_cidr",
+        "source_port",
+        "source_port_range",
+        "network",
+    ];
+    const DESTINATION: [&str; 5] = [
+        "domain",
+        "domain_suffix",
+        "domain_keyword",
+        "ip_cidr",
+        "ipcidr",
+    ];
+    for rule in rules {
+        let Some(obj) = rule.as_object() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) == Some("logical") {
+            return Some("logical rule");
+        }
+        if obj.get("invert") == Some(&Value::Bool(true)) {
+            return Some("invert");
+        }
+        if let Some(field) = NOT_HELD.iter().find(|field| obj.contains_key(**field)) {
+            return Some(field);
+        }
+        let destination = DESTINATION.iter().any(|field| obj.contains_key(*field));
+        let port = obj.contains_key("port") || obj.contains_key("port_range");
+        if destination && port {
+            return Some("destination and port in one rule");
+        }
+    }
+    None
+}
+
 pub struct RuleSetCompiler {
     domains: HashSet<String>,
     suffixes: HashSet<String>,

@@ -465,6 +465,21 @@ impl Outbound {
     }
 }
 
+/// Whether TSRS can hold `rules` as they are. When it cannot, the set is
+/// loaded into memory instead, and the log says why.
+pub(crate) fn mmap_keeps(rules: &[Value], tags: &[String]) -> bool {
+    match mmap_set::tsrs_unsupported(rules) {
+        None => true,
+        Some(reason) => {
+            logging::warn(format_args!(
+                "rule-set {}: mmap cannot keep {reason}, using memory rules",
+                tags.join(",")
+            ));
+            false
+        }
+    }
+}
+
 /// `route` section fields accepted by check but not yet honored at runtime.
 /// `route.rule_set`: the inline, local and remote variants. Inline and local
 /// sets load here; a remote set needs the downloader and is reported instead of
@@ -506,7 +521,7 @@ pub(crate) fn build_rule_sets(
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                if use_mmap {
+                if use_mmap && mmap_keeps(&rules, &tags) {
                     let mut compiler = mmap_set::RuleSetCompiler::new();
                     let tsrs_bytes = compiler.compile(&rules)?;
                     let cache_file = entry.get("cache_file").and_then(Value::as_str);
@@ -559,7 +574,7 @@ pub(crate) fn build_rule_sets(
                     let rules = parse_rule_set_payload(&data, entry, &at)?;
                     // the file is not needed once decoded
                     drop(data);
-                    if use_mmap {
+                    if use_mmap && mmap_keeps(&rules, &tags) {
                         let mut compiler = mmap_set::RuleSetCompiler::new();
                         let tsrs_bytes = compiler.compile(&rules)?;
                         let cache_file = entry.get("cache_file").and_then(Value::as_str);

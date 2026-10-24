@@ -9,7 +9,7 @@ pub mod format;
 pub mod matcher;
 pub mod mmap_io;
 
-pub use compiler::RuleSetCompiler;
+pub use compiler::{RuleSetCompiler, tsrs_unsupported};
 pub use delta::{DeltaBuilder, apply_delta};
 
 use self::matcher::MmapView;

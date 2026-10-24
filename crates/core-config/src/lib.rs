@@ -1,5 +1,6 @@
 pub mod asn1_x509;
 pub mod fptn;
+pub mod go_regex;
 pub mod netip_parse;
 pub mod srs;
 pub mod validate;

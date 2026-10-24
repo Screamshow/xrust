@@ -524,7 +524,11 @@ fn validate_dns_rules(rules: &Value) -> Result<(), String> {
         for field in ["domain_regex", "process_path_regex"] {
             if let Some(value) = rule.get(field).filter(|value| !prunes_value(value)) {
                 check_listable_string_field(value, &format!("dns.rules[{i}].{field}"))?;
-                check_regex_listable(value, &format!("dns.rules[{i}].{field}"))?;
+                check_regex_listable(
+                    value,
+                    &format!("dns.rules[{i}].{field}"),
+                    field == "domain_regex",
+                )?;
             }
         }
         let action = rule.get("action").and_then(Value::as_str).unwrap_or("");
@@ -572,8 +576,10 @@ fn check_listable_string_field(value: &Value, at: &str) -> Result<(), String> {
 /// A `*_regex` listable: the reference compiles every expression while it
 /// parses the rule (`parse expression N: ...`), so a pattern it cannot read is
 /// a config error, not a runtime surprise. Go's regexp and the `regex` crate
-/// are both RE2, so a pattern one accepts the other does too.
-fn check_regex_listable(value: &Value, at: &str) -> Result<(), String> {
+/// are both RE2-like but not identical (see `docs/rule-set-regex.md`).
+/// `go_quotes` translates Go's `\Q...\E`, as the runtime does for
+/// `domain_regex`.
+fn check_regex_listable(value: &Value, at: &str, go_quotes: bool) -> Result<(), String> {
     let list = match value {
         Value::Null => return Ok(()),
         Value::String(_) => vec![value],
@@ -594,13 +600,19 @@ fn check_regex_listable(value: &Value, at: &str) -> Result<(), String> {
             ));
         };
         #[cfg(feature = "regex")]
-        if let Err(err) = regex::Regex::new(pattern) {
+        let translated = if go_quotes {
+            crate::go_regex::translate(pattern)
+        } else {
+            std::borrow::Cow::Borrowed(pattern)
+        };
+        #[cfg(feature = "regex")]
+        if let Err(err) = regex::Regex::new(&translated) {
             return Err(format!(
                 "{at}: parse expression {index}: error parsing regexp: {err}"
             ));
         }
         #[cfg(not(feature = "regex"))]
-        let _ = pattern;
+        let _ = (pattern, go_quotes);
     }
     Ok(())
 }
@@ -3528,7 +3540,7 @@ fn check_headless_rules_regex(rules: &[Value], at: &str) -> Result<(), String> {
             .get("domain_regex")
             .filter(|value| !prunes_value(value))
         {
-            check_regex_listable(value, &format!("{at}: domain_regex"))?;
+            check_regex_listable(value, &format!("{at}: domain_regex"), true)?;
         }
         if rule.get("type").and_then(Value::as_str) == Some("logical")
             && let Some(Value::Array(subs)) = rule.get("rules")
@@ -4946,7 +4958,7 @@ fn validate_route_rule(rule: &Value, at: &str, nested: bool) -> Result<(), Strin
     }
     for field in ["domain_regex", "process_path_regex"] {
         if let Some(value) = rule.get(field).filter(|value| !prunes_value(value)) {
-            check_regex_listable(value, &format!("{at}.{field}"))?;
+            check_regex_listable(value, &format!("{at}.{field}"), field == "domain_regex")?;
         }
     }
     if let Some(value) = rule.get("user_id").filter(|value| !prunes_value(value)) {

@@ -511,3 +511,330 @@ async fn remote_update_with_regex_and_a_bad_update_keeps_the_set() {
     assert!(!set.matches(&domain("srs.example", 443)));
     server.abort();
 }
+
+/// Go's `\Q...\E` literal spans. Expected answers from sing-box 1.14.3
+/// `rule-set match` (it lowercases the host first).
+const GO_QUOTES: &[(&str, &str, bool)] = &[
+    (r"^\Qa.b\E$", "a.b", true),
+    (r"^\Qa.b\E$", "axb", false),
+    (r"^\Qa.b\E$", "a.b.c", false),
+    // unterminated: the span runs to the end of the pattern
+    (r"^\Qa.b", "a.b", true),
+    (r"^\Qa.b", "axb", false),
+    (r"^\Qa.b", "a.bc", true),
+    (r"\Qa.b\E\.c$", "a.b.c", true),
+    (r"\Qa.b\E\.c$", "a.bxc", false),
+    (r"\Qa.b\E\.c$", "xa.b.c", true),
+    // backslashes inside the span are literal; the first \E ends it
+    (r"^\Qa\b\E", r"a\b", true),
+    (r"^\Qa\b\E", "ab", false),
+    (r"^\Qa\\E", r"a\", true),
+    (r"^\Qa\\E", "a", false),
+    // an escaped backslash, then a quoted span
+    (r"^\\\Qa.\E", r"\a.", true),
+    (r"^\\\Qa.\E", r"\ax", false),
+    (r"^\\\Qa.\E", "a.", false),
+    // a repeat applies to the last quoted character only
+    (r"^\Qa*\E+$", "a*", true),
+    (r"^\Qa*\E+$", "a***", true),
+    (r"^\Qa*\E+$", "aa*", false),
+    (r"^(\Qa.\E)+$", "a.a.", true),
+    (r"^(\Qa.\E)+$", "a.a", false),
+    (r"^a\Q\E*$", "aaa", true),
+    (r"(?i)^\QFOO.\E", "foo.x", true),
+    (r"(?i)^\QFOO.\E", "fooxx", false),
+    (r"(?i)\Qa.B\E", "xA.b", true),
+    (r"(?i)\Qa.B\E", "xaxb", false),
+    (r"^\Q[a-z]\E$", "[a-z]", true),
+    (r"^\Q[a-z]\E$", "b", false),
+    (r"^\Qa|b\E$", "a|b", true),
+    (r"^\Qa|b\E$", "a", false),
+    (r"^\Q(\E", "(x", true),
+    (r"^\Q(\E", "x", false),
+    (r"\Q$\E$", "a$", true),
+    (r"\Q$\E$", "a", false),
+    (r"^\Q a\E$", " a", true),
+    (r"^\Q a\E$", "a", false),
+    (r"^\Q#x\E$", "#x", true),
+    (r"^\Qé.\E", "é.x", true),
+    (r"^\Qé.\E", "éxx", false),
+];
+
+#[tokio::test]
+async fn go_quoted_literals_match_like_the_reference() {
+    for (pattern, host, expected) in GO_QUOTES {
+        let rule = json!({"domain_regex": [pattern]});
+        assert_eq!(
+            match_rule(&rule, &domain(host, 443)),
+            *expected,
+            "interpreter {pattern} {host}"
+        );
+        let set = inline(json!([rule]));
+        assert_eq!(
+            hits(&set, domain(host, 443)).await,
+            *expected,
+            "rule set {pattern} {host}"
+        );
+        let route = Router::new(&json!({
+            "log": {"level": "error"},
+            "outbounds": [{"type": "direct", "tag": "hit"}, {"type": "direct", "tag": "miss"}],
+            "route": {"final": "miss", "rules": [{"domain_regex": [pattern], "outbound": "hit"}]}
+        }))
+        .expect("router");
+        assert_eq!(
+            hits(&route, domain(host, 443)).await,
+            *expected,
+            "route rule {pattern} {host}"
+        );
+    }
+}
+
+#[test]
+fn go_quoted_literals_pass_check_and_bad_escapes_fail() {
+    let config = |regex: &str| {
+        json!({
+            "dns": {
+                "servers": [{"type": "local", "tag": "local"}],
+                "rules": [{"domain_regex": [regex], "server": "local"}]
+            },
+            "outbounds": [{"type": "direct", "tag": "hit"}],
+            "route": {
+                "rule_set": [{"type": "inline", "tag": "set", "rules": [{"domain_regex": [regex]}]}],
+                "rules": [
+                    {"domain_regex": [regex], "outbound": "hit"},
+                    {"rule_set": ["set"], "outbound": "hit"}
+                ]
+            }
+        })
+        .to_string()
+    };
+    for (pattern, _, _) in GO_QUOTES {
+        core_config::check_str(&config(pattern)).unwrap_or_else(|err| panic!("{pattern}: {err}"));
+    }
+    // rejected by the reference too: \Q inside a class, a stray \E
+    for pattern in [r"^[\Q]", r"^x\E"] {
+        let error = core_config::check_str(&config(pattern)).expect_err(pattern);
+        assert!(error.contains("parse expression 0"), "{pattern}: {error}");
+        assert!(
+            router_with(
+                json!({"type": "inline", "tag": "set", "rules": [{"domain_regex": [pattern]}]})
+            )
+            .is_err(),
+            "{pattern}"
+        );
+    }
+}
+
+/// Rule shapes the flat TSRS tables cannot hold. Each with connections it
+/// must and must not match, as the in-memory matcher answers them.
+fn tsrs_lossy_cases() -> Vec<(Value, Vec<ConnContext>, Vec<ConnContext>)> {
+    let mut udp = domain("s.com", 443);
+    udp.network = "udp";
+    let mut lan = ip("10.1.1.1", 443);
+    lan.source = "192.168.1.2:1234".parse().expect("source");
+    vec![
+        (
+            json!({"domain_regex": [REGEX]}),
+            vec![domain("foo.example", 443)],
+            vec![domain("bar.test", 443), ip("8.8.8.8", 443)],
+        ),
+        (
+            json!({"invert": true, "domain": ["a.com"]}),
+            vec![domain("b.com", 443), ip("8.8.8.8", 443)],
+            vec![domain("a.com", 443)],
+        ),
+        (
+            json!({"type": "logical", "mode": "or", "rules": [{"domain": ["l.com"]}, {"port": [8080]}]}),
+            vec![domain("l.com", 80), domain("x.test", 8080)],
+            vec![domain("x.test", 443)],
+        ),
+        (
+            json!({"domain": ["and.com"], "port": [443]}),
+            vec![domain("and.com", 443)],
+            vec![domain("and.com", 80), domain("x.test", 443)],
+        ),
+        (
+            json!({"domain_suffix": ["s.com"], "network": ["udp"]}),
+            vec![udp],
+            vec![domain("s.com", 443)],
+        ),
+        (
+            json!({"ip_cidr": ["10.0.0.0/8"], "source_ip_cidr": ["192.168.0.0/16"]}),
+            vec![lan],
+            vec![ip("10.1.1.1", 443)],
+        ),
+        (
+            json!({"source_port": [1234]}),
+            vec![domain("x.test", 443)],
+            vec![],
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn mmap_sets_with_rules_tsrs_cannot_hold_stay_in_memory() {
+    for (n, (rule, hit, miss)) in tsrs_lossy_cases().into_iter().enumerate() {
+        let source = json!({"version": 3, "rules": [rule.clone()]});
+        let json_file = TempFile::new("lossy.json", source.to_string().as_bytes());
+        let srs_file = TempFile::new(
+            "lossy.srs",
+            &core_config::srs::compile(&source, 3).expect("compile srs"),
+        );
+        let cache = TempFile::new("lossy.tsrs", b"");
+        let _ = std::fs::remove_file(&cache.0);
+        let entries = [
+            json!({"type": "inline", "tag": "set", "rules": [rule.clone()], "mmap": true, "cache_file": cache.path()}),
+            json!({"type": "local", "tag": "set", "format": "source", "path": json_file.path(), "mmap": true, "cache_file": cache.path()}),
+            json!({"type": "local", "tag": "set", "format": "binary", "path": srs_file.path(), "mmap": true, "cache_file": cache.path()}),
+        ];
+        for entry in entries {
+            let router = router_with(entry.clone()).expect("router");
+            for ctx in &hit {
+                let ctx = ctx.clone();
+                assert!(hits(&router, ctx).await, "{n} {entry} must match");
+            }
+            for ctx in &miss {
+                let ctx = ctx.clone();
+                assert!(!hits(&router, ctx).await, "{n} {entry} must not match");
+            }
+            assert!(!cache.0.exists(), "{n} {entry} was compiled to TSRS");
+        }
+    }
+
+    // a set TSRS can hold is still compiled to it
+    let cache = TempFile::new("plain.tsrs", b"");
+    let _ = std::fs::remove_file(&cache.0);
+    let router = router_with(json!({
+        "type": "inline", "tag": "set", "rules": [{"domain": ["plain.com"]}, {"port": [8443]}],
+        "mmap": true, "cache_file": cache.path()
+    }))
+    .expect("router");
+    assert!(cache.0.exists(), "plain set not compiled to TSRS");
+    assert!(hits(&router, domain("plain.com", 443)).await);
+    assert!(hits(&router, domain("x.test", 8443)).await);
+    assert!(!hits(&router, domain("x.test", 443)).await);
+}
+
+fn remote_set(
+    url: String,
+    cache_file: &TempFile,
+    initial_path: Option<String>,
+) -> core_runtime::route::rule_set_remote::RemoteRuleSet {
+    use core_runtime::http_client::HttpClient;
+    use core_runtime::route::rule_set_remote::{RemoteRuleSet, RemoteSpec};
+    let tags = vec!["remote".to_string()];
+    RemoteRuleSet {
+        tags: tags.clone(),
+        spec: RemoteSpec {
+            url,
+            initial_path,
+            update_interval: Duration::ZERO,
+            client: HttpClient::default(),
+            format: None,
+            mmap: true,
+            delta_update: false,
+            cache_interval: Duration::ZERO,
+            cache_file: Some(cache_file.path()),
+            mode: core_runtime::route::mmap_set::MmapMode::Auto,
+        },
+        set: Arc::new(RuleSet::new(tags, Vec::new()).expect("rule set")),
+        etag: None,
+        last_updated: None,
+    }
+}
+
+#[tokio::test]
+async fn remote_mmap_set_with_regex_stays_in_memory() {
+    use core_runtime::cache_file::{CacheFile, CacheFileOptions};
+    use core_runtime::route::mmap_set::RuleSetCompiler;
+
+    let regex_rules = json!({"version": 3, "rules": [{"domain_regex": [REGEX]}]});
+    let plain_rules = json!({"version": 3, "rules": [{"domain": ["plain.com"]}]});
+    let (url, server) = serve_in_order(vec![
+        regex_rules.to_string().into_bytes(),
+        plain_rules.to_string().into_bytes(),
+        regex_rules.to_string().into_bytes(),
+    ])
+    .await;
+    let router = Router::new(&json!({
+        "log": {"level": "error"},
+        "outbounds": [{"type": "direct", "tag": "direct"}]
+    }))
+    .expect("router");
+    let tsrs = TempFile::new("remote.tsrs", b"");
+    // a TSRS left by an earlier build of this regex set
+    std::fs::write(
+        &tsrs.0,
+        RuleSetCompiler::new()
+            .compile(&[json!({"domain_regex": [REGEX]})])
+            .expect("tsrs"),
+    )
+    .expect("write tsrs");
+    let db = TempFile::new("cache.db", b"");
+    let _ = std::fs::remove_file(&db.0);
+    let cache = Arc::new(std::sync::Mutex::new(
+        CacheFile::open(CacheFileOptions {
+            enabled: true,
+            path: db.path(),
+            ..CacheFileOptions::default()
+        })
+        .expect("open cache")
+        .expect("cache enabled"),
+    ));
+
+    let mut remote = remote_set(url.clone(), &tsrs, None);
+    remote
+        .fetch(&router, true, Some(&cache))
+        .await
+        .expect("fetch");
+    assert!(remote.set.mmap().is_none(), "regex set compiled to TSRS");
+    assert!(
+        !tsrs.0.exists(),
+        "the stale TSRS is left for the next start"
+    );
+    assert!(remote.set.matches(&domain("foo.example", 443)));
+    assert!(!remote.set.matches(&domain("bar.test", 443)));
+    assert!(!remote.set.matches(&ip("8.8.8.8", 443)));
+
+    // a set TSRS can hold still goes to mmap
+    remote
+        .fetch(&router, false, Some(&cache))
+        .await
+        .expect("plain fetch");
+    assert!(remote.set.mmap().is_some(), "plain set not mmapped");
+    assert!(remote.set.matches(&domain("plain.com", 443)));
+    assert!(tsrs.0.exists());
+
+    // and back to memory, removing the TSRS again
+    remote
+        .fetch(&router, false, Some(&cache))
+        .await
+        .expect("regex fetch");
+    assert!(remote.set.mmap().is_none());
+    assert!(!tsrs.0.exists());
+    server.abort();
+
+    // restart (same URL, server gone): no TSRS, so the cache restores the
+    // regex set into memory
+    let mut restarted = remote_set(url, &tsrs, None);
+    restarted
+        .start(&router, Some(&cache))
+        .await
+        .expect("restore");
+    assert!(restarted.set.mmap().is_none());
+    assert!(restarted.set.matches(&domain("foo.example", 443)));
+    assert!(!restarted.set.matches(&domain("bar.test", 443)));
+
+    // an initial path with a regex set loads into memory as well
+    let initial = TempFile::new("initial.json", regex_rules.to_string().as_bytes());
+    let mut first = remote_set(
+        "http://127.0.0.1:1/rules.json".into(),
+        &tsrs,
+        Some(initial.path()),
+    );
+    first.start(&router, None).await.expect("initial path");
+    assert!(first.set.mmap().is_none());
+    assert!(!tsrs.0.exists());
+    assert!(first.set.matches(&domain("foo.example", 443)));
+    assert!(!first.set.matches(&domain("bar.test", 443)));
+}

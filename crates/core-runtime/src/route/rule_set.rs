@@ -301,7 +301,8 @@ fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bo
                     .any(|entry| domain.contains(entry.as_str()))
                 // a bad expression never matches here; loading rejects it
                 || list(rule.get("domain_regex")).iter().any(|entry| {
-                    regex::Regex::new(entry).is_ok_and(|re| re.is_match(&domain))
+                    regex::Regex::new(&core_config::go_regex::translate(entry))
+                        .is_ok_and(|re| re.is_match(&domain))
                 });
         }
         if !dest_matched

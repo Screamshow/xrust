@@ -134,7 +134,7 @@ impl Rule {
         let domain_regex = string_list(map, "domain_regex", at)?
             .into_iter()
             .map(|expr| {
-                Regex::new(&expr)
+                Regex::new(&core_config::go_regex::translate(&expr))
                     .map_err(|e| anyhow::anyhow!("{at}: parse expression {expr:?}: {e}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
@@ -712,6 +712,18 @@ mod tests {
         ] {
             assert!(Rule::build(&json!({"action":"predefined", "rcode":value}), "rule").is_err());
         }
+    }
+
+    #[test]
+    fn domain_regex_reads_go_quoted_literals() {
+        let rule = Rule::build(
+            &json!({"action":"reject", "domain_regex":["^\\Qa.b\\E$"]}),
+            "rule",
+        )
+        .unwrap();
+        let meta = QueryMeta::default();
+        assert!(rule.matches(&meta, &info("a.b", RecordType::A)));
+        assert!(!rule.matches(&meta, &info("axb", RecordType::A)));
     }
 
     #[test]

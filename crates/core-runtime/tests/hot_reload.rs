@@ -638,3 +638,64 @@ async fn domain_regex_rule_set_reload_and_bad_regex_keeps_running_state() {
     assert_eq!(routed(&instance, ip()).await, "miss");
     instance.shutdown_wait().await;
 }
+
+#[tokio::test]
+async fn mmap_local_set_switches_to_memory_when_reloaded_with_regex() {
+    use core_runtime::inbound::Target;
+    use core_runtime::route::{ConnContext, Decision};
+    struct Cleanup(Vec<std::path::PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let base = format!("rust-x-hot-mmap-{}-{nonce}", std::process::id());
+    let path = std::env::temp_dir().join(format!("{base}.json"));
+    let tsrs = std::env::temp_dir().join(format!("{base}.tsrs"));
+    let _cleanup = Cleanup(vec![path.clone(), tsrs.clone()]);
+    std::fs::write(
+        &path,
+        json!({"version": 3, "rules": [{"domain": ["plain.com"]}]}).to_string(),
+    )
+    .unwrap();
+    let root = json!({
+        "outbounds":[{"type":"direct","tag":"hit"},{"type":"direct","tag":"miss"}],
+        "route":{"final":"miss","rule_set":[{"type":"local","tag":"list","format":"source","path":path,
+            "mmap":true,"cache_file":tsrs}],
+            "rules":[{"rule_set":["list"],"outbound":"hit"}]}
+    });
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    async fn routed(instance: &core_runtime::BoxInstance, host: &str) -> bool {
+        let router = instance.router();
+        let mut ctx = ConnContext::new(
+            "in",
+            "10.0.0.2:1234".parse().unwrap(),
+            Target::Domain(host.into(), 443),
+            "tcp",
+        );
+        let Decision::Outbound(index) = router.route_raw(&mut ctx).await.unwrap() else {
+            panic!("outbound expected")
+        };
+        Some(index) == router.index_of("hit")
+    }
+    assert!(tsrs.exists(), "plain set compiled to TSRS");
+    assert!(routed(&instance, "plain.com").await);
+    assert!(!routed(&instance, "foo.example").await);
+
+    std::fs::write(
+        &path,
+        json!({"version": 3, "rules": [{"domain_regex": ["^foo\\.example$"]}]}).to_string(),
+    )
+    .unwrap();
+    instance.reload_in_place(&root).await.unwrap();
+    assert!(routed(&instance, "foo.example").await);
+    assert!(!routed(&instance, "bar.test").await);
+    assert!(!routed(&instance, "plain.com").await);
+    instance.shutdown_wait().await;
+}

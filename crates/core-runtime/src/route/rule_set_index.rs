@@ -773,7 +773,7 @@ fn compile_regexes(value: Option<Value>) -> anyhow::Result<Vec<Regex>> {
     take_list(value)
         .enumerate()
         .map(|(at, expr)| {
-            Regex::new(&expr)
+            Regex::new(&core_config::go_regex::translate(&expr))
                 .map_err(|err| anyhow::anyhow!("domain_regex: parse expression {at}: {err}"))
         })
         .collect()

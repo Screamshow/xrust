@@ -410,7 +410,7 @@ impl Rule {
         if let Some(exprs) = string_list(map, "domain_regex", at)? {
             let mut compiled = Vec::with_capacity(exprs.len());
             for (i, expr) in exprs.iter().enumerate() {
-                let re = Regex::new(expr)
+                let re = Regex::new(&core_config::go_regex::translate(expr))
                     .map_err(|e| anyhow::anyhow!("{at}: parse expression {i}: {e}"))?;
                 compiled.push(re);
             }
