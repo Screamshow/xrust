@@ -806,25 +806,11 @@ pub(crate) fn parse_short_id(value: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// TLS wrap for runtime fetches without a `tls` block: any proxy stream, any
-/// certificate (the reference fetches through the same accept-any path).
-pub(crate) async fn wrap_probe_stream<S>(stream: S, server_name: &str) -> io::Result<AnyStream>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAny))
-        .with_no_client_auth();
-    let connector = TlsConnector::from(Arc::new(config));
-    let name = rustls::pki_types::ServerName::try_from(server_name.to_string())
-        .map_err(|_| io::Error::other(format!("invalid fetch server_name {server_name:?}")))?;
-    Ok(Box::new(connector.connect(name, stream).await?))
-}
-
-/// URLTest's trust is independent of the proxy node's TLS/REALITY options.
-/// Embedded Mozilla roots also work on OpenWrt without a system CA package.
-/// Additional roots use the existing top-level certificate configuration.
+/// Trust for the runtime's own HTTPS: URLTest probes and the downloads of
+/// remote rule-sets and external_ui without an explicit `tls` block. It is
+/// independent of the proxy node's TLS/REALITY options. Embedded Mozilla
+/// roots also work on OpenWrt without a system CA package. Additional roots
+/// use the existing top-level certificate configuration.
 pub(crate) fn probe_connector(root: &Value) -> anyhow::Result<TlsConnector> {
     let mut roots = core_tls::verify::WebpkiVerifier::mozilla_store();
     if let Some(options) = root.get("certificate") {
@@ -875,7 +861,8 @@ pub(crate) fn probe_connector(root: &Value) -> anyhow::Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-/// Authenticate the HTTPS test site, including its name and handshake signatures.
+/// Authenticate an HTTPS server (URLTest site or download), including its name
+/// and handshake signatures.
 pub(crate) async fn wrap_probe(
     stream: AnyStream,
     server_name: &str,

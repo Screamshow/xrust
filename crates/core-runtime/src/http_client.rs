@@ -220,8 +220,17 @@ impl HttpClient {
 
         let stream: AnyStream = if url.secure {
             match &self.tls {
+                // an explicit `tls` block on the client is used as written
                 Some(tls) => Box::new(tls.connect_stream(conn, &[b"http/1.1"]).await?),
-                None => crate::tls_client::wrap_probe_stream(conn, &url.host).await?,
+                // Otherwise the server is verified (chain, name, validity)
+                // against the embedded Mozilla roots plus the top-level
+                // `certificate` option, like the URLTest probes. The detour
+                // outbound only carries the bytes: its own TLS settings,
+                // `insecure` included, do not apply to this server.
+                None => {
+                    let trust = router.inner().probe_tls.clone();
+                    crate::tls_client::wrap_probe(conn, &url.host, &trust).await?
+                }
             }
         } else {
             conn

@@ -882,6 +882,109 @@ mod tests {
         server.abort();
     }
 
+    mod https_fixture {
+        include!("../../tests/support/https_fixture.rs");
+    }
+
+    /// A router that trusts the test CA through the top-level `certificate`
+    /// option, as a user with a private rule-set server would configure it.
+    async fn router_trusting_test_ca() -> Arc<Router> {
+        Router::new(&json!({
+            "log": {"level": "error"},
+            "certificate": {"certificate_path": [https_fixture::CA_PATH]},
+            "outbounds": [{"type": "direct", "tag": "direct"}]
+        }))
+        .expect("router")
+    }
+
+    #[tokio::test]
+    async fn https_fetch_with_a_trusted_ca_and_the_right_name_fills_the_set() {
+        let router = router_trusting_test_ca().await;
+        let payload = srs_with("trusted.example");
+        let server =
+            https_fixture::serve_https(https_fixture::VALID, https_fixture::ok_response(&payload))
+                .await;
+        let mut set = remote("rs", &server.url("/ruleset.srs"));
+        set.start(&router, None).await.expect("trusted https fetch");
+        assert_eq!(set.set.rule_count(), 1);
+        assert_eq!(server.served(), 1);
+        // the same through a named detour outbound
+        let mut set = remote("rs", &server.url("/ruleset.srs"));
+        set.spec.client.detour = Some("direct".to_string());
+        set.start(&router, None)
+            .await
+            .expect("trusted fetch via detour");
+        assert_eq!(set.set.rule_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn https_fetch_refuses_an_unverified_server() {
+        let payload = srs_with("never.example");
+        let trusting = router_trusting_test_ca().await;
+        let default_roots = router().await;
+        for (label, cert, router, expected) in [
+            // valid chain, but its CA is not configured: only Mozilla roots
+            (
+                "unknown CA",
+                https_fixture::VALID,
+                &default_roots,
+                "UnknownIssuer",
+            ),
+            (
+                "bad signature",
+                https_fixture::UNTRUSTED,
+                &trusting,
+                "BadSignature",
+            ),
+            (
+                "wrong name",
+                https_fixture::WRONG_NAME,
+                &trusting,
+                "not valid for name",
+            ),
+            (
+                "expired",
+                https_fixture::EXPIRED,
+                &trusting,
+                "certificate expired",
+            ),
+        ] {
+            let server =
+                https_fixture::serve_https(cert, https_fixture::ok_response(&payload)).await;
+            let mut set = remote("rs", &server.url("/ruleset.srs"));
+            let error = set.start(router, None).await.unwrap_err().to_string();
+            assert!(error.contains(expected), "{label}: {error}");
+            assert_eq!(set.set.rule_count(), 0, "{label}");
+            assert_eq!(server.served(), 0, "{label}: the request was sent");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_https_update_keeps_the_previous_set() {
+        let router = router_trusting_test_ca().await;
+        let first = https_fixture::serve_https(
+            https_fixture::VALID,
+            https_fixture::ok_response(&srs_with("first.example")),
+        )
+        .await;
+        let mut set = remote("rs", &first.url("/ruleset.srs"));
+        set.start(&router, None).await.expect("first fetch");
+        assert_eq!(set.set.rule_count(), 1);
+        let updated = set.last_updated;
+        // the next update meets a certificate that does not verify
+        let second = https_fixture::serve_https(
+            https_fixture::EXPIRED,
+            https_fixture::ok_response(&srs_with("a.example b.example")),
+        )
+        .await;
+        set.spec.url = second.url("/ruleset.srs");
+        let error = set.fetch(&router, false, None).await.unwrap_err();
+        assert!(error.to_string().contains("certificate expired"), "{error}");
+        assert_eq!(set.set.rule_count(), 1, "the old rules stay in place");
+        assert_eq!(set.last_updated, updated);
+        assert_eq!(second.served(), 0);
+    }
+
     #[tokio::test]
     async fn soft_start_survives_and_recovers_the_set() {
         let router = router().await;
