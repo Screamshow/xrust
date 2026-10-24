@@ -20,7 +20,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | CQ-01 | Паника `percent_decode` в Clash API до проверки secret | P0 | исправлено, проверено | `49987e66b78e14fc4f57ff367ece1f2fd9d88569` |
 | SEC-04 | Переполнение размера чанка в HTTP-клиенте (`decode_chunked`) | P0 | исправлено, проверено | `5de21230da8bf883f3616f7b7b952917646e9cdb`, `2b49308ed8af6fa4fe1cce16fe1b290b9e4aa325` |
 | SEC-07 | Тело по `Content-Length` не ограничено до чтения | P1 | исправлено, проверено | `48c70f91e32a30a2f2a281a66a46703891604bb5` |
-| SEC-05 | HTTPS-загрузки rule-set и external_ui без проверки сертификата | P1 | исправлено, ожидает независимой проверки | `11ada8206da3ccdd5cbb54c6758133c7c290d362` |
+| SEC-05 | HTTPS-загрузки rule-set и external_ui без проверки сертификата | P1 | исправлено, проверено | `11ada8206da3ccdd5cbb54c6758133c7c290d362` |
 
 ## Задачи
 
@@ -257,7 +257,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 ### SEC-05 — HTTPS-загрузки rule-set и external_ui без проверки сертификата
 
 - **Приоритет:** P1. В сводном отчёте аудита повышен до P0: вместе с SEC-04 и CQ-03 давал удалённый отказ в обслуживании через MITM.
-- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Статус:** исправлено, проверено. В `main` не слито, не выпущено.
 - **Коммит:** [`11ada8206da3ccdd5cbb54c6758133c7c290d362`](https://github.com/Screamshow/xrust/commit/11ada8206da3ccdd5cbb54c6758133c7c290d362).
 - **Файлы:**
   - `crates/core-runtime/src/http_client.rs`, `crates/core-runtime/src/tls_client.rs` — исправление;
@@ -327,10 +327,15 @@ URLTest и delay-пробы Clash API уже проверяли сертифик
 | `cargo test -p core-runtime --no-default-features --features rust-x --test hot_reload` | 9 passed |
 | `cargo test -p core-runtime --no-default-features --features rust-x --test dns_resolver` | 18 passed, 1 failed: прежний `tcp_transport_uses_the_detour_outbound`, в его конфиге outbound `socks`, которого нет в rust-x |
 
+#### Независимая проверка (Codex)
+
+- **`11ada82`.** Ревью без замечаний, 47 целевых тестов rust-x и 15 сценариев на OpenWrt 25 VM прошли.
+
 #### Ограничения
 
-- Независимая проверка ещё не проводилась.
+- В `main` не слито, не выпущено.
 - ARM, установка пакета и LuCI не проверялись.
+- Живая загрузка UI с GitHub не проверялась.
 - Связанные проблемы вне задачи, не исправлялись:
   - при явном `tls` у HTTP-клиента без `server_name` проверка идёт по имени `localhost`, а не по хосту из URL — для обычных серверов это отказ;
   - доверенные корни берутся из `webpki-roots 1.0.9` и `rustls-webpki 0.103.15` с известными advisory (BLD-02);
