@@ -177,28 +177,21 @@ impl Tproxy {
                             };
                             *a
                         });
-                        if hub.try_existing(source, dest, &buf[..n]) {
+                        // one task per opening flow; its other datagrams queue
+                        let Some(opener) = hub.offer(source, dest, &buf[..n]) else {
                             continue;
-                        }
-                        let hub = Arc::clone(&hub);
+                        };
                         let tag = tag.clone();
-                        let payload = buf[..n].to_vec();
                         reply_sockets.retain(|_, socket| socket.strong_count() != 0);
                         if let Some(socket) = reply_sockets
                             .get(&(source, dest))
                             .and_then(std::sync::Weak::upgrade)
                         {
-                            // The first packet is still opening its outbound. Reuse
-                            // its reply socket and receive pump for the whole burst.
+                            // An earlier flow of this tuple owns the reply socket and
+                            // its receive pump; reuse them for the reopened flow.
                             flows.spawn(async move {
-                                let _ = hub
-                                    .handle(
-                                        Reply::Socket(Arc::downgrade(&socket)),
-                                        source,
-                                        dest,
-                                        &payload,
-                                        &tag,
-                                    )
+                                let _ = opener
+                                    .run(Reply::Socket(Arc::downgrade(&socket)), &tag)
                                     .await;
                             });
                             continue;
@@ -213,12 +206,12 @@ impl Tproxy {
                             }
                         };
                         reply_sockets.insert((source, dest), Arc::downgrade(&socket));
+                        let hub = Arc::clone(&hub);
                         flows.spawn(async move {
                             // A TPROXY reply must originate at the destination the
                             // client contacted, not at the inbound listener's port.
                             let reply = Reply::Socket(Arc::downgrade(&socket));
-                            if let Err(err) = hub.handle(reply, source, dest, &payload, &tag).await
-                            {
+                            if let Err(err) = opener.run(reply, &tag).await {
                                 logging::debug(format_args!("tproxy[{tag}] udp {source}: {err}"));
                                 return;
                             }
@@ -236,15 +229,9 @@ impl Tproxy {
                                     Err(_) if hub.has_active_flow(source, dest) => continue,
                                     _ => break,
                                 };
-                                if !hub.try_existing(source, dest, &payload[..n])
-                                    && hub
-                                        .handle(
-                                            Reply::Socket(Arc::downgrade(&socket)),
-                                            source,
-                                            dest,
-                                            &payload[..n],
-                                            &tag,
-                                        )
+                                if let Some(opener) = hub.offer(source, dest, &payload[..n])
+                                    && opener
+                                        .run(Reply::Socket(Arc::downgrade(&socket)), &tag)
                                         .await
                                         .is_err()
                                 {

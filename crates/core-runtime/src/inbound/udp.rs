@@ -6,7 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,13 @@ const UDP_BACKLOG_MAX: usize = 64;
 /// How many datagrams a flow may hold while a QUIC ClientHello comes
 /// together. A post-quantum hello takes two; past this it is not coming.
 const MAX_SNIFF_DATAGRAMS: usize = 8;
+
+/// Datagrams a flow may queue while its first datagram opens the outbound.
+/// The opener sends them in arrival order once the flow is up; the ones past
+/// the cap are dropped. A QUIC or DNS client sends a handful before it waits
+/// for an answer, and a full 64 KiB datagram per slot keeps the worst case at
+/// 1 MiB per opening flow (about 24 KiB at a 1500-byte MTU).
+const MAX_OPENING_DATAGRAMS: usize = 16;
 
 /// What [`UdpHub::open_flow`] made of a flow's datagrams so far.
 enum Opened {
@@ -329,6 +336,78 @@ impl Reply {
     }
 }
 
+struct PendingFlow {
+    id: u64,
+    queue: VecDeque<Vec<u8>>,
+}
+
+impl PendingFlow {
+    /// Keep the first datagrams, drop the rest: once the flow is up the
+    /// client's retransmits get through on the fast path anyway.
+    fn push(&mut self, payload: &[u8]) {
+        if self.queue.len() < MAX_OPENING_DATAGRAMS {
+            self.queue.push_back(payload.to_vec());
+        }
+    }
+}
+
+/// The single task allowed to open one flow. It routes and opens on the
+/// first datagram, then sends what queued up meanwhile. On error or drop the
+/// queue is discarded and the entry released, so the next datagram of the
+/// tuple starts a fresh open.
+pub(crate) struct FlowOpener {
+    hub: Arc<UdpHub>,
+    key: FlowKey,
+    id: u64,
+    first: Option<Vec<u8>>,
+}
+
+impl FlowOpener {
+    pub async fn run(mut self, reply: Reply, tag: &str) -> io::Result<()> {
+        let (source, dest) = self.key;
+        let target = Target::Ip(dest);
+        let mut next = self.first.take();
+        loop {
+            let payload = match next.take() {
+                Some(payload) => payload,
+                None => match self.hub.next_pending(self.key, self.id) {
+                    Some(payload) => payload,
+                    None => return Ok(()),
+                },
+            };
+            let Some(flow) = self
+                .hub
+                .flow_for(reply.clone(), source, dest, &payload, tag, &target)
+                .await?
+            else {
+                continue;
+            };
+            if let FlowKind::Dns = flow.kind {
+                // one exchange per query, as before: a slow answer must not
+                // hold the next query of the same tuple
+                let hub = Arc::clone(&self.hub);
+                let reply = reply.clone();
+                let tag = tag.to_string();
+                tokio::spawn(async move {
+                    if let Err(err) = hub.hijack_one(reply, source, dest, &payload, &tag).await {
+                        logging::debug(format_args!("udp hijack-dns {tag} {source}: {err}"));
+                    }
+                });
+                continue;
+            }
+            self.hub
+                .deliver(&flow, reply.clone(), source, dest, &payload, tag)
+                .await?;
+        }
+    }
+}
+
+impl Drop for FlowOpener {
+    fn drop(&mut self) {
+        self.hub.release_pending(self.key, self.id);
+    }
+}
+
 pub(crate) struct UdpHub {
     router: Arc<Router>,
     flows: RwLock<HashMap<FlowKey, Arc<Flow>>>,
@@ -338,6 +417,12 @@ pub(crate) struct UdpHub {
     /// Datagrams of flows not routed yet because a packet sniff asked for
     /// more, in arrival order. Touched only under the flow's opening gate.
     held: Mutex<HashMap<FlowKey, Vec<Vec<u8>>>>,
+    /// Flows a [`FlowOpener`] is opening, with the datagrams that came in
+    /// meanwhile. One opener owns each entry, tagged by its id.
+    pending: Mutex<HashMap<FlowKey, PendingFlow>>,
+    /// `pending.len()`, readable without the lock on the fast path
+    pending_count: AtomicUsize,
+    next_opener: AtomicU64,
     reverse_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     timeout: Duration,
     /// how replies are framed before they go back
@@ -351,6 +436,9 @@ impl UdpHub {
             flows: RwLock::new(HashMap::new()),
             opening: Mutex::new(HashMap::new()),
             held: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            pending_count: AtomicUsize::new(0),
+            next_opener: AtomicU64::new(0),
             reverse_tasks: Mutex::new(Vec::new()),
             timeout: if timeout.is_zero() {
                 DEFAULT_UDP_TIMEOUT
@@ -379,6 +467,9 @@ impl UdpHub {
         }
         self.flows.write().expect("flows").clear();
         self.held.lock().expect("held").clear();
+        let mut pending = self.pending.lock().expect("pending");
+        pending.clear();
+        self.pending_count.store(0, Ordering::Release);
     }
 
     async fn sweep(&self) {
@@ -438,6 +529,84 @@ impl UdpHub {
         }
     }
 
+    /// Entry point for receive loops that must not wait on an open. Sends
+    /// the datagram on an open flow, queues it behind a flow that is still
+    /// opening (bounded, see [`MAX_OPENING_DATAGRAMS`]), or returns the one
+    /// [`FlowOpener`] for this tuple, which the caller runs in its own task.
+    pub fn offer(
+        self: &Arc<Self>,
+        source: SocketAddr,
+        dest: SocketAddr,
+        payload: &[u8],
+    ) -> Option<FlowOpener> {
+        let key = (source, dest);
+        // a flow still draining its queue keeps later datagrams behind it
+        if self.pending_count.load(Ordering::Acquire) != 0 && self.queue_pending(key, payload) {
+            return None;
+        }
+        if self.try_existing(source, dest, payload) {
+            return None;
+        }
+        let mut pending = self.pending.lock().expect("pending");
+        if let Some(entry) = pending.get_mut(&key) {
+            entry.push(payload);
+            return None;
+        }
+        let id = self.next_opener.fetch_add(1, Ordering::Relaxed);
+        pending.insert(
+            key,
+            PendingFlow {
+                id,
+                queue: VecDeque::new(),
+            },
+        );
+        self.pending_count.store(pending.len(), Ordering::Release);
+        Some(FlowOpener {
+            hub: Arc::clone(self),
+            key,
+            id,
+            first: Some(payload.to_vec()),
+        })
+    }
+
+    /// Queue behind an opening flow; `false` when the flow is not opening.
+    fn queue_pending(&self, key: FlowKey, payload: &[u8]) -> bool {
+        match self.pending.lock().expect("pending").get_mut(&key) {
+            Some(entry) => {
+                entry.push(payload);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The next queued datagram of opener `id`, or release its entry when
+    /// the queue is empty. Both happen under one lock, so a datagram either
+    /// lands in the queue before the release or finds the flow open after it.
+    fn next_pending(&self, key: FlowKey, id: u64) -> Option<Vec<u8>> {
+        let mut pending = self.pending.lock().expect("pending");
+        let entry = pending.get_mut(&key).filter(|entry| entry.id == id)?;
+        if let Some(payload) = entry.queue.pop_front() {
+            return Some(payload);
+        }
+        pending.remove(&key);
+        self.pending_count.store(pending.len(), Ordering::Release);
+        None
+    }
+
+    fn release_pending(&self, key: FlowKey, id: u64) {
+        let mut pending = self.pending.lock().expect("pending");
+        if pending.get(&key).is_some_and(|entry| entry.id == id) {
+            pending.remove(&key);
+            self.pending_count.store(pending.len(), Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    fn opening_flows(&self) -> usize {
+        self.pending.lock().expect("pending").len()
+    }
+
     /// Handle one datagram received from `source` toward `dest`, and answer it
     /// through `reply`.
     pub async fn handle(
@@ -464,75 +633,81 @@ impl UdpHub {
         tag: &str,
         target: &Target,
     ) -> std::io::Result<()> {
-        let key = (source, dest);
-        let found = {
-            let map = self.flows.read().expect("flows");
-            map.get(&key)
-                .filter(|flow| {
-                    !flow
-                        .tracker
-                        .as_ref()
-                        .is_some_and(|tracker| tracker.is_closed())
-                })
-                .cloned()
-        };
-        let flow = match found {
-            Some(flow) => {
-                flow.touch();
-                flow
-            }
-            None => {
-                let _gate = self.gate(key).lock_owned().await;
-                let found = self
-                    .flows
-                    .read()
-                    .expect("flows")
-                    .get(&key)
-                    .filter(|flow| {
-                        !flow
-                            .tracker
-                            .as_ref()
-                            .is_some_and(|tracker| tracker.is_closed())
-                    })
-                    .cloned();
-                if let Some(existing) = found {
-                    existing.touch();
-                    existing
-                } else {
-                    let mut held = self
-                        .held
-                        .lock()
-                        .expect("held")
-                        .remove(&key)
-                        .unwrap_or_default();
-                    let first = held.is_empty();
-                    held.push(payload.to_vec());
-                    let force = held.len() >= MAX_SNIFF_DATAGRAMS;
-                    match self
-                        .open_flow(reply.clone(), source, dest, tag, target, &held, force)
-                        .await?
-                    {
-                        Opened::Wait(timeout) => {
-                            self.held.lock().expect("held").insert(key, held);
-                            if first {
-                                self.route_held_after(key, timeout, reply, tag, target);
-                            }
-                            return Ok(());
-                        }
-                        Opened::Flow(flow) => {
-                            // the held ones go first; this datagram goes below
-                            held.pop();
-                            for earlier in &held {
-                                self.deliver(&flow, reply.clone(), source, dest, earlier, tag)
-                                    .await?;
-                            }
-                            flow
-                        }
-                    }
-                }
-            }
+        let Some(flow) = self
+            .flow_for(reply.clone(), source, dest, payload, tag, target)
+            .await?
+        else {
+            return Ok(());
         };
         self.deliver(&flow, reply, source, dest, payload, tag).await
+    }
+
+    /// The live flow `payload` goes to, opening it if needed; datagrams a
+    /// packet sniff held back are delivered before it returns. `None` means
+    /// the sniff held `payload` too.
+    async fn flow_for(
+        self: &Arc<Self>,
+        reply: Reply,
+        source: SocketAddr,
+        dest: SocketAddr,
+        payload: &[u8],
+        tag: &str,
+        target: &Target,
+    ) -> std::io::Result<Option<Arc<Flow>>> {
+        let key = (source, dest);
+        if let Some(flow) = self.live_flow(key) {
+            flow.touch();
+            return Ok(Some(flow));
+        }
+        let _gate = self.gate(key).lock_owned().await;
+        if let Some(existing) = self.live_flow(key) {
+            existing.touch();
+            return Ok(Some(existing));
+        }
+        let mut held = self
+            .held
+            .lock()
+            .expect("held")
+            .remove(&key)
+            .unwrap_or_default();
+        let first = held.is_empty();
+        held.push(payload.to_vec());
+        let force = held.len() >= MAX_SNIFF_DATAGRAMS;
+        match self
+            .open_flow(reply.clone(), source, dest, tag, target, &held, force)
+            .await?
+        {
+            Opened::Wait(timeout) => {
+                self.held.lock().expect("held").insert(key, held);
+                if first {
+                    self.route_held_after(key, timeout, reply, tag, target);
+                }
+                Ok(None)
+            }
+            Opened::Flow(flow) => {
+                // the held ones go first; this datagram goes after them
+                held.pop();
+                for earlier in &held {
+                    self.deliver(&flow, reply.clone(), source, dest, earlier, tag)
+                        .await?;
+                }
+                Ok(Some(flow))
+            }
+        }
+    }
+
+    fn live_flow(&self, key: FlowKey) -> Option<Arc<Flow>> {
+        self.flows
+            .read()
+            .expect("flows")
+            .get(&key)
+            .filter(|flow| {
+                !flow
+                    .tracker
+                    .as_ref()
+                    .is_some_and(|tracker| tracker.is_closed())
+            })
+            .cloned()
     }
 
     /// The opening gate of one tuple: first datagrams share it, so a burst
@@ -1422,5 +1597,275 @@ mod tests {
             crate::outbound::packet::take_addr_port(&framed[2..]).expect("take addr port");
         assert_eq!(got_target, Target::Ip(dest));
         assert_eq!(got_payload, payload);
+    }
+
+    /// VLESS-over-WebSocket server that holds every upgrade until the test
+    /// answers it: `true` opens the flow, `false` closes the connection,
+    /// which fails the open.
+    struct HeldProxy {
+        port: u16,
+        requests: tokio::sync::mpsc::UnboundedReceiver<tokio::sync::oneshot::Sender<bool>>,
+        datagrams: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    }
+
+    impl HeldProxy {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("proxy");
+            let port = listener.local_addr().expect("proxy addr").port();
+            let (request_tx, requests) = tokio::sync::mpsc::unbounded_channel();
+            let (datagram_tx, datagrams) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(serve_held(stream, request_tx.clone(), datagram_tx.clone()));
+                }
+            });
+            Self {
+                port,
+                requests,
+                datagrams,
+            }
+        }
+
+        fn router(&self) -> Arc<Router> {
+            Router::new(&serde_json::json!({
+                "outbounds": [{"type": "vless", "tag": "out", "server": "127.0.0.1",
+                    "server_port": self.port, "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                    "packet_encoding": "", "transport": {"type": "ws", "path": "/"}}],
+                "route": {"final": "out"}
+            }))
+            .expect("proxy router")
+        }
+
+        async fn next_request(&mut self) -> tokio::sync::oneshot::Sender<bool> {
+            tokio::time::timeout(Duration::from_secs(5), self.requests.recv())
+                .await
+                .expect("dial deadline")
+                .expect("proxy server")
+        }
+
+        /// No further dial shows up within a short window.
+        async fn assert_no_request(&mut self) {
+            let next = tokio::time::timeout(Duration::from_millis(200), self.requests.recv()).await;
+            assert!(next.is_err(), "an unexpected extra dial reached the proxy");
+        }
+
+        /// Payloads that reached the server within `window`.
+        async fn received(&mut self, window: Duration) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let deadline = tokio::time::Instant::now() + window;
+            while let Ok(Some(payload)) =
+                tokio::time::timeout_at(deadline, self.datagrams.recv()).await
+            {
+                out.push(payload);
+            }
+            out
+        }
+    }
+
+    /// One VLESS-over-WebSocket connection: hold the upgrade until the test
+    /// decides, then forward the `[len][payload]` datagrams it carries.
+    async fn serve_held(
+        mut stream: tokio::net::TcpStream,
+        requests: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<bool>>,
+        datagrams: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Option<()> {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.ok()?;
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).ok()?;
+        let key = head.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("sec-websocket-key")
+                .then(|| value.trim().to_string())
+        })?;
+        let (answer, decided) = tokio::sync::oneshot::channel();
+        requests.send(answer).ok()?;
+        if decided.await != Ok(true) {
+            return None; // closing before the upgrade fails the open
+        }
+        crate::ws::accept(&mut stream, &key).await.ok()?;
+        let mut data = Vec::new();
+        // VLESS head for an IPv4 target: version, uuid, addons, command, port,
+        // address type, address
+        let mut head_left = 26;
+        loop {
+            let mut frame = [0u8; 2];
+            stream.read_exact(&mut frame).await.ok()?;
+            let len = match frame[1] & 0x7f {
+                126 => {
+                    let mut len = [0u8; 2];
+                    stream.read_exact(&mut len).await.ok()?;
+                    u64::from(u16::from_be_bytes(len))
+                }
+                127 => {
+                    let mut len = [0u8; 8];
+                    stream.read_exact(&mut len).await.ok()?;
+                    u64::from_be_bytes(len)
+                }
+                len => u64::from(len),
+            };
+            let mut mask = [0u8; 4];
+            if frame[1] & 0x80 != 0 {
+                stream.read_exact(&mut mask).await.ok()?;
+            }
+            let mut payload = vec![0u8; usize::try_from(len).ok()?];
+            stream.read_exact(&mut payload).await.ok()?;
+            for (i, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[i % 4];
+            }
+            match frame[0] & 0x0f {
+                0..=2 => data.extend_from_slice(&payload),
+                8 => return None,
+                _ => continue,
+            }
+            let skip = head_left.min(data.len());
+            data.drain(..skip);
+            head_left -= skip;
+            while data.len() >= 2 {
+                let n = usize::from(u16::from_be_bytes([data[0], data[1]]));
+                if data.len() < 2 + n {
+                    break;
+                }
+                datagrams.send(data[2..2 + n].to_vec()).ok()?;
+                data.drain(..2 + n);
+            }
+        }
+    }
+
+    fn opener_flow(port: u16) -> (SocketAddr, SocketAddr) {
+        (
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            "192.0.2.1:9".parse().expect("dest"),
+        )
+    }
+
+    async fn reply_socket() -> Arc<UdpSocket> {
+        Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("reply"))
+    }
+
+    #[tokio::test]
+    async fn datagrams_of_an_opening_flow_queue_behind_its_one_opener() {
+        let mut proxy = HeldProxy::start().await;
+        let hub = UdpHub::new(proxy.router(), Duration::from_secs(60), DatagramFrame::Raw);
+        let reply = reply_socket().await;
+        let (source, dest) = opener_flow(31000);
+        let mut openers = Vec::new();
+        for sequence in 0..200u8 {
+            openers.extend(hub.offer(source, dest, &[sequence]));
+        }
+        assert_eq!(openers.len(), 1, "one opener for the whole burst");
+        assert_eq!(hub.opening_flows(), 1);
+        let opener = openers.pop().expect("opener");
+        let run = tokio::spawn(async move {
+            opener
+                .run(Reply::Socket(Arc::downgrade(&reply)), "test")
+                .await
+        });
+        let open = proxy.next_request().await;
+        assert!(hub.offer(source, dest, &[200]).is_none());
+        open.send(true).expect("accept");
+        run.await.expect("opener task").expect("opened");
+        let expected: Vec<Vec<u8>> = (0..=MAX_OPENING_DATAGRAMS as u8).map(|s| vec![s]).collect();
+        assert_eq!(proxy.received(Duration::from_millis(300)).await, expected);
+        assert_eq!(hub.opening_flows(), 0, "the entry is released once drained");
+        assert_eq!(hub.pending_count.load(Ordering::Acquire), 0);
+        assert!(
+            hub.offer(source, dest, b"late").is_none(),
+            "open flow, fast path"
+        );
+        assert_eq!(
+            proxy.received(Duration::from_millis(300)).await,
+            vec![b"late".to_vec()]
+        );
+        proxy.assert_no_request().await;
+        hub.stop();
+    }
+
+    #[tokio::test]
+    async fn a_slow_opening_flow_does_not_hold_back_another_flow() {
+        let mut proxy = HeldProxy::start().await;
+        let hub = UdpHub::new(proxy.router(), Duration::from_secs(60), DatagramFrame::Raw);
+        let reply = reply_socket().await;
+        let (slow_source, dest) = opener_flow(31001);
+        let (fast_source, _) = opener_flow(31002);
+        let slow = hub.offer(slow_source, dest, b"slow").expect("slow opener");
+        let slow_reply = Reply::Socket(Arc::downgrade(&reply));
+        let slow_run = tokio::spawn(async move { slow.run(slow_reply, "test").await });
+        let slow_open = proxy.next_request().await;
+
+        let fast = hub.offer(fast_source, dest, b"fast").expect("fast opener");
+        let fast_reply = Reply::Socket(Arc::downgrade(&reply));
+        let fast_run = tokio::spawn(async move { fast.run(fast_reply, "test").await });
+        proxy.next_request().await.send(true).expect("accept fast");
+        fast_run.await.expect("fast task").expect("fast opened");
+        assert_eq!(
+            proxy.received(Duration::from_millis(300)).await,
+            vec![b"fast".to_vec()]
+        );
+        assert_eq!(
+            hub.opening_flows(),
+            1,
+            "only the slow flow is still opening"
+        );
+
+        slow_open.send(false).expect("reject slow");
+        assert!(slow_run.await.expect("slow task").is_err());
+        assert_eq!(hub.opening_flows(), 0);
+        hub.stop();
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_drops_its_queue_and_the_next_datagram_retries() {
+        let mut proxy = HeldProxy::start().await;
+        let hub = UdpHub::new(proxy.router(), Duration::from_secs(60), DatagramFrame::Raw);
+        let reply = reply_socket().await;
+        let (source, dest) = opener_flow(31003);
+        let opener = hub.offer(source, dest, b"first").expect("opener");
+        for _ in 0..50 {
+            assert!(hub.offer(source, dest, b"queued").is_none());
+        }
+        let first_reply = Reply::Socket(Arc::downgrade(&reply));
+        let run = tokio::spawn(async move { opener.run(first_reply, "test").await });
+        proxy.next_request().await.send(false).expect("reject");
+        assert!(run.await.expect("opener task").is_err());
+        assert_eq!(hub.opening_flows(), 0, "a failed open leaves no entry");
+        assert_eq!(hub.pending_count.load(Ordering::Acquire), 0);
+        proxy.assert_no_request().await;
+        assert!(proxy.received(Duration::from_millis(100)).await.is_empty());
+
+        let retry = hub.offer(source, dest, b"retry").expect("fresh opener");
+        let retry_reply = Reply::Socket(Arc::downgrade(&reply));
+        let run = tokio::spawn(async move { retry.run(retry_reply, "test").await });
+        proxy.next_request().await.send(true).expect("accept");
+        run.await.expect("retry task").expect("opened");
+        assert_eq!(
+            proxy.received(Duration::from_millis(300)).await,
+            vec![b"retry".to_vec()]
+        );
+        assert_eq!(hub.opening_flows(), 0);
+        hub.stop();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_opener_releases_its_flow() {
+        let hub = UdpHub::new(
+            direct_test_router(),
+            Duration::from_secs(60),
+            DatagramFrame::Raw,
+        );
+        let (source, dest) = opener_flow(31004);
+        let opener = hub.offer(source, dest, b"one").expect("opener");
+        assert!(hub.offer(source, dest, b"two").is_none());
+        drop(opener);
+        assert_eq!(hub.opening_flows(), 0);
+        assert!(hub.offer(source, dest, b"three").is_some());
+        assert_eq!(hub.opening_flows(), 0, "and so does the second one");
+        hub.stop();
     }
 }

@@ -974,16 +974,16 @@ fn handle_ipv4_packet(
                 let dst_port = u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]);
                 let udp_len = u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]) as usize;
                 if udp_len >= 8 && packet.len() >= ihl + udp_len {
-                    let payload = packet[ihl + 8..ihl + udp_len].to_vec();
+                    let payload = &packet[ihl + 8..ihl + udp_len];
                     let source = SocketAddr::new(IpAddr::V4(src_ip), src_port);
                     let dest = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
 
-                    if !hub.try_existing(source, dest, &payload) {
-                        let hub = Arc::clone(hub);
+                    // one task per opening flow; its other datagrams queue
+                    if let Some(opener) = hub.offer(source, dest, payload) {
                         let reply = reply.clone();
                         let tag = tag.to_string();
                         tokio::spawn(async move {
-                            let _ = hub.handle(reply, source, dest, &payload, &tag).await;
+                            let _ = opener.run(reply, &tag).await;
                         });
                     }
                 }
@@ -1112,16 +1112,16 @@ fn handle_ipv6_packet(
                 let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
                 let udp_len = u16::from_be_bytes([payload[4], payload[5]]) as usize;
                 if udp_len >= 8 && payload.len() >= udp_len {
-                    let data = payload[8..udp_len].to_vec();
+                    let data = &payload[8..udp_len];
                     let source = SocketAddr::new(IpAddr::V6(src_ip), src_port);
                     let dest = SocketAddr::new(IpAddr::V6(dst_ip), dst_port);
 
-                    if !hub.try_existing(source, dest, &data) {
-                        let hub = Arc::clone(hub);
+                    // one task per opening flow; its other datagrams queue
+                    if let Some(opener) = hub.offer(source, dest, data) {
                         let reply = reply.clone();
                         let tag = tag.to_string();
                         tokio::spawn(async move {
-                            let _ = hub.handle(reply, source, dest, &data, &tag).await;
+                            let _ = opener.run(reply, &tag).await;
                         });
                     }
                 }

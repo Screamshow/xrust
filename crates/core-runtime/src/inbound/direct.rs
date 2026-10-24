@@ -230,16 +230,14 @@ impl Direct {
                         let Target::Ip(dest) = dest else {
                             continue;
                         };
-                        if hub.try_existing(source, dest, &buf[..n]) {
+                        // one task per opening flow; its other datagrams queue
+                        let Some(opener) = hub.offer(source, dest, &buf[..n]) else {
                             continue;
-                        }
-                        let hub = Arc::clone(&hub);
+                        };
                         let reply = Reply::Socket(Arc::downgrade(&sock));
                         let tag = tag.clone();
-                        let payload = buf[..n].to_vec();
                         packets.spawn(async move {
-                            if let Err(err) = hub.handle(reply, source, dest, &payload, &tag).await
-                            {
+                            if let Err(err) = opener.run(reply, &tag).await {
                                 logging::debug(format_args!("direct[{tag}] udp {source}: {err}"));
                             }
                         });
