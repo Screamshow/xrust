@@ -21,6 +21,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | SEC-04 | Переполнение размера чанка в HTTP-клиенте (`decode_chunked`) | P0 | исправлено, проверено | `5de21230da8bf883f3616f7b7b952917646e9cdb`, `2b49308ed8af6fa4fe1cce16fe1b290b9e4aa325` |
 | SEC-07 | Тело по `Content-Length` не ограничено до чтения | P1 | исправлено, проверено | `48c70f91e32a30a2f2a281a66a46703891604bb5` |
 | SEC-05 | HTTPS-загрузки rule-set и external_ui без проверки сертификата | P1 | исправлено, проверено | `11ada8206da3ccdd5cbb54c6758133c7c290d362` |
+| BLD-02 | `rustls-webpki` и `webpki-roots`: доверие к скомпрометированным промежуточным emSign | P0 | исправлено, ожидает независимой проверки | `e0404da672defc885295297a8e4cf3c2087f2d44` |
 
 ## Задачи
 
@@ -341,3 +342,101 @@ URLTest и delay-пробы Clash API уже проверяли сертифик
   - доверенные корни берутся из `webpki-roots 1.0.9` и `rustls-webpki 0.103.15` с известными advisory (BLD-02);
   - ошибка **начальной** загрузки remote rule-set по-прежнему завершает запуск — как при 404 или таймауте;
   - REALITY, pins при `insecure`, MASQUE и прочие находки TLS (SEC-01…03) не затрагивались.
+
+### BLD-02 — `rustls-webpki` и `webpki-roots`: доверие к скомпрометированным промежуточным emSign
+
+- **Приоритет:** P0.
+- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Коммит:** [`e0404da672defc885295297a8e4cf3c2087f2d44`](https://github.com/Screamshow/xrust/commit/e0404da672defc885295297a8e4cf3c2087f2d44).
+- **Файл:** `Cargo.lock`. Исходный код, `Cargo.toml`, TLS-политика, REALITY, pins и криптография не менялись.
+
+#### Применимость advisories
+
+Обе advisory относятся к CVE-2026-111943: могли приниматься цепочки через промежуточные сертификаты emSign, закрытые ключи которых теперь известны.
+
+| Advisory | Пакет | Исправлено в | До | Применимо к проекту |
+|---|---|---|---|---|
+| RUSTSEC-2026-0382 | `rustls-webpki` | `>= 0.103.16` (ветка 0.103) | 0.103.15 | да: используется `core-tls` напрямую и через `rustls 0.23.45` |
+| RUSTSEC-2026-0381 | `webpki-roots` | `>= 1.0.10` | 1.0.9 | да: корни Mozilla приходят в `core-tls` через совместимый пакет `webpki-roots 0.26.11` |
+
+Пакет `webpki-roots 0.26.11` в advisory отмечен как `unaffected`. Но своего набора корней у него нет: он реэкспортирует отдельно разрешённую зависимость 1.x. Поэтому решает версия 1.x.
+
+#### Обновление
+
+Адресное, без общего `cargo update`:
+
+```
+cargo update -p rustls-webpki --precise 0.103.16
+cargo update -p webpki-roots@1.0.9 --precise 1.0.10
+```
+
+| Пакет | До | После |
+|---|---|---|
+| `rustls-webpki` | 0.103.15 | 0.103.16 |
+| `webpki-roots` (1.x) | 1.0.9 | 1.0.10 |
+| `webpki-roots` (0.26, совместимый) | 0.26.11 | 0.26.11 — изменилась только ссылка на 1.x |
+
+- **Транзитивных обновлений нет.** Зависимости новых версий совпадают с прежними: `ring`, `rustls-pki-types`, `untrusted`.
+- **Выбор версий.** Взяты минимальные исправленные. `webpki-roots 1.0.11` опубликован, но для этой задачи не нужен.
+- **Источники:** база RustSec advisory-db (официальный репозиторий, состояние на 2026-10-23) и индекс crates.io. Контрольные суммы проверены cargo при загрузке.
+
+#### Проверки разработки
+
+- **Корни:** в `webpki-roots 1.0.10` записей `emSign ECC Root CA - G3` — 0, в 1.0.9 было 4.
+- **cargo audit** (advisory-db от 2026-10-23, `--no-fetch`):
+
+| | Уязвимости | Предупреждения |
+|---|---|---|
+| до | 8, включая RUSTSEC-2026-0381 и -0382 | 5 |
+| после | 6 — обе advisory ушли, остальное без изменений | 5 |
+
+Профиль legacy:
+
+| Команда | Результат |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --locked --workspace --all-targets --features legacy-protocols -- -D warnings` | exit 0 |
+| `cargo test --locked --workspace --features legacy-protocols` | 79 бинарников: 1517 passed, 0 failed, 19 ignored |
+
+Профиль rust-x и TLS:
+
+| Команда | Результат |
+|---|---|
+| `cargo check --locked --workspace --no-default-features --features rust-x` | exit 0; 14 прежних предупреждений `dead_code` |
+| `cargo test --locked -p core-config --no-default-features --features rust-x --test rust_x_profile` | 3 passed |
+| `cargo test --locked -p core-tls` | 10 бинарников: 88 passed, 0 failed |
+| rust-x `--lib http_client` / `--lib rule_set_remote` / `--lib tls_client` | 24 / 12 / 9 passed |
+| rust-x `--test fetch_tls` (SEC-05) / `--test urltest_tls` | 3 / 1 passed |
+| rust-x `--test tls_interop` / `--test tls_own_stack` / `--test imported_pins` | 4 / 4 / 1 passed |
+| rust-x `--test clash_api` / `--test rule_set_compiled` / `--test hot_reload` | 7 / 13 / 9 passed |
+
+Релизные сборки rust-x (`cargo build --locked -p core-cli --no-default-features --features rust-x --release --target …`, без `RUSTFLAGS` в окружении):
+
+| Цель | Результат |
+|---|---|
+| `aarch64-unknown-linux-musl` | собран, 10 220 032 байт (до: 10 220 464). Флаги из `.cargo/config.toml` подтверждены по `-v`: `--cfg aes_armv8`, `polyval_armv8`, `chacha20_force_neon`, `rust-lld`, `link-self-contained=yes`, `--icf=safe`, `noseparate-code`, `norelro` |
+| `x86_64-unknown-linux-musl` | **не собран в этом окружении**: нет `x86_64-linux-musl-gcc` (пакет `musl-tools`) для `libmimalloc-sys`. Это прежнее ограничение окружения, не связанное с изменением |
+| `x86_64-unknown-linux-gnu` (замена для проверки кода) | собран, 12 408 216 байт |
+
+#### Ограничения
+
+- Независимая проверка ещё не проводилась.
+- Релизная сборка x86_64-musl не выполнена: нужна машина с `musl-tools`, как в CI.
+- ARM-исполнение, установка пакета и LuCI не проверялись.
+
+#### Остальные advisories (не обновлялись, отдельные задачи)
+
+| Advisory | Пакет | Версия | Суть | Исправлено в |
+|---|---|---|---|---|
+| RUSTSEC-2026-0349 | `rustls` | 0.23.45 | неаутентифицированный ServerHello может понизить последующие соединения до классического обмена ключами | 0.23.46 (BLD-03) |
+| RUSTSEC-2026-0346 | `rustls` | 0.23.45 | `Debug` клиентских сессий раскрывает секреты TLS | 0.23.46 |
+| RUSTSEC-2026-0347 | `rustls` | 0.23.45 | буферизованные данные уходят внешнему серверу после отказа ECH | 0.23.46 |
+| RUSTSEC-2026-0348 | `rustls` | 0.23.45 | распаковка Brotli-сертификата до 1 ГиБ до аутентификации | 0.23.46 |
+| RUSTSEC-2026-0344 | `ruzstd` | 0.8.3 | OOM при распаковке (BLD-01) | ≥ 0.9.1, нужна правка `Cargo.toml` |
+| RUSTSEC-2023-0071 | `rsa` | 0.9.10 | Marvin, тайминговая атака | исправления нет |
+| RUSTSEC-2026-0002, -0253 | `lru` | 0.12.5 | unsound | см. BLD-16 |
+| RUSTSEC-2026-0386 | `tokio` | 1.53.1 | unsound `AsyncFd<RawFd>` (BLD-05) | см. advisory |
+| RUSTSEC-2024-0436 | `paste` | 1.0.15 | не поддерживается | — |
+| RUSTSEC-2025-0134 | `rustls-pemfile` | 2.2.0 | не поддерживается | — |
+
+Также `cargo audit` сообщает, что `yoke-derive` отозван (yanked).
