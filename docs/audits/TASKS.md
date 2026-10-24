@@ -30,6 +30,9 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | CQ-06 | UDP: лавина задач открытия, пока поток открывается | P1 | исправлено, проверено | `b0bc97be3a552e98cf2b128d67ab167ca92b3481` |
 | CN-01 | XHTTP: мёртвое HTTP/2-соединение навсегда остаётся в пуле | P0 | исправлено, проверено | `fd03c0aabd38a2b954dbd7e5695667326d7613c5` |
 | CN-03 | Hysteria2: `server_ports` без `server_port` не запускается; port hopping течёт и рвёт соединения | P0 | исправлено, проверено | `c90ab92c9415072ebfe6fba27a9f875f0b0204bd` |
+| FP-06 / CN-18 | WebSocket early data: стандартный base64, `early_data_header_name` игнорируется, сервер не читает early data | P0 (серверы sing-box) | исправлено, ожидает независимой проверки | `808bfa4c0fc1b3ceced6d6c386a2d22fa38a2e3b` |
+| BLD-08 | Таблицы раскрутки в release-сборке aarch64 | P2 | исправлено, ожидает независимой проверки | `477d0826627f2a8ad6706f8df874ff90550a0064` |
+| BLD-06 / BLD-07 | Профиль `opt-level="s"` и per-package `opt-level=3` | P2 | не применено: по замерам теряется скорость TLS ChaCha20 | — (комментарий в `477d082`) |
 
 ## Задачи
 
@@ -1002,3 +1005,121 @@ PID основной службы и контрольные суммы `/etc/con
 - Локальные модульные проверки и проверки конфигурации прошли. Весь локальный набор успешным не засчитан: в WSL остаются падения по fd в двух тестах Hysteria2 и двух H2-тестах; на VM они не повторились.
 - **Не проверялись:** ARM, внешние серверы Xray, Hysteria и sing-box, настоящий WAN и DNAT, пакетное обновление, полный CI.
 - Дополнительные таймауты не добавлялись.
+
+### FP-06 / CN-18 — WebSocket early data
+
+- **Приоритет:** P0 для серверов sing-box.
+- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Коммит:** [`808bfa4c0fc1b3ceced6d6c386a2d22fa38a2e3b`](https://github.com/Screamshow/xrust/commit/808bfa4c0fc1b3ceced6d6c386a2d22fa38a2e3b).
+- **Файлы:** `crates/core-runtime/src/outbound/transport/mod.rs`, `outbound/transport/tests.rs`, WS-часть `crates/core-runtime/src/inbound/transport.rs` (XHTTP не менялся), `docs/reference/common/transports.md`, новые `crates/core-runtime/tests/ws_early_data.rs` и `crates/core-config/tests/ws_early_data_options.rs`. Forkop X не менялся.
+
+#### Эталоны
+
+- **sing-box** (`824dbcfb4dd0a95921840b1737b950cde590241e`), `transport/v2raywebsocket/conn.go`: `:164-169` — первая запись делится по `max_early_data`; `:171` — base64url без паддинга (`RawURLEncoding`); `:172-174` — пустое `early_data_header_name` означает early data в пути URL; `:177-178` — заданное имя — в этом заголовке. `server.go`: `:75-79`, `:86-93` — path-режим с совпадением по префиксу; `:94-102` — заголовок, строгое декодирование; `:104-106` — ошибка декодирования даёт 400.
+- **Xray** v26.10.21 (`1b1647cd9ddf0abc34b981d4611fc03bcac1ca74`): `transport/internet/websocket/dialer.go:143-146` — early data только в `Sec-WebSocket-Protocol`, base64url; `:194-197` — если первая запись больше `ed`, early data не отправляется; `hub.go:47` — точный путь; `:55-58` — нестрогое декодирование `Sec-WebSocket-Protocol`; `infra/conf/transport_method.go:630-637` — `?ed=` убирается из пути. Настройки имени заголовка нет.
+- **Forkop X:** `subscription/parser.uc:749-756`, `singbox/generator.uc:1953-1957` превращают `ed=` в `max_early_data` без `early_data_header_name`.
+
+#### Причина
+
+- Клиент (`outbound/transport/mod.rs:493-533`): стандартный base64 с `+/=`, всегда в `Sec-WebSocket-Protocol`; `early_data_header_name` не разбирался. Серверы sing-box отвергали такое соединение.
+- Сервер (`inbound/transport.rs:218-248`) early data не читал вовсе: даже xrust ↔ xrust с early data терял эти байты.
+
+#### Исправление (решение владельца проекта)
+
+- **Клиент:** base64url без паддинга; заголовок — `early_data_header_name`, а при пустом или отсутствующем имени — `Sec-WebSocket-Protocol` (как Xray; так работают конфигурации Forkop X из ссылок с `ed=`). Первая запись делится по `max_early_data`, как в sing-box: оба сервера просто ставят декодированные байты перед следующими кадрами без проверки длины. Early data заменяет одноимённый заголовок из конфигурации. Путь не меняется.
+- **Сервер:** если задан `max_early_data` или имя заголовка, early data читается из этого заголовка (по умолчанию `Sec-WebSocket-Protocol`), декодируется строго (base64url без паддинга) и ставится перед потоком WS; недекодируемое значение — отказ. Путь сравнивается точно.
+- **Проверка типов:** для WS-inbound `max_early_data` (uint32) и `early_data_header_name` (строка) проверяются при запуске.
+- **Отличие от sing-box (задокументировано в `docs/reference/common/transports.md` и в коде):** в sing-box пустое имя заголовка означает path-режим, в xrust — `Sec-WebSocket-Protocol`. Path-режим не поддерживается; полной совместимости всех режимов нет. Пользовательское имя заголовка работает только с sing-box и xrust.
+
+#### Поведение по форме конфигурации и серверу
+
+| Конфигурация | Сервер Xray | Сервер sing-box | Сервер xrust |
+|---|---|---|---|
+| без early data | OK | OK | OK |
+| как в Forkop X (`max_early_data` без имени), бюджеты 2048/25/26/27/1 | OK | **отказ**: sing-box трактует такую форму как path-режим | OK |
+| явный `Sec-WebSocket-Protocol`, бюджеты 2048/25/26/27 | OK | OK | OK |
+| пользовательский заголовок (2048, 1) | неприменимо (настройки нет) | OK | OK |
+
+- Клиент Xray (`?ed=`) → сервер xrust: OK; клиент sing-box с именем заголовка → xrust: OK; клиент sing-box без имени (path-режим) → xrust: отказ, ожидаемо.
+
+#### Воспроизведение до исправления
+
+- Проверено разработкой на копии `HEAD` (legacy, отдельный каталог сборки, sing-box 1.14.3 и Xray 26.10.21): `ws_early_data` — 1 passed, 4 failed. Падают `our_client_against_our_server`, `our_client_against_the_reference_server`, `the_reference_client_against_our_server`, `xray_against_our_server`. Проходит `our_client_against_xray`: нестрогий сервер Xray принимал прежний base64 с паддингом.
+- По ручным запускам исполнителя на старом коде: сервер sing-box — `decode early data: illegal base64 data at input byte 14` (заголовок `Sec-WebSocket-Protocol`), `unknown version: 114` (пользовательский заголовок).
+
+#### Проверки разработки
+
+- Тесты: 5 интеграционных в `ws_early_data.rs` (xrust ↔ xrust, xrust → sing-box, sing-box → xrust, xrust → Xray, Xray → xrust; эталонные — при `SING_BOX_REF` / `XRAY_REF`), в каждом — передача 9 Б и 40 КБ со всеми значениями байтов в обе стороны; конфигурация Forkop X (`forkop_ws()`, включая `headers.Host`) — против Xray и xrust; модульные тесты формата, разбиения по `max_early_data`, замены заголовка, отказа сервера и проверки типов; 2 теста `ws_early_data_options`.
+- Проверено на копии `HEAD` + файлы FP-06 с отдельным каталогом сборки, `SING_BOX_REF` и `XRAY_REF` заданы:
+
+| Команда | legacy | rust-x |
+|---|---|---|
+| `cargo fmt --all -- --check` | чисто | — |
+| `cargo clippy --locked -p core-runtime --all-targets --features legacy-protocols -- -D warnings` | чисто | — |
+| `--lib transport` | 114 passed | 113 passed |
+| `--test ws_early_data` | 5 passed | 5 passed |
+| `--test xhttp_packet_up_sessions` | 10 passed | 10 passed |
+| `--test transports_interop` / `server_inbounds` | 1 / 49 passed | — |
+| `cargo test -p core-config --test ws_early_data_options` | 2 passed | — |
+
+- По отчёту исполнителя: в rust-x `transports_interop` 0/1, `server_interop` 3/9, `server_inbounds` 31/49 — те же числа на `HEAD` (vmess, trojan, shadowsocks не реализованы); в legacy `server_interop` 7/9 — 2 случая XHTTP падают и на `HEAD` (в sing-box 1.14.3 нет XHTTP).
+
+#### Ограничения
+
+- В `main` не слито, не выпущено.
+- Конфигурация в форме Forkop X не работает с серверами sing-box (они ждут path-режим); для них нужен явный `early_data_header_name`. Path-режим sing-box не поддерживается ни на клиенте, ни на сервере.
+- Сервер xrust читает early data, только если в inbound задан `max_early_data` или имя заголовка; без них early data клиента Xray с `?ed=` теряется.
+- Декодирование строгое: base64 с паддингом или стандартный алфавит отвергаются (Xray их принимает).
+- Заголовок запроса ограничен 8 КиБ, поэтому early data больше ≈6 КиБ отвергается.
+- `core-config` по-прежнему не проверяет типы полей транспорта inbound в целом.
+- OpenWrt и другие архитектуры не проверялись; полный CI не запускался.
+
+### BLD-06 / BLD-07 / BLD-08 — размер бинарника
+
+- **Приоритет:** P2.
+- **Статус:** BLD-08 — исправлено (только aarch64), ожидает независимой проверки. BLD-06 и BLD-07 — не применены: безопасный выигрыш замерами не подтверждён. В `main` не слито, не выпущено.
+- **Коммит:** [`477d0826627f2a8ad6706f8df874ff90550a0064`](https://github.com/Screamshow/xrust/commit/477d0826627f2a8ad6706f8df874ff90550a0064): в `.cargo/config.toml` к rustflags `aarch64-unknown-linux-musl` добавлен `-C force-unwind-tables=no` (существующие записи и комментарии сохранены); в `Cargo.toml` — только комментарий над per-package `opt-level`. Профиль, зависимости, `Cargo.lock`, аллокатор, набор функций и упаковка не менялись.
+
+#### Среда замеров
+
+- rustc 1.99.1, LLVM 23.1.1; Xeon E5-2690 v4 (AES-NI, PCLMUL, AVX2). Сборки `cargo build --locked -p core-cli --no-default-features --features rust-x --release --target …` без `RUSTFLAGS`, каждая — в своей копии `HEAD` со своим каталогом сборки.
+- x86_64-musl собран с musl 1.2.5, собранным из исходников во временном каталоге (передан только `CC_x86_64_unknown_linux_musl`); `cargo build -v` подтверждает флаги `.cargo/config.toml`.
+
+#### Размеры (stripped, байт; по отчёту исполнителя)
+
+| Вариант | x86_64-musl | aarch64-musl |
+|---|---:|---:|
+| A: текущий профиль (opt 3) | 12 615 856 | 10 282 664 |
+| B: `"s"` + `core-crypto`=3 (и прежний список) | 8 994 864 (−28,7 %) | 7 420 856 (−27,8 %) |
+| C: B + `force-unwind-tables=no` | 8 994 864 (как B) | 7 191 768 (−30,1 %) |
+| D: `"z"` + `core-crypto`=3 | 8 365 440 (−33,7 %) | 6 438 240 (−37,4 %) |
+| E: B + `core-tls`=3 + `core-runtime`=3 | 10 991 792 (−12,9 %) | 8 980 568 (−12,7 %) |
+| G: B + `core-cli`=3 (корень LTO) | 12 857 704 (+1,9 %) | 11 744 400 (+14,2 %) |
+| Принятый: A + флаг только для aarch64 | без изменений (флаг не добавлен) | 9 995 544 (−2,79 %) |
+
+- Проверено разработкой на текущем `HEAD` (`808bfa4`), aarch64-musl release: 10 285 480 → 9 995 544 байт (−289 936, −2,8 %); во всех 199 вызовах rustc для aarch64 присутствуют `--cfg aes_armv8`, `--cfg polyval_armv8`, `--cfg chacha20_force_neon`, `force-unwind-tables=no`; флаги компоновщика (`rust-lld`, `link-self-contained=yes`, `--icf=safe`, `-z noseparate-code`, `-z norelro`) на месте.
+- На x86_64 флаг размер не меняет (`.eh_frame` 665 КБ остаётся), поэтому туда не добавлен. На aarch64 `.eh_frame` уменьшается с 679 до 393 КБ (остаток — из готовой std).
+
+#### Производительность x86_64 (musl release; по отчёту исполнителя)
+
+- `perf_aead` (одно ядро, 5 чередующихся прогонов, ГиБ/с, медиана): fastgcm и fastchacha из `core-crypto` при `"s"` не теряют скорость; AEAD из крейтов RustCrypto, инстанцируемые вне per-package переопределений, — около 3 раз медленнее (aes-128-gcm 64K: 0,91 → 0,32; chacha20poly1305: 1,03 → 0,33).
+- Сквозной тест `scripts/bench/proto.py` (VLESS, клиент и сервер — тот же бинарник, медиана 3 серий): plain и TLS AES-128/256 — в пределах шума; **TLS с ChaCha20-Poly1305 при `"s"`: 1 поток 2,6 → 1,93 Гбит/с, 8 потоков 6,4 → 5,0 Гбит/с, CPU на ГиБ +≈30 %**. Возврат `core-tls`, `core-runtime` или `rustls` к opt 3 потерю не устраняет: при fat LTO оптимизация идёт с opt-level корневого крейта, поэтому per-package `opt-level=3` (BLD-07) в текущем виде ничего не дают.
+- Пиковая RSS при `"s"` ниже на ≈2,3 МиБ; время `check` ≈2 мс для всех вариантов.
+- Smoke (x86_64-musl, варианты A–D): `version`, `check` (rc 0), `run` с mixed inbound (HTTP-запрос через SOCKS5 и HTTP-прокси), выход по SIGTERM с кодом 0.
+
+#### Решение
+
+- Профиль остаётся `opt-level = 3`. BLD-06 в описанном виде не применять: возвращаться к нему вместе с изменением кода (например, перевести TLS ChaCha на собственную реализацию `core-crypto`) и после A/B-замера на Cortex-A53 (`perf_aead`, `proto.py`).
+- BLD-07: предложенное в аудите «исправление» при fat LTO не работает; комментарий в `Cargo.toml` исправлен.
+- BLD-08 применён только для aarch64.
+
+#### Цена BLD-08
+
+- При `panic = "abort"` и `strip = "symbols"` раскрутки нет, а backtrace и так без имён; сообщение о панике по-прежнему выводится. Теряются обход стека по `RUST_BACKTRACE` и профилировщики на основе DWARF CFI на устройстве.
+
+#### Ограничения
+
+- **Скорость на ARM не измерялась** — ни для принятого флага, ни для вариантов `"s"`: здесь нет ARM-устройства и эмулятора; aarch64-бинарник не запускался. Выводы по ARM — только по статическому подсчёту инструкций: в принятом варианте число `aese`, `aesmc`, `pmull`, `pmull2` не изменилось (1002/904/83/74).
+- Быстрый путь `fastchacha` на AVX2 есть только на x86, поэтому замеры x86 не заменяют ARM для ChaCha.
+- Сквозные замеры — только VLESS plain/TLS/Vision; Hysteria2 и XHTTP не замерялись.
+- Замеры сделаны исполнителем; разработкой повторно проверены только размер и флаги aarch64 на текущем `HEAD`. Полный CI не запускался.
