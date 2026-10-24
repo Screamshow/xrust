@@ -3434,6 +3434,7 @@ fn validate_rule_sets(route: &Map<String, Value>) -> Result<(), String> {
                 if rules.is_empty() || rules.iter().any(|rule| !headless_rule_is_valid(rule)) {
                     return Err(format!("{at_init}: empty inline rule-set"));
                 }
+                check_headless_rules_regex(rules, &at_init)?;
             }
             "local" => {
                 let path = entry.get("path").and_then(Value::as_str).unwrap_or("");
@@ -3516,6 +3517,34 @@ fn headless_rule_is_valid(rule: &Value) -> bool {
     rule.keys().any(|key| key != "invert" && key != "type")
 }
 
+/// `NewHeadlessRule`: every `domain_regex` of a rule-set rule must compile,
+/// including those inside logical rules.
+fn check_headless_rules_regex(rules: &[Value], at: &str) -> Result<(), String> {
+    fn check(rule: &Value, at: &str) -> Result<(), String> {
+        let Some(rule) = rule.as_object() else {
+            return Ok(());
+        };
+        if let Some(value) = rule
+            .get("domain_regex")
+            .filter(|value| !prunes_value(value))
+        {
+            check_regex_listable(value, &format!("{at}: domain_regex"))?;
+        }
+        if rule.get("type").and_then(Value::as_str) == Some("logical")
+            && let Some(Value::Array(subs)) = rule.get("rules")
+        {
+            for (index, sub) in subs.iter().enumerate() {
+                check(sub, &format!("{at}: sub rule[{index}]"))?;
+            }
+        }
+        Ok(())
+    }
+    for (index, rule) in rules.iter().enumerate() {
+        check(rule, &format!("{at}: parse rule_set.rules.[{index}]"))?;
+    }
+    Ok(())
+}
+
 /// The payload of a local rule set: source JSON or the binary SRS container.
 fn check_rule_set_payload(data: &[u8], entry: &Map<String, Value>, at: &str) -> Result<(), String> {
     let format = rule_set_payload_format(entry);
@@ -3524,7 +3553,7 @@ fn check_rule_set_payload(data: &[u8], entry: &Map<String, Value>, at: &str) -> 
     }
     if format == "binary" {
         return match crate::srs::read(data) {
-            Ok(_) => Ok(()),
+            Ok(rules) => check_headless_rules_regex(&rules, at),
             Err(message) => Err(format!("{at}: {message}")),
         };
     }
@@ -3564,6 +3593,7 @@ fn check_rule_set_payload(data: &[u8], entry: &Map<String, Value>, at: &str) -> 
         if rules.is_empty() || rules.iter().any(|rule| !headless_rule_is_valid(rule)) {
             return Err(format!("{at}: empty rule-set"));
         }
+        check_headless_rules_regex(rules, at)?;
     }
     reject_unknown_fields(object, &["version", "rules"], at)?;
     Ok(())

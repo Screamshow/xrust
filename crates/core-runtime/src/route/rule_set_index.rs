@@ -78,6 +78,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use aho_corasick::AhoCorasick;
+use regex::Regex;
 use serde_json::Value;
 
 use crate::inbound::Target;
@@ -201,6 +202,8 @@ pub struct RuleSetIndex {
     /// Held until `build`, where the automaton wants them all at once.
     keywords_raw: Vec<String>,
     keywords: Option<AhoCorasick>,
+    /// `domain_regex`, tested against each lowercased host.
+    regexes: Vec<Regex>,
     dest_v4: PrefixSet<u32>,
     dest_v6: PrefixSet<u128>,
     source_v4: PrefixSet<u32>,
@@ -272,26 +275,26 @@ enum FallbackRule {
 }
 
 impl FallbackRule {
-    fn compile(mut object: serde_json::Map<String, Value>) -> Self {
+    fn compile(mut object: serde_json::Map<String, Value>) -> anyhow::Result<Self> {
         if object.get("type").and_then(Value::as_str) == Some("logical") {
-            let subs = match object.remove("rules") {
-                Some(Value::Array(subs)) => subs
-                    .into_iter()
-                    .map(|sub| match sub {
-                        Value::Object(object) => FallbackRule::compile(object),
+            let mut subs = Vec::new();
+            if let Some(Value::Array(rules)) = object.remove("rules") {
+                for (at, sub) in rules.into_iter().enumerate() {
+                    subs.push(match sub {
+                        Value::Object(object) => FallbackRule::compile(object)
+                            .map_err(|err| anyhow::anyhow!("sub rule[{at}]: {err}"))?,
                         // Preserve match_rule's rejection of non-objects.
                         _ => FallbackRule::Never,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            return FallbackRule::Logical {
+                    });
+                }
+            }
+            return Ok(FallbackRule::Logical {
                 all: object.get("mode").and_then(Value::as_str) != Some("or"),
                 inverted: object.get("invert") == Some(&Value::Bool(true)),
                 rules: subs,
-            };
+            });
         }
-        FallbackRule::Plain(Box::new(PlainRule::compile(object)))
+        Ok(FallbackRule::Plain(Box::new(PlainRule::compile(object)?)))
     }
 
     fn matches(&self, ctx: &ConnContext) -> bool {
@@ -333,6 +336,7 @@ struct PlainRule {
     /// label-walk over a set would not for the last one.
     suffixes: Vec<Box<str>>,
     keywords: Vec<Box<str>>,
+    regexes: Vec<Regex>,
     dest_v4: PrefixSet<u32>,
     dest_v6: PrefixSet<u128>,
     source_v4: PrefixSet<u32>,
@@ -346,12 +350,13 @@ struct PlainRule {
 
 impl PlainRule {
     /// Takes the rule by value: its strings move into the rule, not copied.
-    fn compile(mut object: serde_json::Map<String, Value>) -> Self {
+    fn compile(mut object: serde_json::Map<String, Value>) -> anyhow::Result<Self> {
         let mut rule = PlainRule {
             inverted: object.get("invert") == Some(&Value::Bool(true)),
             has_domains: object.contains_key("domain")
                 || object.contains_key("domain_suffix")
-                || object.contains_key("domain_keyword"),
+                || object.contains_key("domain_keyword")
+                || object.contains_key("domain_regex"),
             has_dest_ip: object.contains_key("ip_cidr"),
             has_source_ip: object.contains_key("source_ip_cidr"),
             has_dest_ports: object.contains_key("port") || object.contains_key("port_range"),
@@ -367,6 +372,7 @@ impl PlainRule {
             .extend(take_list(object.remove("domain_suffix")).map(String::into_boxed_str));
         rule.keywords
             .extend(take_list(object.remove("domain_keyword")).map(String::into_boxed_str));
+        rule.regexes = compile_regexes(object.remove("domain_regex"))?;
 
         for entry in take_list(object.remove("ip_cidr")) {
             insert_prefix(&mut rule.dest_v4, &mut rule.dest_v6, &entry);
@@ -400,7 +406,7 @@ impl PlainRule {
         rule.dest_v6.build();
         rule.source_v4.build();
         rule.source_v6.build();
-        rule
+        Ok(rule)
     }
 
     fn matches(&self, ctx: &ConnContext) -> bool {
@@ -416,7 +422,8 @@ impl PlainRule {
                     || self
                         .keywords
                         .iter()
-                        .any(|entry| host.contains(entry.as_ref()));
+                        .any(|entry| host.contains(entry.as_ref()))
+                    || self.regexes.iter().any(|re| re.is_match(&host));
             }
             if !dest_matched
                 && self.has_dest_ip
@@ -480,7 +487,13 @@ impl PlainRule {
 /// express -- it matches everything, and only the plain fallback says so.
 fn poolable(object: &serde_json::Map<String, Value>) -> bool {
     const GROUPS: [&[&str]; 5] = [
-        &["domain", "domain_suffix", "domain_keyword", "ip_cidr"],
+        &[
+            "domain",
+            "domain_suffix",
+            "domain_keyword",
+            "domain_regex",
+            "ip_cidr",
+        ],
         &["source_ip_cidr"],
         &["port", "port_range"],
         &["source_port", "source_port_range"],
@@ -504,11 +517,14 @@ impl RuleSetIndex {
     /// The rules are consumed one by one and their strings move into the
     /// index, so the decoded tree and the index never hold the same entries
     /// twice.
-    pub fn compile(rules: Vec<Value>) -> (Self, Fallbacks) {
+    ///
+    /// Fails on a `domain_regex` that does not compile, like the reference's
+    /// `NewHeadlessRule`.
+    pub fn compile(rules: Vec<Value>) -> anyhow::Result<(Self, Fallbacks)> {
         let mut index = RuleSetIndex::default();
         let mut fallbacks = Fallbacks::default();
 
-        for rule in rules {
+        for (at, rule) in rules.into_iter().enumerate() {
             let Value::Object(object) = rule else {
                 // `match_rule` returned false for a non-object; dropping it is
                 // the same answer without evaluating it again.
@@ -516,20 +532,21 @@ impl RuleSetIndex {
             };
             let inverted = object.get("invert") == Some(&Value::Bool(true));
             let logical = object.get("type").and_then(Value::as_str) == Some("logical");
-            if inverted || logical || !poolable(&object) {
-                fallbacks.rules.push(FallbackRule::compile(object));
-                continue;
-            }
-            index.add_rule(object);
+            let compiled = if inverted || logical || !poolable(&object) {
+                FallbackRule::compile(object).map(|rule| fallbacks.rules.push(rule))
+            } else {
+                index.add_rule(object)
+            };
+            compiled.map_err(|err| anyhow::anyhow!("parse rule_set.rules.[{at}]: {err}"))?;
         }
 
         index.build();
         index.empty = index.is_void();
-        (index, fallbacks)
+        Ok((index, fallbacks))
     }
 
     /// `match_default`, with every list folded into a shared pool.
-    fn add_rule(&mut self, mut object: serde_json::Map<String, Value>) {
+    fn add_rule(&mut self, mut object: serde_json::Map<String, Value>) -> anyhow::Result<()> {
         for entry in take_list(object.remove("domain")) {
             self.domains.insert(entry.into_boxed_str());
         }
@@ -542,6 +559,8 @@ impl RuleSetIndex {
         }
         self.keywords_raw
             .extend(take_list(object.remove("domain_keyword")));
+        self.regexes
+            .extend(compile_regexes(object.remove("domain_regex"))?);
 
         for entry in take_list(object.remove("ip_cidr")) {
             insert_prefix(&mut self.dest_v4, &mut self.dest_v6, &entry);
@@ -564,6 +583,7 @@ impl RuleSetIndex {
                 self.networks.push(entry.into_boxed_str());
             }
         }
+        Ok(())
     }
 
     fn build(&mut self) {
@@ -607,6 +627,9 @@ impl RuleSetIndex {
                 .as_ref()
                 .is_some_and(|keywords| keywords.is_match(host.as_ref()))
             {
+                return true;
+            }
+            if self.regexes.iter().any(|re| re.is_match(&host)) {
                 return true;
             }
         }
@@ -669,6 +692,7 @@ impl RuleSetIndex {
             + self.suffixes.len()
             + self.dot_suffixes.len()
             + self.keyword_count()
+            + self.regexes.len()
             + self.dest_v4.len()
             + self.dest_v6.len()
             + self.source_v4.len()
@@ -741,6 +765,18 @@ fn insert_prefix(v4: &mut PrefixSet<u32>, v6: &mut PrefixSet<u128>, prefix: &str
         IpAddr::V4(base) => v4.insert(u32::from(base), bits),
         IpAddr::V6(base) => v6.insert(u128::from(base), bits),
     }
+}
+
+/// `domain_regex`, compiled once. A bad expression is an error, as in the
+/// reference (`NewDomainRegexItem`).
+fn compile_regexes(value: Option<Value>) -> anyhow::Result<Vec<Regex>> {
+    take_list(value)
+        .enumerate()
+        .map(|(at, expr)| {
+            Regex::new(&expr)
+                .map_err(|err| anyhow::anyhow!("domain_regex: parse expression {at}: {err}"))
+        })
+        .collect()
 }
 
 /// `port_range_contains` acceptance rules, applied once instead of per lookup.

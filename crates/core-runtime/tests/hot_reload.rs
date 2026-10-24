@@ -571,3 +571,70 @@ async fn connection_revalidation_handles_domains_cidrs_and_changed_list_entries(
     instance.shutdown_wait().await;
     std::fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn domain_regex_rule_set_reload_and_bad_regex_keeps_running_state() {
+    use core_runtime::inbound::Target;
+    use core_runtime::route::{ConnContext, Decision};
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "rust-x-hot-regex-{}-{nonce}.json",
+        std::process::id()
+    ));
+    let _cleanup = Cleanup(path.clone());
+    let write = |regex: &str| {
+        let body = json!({"version": 3, "rules": [{"domain_regex": [regex]}]});
+        std::fs::write(&path, body.to_string()).unwrap();
+    };
+    write("^foo\\.example$");
+    let root = json!({
+        "outbounds":[{"type":"direct","tag":"hit"},{"type":"direct","tag":"miss"}],
+        "route":{"final":"miss","rule_set":[{"type":"local","tag":"list","format":"source","path":path}],
+            "rules":[{"rule_set":["list"],"outbound":"hit"}]}
+    });
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    async fn routed(instance: &core_runtime::BoxInstance, target: Target) -> String {
+        let router = instance.router();
+        let mut ctx = ConnContext::new("in", "10.0.0.2:1234".parse().unwrap(), target, "tcp");
+        let Decision::Outbound(index) = router.route_raw(&mut ctx).await.unwrap() else {
+            panic!("outbound expected")
+        };
+        if Some(index) == router.index_of("hit") {
+            "hit".into()
+        } else {
+            "miss".into()
+        }
+    }
+    let foo = || Target::Domain("foo.example".into(), 443);
+    let bar = || Target::Domain("bar.test".into(), 443);
+    let ip = || Target::Ip("8.8.8.8:443".parse().unwrap());
+    assert_eq!(routed(&instance, foo()).await, "hit");
+    assert_eq!(routed(&instance, bar()).await, "miss");
+    assert_eq!(routed(&instance, ip()).await, "miss");
+
+    // a bad expression fails the reload and keeps the running router
+    let before = instance.router().applied_config();
+    write("(unclosed");
+    let error = instance.reload_in_place(&root).await.unwrap_err();
+    assert!(format!("{error:#}").contains("domain_regex"), "{error:#}");
+    assert_eq!(instance.router().applied_config(), before);
+    assert_eq!(routed(&instance, foo()).await, "hit");
+    assert_eq!(routed(&instance, bar()).await, "miss");
+
+    // a good one applies
+    write("^bar\\.test$");
+    instance.reload_in_place(&root).await.unwrap();
+    assert_eq!(routed(&instance, foo()).await, "miss");
+    assert_eq!(routed(&instance, bar()).await, "hit");
+    assert_eq!(routed(&instance, ip()).await, "miss");
+    instance.shutdown_wait().await;
+}

@@ -237,13 +237,19 @@ impl RemoteRuleSet {
                                         }
                                     }
                                     if !loaded {
-                                        self.set.replace_rules(rules);
-                                        loaded = true;
-                                        logging::info(format_args!(
-                                            "loaded rule-set {} from {}",
-                                            self.tag(),
-                                            path
-                                        ));
+                                        match self.set.replace_rules(rules) {
+                                            Ok(()) => {
+                                                loaded = true;
+                                                logging::info(format_args!(
+                                                    "loaded rule-set {} from {}",
+                                                    self.tag(),
+                                                    path
+                                                ));
+                                            }
+                                            Err(error) => logging::warn(format_args!(
+                                                "load initial rule-set from {path}: {error}"
+                                            )),
+                                        }
                                     }
                                 }
                                 Err(error) => logging::warn(format_args!(
@@ -288,7 +294,7 @@ impl RemoteRuleSet {
         let content = std::mem::take(&mut saved.content);
         let rules = parse_payload(&content, self.spec.format.as_deref())?;
         drop(content);
-        self.set.replace_rules(rules);
+        self.set.replace_rules(rules).map_err(io::Error::other)?;
         self.etag = if saved.last_etag.is_empty() {
             None
         } else {
@@ -468,11 +474,12 @@ impl RemoteRuleSet {
                         logging::warn(format_args!(
                             "failed to compile mmap: {e}, falling back to memory rules"
                         ));
-                        self.set.replace_rules(rules);
+                        self.set.replace_rules(rules).map_err(io::Error::other)?;
                     }
                 }
             } else {
-                self.set.replace_rules(rules);
+                // a set that does not compile keeps the current rules
+                self.set.replace_rules(rules).map_err(io::Error::other)?;
             }
         }
 
@@ -763,7 +770,7 @@ mod tests {
 
     fn remote(tag: &str, url: &str) -> RemoteRuleSet {
         let tags = vec![tag.to_string()];
-        let set = Arc::new(RuleSet::new(tags.clone(), Vec::new()));
+        let set = Arc::new(RuleSet::new(tags.clone(), Vec::new()).expect("empty set"));
         RemoteRuleSet {
             tags,
             spec: RemoteSpec {

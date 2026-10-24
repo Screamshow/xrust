@@ -1616,10 +1616,13 @@ mod tests {
     fn connection_monitor_preserves_telegram_rule_set_inside_device_guard() {
         use super::super::rule_set::{RuleSet, RuleSetRegistry};
         let mut registry = RuleSetRegistry::new();
-        registry.insert(std::sync::Arc::new(RuleSet::new(
-            vec!["VPN-telegram-community-ruleset".into()],
-            vec![json!({"ip_cidr":"149.154.160.0/20"})],
-        )));
+        registry.insert(std::sync::Arc::new(
+            RuleSet::new(
+                vec!["VPN-telegram-community-ruleset".into()],
+                vec![json!({"ip_cidr":"149.154.160.0/20"})],
+            )
+            .expect("rule set"),
+        ));
         let rule = Rule::build_with_rule_sets(
             &json!({
                 "type":"logical", "mode":"and", "outbound":"VPN-out",

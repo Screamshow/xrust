@@ -100,7 +100,7 @@ const LOOKUPS: usize = 200;
 fn rule_set_matching_cost() {
     // ---------------------------------------------------------------- domains
     for n in [1_000usize, 50_000, 200_000] {
-        let set = RuleSet::new(vec!["geo".into()], domain_rules(n));
+        let set = RuleSet::new(vec!["geo".into()], domain_rules(n)).expect("rule set");
 
         // Worst case for a scan: the answer is "no", so every rule is visited.
         let miss = domain_ctx("nothing.in.this.list.example");
@@ -139,7 +139,7 @@ fn rule_set_matching_cost() {
 
     // ------------------------------------------------------------------ CIDRs
     for n in [1_000usize, 50_000, 200_000] {
-        let set = RuleSet::new(vec!["geo-ip".into()], cidr_rules(n));
+        let set = RuleSet::new(vec!["geo-ip".into()], cidr_rules(n)).expect("rule set");
         let miss = ip_ctx("203.0.113.7:443");
         let start = Instant::now();
         for _ in 0..LOOKUPS {
@@ -155,10 +155,10 @@ fn rule_set_matching_cost() {
     for n in [1_000usize, 50_000, 200_000] {
         let rules = domain_rules(n);
         let start = Instant::now();
-        let set = RuleSet::new(vec!["geo".into()], rules.clone());
+        let set = RuleSet::new(vec!["geo".into()], rules.clone()).expect("rule set");
         let first = start.elapsed();
         let start = Instant::now();
-        set.replace_rules(rules);
+        set.replace_rules(rules).expect("rule set");
         let update = start.elapsed();
         println!(
             "compile n={:>7}  first load {:>10?}  remote update {:>10?}",

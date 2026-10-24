@@ -76,7 +76,7 @@ fn compile_moves_decoded_strings_into_the_index() {
 
     let before = LIVE.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
-    let set = RuleSet::new(vec!["geo".into()], rules);
+    let set = RuleSet::new(vec!["geo".into()], rules).expect("rule set");
     let extra = PEAK.load(Ordering::Relaxed) - before;
 
     assert!(set.index().has_domain(entry('d', 7).as_str().unwrap()));

@@ -717,11 +717,13 @@ mod tests {
     #[test]
     fn ruleset_miss_does_not_match_and_hit_keeps_other_conditions() {
         let mut rule = Rule::build(&json!({"action":"reject"}), "rule").unwrap();
-        rule.rule_sets
-            .push(std::sync::Arc::new(crate::route::rule_set::RuleSet::new(
+        rule.rule_sets.push(std::sync::Arc::new(
+            crate::route::rule_set::RuleSet::new(
                 vec!["domains".into()],
                 vec![json!({"domain_suffix":["example.com"]})],
-            )));
+            )
+            .expect("rule set"),
+        ));
         let meta = QueryMeta::default();
         assert!(rule.matches(&meta, &info("www.example.com", RecordType::A)));
         assert!(!rule.matches(&meta, &info("other.test", RecordType::A)));

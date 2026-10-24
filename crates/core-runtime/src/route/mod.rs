@@ -531,8 +531,10 @@ pub(crate) fn build_rule_sets(
                         tags, mmap_set,
                     )));
                 } else {
-                    logging::info(format_args!("loaded rule-set {}", tags.join(",")));
-                    registry.insert(std::sync::Arc::new(rule_set::RuleSet::new(tags, rules)));
+                    let set = rule_set::RuleSet::new(tags, rules)
+                        .map_err(|err| anyhow::anyhow!("{at}: {err}"))?;
+                    logging::info(format_args!("loaded rule-set {}", set.tags().join(",")));
+                    registry.insert(std::sync::Arc::new(set));
                 }
             }
             "local" => {
@@ -583,8 +585,10 @@ pub(crate) fn build_rule_sets(
                             tags, mmap_set,
                         )));
                     } else {
-                        logging::info(format_args!("loaded rule-set {}", tags.join(",")));
-                        registry.insert(std::sync::Arc::new(rule_set::RuleSet::new(tags, rules)));
+                        let set = rule_set::RuleSet::new(tags, rules)
+                            .map_err(|err| anyhow::anyhow!("{at}: {err}"))?;
+                        logging::info(format_args!("loaded rule-set {}", set.tags().join(",")));
+                        registry.insert(std::sync::Arc::new(set));
                     }
                 }
             }
@@ -645,7 +649,8 @@ pub(crate) fn build_rule_sets(
                     .filter(|path| !path.is_empty())
                     .and_then(|path| std::path::absolute(resolve_rule_set_path(path, &tags)).ok())
                     .map(|path| path.to_string_lossy().replace('\\', "/"));
-                let set = std::sync::Arc::new(rule_set::RuleSet::new(tags.clone(), Vec::new()));
+                // an empty set has nothing to compile
+                let set = std::sync::Arc::new(rule_set::RuleSet::new(tags.clone(), Vec::new())?);
                 remotes.push(rule_set_remote::RemoteRuleSet {
                     tags: tags.clone(),
                     spec: rule_set_remote::RemoteSpec {

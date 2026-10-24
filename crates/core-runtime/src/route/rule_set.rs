@@ -36,10 +36,11 @@ struct RuleSetBody {
 }
 
 impl RuleSet {
-    pub fn new(tags: Vec<String>, rules: Vec<Value>) -> Self {
+    /// Fails when a rule does not compile (a bad `domain_regex`).
+    pub fn new(tags: Vec<String>, rules: Vec<Value>) -> anyhow::Result<Self> {
         let count = rules.len();
-        let (index, fallbacks) = RuleSetIndex::compile(rules);
-        Self {
+        let (index, fallbacks) = RuleSetIndex::compile(rules)?;
+        Ok(Self {
             tags,
             body: RwLock::new(RuleSetBody {
                 index,
@@ -47,7 +48,7 @@ impl RuleSet {
                 count,
                 mmap: None,
             }),
-        }
+        })
     }
 
     /// Construct a rule set backed directly by memory-mapped TSRS binary.
@@ -99,10 +100,11 @@ impl RuleSet {
     ///
     /// The new rules are compiled *before* the lock is taken. Compiling a geo
     /// list is not free, and a write lock held across it would stall every
-    /// matching connection behind an HTTP update.
-    pub fn replace_rules(&self, rules: Vec<Value>) {
+    /// matching connection behind an HTTP update. On a compile error the
+    /// current rules stay in place.
+    pub fn replace_rules(&self, rules: Vec<Value>) -> anyhow::Result<()> {
         let count = rules.len();
-        let (index, fallbacks) = RuleSetIndex::compile(rules);
+        let (index, fallbacks) = RuleSetIndex::compile(rules)?;
         let body = RuleSetBody {
             index,
             fallbacks,
@@ -113,6 +115,7 @@ impl RuleSet {
             Ok(mut current) => *current = body,
             Err(poisoned) => *poisoned.into_inner() = body,
         }
+        Ok(())
     }
 
     /// Atomically swap the rule-set pointer to a newly mmap'ed TSRS image.
@@ -277,10 +280,12 @@ pub fn match_rule(rule: &Value, ctx: &ConnContext) -> bool {
 }
 
 fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bool {
-    // 1. Destination criteria: domain, domain_suffix, domain_keyword, ip_cidr
+    // 1. Destination criteria: domain, domain_suffix, domain_keyword,
+    // domain_regex, ip_cidr
     let has_domain = rule.contains_key("domain")
         || rule.contains_key("domain_suffix")
-        || rule.contains_key("domain_keyword");
+        || rule.contains_key("domain_keyword")
+        || rule.contains_key("domain_regex");
     let has_ip = rule.contains_key("ip_cidr");
     if has_domain || has_ip {
         let mut dest_matched = false;
@@ -293,7 +298,11 @@ fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bo
                     .any(|entry| super::rule::domain_suffix_match(&domain, entry))
                 || list(rule.get("domain_keyword"))
                     .iter()
-                    .any(|entry| domain.contains(entry.as_str()));
+                    .any(|entry| domain.contains(entry.as_str()))
+                // a bad expression never matches here; loading rejects it
+                || list(rule.get("domain_regex")).iter().any(|entry| {
+                    regex::Regex::new(entry).is_ok_and(|re| re.is_match(&domain))
+                });
         }
         if !dest_matched
             && has_ip
@@ -569,10 +578,13 @@ mod tests {
     #[test]
     fn registry_resolves_every_tag() {
         let mut registry = RuleSetRegistry::new();
-        registry.insert(Arc::new(RuleSet::new(
-            vec!["one".into(), "two".into()],
-            vec![json!({"domain_suffix": ["a.com"]})],
-        )));
+        registry.insert(Arc::new(
+            RuleSet::new(
+                vec!["one".into(), "two".into()],
+                vec![json!({"domain_suffix": ["a.com"]})],
+            )
+            .expect("rule set"),
+        ));
         assert!(registry.get("one").is_some());
         assert!(registry.get("two").is_some());
         assert!(registry.get("three").is_none());
@@ -597,7 +609,7 @@ mod tests {
         );
         assert!(match_rule(&rule, &udp_match));
 
-        let set = RuleSet::new(vec!["test".into()], vec![rule]);
+        let set = RuleSet::new(vec!["test".into()], vec![rule]).expect("rule set");
         assert!(set.matches(&udp_match));
 
         // Wrong network (tcp) must fail

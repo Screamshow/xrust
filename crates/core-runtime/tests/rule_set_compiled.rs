@@ -53,6 +53,9 @@ fn corpus() -> Vec<Value> {
         // require a separate compiled fallback to preserve conjunction.
         json!({"domain": ["multi.com"], "port": [443], "network": ["tcp"]}),
         json!({"domain": ["split.com"], "ip_cidr": ["10.1.0.0/16"]}),
+        json!({"domain_regex": ["^cdn\\.a\\.com$", "track"]}),
+        json!({"domain_regex": ["^nota"], "port": [443]}),
+        json!({"domain_regex": ["^a\\.com$"], "invert": true}),
         // Not flattenable.
         json!({"invert": true, "domain": ["inverted.com"]}),
         json!({"invert": false, "domain": ["plain-invert-flag.com"]}),
@@ -206,7 +209,7 @@ fn contexts() -> Vec<ConnContext> {
 #[test]
 fn compiled_index_agrees_with_the_interpreter() {
     let rules = corpus();
-    let set = RuleSet::new(vec!["corpus".into()], rules.clone());
+    let set = RuleSet::new(vec!["corpus".into()], rules.clone()).expect("rule set");
     let cases = contexts();
 
     let mut checked = 0usize;
@@ -233,7 +236,7 @@ fn one_rule_per_set_agrees_with_the_interpreter() {
     let rules = corpus();
     let cases = contexts();
     for (at, rule) in rules.iter().enumerate() {
-        let set = RuleSet::new(vec!["one".into()], vec![rule.clone()]);
+        let set = RuleSet::new(vec!["one".into()], vec![rule.clone()]).expect("rule set");
         for ctx in &cases {
             assert_eq!(
                 set.matches(ctx),
@@ -258,7 +261,8 @@ fn prefix_edges() {
             json!({"ip_cidr": ["172.16.0.0/12"]}),
             json!({"ip_cidr": ["2001:db8::/32"]}),
         ],
-    );
+    )
+    .expect("rule set");
 
     let all = RuleSet::new(
         vec!["all".into()],
@@ -266,7 +270,8 @@ fn prefix_edges() {
             json!({"ip_cidr": ["0.0.0.0/0"]}),
             json!({"ip_cidr": ["::/0"]}),
         ],
-    );
+    )
+    .expect("rule set");
 
     let ip = |addr: &str, port: u16| {
         ConnContext::new(
@@ -308,11 +313,13 @@ fn suffix_is_label_bounded_but_dot_suffix_is_not() {
     let bare = RuleSet::new(
         vec!["s".into()],
         vec![json!({"domain_suffix": ["example.com"]})],
-    );
+    )
+    .expect("rule set");
     let dotted = RuleSet::new(
         vec!["s".into()],
         vec![json!({"domain_suffix": [".example.com"]})],
-    );
+    )
+    .expect("rule set");
     let domain = |host: &str| {
         ConnContext::new(
             "mixed-in",
@@ -351,7 +358,8 @@ fn inverted_and_logical_rules_stay_on_the_interpreter() {
     let inverted = RuleSet::new(
         vec!["s".into()],
         vec![json!({"invert": true, "domain": ["a.com"]})],
-    );
+    )
+    .expect("rule set");
     assert_eq!(inverted.fallback_count(), 1, "invert kept as a fallback");
     assert!(
         inverted.index().is_empty(),
@@ -364,7 +372,8 @@ fn inverted_and_logical_rules_stay_on_the_interpreter() {
             {"domain": ["a.com"]},
             {"port": [443]}
         ]})],
-    );
+    )
+    .expect("rule set");
     assert_eq!(logical.fallback_count(), 1, "logical kept as a fallback");
     assert!(logical.index().is_empty());
 
@@ -374,7 +383,8 @@ fn inverted_and_logical_rules_stay_on_the_interpreter() {
             json!({"domain": ["pooled.com"]}),
             json!({"invert": true, "domain": ["never.com"]}),
         ],
-    );
+    )
+    .expect("rule set");
     assert_eq!(
         mixed.fallback_count(),
         1,
@@ -400,7 +410,7 @@ fn nothing_to_match_means_no_match() {
         vec![json!({"port_range": ["nonsense"]})],
         vec![Value::Null],
     ] {
-        let set = RuleSet::new(vec!["s".into()], rules.clone());
+        let set = RuleSet::new(vec!["s".into()], rules.clone()).expect("rule set");
         for ctx in contexts().iter().take(20) {
             assert!(
                 !set.matches(ctx),
@@ -425,7 +435,7 @@ fn matcher_free_objects_preserve_catch_all_semantics() {
         json!({"unknown_field":"ignored"}),
         json!({"invert":true}),
     ] {
-        let set = RuleSet::new(vec!["s".into()], vec![rule.clone()]);
+        let set = RuleSet::new(vec!["s".into()], vec![rule.clone()]).expect("rule set");
         assert_eq!(set.fallback_count(), 1);
         for ctx in contexts() {
             assert_eq!(set.matches(&ctx), match_rule(&rule, &ctx));
@@ -448,7 +458,8 @@ fn stored_case_is_left_alone_and_the_query_is_lowered() {
     let set = RuleSet::new(
         vec!["s".into()],
         vec![json!({"domain": ["Mixed.Example.COM"]})],
-    );
+    )
+    .expect("rule set");
     let domain = |host: &str| {
         ConnContext::new(
             "mixed-in",
@@ -468,7 +479,8 @@ fn stored_case_is_left_alone_and_the_query_is_lowered() {
     let lower = RuleSet::new(
         vec!["s".into()],
         vec![json!({"domain": ["mixed.example.com"]})],
-    );
+    )
+    .expect("rule set");
     assert!(lower.matches(&domain("mixed.example.com")));
     assert!(lower.matches(&domain("Mixed.Example.COM")));
     assert!(lower.matches(&domain("MIXED.EXAMPLE.COM")));
@@ -478,7 +490,8 @@ fn stored_case_is_left_alone_and_the_query_is_lowered() {
 /// answers immediately after.
 #[test]
 fn a_remote_update_replaces_the_compiled_form() {
-    let set = RuleSet::new(vec!["s".into()], vec![json!({"domain": ["old.com"]})]);
+    let set =
+        RuleSet::new(vec!["s".into()], vec![json!({"domain": ["old.com"]})]).expect("rule set");
     let domain = |host: &str| {
         ConnContext::new(
             "mixed-in",
@@ -492,7 +505,8 @@ fn a_remote_update_replaces_the_compiled_form() {
     set.replace_rules(vec![
         json!({"domain": ["new.com"]}),
         json!({"domain_suffix": ["suffix.com"]}),
-    ]);
+    ])
+    .expect("rule set");
     assert!(!set.matches(&domain("old.com")), "the old entry is gone");
     assert!(set.matches(&domain("new.com")));
     assert!(set.matches(&domain("cdn.suffix.com")));
@@ -500,7 +514,7 @@ fn a_remote_update_replaces_the_compiled_form() {
     assert_eq!(set.fallback_count(), 0);
 
     // And an update that empties the set empties the matching too.
-    set.replace_rules(Vec::new());
+    set.replace_rules(Vec::new()).expect("rule set");
     assert!(!set.matches(&domain("new.com")));
     assert_eq!(set.rule_count(), 0);
 }
@@ -518,7 +532,8 @@ fn the_index_reports_what_it_holds() {
             json!({"ip_cidr": ["10.0.0.0/8"]}),
             json!({"port": [80, 443]}),
         ],
-    );
+    )
+    .expect("rule set");
     let index = set.index();
     assert_eq!(index.domain_count(), 2);
     assert!(index.has_domain("a.com") && index.has_domain("b.com"));
@@ -556,7 +571,7 @@ fn discord_colon_tuple_matches_in_interpreter_and_compiled_paths() {
             rule.clone(),
             json!({"type":"logical","mode":"and","rules":[rule.clone()]}),
         ] {
-            let set = RuleSet::new(vec!["discord".into()], vec![entry.clone()]);
+            let set = RuleSet::new(vec!["discord".into()], vec![entry.clone()]).expect("rule set");
             for (ip, port, network, expected) in [
                 ("104.29.155.207", 19314, "udp", true),
                 ("104.29.155.207", 19294, "udp", true),
@@ -601,7 +616,9 @@ fn discord_colon_tuple_matches_in_interpreter_and_compiled_paths() {
         );
         assert_eq!(match_rule(&rule, &ctx), expected);
         assert_eq!(
-            RuleSet::new(vec!["source".into()], vec![rule]).matches(&ctx),
+            RuleSet::new(vec!["source".into()], vec![rule])
+                .expect("rule set")
+                .matches(&ctx),
             expected
         );
     }
@@ -676,7 +693,7 @@ async fn discord_packet_routes_to_proxy_and_fallback_overwrites_sniff_metadata()
 /// interpreter answers on a kept copy of the same decoded rules.
 fn assert_srs_agrees(srs: &[u8], extra: &[ConnContext]) {
     let rules = core_config::srs::read(srs).expect("decode srs");
-    let set = RuleSet::new(vec!["srs".into()], rules.clone());
+    let set = RuleSet::new(vec!["srs".into()], rules.clone()).expect("rule set");
     assert_eq!(set.rule_count(), rules.len());
     for ctx in contexts().iter().chain(extra) {
         assert_eq!(
@@ -690,35 +707,109 @@ fn assert_srs_agrees(srs: &[u8], extra: &[ConnContext]) {
     }
 }
 
+/// Each decoded rule on its own, with a connection it must match and one it
+/// must not: in one shared set a rule that matches almost everything (such as
+/// `network`) would hide a wrong answer from any other rule.
 #[test]
 fn srs_decoded_set_agrees_with_the_interpreter() {
-    let source = json!({"version": 3, "rules": [
-        {"domain": ["a.com", "exact.org"], "domain_suffix": ["example.com", ".com", "a.com"]},
-        {"domain_suffix": ["cdn.example.net"]},
-        {"domain_keyword": ["ads", "tracker"]},
-        {"domain_regex": ["^re[0-9]+\\.test$"]},
-        {"ip_cidr": ["10.0.0.0/8", "192.168.1.0/24", "2001:db8::/32"]},
-        {"source_ip_cidr": ["10.0.0.0/8"]},
-        {"port": [80, 443]},
-        {"port_range": ["8000:9000"]},
-        {"source_port": [1234]},
-        {"source_port_range": ["1000:2000"]},
-        {"network": ["udp"]},
-        {"domain": ["multi.com"], "port": [443], "network": ["tcp"]},
-        {"invert": true, "domain": ["inverted.com"], "domain_suffix": ["inv.net"]},
-        {"type": "logical", "mode": "or", "rules": [
-            {"domain": ["logical-or.com"]},
-            {"port": [8080]}
-        ]},
-        {"type": "logical", "mode": "and", "invert": true, "rules": [
-            {"domain_suffix": ["nested.com"]},
-            {"type": "logical", "mode": "or", "rules": [
-                {"port": [8443]},
-                {"invert": true, "ip_cidr": ["203.0.113.0/24"]}
-            ]}
-        ]}
-    ]});
+    let d = |host: &str| context(Some(host), None, 443, "10.0.0.2:1234", "tcp");
+    let at = |host: &str, port: u16, source: &str, network: &'static str| {
+        context(Some(host), None, port, source, network)
+    };
+    let ip = |address: &str| context(None, Some(address), 443, "10.0.0.2:1234", "tcp");
+    let cases: Vec<(Value, ConnContext, ConnContext)> = vec![
+        (
+            json!({"domain": ["a.com", "exact.org"], "domain_suffix": ["example.com", ".com", "a.com"]}),
+            d("exact.org"),
+            d("x.exact.org"),
+        ),
+        (
+            json!({"domain_suffix": ["cdn.example.net"]}),
+            d("a.cdn.example.net"),
+            d("example.net"),
+        ),
+        (
+            json!({"domain_keyword": ["ads", "tracker"]}),
+            d("ads.example.net"),
+            d("example.org"),
+        ),
+        (
+            json!({"domain_regex": ["^re[0-9]+\\.test$"]}),
+            d("re42.test"),
+            d("rex.test"),
+        ),
+        (
+            json!({"ip_cidr": ["10.0.0.0/8", "192.168.1.0/24", "2001:db8::/32"]}),
+            ip("10.1.2.3"),
+            ip("8.8.8.8"),
+        ),
+        (
+            json!({"source_ip_cidr": ["10.0.0.0/8"]}),
+            d("a.com"),
+            at("a.com", 443, "203.0.113.5:1234", "tcp"),
+        ),
+        (
+            json!({"port": [80, 443]}),
+            d("a.com"),
+            at("a.com", 8443, "10.0.0.2:1234", "tcp"),
+        ),
+        (
+            json!({"port_range": ["8000:9000"]}),
+            at("a.com", 8500, "10.0.0.2:1234", "tcp"),
+            d("a.com"),
+        ),
+        (
+            json!({"source_port": [1234]}),
+            d("a.com"),
+            at("a.com", 443, "10.0.0.2:1500", "tcp"),
+        ),
+        (
+            json!({"source_port_range": ["1000:2000"]}),
+            d("a.com"),
+            at("a.com", 443, "10.0.0.2:5000", "tcp"),
+        ),
+        (
+            json!({"network": ["udp"]}),
+            at("a.com", 443, "10.0.0.2:1234", "udp"),
+            d("a.com"),
+        ),
+        (
+            json!({"domain": ["multi.com"], "port": [443], "network": ["tcp"]}),
+            d("multi.com"),
+            at("multi.com", 443, "10.0.0.2:1234", "udp"),
+        ),
+        (
+            json!({"invert": true, "domain": ["inverted.com"], "domain_suffix": ["inv.net"]}),
+            d("other.org"),
+            d("x.inv.net"),
+        ),
+        (
+            json!({"type": "logical", "mode": "or", "rules": [
+                {"domain": ["logical-or.com"]},
+                {"port": [8080]}
+            ]}),
+            d("logical-or.com"),
+            d("other.org"),
+        ),
+        (
+            json!({"type": "logical", "mode": "and", "invert": true, "rules": [
+                {"domain_suffix": ["nested.com"]},
+                {"type": "logical", "mode": "or", "rules": [
+                    {"port": [8443]},
+                    {"invert": true, "ip_cidr": ["203.0.113.0/24"]}
+                ]}
+            ]}),
+            d("other.org"),
+            d("a.nested.com"),
+        ),
+    ];
+    let source = json!({
+        "version": 3,
+        "rules": cases.iter().map(|(rule, _, _)| rule.clone()).collect::<Vec<_>>()
+    });
     let srs = core_config::srs::compile(&source, 3).expect("compile srs");
+    let decoded = core_config::srs::read(&srs).expect("decode srs");
+    assert_eq!(decoded.len(), cases.len());
     let extra: Vec<ConnContext> = [
         "exact.org",
         "x.exact.org",
@@ -739,6 +830,30 @@ fn srs_decoded_set_agrees_with_the_interpreter() {
         ]
     })
     .collect();
+    for (rule, (source_rule, hit, miss)) in decoded.iter().zip(&cases) {
+        let set = RuleSet::new(vec!["one".into()], vec![rule.clone()]).expect("rule set");
+        assert!(
+            set.matches(hit),
+            "{source_rule} must match {:?}",
+            hit.destination
+        );
+        assert!(
+            !set.matches(miss),
+            "{source_rule} must not match {:?}",
+            miss.destination
+        );
+        for ctx in contexts().iter().chain(&extra).chain([hit, miss]) {
+            assert_eq!(
+                set.matches(ctx),
+                match_rule(rule, ctx),
+                "{source_rule} disagrees on {:?} {:?} {:?}",
+                ctx.destination,
+                ctx.network,
+                ctx.source
+            );
+        }
+    }
+    // and all of them in one set, as loaded
     assert_srs_agrees(&srs, &extra);
 }
 

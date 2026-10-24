@@ -53,7 +53,7 @@ async fn fakeip_domain_survives_ech_and_resolve_for_inline_and_compiled_rules() 
         json!({"domain_suffix":["inner.example"],"port":[443]}),
     ] {
         assert!(match_rule(&matcher, &ctx), "interpreted {matcher}");
-        let set = RuleSet::new(vec!["test".into()], vec![matcher.clone()]);
+        let set = RuleSet::new(vec!["test".into()], vec![matcher.clone()]).expect("rule set");
         assert!(set.matches(&ctx), "compiled {matcher}");
     }
     let bytes = core_runtime::route::mmap_set::RuleSetCompiler::new()
