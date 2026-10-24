@@ -36,7 +36,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | FP-01 | Статичный ECH GREASE в шаблонах Firefox и Chrome | P0 | исправлено, проверено | `4be666f3c8ed722eaed284847958d0b82a1b7166` |
 | MEM-07 | Rule sets: SRS загружается через промежуточные копии, пик ×2–3 | P1 | частично исправлено, проверено (промежуточный `Vec<Value>` остаётся) | `fc143dc9a2207816db6fe06d1ad6c4fb01d0b415` |
 | MEM-08 | cache.db: flush клонирует всё дерево | P1 | исправлено, проверено (только клонирование при сериализации) | `cc6c8829108d5428b06246a4b5410bfcc5f53abc` |
-| RS-01 | Правило rule set только с `domain_regex` совпадает с любым соединением; в смешанных правилах regex игнорируется | P1 | исправлено, ожидает независимой проверки | `79fb8be31263157aabd07c7c5c1419528c4e40f0`, `08d35a3814dac7d528d9d1e1a8a9ee336cce647c` |
+| RS-01 | Правило rule set только с `domain_regex` совпадает с любым соединением; в смешанных правилах regex игнорируется | P1 | исправлено, ожидает независимой проверки | `79fb8be31263157aabd07c7c5c1419528c4e40f0`, `08d35a3814dac7d528d9d1e1a8a9ee336cce647c`, `9c688b2e9c28f8b78dba7833f1ccc71e2e13f5ed` |
 
 ## Задачи
 
@@ -1392,7 +1392,7 @@ PID основной службы и контрольные суммы `/etc/con
 
 - **Приоритет:** P1 (неверная маршрутизация: трафик уходит не в тот outbound).
 - **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
-- **Коммиты:** [`79fb8be31263157aabd07c7c5c1419528c4e40f0`](https://github.com/Screamshow/xrust/commit/79fb8be31263157aabd07c7c5c1419528c4e40f0) — исправление; [`08d35a3814dac7d528d9d1e1a8a9ee336cce647c`](https://github.com/Screamshow/xrust/commit/08d35a3814dac7d528d9d1e1a8a9ee336cce647c) — доработка по ревью: Go `\Q...\E` и исключение наборов, которые теряет TSRS.
+- **Коммиты:** [`79fb8be31263157aabd07c7c5c1419528c4e40f0`](https://github.com/Screamshow/xrust/commit/79fb8be31263157aabd07c7c5c1419528c4e40f0) — исправление; [`08d35a3814dac7d528d9d1e1a8a9ee336cce647c`](https://github.com/Screamshow/xrust/commit/08d35a3814dac7d528d9d1e1a8a9ee336cce647c) — доработка по ревью: Go `\Q...\E` и исключение наборов, которые теряет TSRS; [`9c688b2e9c28f8b78dba7833f1ccc71e2e13f5ed`](https://github.com/Screamshow/xrust/commit/9c688b2e9c28f8b78dba7833f1ccc71e2e13f5ed) — исправление замечания Codex к `08d35a3` (сохранение TSRS при неудачном обновлении).
 - **Происхождение:** найдено при проверке MEM-07, подтверждено замечанием независимой проверки MEM-07/MEM-08.
 - **Файлы:** `crates/core-runtime/src/route/{rule_set_index.rs,rule_set.rs,mod.rs,rule_set_remote.rs}`, `crates/core-config/src/validate.rs`; вызовы в тестах `route/rule.rs`, `dns/rules.rs`; тесты `crates/core-runtime/tests/{rule_set_domain_regex.rs (новый),hot_reload.rs,rule_set_compiled.rs,rule_set_cost.rs,fakeip_ech.rs,rule_set_load_memory.rs}`.
 - **Организация:** исправление — один исполнитель; независимое ревью — второй, только чтение, на замороженном снимке.
@@ -1539,3 +1539,12 @@ PID основной службы и контрольные суммы `/etc/con
 - **Новая находка (не исправлялась):** правило только с необработанными полями (например, `process_name`) на пути в памяти совпадает со всем, а в TSRS — ни с чем. Требует отдельной задачи, аналогичной RS-01.
 - CLI `rule-set match` по-прежнему игнорирует `domain_regex`.
 - OpenWrt и полный CI не проверялись. Отчёт внутреннего ревью не заменяет независимую проверку Codex.
+
+#### Замечание независимой проверки `08d35a3` и исправление (`9c688b2`)
+
+- **Замечание (Codex, checkout `7df6331`):** `compile_and_cache_mmap` (`rule_set_remote.rs:139`) удалял существующий TSRS до компиляции новых правил в памяти через `replace_rules` (`:488`). Воспроизведение: remote-набор `mmap: true` с `domain: plain.com` создаёт TSRS; следующее обновление содержит `domain_regex: (unclosed`; fetch возвращает ошибку, старые правила в памяти сохранены, но рабочий TSRS-файл уже удалён. Сценарий воспроизведён с отключённым общим cache.db; дополнительный независимый тест падает: `failed update deleted the working TSRS cache`.
+- **Результаты Codex на `7df6331` до исправления:** `go_regex` 1, `hot_reload` 11, `routing` 13, `rule_set_compiled` 15, `rule_set_domain_regex` 12 — все 52 прошли; дополнительный тест сохранности кэша упал. Модульный набор, musl/OpenWrt, legacy, полный CI и живой sing-box на этом этапе не запускались.
+- **Исправление:** `compile_and_cache_mmap` только сообщает, что TSRS не может сохранить правила; устаревший `.tsrs` удаляет вызывающий код (`remove_stale_tsrs`) после успешного `replace_rules` — и на пути обновления, и на пути `initial_path`. Неудачное обновление сохраняет текущие правила, файл TSRS и метаданные; успешный переход mmap → память по-прежнему удаляет устаревший TSRS.
+- **Регрессионный тест:** `failed_move_from_mmap_to_memory_keeps_the_tsrs` — plain-набор в mmap; обновление с `domain_regex: (unclosed` завершается ошибкой, набор остаётся в mmap, `plain.com` совпадает, байты TSRS, `etag` и `last_updated` не изменились; затем корректное обновление с regex переводит набор в память и удаляет TSRS. На `7df6331` тест падает с `failed update deleted or changed the working TSRS cache` (проверено разработкой, отдельная копия и каталог сборки).
+- **Проверки разработки** (копия `HEAD` + исправление, отдельный каталог сборки, оба профиля): fmt и clippy (legacy, `-D warnings`) чисто; `rule_set_domain_regex` 13, `hot_reload` 11, `routing` 13, `rule_set_compiled` 15, `--lib rule_set_remote` 12, `--lib rule_set` 18, `--lib mmap` 3 — все прошли.
+- **Статус RS-01 не меняется:** исправлено, ожидает независимой проверки.
