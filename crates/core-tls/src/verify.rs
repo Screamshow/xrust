@@ -174,8 +174,7 @@ mod tests {
     }
 
     /// The leaf here is not Ed25519, so there is no key in it -- which is the
-    /// point: a REALITY check on a certificate of the wrong type has to fall
-    /// through to the ordinary one rather than trust it.
+    /// point: a certificate of the wrong type is not a REALITY certificate.
     #[test]
     fn a_certificate_of_another_algorithm_has_no_ed25519_key() {
         let cert = rustls::pki_types::CertificateDer::from(fixture_der());
@@ -185,30 +184,88 @@ mod tests {
         assert!(ed25519_public_key(&spki).is_none());
     }
 
-    /// The verdict is what a caller has to report, because a REALITY server that
-    /// does not recognise us hands us the site it hides behind and the handshake
-    /// still succeeds. So: unknown before the check, and a reason after it.
+    /// A certificate that is not the one the named server made is refused, and
+    /// the verdict says why. No fallback verifier is consulted, so passing one
+    /// that accepts anything changes nothing.
     #[test]
-    fn the_verdict_says_why_a_certificate_was_not_taken_on_reality_terms() {
+    fn a_certificate_that_fails_the_reality_check_is_refused() {
         let der = fixture_der();
         let leaf = rustls::pki_types::CertificateDer::from(der);
         let name = ServerName::try_from("example.com").expect("a name");
         let verifier = RealityVerifier::new(Box::new(AcceptsAnything));
+        assert_eq!(verifier.outcome(), RealityVerdict::NotChecked);
         assert_eq!(verifier.verdict(), "not checked yet");
 
         // no auth key yet: the key exchange has not run, so this cannot be REALITY
-        verifier
+        let err = verifier
             .verify_chain(&leaf, &[], &name)
-            .expect("the fallback accepts anything");
-        assert_eq!(verifier.verdict(), "the key exchange produced no auth key");
+            .expect_err("no auth key");
+        assert!(
+            err.to_string().contains("REALITY authentication failed"),
+            "{err}"
+        );
+        assert_eq!(verifier.outcome(), RealityVerdict::NoAuthKey);
 
         // with one, the certificate here is ECDSA, so there is no Ed25519 key to
         // check against -- which is exactly the "not the node we named" case
         verifier.set_reality_auth_key(&[9u8; 32]);
         verifier
             .verify_chain(&leaf, &[], &name)
-            .expect("the fallback accepts anything");
+            .expect_err("an ECDSA leaf is not a REALITY leaf");
+        assert_eq!(verifier.outcome(), RealityVerdict::NoEd25519Key);
         assert_eq!(verifier.verdict(), "the certificate carries no Ed25519 key");
+        assert!(!verifier.is_verified());
+    }
+
+    /// The handshake signature is checked against the leaf key whatever
+    /// verifier was passed in: a REALITY leaf copied without its key is useless
+    /// to whoever copied it.
+    #[test]
+    fn reality_checks_the_handshake_signature_against_the_leaf() {
+        let leaf = rustls::pki_types::CertificateDer::from(fixture_der());
+        let verifier = RealityVerifier::new(Box::new(AcceptsAnything));
+        let scheme = u16::from(rustls::SignatureScheme::ECDSA_NISTP256_SHA256);
+        assert!(
+            verifier
+                .verify_handshake_signature(b"transcript", &leaf, scheme, &[0x30, 0x00])
+                .is_err()
+        );
+    }
+
+    /// Pin instead of CA: no chain, no name, but the pin and the handshake
+    /// signature both have to hold. And it cannot be built without a pin.
+    #[test]
+    fn a_pin_without_the_chain_still_needs_the_pin_and_the_signature() {
+        let der = fixture_der();
+        let leaf = rustls::pki_types::CertificateDer::from(der.clone());
+        let name = ServerName::try_from("not-the-name.invalid").expect("a name");
+        let cert_pin: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&der).into();
+        let key_pin = spki_sha256(&der).expect("an SPKI");
+
+        assert!(PinVerifier::instead_of_chain(vec![], vec![]).is_err());
+
+        for (cert_pins, key_pins, expected) in [
+            (vec![cert_pin], vec![], true),
+            (vec![], vec![key_pin], true),
+            (vec![cert_pin], vec![key_pin], true),
+            (vec![[0; 32]], vec![], false),
+            (vec![], vec![[0; 32]], false),
+            (vec![cert_pin], vec![[0; 32]], false),
+            (vec![[0; 32]], vec![key_pin], false),
+        ] {
+            let verifier = PinVerifier::instead_of_chain(cert_pins, key_pins).expect("pins");
+            assert_eq!(
+                verifier.verify_chain(&leaf, &[], &name).is_ok(),
+                expected,
+                "{verifier:?}"
+            );
+            let scheme = u16::from(rustls::SignatureScheme::ECDSA_NISTP256_SHA256);
+            assert!(
+                verifier
+                    .verify_handshake_signature(b"transcript", &leaf, scheme, &[0x30, 0x00])
+                    .is_err()
+            );
+        }
     }
 
     /// The rule itself, on the two byte strings it reads: the leaf's Ed25519 key
@@ -326,45 +383,106 @@ fn algorithm_for(scheme: u16) -> Option<&'static dyn SignatureVerificationAlgori
         .and_then(|(_, algorithms)| algorithms.first().copied())
 }
 
+/// What the REALITY check concluded about the last certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealityVerdict {
+    /// No certificate has been looked at yet.
+    NotChecked,
+    /// The key exchange produced no auth key, so nothing can be checked.
+    NoAuthKey,
+    /// The leaf is not Ed25519, so it is not a REALITY certificate.
+    NoEd25519Key,
+    /// An Ed25519 leaf, but its signature is not the HMAC under our auth key.
+    WrongAuthKey,
+    /// The leaf is the one the server we named made for this connection.
+    Verified,
+}
+
+impl RealityVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RealityVerdict::NotChecked => "not checked yet",
+            RealityVerdict::NoAuthKey => "the key exchange produced no auth key",
+            RealityVerdict::NoEd25519Key => "the certificate carries no Ed25519 key",
+            RealityVerdict::WrongAuthKey => {
+                "the borrowed certificate is not signed under our auth key"
+            }
+            RealityVerdict::Verified => "the borrowed certificate checks out",
+        }
+    }
+}
+
+impl std::fmt::Display for RealityVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A REALITY server fronts a site it does not own, so its certificate chains to
 /// nothing anybody trusts. It proves itself with a key the config named
 /// instead: the X25519 exchange with the server's public key produced an auth
 /// key, and the leaf is trusted when its own Ed25519 key, HMAC'd under that auth
-/// key, equals the leaf's own signature. Anything else falls through to the
-/// ordinary chain check, so a certificate that does happen to chain still
-/// works.
+/// key, equals the leaf's own signature.
+///
+/// Anything else is refused. A certificate that fails this check belongs to
+/// whoever answered instead of the node -- the site the server fronts, or
+/// somebody on the path -- and a valid chain does not make it the node, so
+/// there is no fallback to the ordinary chain check. `CertificateVerify` is
+/// always checked against the leaf key.
 #[derive(Debug, Clone)]
 pub struct RealityVerifier {
-    fallback: std::sync::Arc<dyn CertVerifier>,
     auth_key: std::sync::Arc<std::sync::Mutex<Option<[u8; 32]>>>,
-    verdict: std::sync::Arc<std::sync::Mutex<&'static str>>,
+    verdict: std::sync::Arc<std::sync::Mutex<RealityVerdict>>,
+}
+
+impl Default for RealityVerifier {
+    fn default() -> Self {
+        RealityVerifier {
+            auth_key: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            verdict: std::sync::Arc::new(std::sync::Mutex::new(RealityVerdict::NotChecked)),
+        }
+    }
 }
 
 impl RealityVerifier {
-    pub fn new(fallback: Box<dyn CertVerifier>) -> Self {
-        RealityVerifier {
-            fallback: std::sync::Arc::from(fallback),
-            auth_key: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            verdict: std::sync::Arc::new(std::sync::Mutex::new("not checked yet")),
-        }
+    /// The argument is not consulted: it is kept so existing callers build
+    /// unchanged. A REALITY leaf is trusted on the HMAC alone, never on a chain
+    /// or on `insecure`. New code uses [`RealityVerifier::default`].
+    pub fn new(_fallback: Box<dyn CertVerifier>) -> Self {
+        Self::default()
     }
 
-    /// What the last certificate check concluded, in one line.
+    /// What the last certificate check concluded.
     ///
-    /// A REALITY server that does not recognise its client does not fail: it
-    /// hands the connection to the site it hides behind, and the client ends up
-    /// talking TLS to that site with a perfectly valid certificate for it. Nothing
-    /// about that looks wrong from here, which is why this exists -- a caller can
-    /// put one line in a log instead of leaving the user with a tunnel that
-    /// quietly goes somewhere else.
-    pub fn verdict(&self) -> &'static str {
-        self.verdict.lock().map(|v| *v).unwrap_or("unreadable")
+    /// A REALITY server that does not recognise its client hands the
+    /// connection to the site it hides behind, so a failed check is the usual
+    /// sign of a wrong key, a wrong short id, clock skew or a redirect.
+    pub fn outcome(&self) -> RealityVerdict {
+        self.verdict
+            .lock()
+            .map(|v| *v)
+            .unwrap_or(RealityVerdict::NotChecked)
     }
 
-    fn set_verdict(&self, what: &'static str) {
+    /// The same as [`RealityVerifier::outcome`], in one line for a log.
+    pub fn verdict(&self) -> &'static str {
+        self.outcome().as_str()
+    }
+
+    /// Only this one means the server is the node we named.
+    pub fn is_verified(&self) -> bool {
+        self.outcome() == RealityVerdict::Verified
+    }
+
+    fn set_verdict(&self, what: RealityVerdict) {
         if let Ok(mut slot) = self.verdict.lock() {
             *slot = what;
         }
+    }
+
+    fn refuse(&self, what: RealityVerdict) -> io::Error {
+        self.set_verdict(what);
+        bad(format!("REALITY authentication failed: {what}"))
     }
 }
 
@@ -378,33 +496,25 @@ impl CertVerifier for RealityVerifier {
     fn verify_chain(
         &self,
         leaf: &CertificateDer<'_>,
-        chain: &[CertificateDer<'_>],
-        server_name: &ServerName<'_>,
+        _chain: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
     ) -> io::Result<()> {
-        let auth_key = self.auth_key.lock().ok().and_then(|slot| *slot);
-        match auth_key {
-            Some(key) => {
-                let der = spki_element(leaf.as_ref())
-                    .map_err(|e| bad(format!("the leaf certificate does not parse: {e}")))?;
-                let Some(public) = ed25519_public_key(der) else {
-                    self.set_verdict("the certificate carries no Ed25519 key");
-                    return self.fallback.verify_chain(leaf, chain, server_name);
-                };
-                let signature = certificate_signature(leaf)
-                    .map_err(|e| bad(format!("the leaf signature: {e}")))?;
-                if hmac_sha512(&key, &public) == signature {
-                    self.set_verdict("the borrowed certificate checks out");
-                    Ok(())
-                } else {
-                    // not the server we named: let the ordinary answer stand
-                    self.set_verdict("the borrowed certificate is not signed under our auth key");
-                    self.fallback.verify_chain(leaf, chain, server_name)
-                }
-            }
-            None => {
-                self.set_verdict("the key exchange produced no auth key");
-                self.fallback.verify_chain(leaf, chain, server_name)
-            }
+        let Some(key) = self.auth_key.lock().ok().and_then(|slot| *slot) else {
+            return Err(self.refuse(RealityVerdict::NoAuthKey));
+        };
+        let Ok(der) = spki_element(leaf.as_ref()) else {
+            return Err(self.refuse(RealityVerdict::NoEd25519Key));
+        };
+        let Some(public) = ed25519_public_key(der) else {
+            return Err(self.refuse(RealityVerdict::NoEd25519Key));
+        };
+        let signature =
+            certificate_signature(leaf).map_err(|_| self.refuse(RealityVerdict::WrongAuthKey))?;
+        if hmac_sha512(&key, &public) == signature {
+            self.set_verdict(RealityVerdict::Verified);
+            Ok(())
+        } else {
+            Err(self.refuse(RealityVerdict::WrongAuthKey))
         }
     }
 
@@ -415,10 +525,9 @@ impl CertVerifier for RealityVerifier {
         scheme: u16,
         signature: &[u8],
     ) -> io::Result<()> {
-        // a REALITY server signs the handshake with the very key it borrowed, so
-        // this check is the same one every TLS client makes
-        self.fallback
-            .verify_handshake_signature(signed, leaf, scheme, signature)
+        // a REALITY server signs the handshake with the key in the leaf, and
+        // that proof of possession is what makes the HMAC above worth anything
+        verify_leaf_signature(signed, leaf, scheme, signature)
     }
 }
 
@@ -676,11 +785,14 @@ fn verify_leaf_signature(
 /// present before 1.15 and the only one lx accepts. Neither can stand in for
 /// the other: they are different byte strings over the same certificate.
 ///
-/// The chain check still runs. A pin narrows what is trusted, it does not widen
-/// it: presenting a pinned certificate that does not chain to a known root is
-/// exactly the case a pin exists to catch.
+/// By default the chain check still runs: a pin narrows what is trusted, it does
+/// not widen it. [`PinVerifier::instead_of_chain`] is the `insecure: true` form:
+/// the chain and the name are not checked, the pin is. Either way the
+/// handshake signature is checked against the leaf key, so a copy of the
+/// pinned certificate without its key does not get through.
 pub struct PinVerifier {
-    inner: Arc<dyn ServerCertVerifier>,
+    /// The chain check, or `None` when the pin replaces it.
+    inner: Option<Arc<dyn ServerCertVerifier>>,
     /// SHA-256 over the whole DER leaf, when pinned.
     certificate_sha256: Vec<[u8; 32]>,
     /// SHA-256 over the SPKI, when pinned.
@@ -694,10 +806,26 @@ impl PinVerifier {
         public_key_sha256: Vec<[u8; 32]>,
     ) -> Self {
         Self {
-            inner,
+            inner: Some(inner),
             certificate_sha256,
             public_key_sha256,
         }
+    }
+
+    /// Pin instead of CA: no chain or name check, only the pins and the
+    /// handshake signature. At least one pin has to be given.
+    pub fn instead_of_chain(
+        certificate_sha256: Vec<[u8; 32]>,
+        public_key_sha256: Vec<[u8; 32]>,
+    ) -> io::Result<Self> {
+        if certificate_sha256.is_empty() && public_key_sha256.is_empty() {
+            return Err(bad("a pin without the chain check needs at least one pin"));
+        }
+        Ok(Self {
+            inner: None,
+            certificate_sha256,
+            public_key_sha256,
+        })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -708,6 +836,7 @@ impl PinVerifier {
 impl Debug for PinVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PinVerifier")
+            .field("chain", &self.inner.is_some())
             .field("certificate_sha256", &self.certificate_sha256.len())
             .field("public_key_sha256", &self.public_key_sha256.len())
             .finish()
@@ -815,9 +944,14 @@ impl CertVerifier for PinVerifier {
         chain: &[CertificateDer<'_>],
         server_name: &ServerName<'_>,
     ) -> io::Result<()> {
-        self.inner
-            .verify_server_cert(leaf, chain, server_name, &[], UnixTime::now())
-            .map_err(|e| bad(format!("certificate chain rejected: {e}")))?;
+        if let Some(inner) = &self.inner {
+            inner
+                .verify_server_cert(leaf, chain, server_name, &[], UnixTime::now())
+                .map_err(|e| bad(format!("certificate chain rejected: {e}")))?;
+        } else if self.is_empty() {
+            // unreachable through the constructor, refused anyway
+            return Err(bad("no pin to check the certificate against"));
+        }
 
         let der = leaf.as_ref();
         if !self.certificate_sha256.is_empty() {
@@ -887,6 +1021,9 @@ impl ServerCertVerifier for PinVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        match &self.inner {
+            Some(inner) => inner.supported_verify_schemes(),
+            None => core_crypto::verify::ALGORITHMS.supported_schemes(),
+        }
     }
 }

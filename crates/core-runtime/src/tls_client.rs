@@ -161,8 +161,8 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 /// REALITY: the server's public key and the short id that opens the session id
-/// seal. The verification of the borrowed certificate is not part of this yet,
-/// which is why enabling it is still refused further down.
+/// seal. A server that fails the REALITY check is refused, see
+/// [`TlsOptions::establish`].
 #[derive(Clone, Debug)]
 pub struct Reality {
     pub public_key: [u8; 32],
@@ -326,6 +326,24 @@ impl TlsOptions {
             _ => None,
         };
 
+        let has_pins = !certificate_sha256.is_empty() || !certificate_public_key_sha256.is_empty();
+        if reality.is_some() && (insecure || has_pins) {
+            let ignored = match (insecure, has_pins) {
+                (true, true) => "tls.insecure and the certificate pins are",
+                (true, false) => "tls.insecure is",
+                _ => "the certificate pins are",
+            };
+            crate::logging::warn(format_args!(
+                "{at}: {ignored} ignored with REALITY: the server is authenticated \
+                 by tls.reality.public_key only"
+            ));
+        } else if insecure && has_pins {
+            crate::logging::info(format_args!(
+                "{at}: tls.insecure with a certificate pin: the pin replaces the CA \
+                 and name check"
+            ));
+        }
+
         let stack = match tls.get("stack").and_then(Value::as_str) {
             Some("core") | Some("own") => Some(true),
             Some("rustls") => Some(false),
@@ -406,6 +424,7 @@ impl TlsOptions {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
+        self.refuse_reality("rustls")?;
         let versions: &[&'static rustls::SupportedProtocolVersion] = if self.min_tls13 {
             &[&rustls::version::TLS13]
         } else if self.max_tls12 {
@@ -430,6 +449,54 @@ impl TlsOptions {
             })?
         };
         connector.connect(name, stream).await
+    }
+
+    fn has_pins(&self) -> bool {
+        !self.certificate_sha256.is_empty() || !self.certificate_public_key_sha256.is_empty()
+    }
+
+    /// The certificate verifier for the rustls paths, or `None` for the plain
+    /// root store.
+    ///
+    /// A pin always holds. With `insecure` it replaces the chain and name
+    /// check (pin instead of CA, as the reference does), without it the chain
+    /// is checked too. Only with no pin does `insecure` accept anything.
+    fn rustls_verifier(
+        &self,
+    ) -> io::Result<Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>> {
+        if self.has_pins() {
+            let verifier = if self.insecure {
+                core_tls::verify::PinVerifier::instead_of_chain(
+                    self.certificate_sha256.clone(),
+                    self.certificate_public_key_sha256.clone(),
+                )?
+            } else {
+                let inner = core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?
+                    .into_inner();
+                core_tls::verify::PinVerifier::new(
+                    inner,
+                    self.certificate_sha256.clone(),
+                    self.certificate_public_key_sha256.clone(),
+                )
+            };
+            return Ok(Some(Arc::new(verifier)));
+        }
+        if self.insecure {
+            return Ok(Some(Arc::new(AcceptAny)));
+        }
+        Ok(None)
+    }
+
+    /// The rustls paths cannot do REALITY. Plain TLS in its place would send
+    /// the traffic to whoever answers, so they refuse instead.
+    fn refuse_reality(&self, path: &str) -> io::Result<()> {
+        if self.reality.is_some() {
+            return Err(io::Error::other(format!(
+                "REALITY {}: not available over {path}; refusing plain TLS",
+                self.server_name
+            )));
+        }
+        Ok(())
     }
 
     fn root_store(&self) -> io::Result<rustls::RootCertStore> {
@@ -507,29 +574,14 @@ impl TlsOptions {
         let builder = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(versions)
             .map_err(|e| io::Error::other(format!("tls: protocol versions: {e}")))?;
-        let mut config = if self.insecure {
-            builder
+        let mut config = match self.rustls_verifier()? {
+            Some(verifier) => builder
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAny))
-                .with_no_client_auth()
-        } else if !self.certificate_sha256.is_empty()
-            || !self.certificate_public_key_sha256.is_empty()
-        {
-            let inner =
-                core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?.into_inner();
-            let verifier = core_tls::verify::PinVerifier::new(
-                inner,
-                self.certificate_sha256.clone(),
-                self.certificate_public_key_sha256.clone(),
-            );
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(verifier))
-                .with_no_client_auth()
-        } else {
-            builder
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth(),
+            None => builder
                 .with_root_certificates(self.root_store()?)
-                .with_no_client_auth()
+                .with_no_client_auth(),
         };
         config.alpn_protocols = alpn.to_vec();
         let config = Arc::new(config);
@@ -550,6 +602,7 @@ impl TlsOptions {
         &self,
         default_alpn: &[&[u8]],
     ) -> io::Result<core_tls::quic::QuicClientConfig> {
+        self.refuse_reality("QUIC")?;
         let provider = if !self.cipher_suites.is_empty() {
             let suites: Vec<_> = self
                 .cipher_suites
@@ -568,29 +621,14 @@ impl TlsOptions {
         let builder = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| io::Error::other(format!("QUIC TLS provider: {e}")))?;
-        let mut config = if self.insecure {
-            builder
+        let mut config = match self.rustls_verifier()? {
+            Some(verifier) => builder
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(AcceptAny))
-                .with_no_client_auth()
-        } else if !self.certificate_sha256.is_empty()
-            || !self.certificate_public_key_sha256.is_empty()
-        {
-            let inner =
-                core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?.into_inner();
-            let verifier = core_tls::verify::PinVerifier::new(
-                inner,
-                self.certificate_sha256.clone(),
-                self.certificate_public_key_sha256.clone(),
-            );
-            builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(verifier))
-                .with_no_client_auth()
-        } else {
-            builder
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth(),
+            None => builder
                 .with_root_certificates(self.root_store()?)
-                .with_no_client_auth()
+                .with_no_client_auth(),
         };
         if !self.alpn.is_empty() {
             config.alpn_protocols = self.alpn.clone();
@@ -623,7 +661,7 @@ impl TlsOptions {
     /// third of the client CPU. The one thing ours cannot do is TLS 1.2 on the
     /// client, so a config pinned to 1.2 stays on rustls.
     fn own_stack(&self) -> bool {
-        if self.fragment {
+        if self.fragment || self.reality.is_some() {
             return true;
         }
         if self.fingerprint().is_some() {
@@ -633,6 +671,43 @@ impl TlsOptions {
             return stack;
         }
         !self.max_tls12
+    }
+
+    /// The verifier for our own stack without REALITY: the same policy as
+    /// [`TlsOptions::rustls_verifier`].
+    fn own_stack_verifier(&self) -> io::Result<Box<dyn core_tls::verify::CertVerifier>> {
+        if self.has_pins() && self.insecure {
+            return Ok(Box::new(core_tls::verify::PinVerifier::instead_of_chain(
+                self.certificate_sha256.clone(),
+                self.certificate_public_key_sha256.clone(),
+            )?));
+        }
+        if self.insecure {
+            return Ok(Box::new(core_tls::verify::AcceptsAnything));
+        }
+        let roots = if self.ca_certs.is_empty() {
+            core_tls::verify::WebpkiVerifier::mozilla_roots()
+        } else {
+            let mut store = rustls::RootCertStore::empty();
+            for cert in &self.ca_certs {
+                store
+                    .add(cert.clone())
+                    .map_err(|e| io::Error::other(format!("trust store: {e}")))?;
+            }
+            core_tls::verify::WebpkiVerifier::new(Arc::new(store))
+        };
+        let base = roots.map_err(|e| io::Error::other(format!("trust store: {e}")))?;
+        // A pin narrows what is trusted, so it wraps the chain check rather
+        // than replacing it: a pinned certificate that does not chain to a
+        // known root is still refused.
+        if !self.has_pins() {
+            return Ok(Box::new(base));
+        }
+        Ok(Box::new(core_tls::verify::PinVerifier::new(
+            base.into_inner(),
+            self.certificate_sha256.clone(),
+            self.certificate_public_key_sha256.clone(),
+        )))
     }
 
     /// Establish the connection, with our own TLS when a fingerprint is
@@ -662,57 +737,21 @@ impl TlsOptions {
             Some(f) => (f.name.clone(), f.template.clone()),
             None => ("chrome".to_string(), core_tls::fingerprints::chrome()),
         };
-        // a REALITY server is trusted by its own borrowed certificate under the
-        // auth key, so the ordinary chain check is the fallback, not the answer
-        let plain: Box<dyn core_tls::verify::CertVerifier> = if self.insecure {
-            Box::new(core_tls::verify::AcceptsAnything)
-        } else {
-            let roots = if self.ca_certs.is_empty() {
-                core_tls::verify::WebpkiVerifier::mozilla_roots()
-            } else {
-                let mut store = rustls::RootCertStore::empty();
-                for cert in &self.ca_certs {
-                    store
-                        .add(cert.clone())
-                        .map_err(|e| io::Error::other(format!("trust store: {e}")))?;
-                }
-                core_tls::verify::WebpkiVerifier::new(Arc::new(store))
-            };
-            let base = roots.map_err(|e| io::Error::other(format!("trust store: {e}")))?;
-            // A pin narrows what is trusted, so it wraps the chain check rather
-            // than replacing it: a pinned certificate that does not chain to a
-            // known root is still refused. With no pin configured this stays the
-            // plain verifier and the handshake path is unchanged.
-            let base: Box<dyn core_tls::verify::CertVerifier> =
-                if self.certificate_sha256.is_empty()
-                    && self.certificate_public_key_sha256.is_empty()
-                {
-                    Box::new(base)
-                } else {
-                    Box::new(core_tls::verify::PinVerifier::new(
-                        base.into_inner(),
-                        self.certificate_sha256.clone(),
-                        self.certificate_public_key_sha256.clone(),
-                    ))
-                };
-            base
-        };
         let reality = self.reality.as_ref();
         let seal = reality.map(|r| core_tls::client::RealitySeal {
             public_key: &r.public_key,
             short_id: &r.short_id,
         });
-        // Kept as a concrete type so the verdict can be reported: a REALITY server
-        // that does not recognise its client answers with the site it hides
-        // behind, and the handshake then *succeeds* against a certificate that
-        // has nothing to do with the node. Without this line that failure is
-        // invisible, and the tunnel simply goes somewhere else.
+        // A REALITY server is trusted by its borrowed certificate under the auth
+        // key and by nothing else: `insecure`, pins and the chain play no part.
+        // Kept as a concrete type so the verdict can be checked after the
+        // handshake.
         let (verifier, reality_verifier): (Box<dyn core_tls::verify::CertVerifier>, _) =
             if reality.is_some() {
-                let v = core_tls::verify::RealityVerifier::new(plain);
+                let v = core_tls::verify::RealityVerifier::default();
                 (Box::new(v.clone()), Some(v))
             } else {
-                (plain, None)
+                (self.own_stack_verifier()?, None)
             };
         let cipher_suites: Vec<u16> = self
             .cipher_suites
@@ -739,6 +778,24 @@ impl TlsOptions {
             .await
             .map_err(|e| io::Error::other(format!("{name} handshake: {e}")));
         if let Some(v) = reality_verifier.as_ref() {
+            if !v.is_verified() {
+                // A server that does not recognise us answers as the site it
+                // fronts; so does a redirect or a MITM. Nothing of ours goes to it.
+                crate::logging::warn(format_args!(
+                    "REALITY {}: authentication failed ({}); connection refused, \
+                     check public_key, short_id and the clock",
+                    self.server_name,
+                    v.verdict()
+                ));
+                return Err(io::Error::other(match result {
+                    Err(e) => format!("REALITY {}: {e}", self.server_name),
+                    Ok(()) => format!(
+                        "REALITY {}: authentication failed: {}",
+                        self.server_name,
+                        v.verdict()
+                    ),
+                }));
+            }
             crate::logging::debug(format_args!(
                 "REALITY {}: {}",
                 self.server_name,
@@ -921,63 +978,179 @@ mod tests {
         ));
     }
 
+    fn golden_cert(pem: &[u8]) -> rustls::pki_types::CertificateDer<'static> {
+        rustls_pemfile::certs(&mut &pem[..])
+            .next()
+            .unwrap()
+            .unwrap()
+    }
+
+    fn golden_key() -> rustls::pki_types::PrivateKeyDer<'static> {
+        rustls_pemfile::private_key(
+            &mut include_bytes!("../../../tests/golden/certs/localhost.key").as_slice(),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// A P-256 key that belongs to none of the golden certificates: a server
+    /// presenting one of them with this key has a copy of the certificate and
+    /// not its key.
+    const OTHER_KEY: &[u8] = b"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg8qHRyWI0YekLHzX+
+AM3z8J7bxUIpWjg/MrnUqb7wchKhRANCAAREXEc3xfZCP97wCTFKHg/dwvuwFf4d
+tKRtIBbVNqzAuojxmi55s2+rAP2MkmRaA4dJ5cDEEsVBbwnQkkEKHOPK
+-----END PRIVATE KEY-----
+";
+
+    /// Serves a certificate with whatever key it is given, matching or not.
+    #[derive(Debug)]
+    struct AnyPair(Arc<rustls::sign::CertifiedKey>);
+
+    impl rustls::server::ResolvesServerCert for AnyPair {
+        fn resolve(
+            &self,
+            _hello: rustls::server::ClientHello<'_>,
+        ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    fn server_config(
+        cert: rustls::pki_types::CertificateDer<'static>,
+        key_holder: bool,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> rustls::ServerConfig {
+        let key = if key_holder {
+            golden_key()
+        } else {
+            rustls_pemfile::private_key(&mut &OTHER_KEY[..])
+                .unwrap()
+                .unwrap()
+        };
+        let key = core_crypto::sign::any_supported_type(&key).unwrap();
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(AnyPair(Arc::new(
+                rustls::sign::CertifiedKey::new(vec![cert], key),
+            ))))
+    }
+
+    /// Which server certificate a row of the pin table presents.
+    #[derive(Clone, Copy, Debug)]
+    enum Served {
+        /// chains to the configured CA, right name, right key
+        Valid,
+        /// self-signed, so it chains to nothing configured
+        SelfSigned,
+        /// chains to the CA, but for another name
+        WrongName,
+        /// the valid certificate, signed for with a key that is not its own
+        Stolen,
+    }
+
+    /// The pin policy on both TCP stacks. A pin always holds; `insecure` only
+    /// decides whether the chain and name are checked as well. With no pin,
+    /// `insecure` still accepts anything.
     #[tokio::test]
     async fn ordinary_tls_requires_matching_pins_in_addition_to_the_ca() {
         use sha2::Digest;
         use tokio::net::TcpListener;
-        let cert = rustls_pemfile::certs(
-            &mut include_bytes!("../../../tests/golden/certs/urltest-valid.crt").as_slice(),
-        )
-        .next()
-        .unwrap()
-        .unwrap();
-        let ca = rustls_pemfile::certs(
-            &mut include_bytes!("../../../tests/golden/certs/urltest-ca.crt").as_slice(),
-        )
-        .next()
-        .unwrap()
-        .unwrap();
-        let cert_pin: [u8; 32] = sha2::Sha256::digest(cert.as_ref()).into();
-        let key_pin = core_tls::verify::spki_sha256(cert.as_ref()).unwrap();
-        for (cert_pins, key_pins, insecure, expected) in [
-            (vec![], vec![], false, true),
-            (vec![cert_pin], vec![key_pin], false, true),
-            (vec![[0; 32]], vec![], false, false),
-            (vec![], vec![[0; 32]], false, false),
-            (vec![[0; 32]], vec![[0; 32]], true, true),
-        ] {
-            let key = rustls_pemfile::private_key(
-                &mut include_bytes!("../../../tests/golden/certs/localhost.key").as_slice(),
-            )
-            .unwrap()
-            .unwrap();
-            let cfg =
-                rustls::ServerConfig::builder_with_provider(Arc::new(core_crypto::provider()))
-                    .with_protocol_versions(&[&rustls::version::TLS13])
+        let valid = golden_cert(include_bytes!(
+            "../../../tests/golden/certs/urltest-valid.crt"
+        ));
+        let self_signed = golden_cert(include_bytes!("../../../tests/golden/certs/localhost.crt"));
+        let wrong_name = golden_cert(include_bytes!(
+            "../../../tests/golden/certs/urltest-wrong-name.crt"
+        ));
+        let ca = golden_cert(include_bytes!("../../../tests/golden/certs/urltest-ca.crt"));
+        let pin = |c: &rustls::pki_types::CertificateDer<'_>| -> [u8; 32] {
+            sha2::Sha256::digest(c.as_ref()).into()
+        };
+        let cert_pin = pin(&valid);
+        let key_pin = core_tls::verify::spki_sha256(valid.as_ref()).unwrap();
+        let self_signed_pin = pin(&self_signed);
+        let wrong_name_pin = pin(&wrong_name);
+        let zero = [0u8; 32];
+        use Served::*;
+        // served, certificate pins, public key pins, insecure, accepted
+        type Row = (Served, Vec<[u8; 32]>, Vec<[u8; 32]>, bool, bool);
+        let table: Vec<Row> = vec![
+            (Valid, vec![], vec![], false, true),
+            (Valid, vec![cert_pin], vec![key_pin], false, true),
+            (Valid, vec![zero], vec![], false, false),
+            (Valid, vec![], vec![zero], false, false),
+            (Valid, vec![cert_pin], vec![zero], false, false),
+            // insecure no longer switches the pins off
+            (Valid, vec![zero], vec![zero], true, false),
+            (Valid, vec![zero], vec![], true, false),
+            (Valid, vec![], vec![zero], true, false),
+            (Valid, vec![cert_pin], vec![zero], true, false),
+            (Valid, vec![cert_pin], vec![key_pin], true, true),
+            (Valid, vec![cert_pin], vec![], true, true),
+            (Valid, vec![], vec![key_pin], true, true),
+            // no pin: insecure accepts anything, as before
+            (Valid, vec![], vec![], true, true),
+            (SelfSigned, vec![], vec![], true, true),
+            (WrongName, vec![], vec![], true, true),
+            (Stolen, vec![], vec![], true, true),
+            // pin instead of CA: a self-signed or misnamed certificate is taken
+            // on its pin with insecure, and still needs the chain without it
+            (SelfSigned, vec![], vec![], false, false),
+            (SelfSigned, vec![self_signed_pin], vec![], false, false),
+            (SelfSigned, vec![self_signed_pin], vec![], true, true),
+            (SelfSigned, vec![zero], vec![], true, false),
+            (WrongName, vec![wrong_name_pin], vec![], false, false),
+            (WrongName, vec![wrong_name_pin], vec![], true, true),
+            // a copy of the pinned certificate without its key is refused
+            (Stolen, vec![cert_pin], vec![key_pin], true, false),
+            (Stolen, vec![cert_pin], vec![], true, false),
+            (Stolen, vec![cert_pin], vec![key_pin], false, false),
+            (Stolen, vec![], vec![], false, false),
+        ];
+        for own_stack in [true, false] {
+            for (served, cert_pins, key_pins, insecure, expected) in &table {
+                let (cert, key_holder) = match served {
+                    Valid => (valid.clone(), true),
+                    SelfSigned => (self_signed.clone(), true),
+                    WrongName => (wrong_name.clone(), true),
+                    Stolen => (valid.clone(), false),
+                };
+                let cfg = server_config(cert, key_holder, Arc::new(core_crypto::provider()));
+                let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let task = tokio::spawn(async move {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    let _ = acceptor.accept(socket).await;
+                });
+                let mut tls = options(json!({"tls":{"enabled":true,"server_name":"localhost"}}))
                     .unwrap()
-                    .with_no_client_auth()
-                    .with_single_cert(vec![cert.clone()], key)
                     .unwrap();
-            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(cfg));
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let task = tokio::spawn(async move {
-                let (socket, _) = listener.accept().await.unwrap();
-                let _ = acceptor.accept(socket).await;
-            });
-            let mut tls = options(json!({"tls":{"enabled":true,"server_name":"localhost"}}))
-                .unwrap()
-                .unwrap();
-            tls.ca_certs = vec![ca.clone()];
-            tls.certificate_sha256 = cert_pins;
-            tls.certificate_public_key_sha256 = key_pins;
-            tls.insecure = insecure;
-            let socket = TcpStream::connect(addr).await.unwrap();
-            let result = tokio::time::timeout(std::time::Duration::from_secs(5), tls.wrap(socket))
-                .await
-                .unwrap();
-            assert_eq!(result.is_ok(), expected, "TLS pin policy");
-            task.abort();
+                tls.ca_certs = vec![ca.clone()];
+                tls.certificate_sha256 = cert_pins.clone();
+                tls.certificate_public_key_sha256 = key_pins.clone();
+                tls.insecure = *insecure;
+                tls.stack = Some(own_stack);
+                assert_eq!(tls.own_stack(), own_stack);
+                let socket = TcpStream::connect(addr).await.unwrap();
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), tls.wrap(socket))
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    result.is_ok(),
+                    *expected,
+                    "TLS pin policy: own_stack={own_stack} served={served:?} \
+                     cert_pins={} key_pins={} insecure={insecure}: {:?}",
+                    cert_pins.len(),
+                    key_pins.len(),
+                    result.err()
+                );
+                task.abort();
+            }
         }
     }
 
@@ -1027,46 +1200,57 @@ mod tests {
         .unwrap();
         let cert_pin: [u8; 32] = sha2::Sha256::digest(cert.as_ref()).into();
         let key_pin = core_tls::verify::spki_sha256(cert.as_ref()).unwrap();
-        let key = rustls_pemfile::private_key(
-            &mut include_bytes!("../../../tests/golden/certs/localhost.key").as_slice(),
-        )
-        .unwrap()
-        .unwrap();
-        let mut cfg =
-            rustls::ServerConfig::builder_with_provider(core_tls::quic::configured_provider())
-                .with_protocol_versions(&[&rustls::version::TLS13])
-                .unwrap()
-                .with_no_client_auth()
-                .with_single_cert(vec![cert], key)
-                .unwrap();
-        cfg.alpn_protocols = vec![b"pin-test".to_vec()];
-        let server_config = quinn::ServerConfig::new(
-            Arc::new(core_tls::quic::QuicServerConfig::try_from(cfg).unwrap()),
-            Arc::new(core_tls::quic::HandshakeTokenKeyRustCrypto::new([7; 64])),
-        );
         let endpoint_config =
             || quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(&[9; 32])));
-        let server = quinn::Endpoint::new(
-            endpoint_config(),
-            Some(server_config),
-            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
-            quinn::default_runtime().unwrap(),
-        )
-        .unwrap();
-        let addr = server.local_addr().unwrap();
-        let server_task = tokio::spawn(async move {
-            while let Some(incoming) = server.accept().await {
-                tokio::spawn(async move {
-                    if let Ok(connection) = incoming.await {
-                        connection.closed().await;
-                    }
-                });
-            }
-        });
-        for (cert_pins, key_pins, expected) in [
-            (vec![cert_pin], vec![key_pin], true),
-            (vec![[0; 32]], vec![], false),
-            (vec![], vec![[0; 32]], false),
+        let serve = |key_holder: bool| {
+            let mut cfg = server_config(
+                cert.clone(),
+                key_holder,
+                core_tls::quic::configured_provider(),
+            );
+            cfg.alpn_protocols = vec![b"pin-test".to_vec()];
+            let server_config = quinn::ServerConfig::new(
+                Arc::new(core_tls::quic::QuicServerConfig::try_from(cfg).unwrap()),
+                Arc::new(core_tls::quic::HandshakeTokenKeyRustCrypto::new([7; 64])),
+            );
+            let server = quinn::Endpoint::new(
+                endpoint_config(),
+                Some(server_config),
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                quinn::default_runtime().unwrap(),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                while let Some(incoming) = server.accept().await {
+                    tokio::spawn(async move {
+                        if let Ok(connection) = incoming.await {
+                            connection.closed().await;
+                        }
+                    });
+                }
+            });
+            (addr, task)
+        };
+        let (genuine, genuine_task) = serve(true);
+        // the pinned certificate, signed for with a key that is not its own
+        let (stolen, stolen_task) = serve(false);
+        for (addr, cert_pins, key_pins, insecure, expected) in [
+            (genuine, vec![cert_pin], vec![key_pin], false, true),
+            (genuine, vec![[0; 32]], vec![], false, false),
+            (genuine, vec![], vec![[0; 32]], false, false),
+            // insecure does not switch the pins off
+            (genuine, vec![cert_pin], vec![key_pin], true, true),
+            (genuine, vec![cert_pin], vec![], true, true),
+            (genuine, vec![[0; 32]], vec![], true, false),
+            (genuine, vec![], vec![[0; 32]], true, false),
+            (genuine, vec![[0; 32]], vec![[0; 32]], true, false),
+            // and without a pin it still accepts anything
+            (genuine, vec![], vec![], true, true),
+            (stolen, vec![], vec![], true, true),
+            // a pin is only as good as the handshake signature behind it
+            (stolen, vec![cert_pin], vec![key_pin], true, false),
+            (stolen, vec![cert_pin], vec![key_pin], false, false),
         ] {
             let mut tls = options(json!({"tls":{"enabled":true,"server_name":"localhost"}}))
                 .unwrap()
@@ -1074,6 +1258,7 @@ mod tests {
             tls.ca_certs = vec![ca.clone()];
             tls.certificate_sha256 = cert_pins;
             tls.certificate_public_key_sha256 = key_pins;
+            tls.insecure = insecure;
             let mut client = quinn::Endpoint::new(
                 endpoint_config(),
                 None,
@@ -1090,10 +1275,16 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(result.is_ok(), expected, "QUIC pin policy");
+            assert_eq!(
+                result.is_ok(),
+                expected,
+                "QUIC pin policy: insecure={insecure} {:?}",
+                result.err()
+            );
             client.close(0u32.into(), b"test complete");
         }
-        server_task.abort();
+        genuine_task.abort();
+        stolen_task.abort();
     }
 
     /// The whole point of the change: a fingerprint in the config is a table we
