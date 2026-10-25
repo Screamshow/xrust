@@ -752,10 +752,16 @@ pub fn write(path: &Path, root: &NodeSpec) -> io::Result<()> {
 /// Write a borrowed tree; the output is the same as `write` for the same
 /// content.
 pub fn write_ref(path: &Path, root: NodeRef<'_>) -> io::Result<()> {
+    fs::write(path, encode_ref(root)?)
+}
+
+/// The file image `write_ref` would write, for callers that do their own
+/// file handling (for example a synced replace).
+pub fn encode_ref(root: NodeRef<'_>) -> io::Result<Vec<u8>> {
     let mut writer = Writer::new(4096);
     let root_pgid = writer.materialize(root)?;
     writer.write_meta(root_pgid);
-    fs::write(path, &writer.file)
+    Ok(writer.file)
 }
 
 #[cfg(test)]
