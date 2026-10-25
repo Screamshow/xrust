@@ -192,14 +192,25 @@ async fn manual_group_and_background_tests_authenticate_the_site() {
                 label == "trusted",
                 "background: {label}"
             );
-            for path in ["/proxies/node/delay", "/group/provider/delay"] {
-                let (status, _) = api(addr, &format!("{path}?timeout=2000&url={url}")).await;
-                assert_eq!(
-                    status,
-                    if label == "trusted" { 200 } else { 503 },
-                    "{path}: {label}"
-                );
-            }
+            let (status, _) =
+                api(addr, &format!("/proxies/node/delay?timeout=2000&url={url}")).await;
+            assert_eq!(
+                status,
+                if label == "trusted" { 200 } else { 503 },
+                "proxy: {label}"
+            );
+            // `/group` lists only the members that passed.
+            let (status, result) = api(
+                addr,
+                &format!("/group/provider/delay?timeout=2000&url={url}"),
+            )
+            .await;
+            assert_eq!(status, 200, "group: {label}");
+            assert_eq!(
+                result.get("node").is_some(),
+                label == "trusted",
+                "group: {label}: {result}"
+            );
             instance.shutdown();
             server.abort();
         }

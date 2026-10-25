@@ -510,6 +510,7 @@ async fn handle_request(
         Route::Proxies
             | Route::Proxy(_)
             | Route::Delay(_)
+            | Route::GroupDelay(_)
             | Route::Logs
             | Route::Traffic
             | Route::Connections
@@ -593,13 +594,19 @@ async fn handle_request(
         }
         Route::Proxy(name) => {
             return handle_proxy_route(
-                stream, router, method, &name, false, &headers, &query, &cors,
+                stream, router, method, &name, false, false, &headers, &query, &cors,
             )
             .await;
         }
         Route::Delay(name) => {
             return handle_proxy_route(
-                stream, router, method, &name, true, &headers, &query, &cors,
+                stream, router, method, &name, true, false, &headers, &query, &cors,
+            )
+            .await;
+        }
+        Route::GroupDelay(name) => {
+            return handle_proxy_route(
+                stream, router, method, &name, true, true, &headers, &query, &cors,
             )
             .await;
         }
@@ -652,6 +659,8 @@ enum Route {
     Proxies,
     Proxy(String),
     Delay(String),
+    /// `/group/{name}/delay`: every member probed, answered as a map
+    GroupDelay(String),
     Logs,
     Traffic,
     Connections,
@@ -726,7 +735,7 @@ fn classify_group(rest: &str) -> (Route, &'static [&'static str]) {
     let rest = rest.strip_suffix('/').unwrap_or(rest);
     match rest.rsplit_once('/') {
         Some((base, "delay")) if !base.is_empty() && !base.contains('/') => {
-            (Route::Delay(percent_decode(base)), GET_ONLY)
+            (Route::GroupDelay(percent_decode(base)), GET_ONLY)
         }
         _ => (Route::Unknown, GET_ONLY),
     }
@@ -1278,6 +1287,7 @@ async fn handle_proxy_route(
     method: &str,
     name: &str,
     delay: bool,
+    group: bool,
     headers: &[(String, String)],
     query: &[(String, String)],
     cors: &[String],
@@ -1366,6 +1376,16 @@ async fn handle_proxy_route(
             Ok(true)
         }
         ("GET", true) => {
+            // Reference `getGroupDelay`: `/group` serves groups only.
+            if group
+                && !matches!(
+                    router.inner().outbounds[index],
+                    Outbound::Selector(_) | Outbound::Urltest(_)
+                )
+            {
+                respond_json(stream, 404, "Not Found", &not_found(), cors).await?;
+                return Ok(true);
+            }
             let timeout_text = query_get("timeout");
             let Ok(timeout) = timeout_text.parse::<i16>() else {
                 respond_json(stream, 400, "Bad Request", &bad_request(), cors).await?;
@@ -1375,7 +1395,7 @@ async fn handle_proxy_route(
             if url.is_empty() {
                 url = DEFAULT_DELAY_URL.to_string();
             }
-            delay_test(stream, router, index, &url, timeout, cors).await?;
+            delay_test(stream, router, index, &url, timeout, group, cors).await?;
             Ok(true)
         }
         _ => {
@@ -1504,12 +1524,17 @@ fn udp_capable(outbound: &Outbound) -> bool {
 /// Reference `urltest.URLTest`: HEAD through the outbound, any HTTP response
 /// counts. For HTTPS, measure the request after the complete TLS handshake;
 /// connection establishment still counts against the overall timeout.
+///
+/// `group` (`/group/{name}/delay`) answers like the reference `getGroupDelay`:
+/// `200` with `{member: delay}` for the members that answered in time (a
+/// nested group reports the delay of its selected member), never `{"delay"}`.
 async fn delay_test(
     stream: &mut TcpStream,
     router: &Arc<Router>,
     index: usize,
     url: &str,
     timeout: i16,
+    group: bool,
     cors: &[String],
 ) -> std::io::Result<()> {
     let deadline = Duration::from_millis(timeout.max(0) as u64);
@@ -1543,6 +1568,12 @@ async fn delay_test(
         &mut std::collections::HashSet::new(),
         &mut order,
     );
+    enum Outcome {
+        Delay(Option<u16>),
+        /// `/group`: member → delay
+        Members(Value),
+        Timeout,
+    }
     let test = async {
         let expires = tokio::time::Instant::now() + deadline;
         let sem = Arc::new(tokio::sync::Semaphore::new(8));
@@ -1579,7 +1610,7 @@ async fn delay_test(
             }
         }
         if !Arc::ptr_eq(&inner, &router.inner()) {
-            return Err(());
+            return Outcome::Timeout;
         }
         for &node in &order {
             let ms = match &inner.outbounds[node] {
@@ -1601,23 +1632,39 @@ async fn delay_test(
                 inner.clear_delay(node);
             }
         }
+        if group {
+            let members: &[String] = match &inner.outbounds[index] {
+                Outbound::Selector(members) => members.all(),
+                Outbound::Urltest(members) => members.all(),
+                _ => &[],
+            };
+            let map: serde_json::Map<String, Value> = members
+                .iter()
+                .filter_map(|tag| {
+                    let ms = results.get(&inner.index_of(tag)?).copied().flatten()?;
+                    Some((tag.clone(), json!(ms)))
+                })
+                .collect();
+            return Outcome::Members(Value::Object(map));
+        }
         match results.get(&index).copied().flatten() {
-            None if timed_out => Err(()),
-            ms => Ok(ms),
+            None if timed_out => Outcome::Timeout,
+            ms => Outcome::Delay(ms),
         }
     };
     match test.await {
-        Err(_) => {
+        Outcome::Members(map) => respond_json(stream, 200, "OK", &map, cors).await,
+        Outcome::Timeout => {
             for node in order {
                 inner.clear_delay(node);
             }
             respond_json(stream, 504, "Gateway Timeout", &timeout_err(), cors).await
         }
-        Ok(None) | Ok(Some(0)) => {
+        Outcome::Delay(None | Some(0)) => {
             router.clear_delay(index);
             respond_json(stream, 503, "Service Unavailable", &delay_err(), cors).await
         }
-        Ok(Some(delay)) => {
+        Outcome::Delay(Some(delay)) => {
             router.record_delay(index, delay.into());
             respond_json(stream, 200, "OK", &json!({"delay": delay}), cors).await
         }
@@ -2358,11 +2405,11 @@ mod tests {
         ));
         assert!(matches!(
             classify_with_ui("/group/sel/delay", false).0,
-            Route::Delay(_)
+            Route::GroupDelay(_)
         ));
         assert!(matches!(
             classify_with_ui("/group/sel/delay/", false).0,
-            Route::Delay(_)
+            Route::GroupDelay(_)
         ));
         assert!(matches!(
             classify_with_ui("/group/sel", false).0,
@@ -2486,11 +2533,11 @@ mod tests {
             _ => panic!("expected Route::Proxy"),
         }
         match classify_with_ui("/group/Group%2FA/delay", false) {
-            (Route::Delay(name), methods) => {
+            (Route::GroupDelay(name), methods) => {
                 assert_eq!(name, "Group/A");
                 assert_eq!(methods, GET_ONLY);
             }
-            _ => panic!("expected Route::Delay"),
+            _ => panic!("expected Route::GroupDelay"),
         }
     }
 

@@ -122,7 +122,13 @@ async fn manual_group_and_background_tests_exclude_tls_but_keep_timeout() {
         let (status, result) = api(addr, &format!("{path}?timeout=2000&url={url}")).await;
         assert_eq!(status, 200);
         assert!(start.elapsed() >= Duration::from_millis(350));
-        let ms = result["delay"].as_u64().unwrap();
+        // `/group` answers member → delay.
+        let key = if path.starts_with("/group/") {
+            "node"
+        } else {
+            "delay"
+        };
+        let ms = result[key].as_u64().unwrap();
         assert!(
             (40..250).contains(&ms),
             "manual included TLS or lost response delay: {ms}"
@@ -190,12 +196,13 @@ async fn failed_manual_and_background_probes_clear_previous_success() {
             api(addr, &format!("{path}?timeout=2000&url={url}")).await.0,
             200
         );
-        assert_eq!(
-            api(addr, &format!("{path}?timeout=2000&url={dead_url}"))
-                .await
-                .0,
-            503
-        );
+        let (status, result) = api(addr, &format!("{path}?timeout=2000&url={dead_url}")).await;
+        if path.starts_with("/group/") {
+            // `/group` answers 200 and lists only the members that passed.
+            assert_eq!((status, result), (200, json!({})));
+        } else {
+            assert_eq!(status, 503);
+        }
         for tag in ["node", "selector", "provider"] {
             let (_, info) = api(addr, &format!("/proxies/{tag}")).await;
             assert_eq!(info["history"], json!([]), "stale success for {tag}");

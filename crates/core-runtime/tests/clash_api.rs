@@ -128,15 +128,21 @@ async fn encoded_slash_names_support_lookup_selection_and_delay() {
         request(addr, &authed("/proxies/Group%2FA")).await.json()["now"],
         "node/B"
     );
-    for path in ["/proxies/node%2FA/delay", "/group/Group%2FA/delay"] {
-        let url = format!("{path}?url=http%3A%2F%2F127.0.0.1%3A1&timeout=100");
-        let response = request(addr, &authed(&url)).await;
-        assert_eq!(
-            response.status, 503,
-            "encoded name must reach the delay handler and report the refused target"
-        );
-        assert!(response.json().get("message").is_some());
-    }
+    let query = "?url=http%3A%2F%2F127.0.0.1%3A1&timeout=100";
+    let response = request(addr, &authed(&format!("/proxies/node%2FA/delay{query}"))).await;
+    assert_eq!(
+        response.status, 503,
+        "encoded name must reach the delay handler and report the refused target"
+    );
+    assert!(response.json().get("message").is_some());
+    // a group answers with the members that responded (none here), as the
+    // reference does; an unknown name would be 404
+    let response = request(addr, &authed(&format!("/group/Group%2FA/delay{query}"))).await;
+    assert_eq!(
+        response.status, 200,
+        "encoded group name must reach the handler"
+    );
+    assert_eq!(response.json(), serde_json::json!({}));
     instance.shutdown();
 }
 

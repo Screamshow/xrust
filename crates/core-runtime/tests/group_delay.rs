@@ -114,8 +114,14 @@ async fn group_probes_all_leaves_deduplicates_and_preserves_selector() {
         "/group/group/delay?timeout=2000&url=http://example.test/",
     )
     .await;
+    // Reference `getGroupDelay`: member → delay; a nested group reports the
+    // delay of its selected member.
     assert_eq!(status, 200, "{result}");
-    assert!(result["delay"].as_u64().unwrap() < 120);
+    let members = result.as_object().unwrap();
+    assert_eq!(members.len(), 2, "{result}");
+    let fast_ms = result["fast"].as_u64().unwrap();
+    assert!(fast_ms < 120, "{result}");
+    assert!(result["child"].as_u64().unwrap() > fast_ms, "{result}");
     assert_eq!(slow_hits.load(Ordering::SeqCst), 1);
     assert_eq!(fast_hits.load(Ordering::SeqCst), 1);
     assert_eq!(api(addr, "/proxies/group").await.1["now"], "fast");
@@ -150,16 +156,30 @@ async fn group_keeps_success_when_another_leaf_times_out() {
     instance
         .router()
         .record_delay(instance.router().index_of("slow").unwrap(), 1);
+    let (status, result) = api(
+        addr,
+        "/group/group/delay?timeout=250&url=http://example.test/",
+    )
+    .await;
+    assert_eq!(status, 200, "{result}");
+    // Only the members that answered in time are listed.
+    assert_eq!(
+        result.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["fast"],
+        "{result}"
+    );
+    assert!(result["fast"].as_u64().unwrap() > 0);
+    assert_eq!(api(addr, "/proxies/group").await.1["now"], "fast");
+    // `/group` serves groups only.
     assert_eq!(
         api(
             addr,
-            "/group/group/delay?timeout=250&url=http://example.test/"
+            "/group/fast/delay?timeout=250&url=http://example.test/"
         )
         .await
         .0,
-        200
+        404
     );
-    assert_eq!(api(addr, "/proxies/group").await.1["now"], "fast");
     assert_eq!(api(addr, "/proxies/slow").await.1["history"], json!([]));
     instance.shutdown_wait().await;
     task.abort();
@@ -195,15 +215,13 @@ async fn group_limits_parallel_probes_to_eight() {
         .collect();
     outbounds.push(json!({"type":"selector","tag":"group","outbounds":tags}));
     let instance=core_runtime::start(&json!({"experimental":{"clash_api":{"external_controller":"127.0.0.1:0"}},"outbounds":outbounds,"route":{"final":"group"}})).await.unwrap();
-    assert_eq!(
-        api(
-            instance.clash_api_addr().unwrap(),
-            &format!("/group/group/delay?timeout=2000&url={url}")
-        )
-        .await
-        .0,
-        200
-    );
+    let (status, result) = api(
+        instance.clash_api_addr().unwrap(),
+        &format!("/group/group/delay?timeout=2000&url={url}"),
+    )
+    .await;
+    assert_eq!(status, 200, "{result}");
+    assert_eq!(result.as_object().unwrap().len(), 12, "{result}");
     assert_eq!(hits.load(Ordering::SeqCst), 12);
     assert!(peak.load(Ordering::SeqCst) <= 8);
     assert!(peak.load(Ordering::SeqCst) > 1);
