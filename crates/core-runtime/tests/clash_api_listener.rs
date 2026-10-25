@@ -70,7 +70,10 @@ async fn silent_client_is_closed_after_header_timeout() {
     let mut silent = TcpStream::connect(addr).await.unwrap();
     // A request line that never ends.
     let mut partial = TcpStream::connect(addr).await.unwrap();
-    partial.write_all(b"GET /version HTTP/1.1\r\nHo").await.unwrap();
+    partial
+        .write_all(b"GET /version HTTP/1.1\r\nHo")
+        .await
+        .unwrap();
 
     for stream in [&mut silent, &mut partial] {
         let mut buf = [0u8; 64];
