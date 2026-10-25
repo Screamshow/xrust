@@ -19,18 +19,20 @@ static STORE: OnceLock<Mutex<Option<SharedCacheFile>>> = OnceLock::new();
 /// the way the reference keeps `bucketMode`, and the mode that was in the cache
 /// becomes the mode we start in.
 pub fn attach_store(store: Option<SharedCacheFile>) {
+    // Read the saved mode first and apply it with no lock held: `set` persists
+    // through the same slot and cache mutexes, which do not re-enter.
+    let saved = store
+        .as_ref()
+        .and_then(|store| {
+            store
+                .lock()
+                .ok()?
+                .get(crate::cache_file::BUCKET_MODE, b"mode")
+        })
+        .and_then(|mode| String::from_utf8(mode).ok());
     let slot = STORE.get_or_init(|| Mutex::new(None));
     *slot.lock().expect("clash mode store") = store;
-    let guard = slot.lock().expect("store");
-    let Some(store) = guard.as_ref() else {
-        return;
-    };
-    let Ok(cache) = store.lock() else {
-        return;
-    };
-    if let Some(mode) = cache.get(crate::cache_file::BUCKET_MODE, b"mode")
-        && let Ok(mode) = String::from_utf8(mode)
-    {
+    if let Some(mode) = saved {
         set(mode.trim());
     }
 }
