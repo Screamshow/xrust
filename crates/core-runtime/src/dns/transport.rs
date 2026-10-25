@@ -408,7 +408,7 @@ impl FakeIpStore {
         ip: IpAddr,
         domain: &str,
     ) -> (Option<(String, IpAddr)>, Option<String>) {
-        let evicted = match ip {
+        let pushed = match ip {
             IpAddr::V4(addr) => state
                 .domain_to_v4
                 .push(domain.to_string(), addr)
@@ -417,6 +417,18 @@ impl FakeIpStore {
                 .domain_to_v6
                 .push(domain.to_string(), addr)
                 .map(|(d, a)| (d, IpAddr::V6(a))),
+        };
+        // `push` also returns the old value when the name was already cached.
+        // That is a replacement, not an eviction: the name keeps its records,
+        // only a different old address loses its reverse entry.
+        let evicted = match pushed {
+            Some((name, old)) if name == domain => {
+                if old != ip && state.addr_to_domain.get(&old).is_some_and(|d| d == domain) {
+                    state.addr_to_domain.remove(&old);
+                }
+                None
+            }
+            other => other,
         };
         if let Some((_, evicted_addr)) = &evicted {
             state.addr_to_domain.remove(evicted_addr);

@@ -324,3 +324,125 @@ fn persistent_lru_eviction_deletes_both_records_and_preserves_other_family() {
     drop((store, cache));
     std::fs::remove_file(path).unwrap();
 }
+
+fn reload_cache(name: &str) -> (std::path::PathBuf, CacheFileOptions) {
+    let path = std::env::temp_dir().join(format!("rust-x-{name}-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let options = CacheFileOptions {
+        enabled: true,
+        store_fakeip: true,
+        path: path.to_string_lossy().into_owned(),
+        // only the explicit flush below writes the file
+        flush_interval: std::time::Duration::from_secs(3600),
+        ..Default::default()
+    };
+    (path, options)
+}
+
+fn assert_pair(cache: &Mutex<CacheFile>, domain: &str, ip: IpAddr) {
+    let (bucket, address) = match ip {
+        IpAddr::V4(ip) => ("fakeip_domain4", ip.octets().to_vec()),
+        IpAddr::V6(ip) => ("fakeip_domain6", ip.octets().to_vec()),
+    };
+    let file = cache.lock().unwrap();
+    assert_eq!(
+        file.get(bucket, domain.as_bytes()),
+        Some(address.clone()),
+        "forward record of {domain}"
+    );
+    assert_eq!(
+        file.get("fakeip_address", &address),
+        Some(domain.as_bytes().to_vec()),
+        "reverse record of {ip}"
+    );
+}
+
+// A hot reload migrates the pool from memory and then attaches the same cache.
+// Names already in memory must keep their records on disk, so a restart after
+// the reload still finds them.
+#[test]
+fn hot_reload_keeps_fakeip_records_on_disk() {
+    let (path, options) = reload_cache("fakeip-reload");
+    let cache = Arc::new(Mutex::new(
+        CacheFile::open(options.clone()).unwrap().unwrap(),
+    ));
+    let old = pool();
+    old.attach_cache(Some(cache.clone()));
+    let names = ["a.example", "b.example", "c.example"];
+    let mut assigned = Vec::new();
+    for name in names {
+        assigned.push((name, old.create(name, false).unwrap()));
+        assigned.push((name, old.create(name, true).unwrap()));
+    }
+
+    // the order of `BoxInstance::reload_in_place`
+    let reloaded = pool();
+    reloaded.migrate_from(&old);
+    reloaded.attach_cache(Some(cache.clone()));
+    for &(name, ip) in &assigned {
+        assert_eq!(reloaded.create(name, ip.is_ipv6()).unwrap(), ip);
+        assert_pair(&cache, name, ip);
+    }
+    cache.lock().unwrap().flush().unwrap();
+    drop((old, reloaded, cache));
+
+    let cache = Arc::new(Mutex::new(CacheFile::open(options).unwrap().unwrap()));
+    for &(name, ip) in &assigned {
+        assert_pair(&cache, name, ip);
+    }
+    let restarted = pool();
+    restarted.attach_cache(Some(cache.clone()));
+    for &(name, ip) in &assigned {
+        assert_eq!(restarted.lookup_domain(ip).as_deref(), Some(name));
+        assert_eq!(restarted.lookup_address(name, ip.is_ipv6()), Some(ip));
+    }
+    // the cursors carry on after the last address of each family
+    assert_eq!(
+        restarted.create("d.example", false).unwrap(),
+        "198.18.0.5".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(
+        restarted.create("d.example", true).unwrap(),
+        "fc00::5".parse::<IpAddr>().unwrap()
+    );
+    drop((restarted, cache));
+    std::fs::remove_file(path).unwrap();
+}
+
+// When the disk holds a different address for a name the migrated memory
+// already knows, the disk pair wins and the old address is released.
+#[test]
+fn hot_reload_prefers_the_disk_address_of_a_known_name() {
+    let (path, options) = reload_cache("fakeip-reload-replace");
+    let cache = Arc::new(Mutex::new(
+        CacheFile::open(options.clone()).unwrap().unwrap(),
+    ));
+    let memory_only = pool();
+    let stale = memory_only.create("moved.example", false).unwrap();
+    let disk: IpAddr = "198.18.0.9".parse().unwrap();
+    {
+        let mut file = cache.lock().unwrap();
+        file.put("fakeip_domain4", b"moved.example", vec![198, 18, 0, 9]);
+        file.put(
+            "fakeip_address",
+            &[198, 18, 0, 9],
+            b"moved.example".to_vec(),
+        );
+    }
+    let reloaded = pool();
+    reloaded.migrate_from(&memory_only);
+    reloaded.attach_cache(Some(cache.clone()));
+    assert_eq!(reloaded.lookup_address("moved.example", false), Some(disk));
+    assert_eq!(
+        reloaded.lookup_domain(disk).as_deref(),
+        Some("moved.example")
+    );
+    assert_eq!(reloaded.lookup_domain(stale), None);
+    assert_pair(&cache, "moved.example", disk);
+    cache.lock().unwrap().flush().unwrap();
+    drop((memory_only, reloaded, cache));
+    let cache = Arc::new(Mutex::new(CacheFile::open(options).unwrap().unwrap()));
+    assert_pair(&cache, "moved.example", disk);
+    drop(cache);
+    std::fs::remove_file(path).unwrap();
+}
