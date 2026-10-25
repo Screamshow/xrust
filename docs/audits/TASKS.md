@@ -40,6 +40,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | SEC-08 / CQ-11 | DNS: ответ upstream не сверяется с запросом, ID предсказуем | P1 | исправлено, проверено | `2506df64e37b5a119c10724a5e7d6287f5e837d8` |
 | CQ-12 | bbolt: бесконечная рекурсия на повреждённом cache.db | P1 | исправлено, проверено | `41c8be591e4c8a664a480498f1aec47192923761` |
 | CQ-13 (частично) | cache.db: запись без fsync файла и каталога — исправлена только долговечность записи | P1 | исправлено (частично), ожидает независимой проверки | `6c7d0da0c6a481d091a0e681c4805517a09c8804` |
+| CN-04 | XHTTP `auto` всегда становится packet-up, даже с REALITY | P1 | исправлено, ожидает независимой проверки | `f9e6ea79f42b1712075a0041f8ecbe2d6d6d3de9` |
 
 ## Задачи
 
@@ -1738,3 +1739,49 @@ PID основной службы и контрольные суммы `/etc/con
 - Если процесс прерывается посреди записи, оставшийся временный файл при старте не удаляется (как и раньше).
 - OpenWrt и полный CI не проверялись.
 - **Соседние находки (не исправлялись):** запись через tmp + rename без fsync файла и каталога в `route/rule_set_remote.rs:150, :406, :484, :759` (кэш rule set и TSRS) и в `outbound/tailscale/service.rs:83` (файл состояния); `outbound/tailscale/control.rs:366-370` уже делает синхронизацию файла, rename и синхронизацию каталога — позже можно вынести общий помощник.
+
+### CN-04 — XHTTP `auto` всегда становится packet-up, даже с REALITY
+
+- **Приоритет:** P1.
+- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Коммит:** [`f9e6ea79f42b1712075a0041f8ecbe2d6d6d3de9`](https://github.com/Screamshow/xrust/commit/f9e6ea79f42b1712075a0041f8ecbe2d6d6d3de9).
+- **Файлы:** `crates/core-runtime/src/outbound/transport/xhttp.rs`, новый `crates/core-runtime/tests/xhttp_auto_mode.rs`, `tests/spikes/xhttp/run.sh` (параметры `MODE` и `SERVER_MODE` для interop, по умолчанию `packet-up`).
+
+#### Причина и эталон
+
+- `xhttp.rs:1026-1036`: `resolved_mode` всегда превращал `auto` в packet-up, хотя комментарий говорил о stream-one для REALITY; признак `has_reality` в обоих местах вызова уже вычислялся.
+- Xray v26.10.21 (`1b1647cd9ddf0abc34b981d4611fc03bcac1ca74`), `transport/internet/splithttp/dialer.go:332-341`: `auto` (или пустой режим) → packet-up; с REALITY → stream-one; с REALITY и `downloadSettings` → stream-up. В xrust `downloadSettings` нет, поэтому применяется только ветка stream-one. `config.go:325-327` — stream-up/stream-one отправляют `application/grpc` (xrust уже так делает); `config.go:20-35` `GetNormalizedPath` добавляет завершающий `/`; `hub.go:154`, `:199`, `:241` — сервер с явным режимом отвергает остальные.
+
+#### Исправление и изменения поведения
+
+- `resolved_mode(has_reality)`: `auto` с REALITY → stream-one, без REALITY → packet-up; явные режимы не меняются. Версия HTTP выбирается отдельно, как в Xray (REALITY с `alpn: ["http/1.1"]` даёт stream-one поверх H1).
+- **Forkop X:** режим по умолчанию `mode=auto` с `security=reality` теперь даёт stream-one на всех узлах REALITY+XHTTP — один двунаправленный POST, без идентификатора сессии.
+- Сервер Xray, явно закреплённый на `mode: packet-up`, теперь отвергает такой клиент — так же, как отвергает собственный клиент Xray; раньше это работало только из-за расхождения xrust с эталоном.
+- Лимит тишины после half-close из CN-02 (10 с) относится только к packet-up: в stream-one half-close передаётся настоящим окончанием тела запроса.
+
+#### Проверки разработки
+
+| Команда (rust-x; изменение не зависит от профиля) | Результат |
+|---|---|
+| `rustfmt --check`, clippy legacy `-D warnings` | чисто; в rust-x новых предупреждений нет |
+| `--lib -- xhttp xmux inbound::transport` | 59 passed (включая новые `auto_mode_resolves_like_xray`, `wire_auto_over_reality_is_stream_one`) |
+| `--test xhttp_auto_mode` | 4 passed |
+| `--test xhttp_packet_up_sessions` (CN-02) / `--test xhttp_h2_keepalive` (CN-01) | 10 / 6 passed |
+| `--test reality_auth` / `--test transports_interop` / core-config `--test xhttp_compat` | 6 / 1 / 1 passed |
+
+- **Отрицательный контроль** (baseline = `6c7d0da` + новые файлы, строка `Mode::Auto if has_reality => Mode::StreamOne` удалена): падают `auto_mode_resolves_like_xray`, `wire_auto_over_reality_is_stream_one` и `xhttp_auto_mode::auto_over_reality_is_stream_one`; три остальных теста `xhttp_auto_mode` проходят на обеих версиях.
+- **Interop с настоящим Xray v26.10.21** (`tests/spikes/xhttp/run.sh`, `LOOPBACK=1`, debug CLI rust-x):
+
+| Клиент xrust | Сервер Xray | Новый код | Старый код |
+|---|---|---|---|
+| `auto` + REALITY | только stream-one | PASS | FAIL |
+| `auto` + REALITY | только packet-up | FAIL (ожидаемо) | PASS |
+| `auto` + REALITY | `auto` | PASS | — |
+| `auto`, обычный TLS | только packet-up | PASS | — |
+
+#### Ограничения
+
+- В `main` не слито, не выпущено.
+- `downloadSettings` (`auto` → stream-up) не реализован.
+- OpenWrt, ARM и удалённый REALITY-сервер не проверялись; полный CI не запускался.
+- **Соседние находки (не исправлялись):** предположительно (только чтение кода) серверная H1-задача stream-one `inbound/transport.rs` `xhttp_stream_one_task` при half-close клиента завершает `select!` и бросает ветку загрузки — ответ после half-close по H1 может обрезаться; теперь это достижимо для REALITY с `alpn: ["http/1.1"]`; не подтверждено тестом. Путь пула h2 в `connect_h2_stream` не логирует выбранный режим. `docs/upstream-0.1.1-adaptation-2026-10-13.md:38` и `docs/upstream-0.1.2-adaptation-2026-10-14.md:11` («xHTTP auto remains packet-up») устарели для REALITY.
