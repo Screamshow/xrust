@@ -79,13 +79,17 @@ pub(crate) struct Transport {
     /// it is `X-Session`.
     session: Place,
     session_key: String,
-    /// Where the packet sequence number lives. The server never reads the
-    /// number -- order is the connection's -- but it has to know whether one
-    /// is there at all: a `GET` with a session and no sequence is the download
-    /// stream, and with one it is an upload written with `uplink_http_method:
-    /// GET`.
+    /// Where the packet sequence number lives. A `GET` with a session and no
+    /// sequence is the download stream, and with one it is an upload written
+    /// with `uplink_http_method: GET`. Packet-up bodies are delivered in
+    /// sequence order.
     seq: Place,
     seq_key: String,
+    /// `sc_max_buffered_posts`: packets a session queues, POSTs that may
+    /// wait for room, and how far ahead of the next seq a POST may be.
+    max_buffered_posts: usize,
+    /// `sc_max_each_post_bytes`, upper bound: the largest packet-up body.
+    max_each_post: usize,
     /// Every live XHTTP session of this listener, keyed by session id.
     sessions: SessionTable,
     /// ws only: `max_early_data` and `early_data_header_name`; see
@@ -158,6 +162,17 @@ impl Transport {
                  only the payload in the body"
             );
         }
+        let max_buffered_posts = match transport.get("sc_max_buffered_posts") {
+            None | Some(Value::Null) => DEFAULT_MAX_BUFFERED_POSTS,
+            Some(v) => match v.as_u64() {
+                Some(0) => DEFAULT_MAX_BUFFERED_POSTS,
+                Some(n) if n <= MAX_BUFFERED_POSTS_LIMIT as u64 => n as usize,
+                _ => anyhow::bail!(
+                    "{at}.transport.sc_max_buffered_posts: must be 0..={MAX_BUFFERED_POSTS_LIMIT}, got {v}"
+                ),
+            },
+        };
+        let max_each_post = parse_max_each_post(at, transport.get("sc_max_each_post_bytes"))?;
         // ws only; the other transports have no such fields
         let ws_field = |key: &str| {
             transport
@@ -188,6 +203,8 @@ impl Transport {
             session_key,
             seq,
             seq_key,
+            max_buffered_posts,
+            max_each_post,
             sessions: Arc::new(Mutex::new(HashMap::new())),
             max_early_data,
             early_data_header_name,
@@ -745,7 +762,8 @@ impl XhttpH2Accept {
                 trimmed.split('/').collect::<Vec<_>>()
             };
             let sid = self.transport.session_id(&segments, query, &headers);
-            let seq = self.transport.seq_present(&segments, query, &headers);
+            let seq_raw = self.transport.seq_value(&segments, query, &headers);
+            let seq = seq_raw.is_some();
             if !xhttp_h2_path_matches(&req_path, &self.transport.path)
                 || (sid.is_none() && (method != "POST" || !segments.is_empty()))
             {
@@ -777,9 +795,10 @@ impl XhttpH2Accept {
                     if let Some(session) = table.get(&sid) {
                         (Arc::clone(session), None)
                     } else {
-                        let (session, up_rx, down_tx) = XhttpSession::new();
+                        let (session, uplink, down_tx) =
+                            XhttpSession::new(self.transport.max_buffered_posts);
                         let protocol = Box::new(XhttpStream {
-                            inner: xhttp_bridge(up_rx, down_tx),
+                            inner: xhttp_bridge(uplink, down_tx, Arc::downgrade(&session)),
                             listed: Some((Arc::clone(&self.transport.sessions), sid.clone())),
                             session: Arc::clone(&session),
                         }) as AnyStream;
@@ -807,7 +826,8 @@ impl XhttpH2Accept {
                         request.into_body(),
                         responder,
                         session,
-                        seq,
+                        seq_raw,
+                        self.transport.max_each_post,
                     ));
                 }
                 if protocol.is_some() {
@@ -845,6 +865,10 @@ async fn xhttp_h2_download_task(
                 _ = std::future::poll_fn(|cx|send.poll_reset(cx)) => {
                     return Err(io::Error::other("xhttp: h2 download reset"));
                 }
+                // the session failed on the upload side
+                _ = session.wait_aborted() => {
+                    return Err(io::Error::other("xhttp: the session failed"));
+                }
                 chunk = down.recv() => match chunk {Some(chunk)=>chunk,None=>break},
             };
             let mut chunk = Bytes::from(chunk);
@@ -876,34 +900,73 @@ async fn xhttp_h2_upload_task(
     mut recv: h2::RecvStream,
     mut responder: h2::server::SendResponse<Bytes>,
     session: Arc<XhttpSession>,
-    packet: bool,
+    seq: Option<String>,
+    max_each_post: usize,
 ) {
-    // Stream-up needs response headers before EOF. Packet-up is acknowledged
-    // after enqueueing its complete body so successive packets cannot overtake.
-    if !packet
-        && responder
+    let Some(raw) = seq else {
+        // Stream-up needs response headers before EOF.
+        if responder
             .send_response(http::Response::new(()), true)
             .is_err()
-    {
+        {
+            return;
+        }
+        while let Some(chunk) = recv.data().await {
+            let Ok(chunk) = chunk else {
+                session.close_up();
+                return;
+            };
+            let size = chunk.len();
+            if session.push(chunk.to_vec()).await.is_err() {
+                return;
+            }
+            if recv.flow_control().release_capacity(size).is_err() {
+                session.close_up();
+                return;
+            }
+        }
         return;
-    }
+    };
+    // Packet-up: a permit before the body is read, so a waiting POST keeps
+    // its body in the client's flow-control window; then the whole body,
+    // queued by its seq, then the answer (Xray hub.go answers after
+    // `uploadQueue.Push`). A body that breaks off is dropped as Xray drops it.
+    let Ok(_permit) = session.packet_permit(&raw).await else {
+        let _ = responder.send_response(
+            http::Response::builder().status(500).body(()).unwrap(),
+            true,
+        );
+        return;
+    };
+    let mut body = Vec::new();
     while let Some(chunk) = recv.data().await {
         let Ok(chunk) = chunk else {
-            session.close_up();
             return;
         };
         let size = chunk.len();
-        if session.push(chunk.to_vec()).await.is_err() {
+        if body.len() + size > max_each_post {
+            crate::logging::debug(format_args!(
+                "xhttp upload: packet-up body over sc_max_each_post_bytes ({max_each_post})"
+            ));
+            let _ = responder.send_response(
+                http::Response::builder().status(413).body(()).unwrap(),
+                true,
+            );
             return;
         }
+        body.extend_from_slice(&chunk);
         if recv.flow_control().release_capacity(size).is_err() {
-            session.close_up();
             return;
         }
     }
-    if packet {
-        let _ = responder.send_response(http::Response::new(()), true);
-    }
+    let status: u16 = match packet_status(&session, &raw, body).await {
+        PacketStatus::Ok => 200,
+        PacketStatus::Failed => 500,
+    };
+    let _ = responder.send_response(
+        http::Response::builder().status(status).body(()).unwrap(),
+        true,
+    );
 }
 
 fn xhttp_h2_path_matches(target: &str, configured: &str) -> bool {
@@ -1075,6 +1138,131 @@ impl Place {
 /// memory, and a stalled protocol stops the uploads instead of queueing them.
 const XHTTP_QUEUE: usize = 64;
 
+/// Xray `GetNormalizedScMaxBufferedPosts` (splithttp/config.go): 0 means 30.
+const DEFAULT_MAX_BUFFERED_POSTS: usize = 30;
+/// A sane ceiling for `sc_max_buffered_posts`; it sizes a channel.
+const MAX_BUFFERED_POSTS_LIMIT: usize = 1 << 20;
+/// Xray `GetNormalizedScMaxEachPostBytes` (splithttp/config.go): 1000000
+/// when unset or 0.
+const DEFAULT_MAX_EACH_POST: usize = 1_000_000;
+
+/// `sc_max_each_post_bytes`: a number or an `"N"` / `"N-M"` range, of which
+/// the server uses the upper bound (Xray hub.go, `.To`).
+fn parse_max_each_post(at: &str, raw: Option<&Value>) -> anyhow::Result<usize> {
+    let bad = |v: &Value| anyhow::anyhow!("{at}.transport.sc_max_each_post_bytes: bad value {v}");
+    let upper = match raw {
+        None | Some(Value::Null) => 0,
+        Some(v @ Value::Number(n)) => n.as_u64().ok_or_else(|| bad(v))?,
+        Some(v @ Value::String(text)) => {
+            let text = text.trim();
+            if text.is_empty() {
+                0
+            } else {
+                let upper = text.rsplit('-').next().unwrap_or(text).trim();
+                upper.parse::<u64>().map_err(|_| bad(v))?
+            }
+        }
+        Some(v) => return Err(bad(v)),
+    };
+    Ok(match upper {
+        0 => DEFAULT_MAX_EACH_POST,
+        n => usize::try_from(n).unwrap_or(usize::MAX),
+    })
+}
+
+/// A packet-up sequence number: decimal digits only, as Go's
+/// `strconv.ParseUint(seq, 10, 64)` takes them (Xray hub.go).
+fn parse_seq(raw: &str) -> Option<u64> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+/// One packet-up POST body and its place in the upload.
+#[derive(Debug)]
+struct Packet {
+    seq: u64,
+    payload: Vec<u8>,
+}
+
+/// Puts packet-up bodies back in sequence order, as Xray's `uploadQueue`
+/// (splithttp/upload_queue.go) does.
+#[derive(Debug)]
+struct Reorder {
+    next: u64,
+    held: std::collections::BTreeMap<u64, Vec<u8>>,
+    max: usize,
+}
+
+/// More than `max + 1` packets wait behind a missing seq (Xray's "packet
+/// queue is too large"); ends the session.
+#[derive(Debug, PartialEq, Eq)]
+struct ReorderOverflow;
+
+impl Reorder {
+    fn new(max: usize) -> Self {
+        Self {
+            next: 0,
+            held: std::collections::BTreeMap::new(),
+            max,
+        }
+    }
+
+    /// Take one packet. A sequence number already delivered or already held
+    /// is a duplicate and is dropped, keeping the first copy (Xray drops a
+    /// packet below `nextSeq`, upload_queue.go:84-118).
+    ///
+    /// Only the held count is limited, as in Xray (upload_queue.go:103-111):
+    /// with `nextSeq` missing it pops the lowest packet and fails when
+    /// `len(h.heap) > h.maxPackets` for the rest, so `maxPackets + 1` may
+    /// wait and the `maxPackets + 2`-th ends the session. `waiting` counts
+    /// all of them, the popped one included, hence `> max + 1` here. Any seq
+    /// is held, however far ahead.
+    fn insert(&mut self, packet: Packet) -> Result<(), ReorderOverflow> {
+        if packet.seq < self.next {
+            return Ok(());
+        }
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.held.entry(packet.seq) {
+            slot.insert(packet.payload);
+        }
+        if self.waiting() > self.max + 1 {
+            return Err(ReorderOverflow);
+        }
+        Ok(())
+    }
+
+    /// Packets held behind a missing seq.
+    fn waiting(&self) -> usize {
+        self.held.len() - usize::from(self.held.contains_key(&self.next))
+    }
+
+    /// The next body in order, once it is here.
+    fn pop_ready(&mut self) -> Option<Vec<u8>> {
+        let payload = self.held.remove(&self.next)?;
+        self.next = self.next.wrapping_add(1);
+        Some(payload)
+    }
+}
+
+/// Where the reorder buffer stands, for the logs of the upload side.
+#[derive(Debug, Default)]
+struct OrderStats {
+    next: std::sync::atomic::AtomicU64,
+    held: std::sync::atomic::AtomicUsize,
+}
+
+/// What the upload side of a session hands its bridge: streamed chunks
+/// (stream-up, stream-one) and sequenced packets (packet-up).
+struct Uplink {
+    stream: mpsc::Receiver<Vec<u8>>,
+    packets: mpsc::Receiver<Packet>,
+    max_buffered: usize,
+    stats: Arc<OrderStats>,
+    /// Set when the session is cancelled or failed: the bridge stops.
+    aborted: tokio::sync::watch::Receiver<bool>,
+}
+
 /// One XHTTP session. It outlives the connections that carry it -- that is
 /// the whole point of the transport: the download is one connection, each
 /// upload packet is a request on another, and the protocol above sees one
@@ -1084,6 +1272,32 @@ struct XhttpSession {
     /// `None` once the session is over: that is what ends the protocol's read
     /// side, and what an upload has to find before it attaches.
     up: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    /// Packet-up bodies, to be put in order by the bridge. Bounded by
+    /// `sc_max_buffered_posts` like Xray's `pushedPackets` channel: when it
+    /// is full an upload waits, and its POST is not answered yet.
+    packets: Mutex<Option<mpsc::Sender<Packet>>>,
+    /// One per packet-up POST between reading its body and queueing it:
+    /// `sc_max_buffered_posts` (W) of them. A POST waits for one before its
+    /// body is read; closed when the session ends.
+    ///
+    /// Bounds per session: at most W permit holders and W POSTs waiting for
+    /// a permit (`waiters`); one more is an explicit error that ends the
+    /// session. Data: W queued, W bodies of permit holders, at most W + 1
+    /// held out of order and one in the bridge -- about (3W + 2) x
+    /// `sc_max_each_post_bytes` -- plus the 64 KiB pipe.
+    permits: tokio::sync::Semaphore,
+    /// Slots for POSTs waiting for a permit, W of them, taken without waiting.
+    waiters: tokio::sync::Semaphore,
+    /// W, for the logs.
+    max_buffered: usize,
+    stats: Arc<OrderStats>,
+    /// Set once the session is over, so an upload waiting for room stops.
+    ended: tokio::sync::watch::Sender<bool>,
+    /// Set when the session is cancelled or failed: the bridge and the
+    /// download stop at once.
+    aborted: tokio::sync::watch::Sender<bool>,
+    /// Set when the packet order could not be restored.
+    overflowed: AtomicBool,
     /// handed to the download (or stream-one) connection when it takes the
     /// session; a second one finds it already taken.
     down: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
@@ -1097,18 +1311,87 @@ struct XhttpSession {
 impl XhttpSession {
     /// The session plus the two ends: the receiver for [`XhttpStream`]'s read
     /// half, the sender for its write half.
-    fn new() -> (Arc<Self>, mpsc::Receiver<Vec<u8>>, mpsc::Sender<Vec<u8>>) {
+    fn new(max_buffered: usize) -> (Arc<Self>, Uplink, mpsc::Sender<Vec<u8>>) {
         let (up_tx, up_rx) = mpsc::channel(XHTTP_QUEUE);
+        let (packet_tx, packet_rx) = mpsc::channel(max_buffered.max(1));
         let (down_tx, down_rx) = mpsc::channel(XHTTP_QUEUE);
+        let stats = Arc::new(OrderStats::default());
+        let aborted = tokio::sync::watch::Sender::new(false);
+        let aborted_rx = aborted.subscribe();
         (
             Arc::new(Self {
                 up: Mutex::new(Some(up_tx)),
+                packets: Mutex::new(Some(packet_tx)),
+                permits: tokio::sync::Semaphore::new(max_buffered.max(1)),
+                waiters: tokio::sync::Semaphore::new(max_buffered.max(1)),
+                max_buffered,
+                stats: Arc::clone(&stats),
+                ended: tokio::sync::watch::Sender::new(false),
+                aborted,
+                overflowed: AtomicBool::new(false),
                 down: Mutex::new(Some(down_rx)),
                 cancelled: AtomicBool::new(false),
             }),
-            up_rx,
+            Uplink {
+                stream: up_rx,
+                packets: packet_rx,
+                max_buffered,
+                stats,
+                aborted: aborted_rx,
+            },
             down_tx,
         )
+    }
+
+    /// The right to read one packet-up body and queue it. Waits while W
+    /// POSTs hold one, as one of at most W waiting; one more POST ends the
+    /// session with an error. Fails once the session is over.
+    async fn packet_permit(&self, seq: &str) -> io::Result<tokio::sync::SemaphorePermit<'_>> {
+        use tokio::sync::TryAcquireError;
+        let over = || io::Error::other("xhttp: the session is over");
+        match self.permits.try_acquire() {
+            Ok(permit) => return Ok(permit),
+            Err(TryAcquireError::Closed) => return Err(over()),
+            Err(TryAcquireError::NoPermits) => {}
+        }
+        let _slot = match self.waiters.try_acquire() {
+            Ok(slot) => slot,
+            Err(TryAcquireError::Closed) => return Err(over()),
+            Err(TryAcquireError::NoPermits) => {
+                crate::logging::warn(format_args!(
+                    "xhttp: packet-up seq {seq}: {w} POSTs already wait for room: next {}, held {}, waiting {w}; ending the session",
+                    self.stats.next.load(Ordering::Acquire),
+                    self.stats.held.load(Ordering::Acquire),
+                    w = self.max_buffered,
+                ));
+                self.fail();
+                return Err(over());
+            }
+        };
+        self.permits.acquire().await.map_err(|_| over())
+    }
+
+    /// One packet-up body towards the bridge. Waits only while the queue is
+    /// full and fails once the session is over, as Xray's `uploadQueue.Push`
+    /// (upload_queue.go:40-53).
+    async fn push_packet(&self, packet: Packet) -> io::Result<()> {
+        let over = || io::Error::other("xhttp: the session is over");
+        let mut ended = self.ended.subscribe();
+        let sender = self.packets.lock().expect("xhttp session poisoned").clone();
+        let Some(tx) = sender else {
+            return Err(over());
+        };
+        tokio::select! {
+            sent = tx.send(packet) => sent.map_err(|_| over())?,
+            _ = async {
+                let _ = ended.wait_for(|ended| *ended).await;
+            } => return Err(over()),
+        }
+        // Xray reports a queue closed meanwhile even after the send
+        if *self.ended.borrow() {
+            return Err(over());
+        }
+        Ok(())
     }
 
     /// One upload chunk towards the protocol. The lock is held only to clone
@@ -1126,12 +1409,41 @@ impl XhttpSession {
 
     fn close_up(&self) {
         *self.up.lock().expect("xhttp session poisoned") = None;
+        *self.packets.lock().expect("xhttp session poisoned") = None;
+        self.permits.close();
+        self.waiters.close();
+        self.ended.send_replace(true);
+    }
+
+    /// Resolves once the session is cancelled or failed.
+    async fn wait_aborted(&self) {
+        let mut aborted = self.aborted.subscribe();
+        let _ = aborted.wait_for(|aborted| *aborted).await;
+    }
+
+    /// The packet order cannot be restored: end the session as an error.
+    fn fail(&self) {
+        self.overflowed.store(true, Ordering::Release);
+        self.cancel();
+    }
+
+    /// Why a cancelled session's reads and writes fail.
+    fn abort_error(&self) -> io::Error {
+        if self.overflowed.load(Ordering::Acquire) {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "xhttp: packet-up POSTs out of order beyond sc_max_buffered_posts",
+            )
+        } else {
+            download_cancelled()
+        }
     }
 
     /// The download is gone: end the session for the protocol as well.
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
         self.close_up();
+        self.aborted.send_replace(true);
     }
 
     fn is_cancelled(&self) -> bool {
@@ -1171,7 +1483,7 @@ impl AsyncRead for XhttpStream {
         ready!(Pin::new(&mut self.inner).poll_read(cx, out))?;
         // EOF on a cancelled session is not the client's half-close
         if out.filled().len() == before && self.session.is_cancelled() {
-            return Poll::Ready(Err(download_cancelled()));
+            return Poll::Ready(Err(self.session.abort_error()));
         }
         Poll::Ready(Ok(()))
     }
@@ -1184,7 +1496,7 @@ impl AsyncWrite for XhttpStream {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         if self.session.is_cancelled() {
-            return Poll::Ready(Err(download_cancelled()));
+            return Poll::Ready(Err(self.session.abort_error()));
         }
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
@@ -1241,7 +1553,8 @@ impl Transport {
             trimmed.split('/').collect()
         };
         let sid = self.session_id(&segments, query, &headers);
-        let seq = self.seq_present(&segments, query, &headers);
+        let seq_raw = self.seq_value(&segments, query, &headers);
+        let seq = seq_raw.is_some();
 
         match (&method[..], sid) {
             // the download stream: a GET with a session and no packet number.
@@ -1254,8 +1567,8 @@ impl Transport {
             }
             // stream-one: the whole session on one POST to the bare path
             (_, None) if segments.is_empty() => {
-                let (session, up_rx, down_tx) = XhttpSession::new();
-                let protocol_end = xhttp_bridge(up_rx, down_tx);
+                let (session, uplink, down_tx) = XhttpSession::new(self.max_buffered_posts);
+                let protocol_end = xhttp_bridge(uplink, down_tx, Arc::downgrade(&session));
                 tokio::spawn(xhttp_stream_one_task(
                     stream,
                     pending,
@@ -1272,14 +1585,21 @@ impl Transport {
             }
             // an upload: attach to the session, or birth it when the client
             // sent its POST before its GET
-            (_, Some(sid)) => self.xhttp_upload(stream, pending, headers, sid).await,
+            (_, Some(sid)) => {
+                self.xhttp_upload(stream, pending, headers, sid, seq_raw)
+                    .await
+            }
             _ => xhttp_reject(stream, format!("no XHTTP session at {path:?}")).await,
         }
     }
 
-    /// The session id a request names, when its path is under this
-    /// listener's.
-    fn request_session_id(&self, target: &str, headers: &[(String, String)]) -> Option<String> {
+    /// The session id and the sequence number a request names, when its path
+    /// is under this listener's.
+    fn request_ids(
+        &self,
+        target: &str,
+        headers: &[(String, String)],
+    ) -> Option<(String, Option<String>)> {
         let (path, query) = match target.split_once('?') {
             Some((path, query)) => (path, Some(query)),
             None => (target, None),
@@ -1293,7 +1613,8 @@ impl Transport {
         } else {
             trimmed.split('/').collect()
         };
-        self.session_id(&segments, query, headers)
+        let sid = self.session_id(&segments, query, headers)?;
+        Some((sid, self.seq_value(&segments, query, headers)))
     }
 
     /// The live session `sid`. A request on a reused upload connection can
@@ -1326,21 +1647,21 @@ impl Transport {
         }
     }
 
-    /// Is a packet sequence number on this request? The server never reads
-    /// the number -- order is the connection's -- but a `GET` with a session
-    /// and no sequence is the download, and with one it is an upload.
-    fn seq_present(
+    /// The packet sequence number as the request carries it, unparsed.
+    fn seq_value(
         &self,
         segments: &[&str],
         query: Option<&str>,
         headers: &[(String, String)],
-    ) -> bool {
+    ) -> Option<String> {
         match self.seq {
             // session in the path: the sequence is the segment after it
-            Place::Path => segments.len() > if self.session == Place::Path { 1 } else { 0 },
-            Place::Query => query.is_some_and(|q| lookup_param(q, &self.seq_key).is_some()),
-            Place::Header => lookup_header(headers, &self.seq_key).is_some(),
-            Place::Cookie => lookup_cookie(headers, &self.seq_key).is_some(),
+            Place::Path => segments
+                .get(if self.session == Place::Path { 1 } else { 0 })
+                .map(|seq| seq.to_string()),
+            Place::Query => query.and_then(|q| lookup_param(q, &self.seq_key)),
+            Place::Header => lookup_header(headers, &self.seq_key),
+            Place::Cookie => lookup_cookie(headers, &self.seq_key),
         }
     }
 
@@ -1357,8 +1678,8 @@ impl Transport {
             tokio::spawn(xhttp_download_task(conn, session));
             anyhow::bail!("xhttp: a download attached to session {sid:?}");
         }
-        let (session, up_rx, down_tx) = XhttpSession::new();
-        let bridge = xhttp_bridge(up_rx, down_tx);
+        let (session, uplink, down_tx) = XhttpSession::new(self.max_buffered_posts);
+        let bridge = xhttp_bridge(uplink, down_tx, Arc::downgrade(&session));
         table.insert(sid.clone(), Arc::clone(&session));
         drop(table);
         tokio::spawn(xhttp_download_task(conn, Arc::clone(&session)));
@@ -1379,6 +1700,7 @@ impl Transport {
         pending: Vec<u8>,
         headers: Vec<(String, String)>,
         sid: String,
+        seq: Option<String>,
     ) -> anyhow::Result<AnyStream> {
         let mut table = self.sessions.lock().expect("xhttp table poisoned");
         if let Some(existing) = table.get(&sid) {
@@ -1388,6 +1710,7 @@ impl Transport {
                 conn,
                 pending,
                 headers,
+                seq,
                 session,
                 self.clone(),
             ));
@@ -1395,14 +1718,15 @@ impl Transport {
             // this one only carries bytes into it
             anyhow::bail!("xhttp: an upload attached to session {sid:?}");
         }
-        let (session, up_rx, down_tx) = XhttpSession::new();
-        let bridge = xhttp_bridge(up_rx, down_tx);
+        let (session, uplink, down_tx) = XhttpSession::new(self.max_buffered_posts);
+        let bridge = xhttp_bridge(uplink, down_tx, Arc::downgrade(&session));
         table.insert(sid.clone(), Arc::clone(&session));
         drop(table);
         tokio::spawn(xhttp_upload_task(
             conn,
             pending,
             headers,
+            seq,
             Arc::clone(&session),
             self.clone(),
         ));
@@ -1422,17 +1746,64 @@ const XHTTP_PIPE: usize = 64 * 1024;
 /// tasks -- this bridge between the pipe and the session channels, and the
 /// connection task that was spawned with it.
 fn xhttp_bridge(
-    up_rx: mpsc::Receiver<Vec<u8>>,
+    uplink: Uplink,
     down_tx: mpsc::Sender<Vec<u8>>,
+    session: std::sync::Weak<XhttpSession>,
 ) -> tokio::io::DuplexStream {
     let (protocol_end, bridge_end) = tokio::io::duplex(XHTTP_PIPE);
+    let mut aborted = uplink.aborted.clone();
     tokio::spawn(async move {
         let (mut rd, mut wr) = tokio::io::split(bridge_end);
         let up = async {
-            let mut up_rx = up_rx;
-            while let Some(chunk) = up_rx.recv().await
-                && wr.write_all(&chunk).await.is_ok()
-            {}
+            let Uplink {
+                mut stream,
+                mut packets,
+                max_buffered,
+                stats,
+                aborted: _,
+            } = uplink;
+            let mut order = Reorder::new(max_buffered);
+            let (mut stream_open, mut packets_open) = (true, true);
+            while stream_open || packets_open {
+                tokio::select! {
+                    chunk = stream.recv(), if stream_open => match chunk {
+                        Some(chunk) => {
+                            if wr.write_all(&chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => stream_open = false,
+                    },
+                    packet = packets.recv(), if packets_open => match packet {
+                        Some(packet) => {
+                            let seq = packet.seq;
+                            let inserted = order.insert(packet);
+                            stats.held.store(order.waiting(), Ordering::Release);
+                            if inserted.is_err() {
+                                crate::logging::warn(format_args!(
+                                    "xhttp: packet-up seq {seq} overflows the queue: next {}, held {}; ending the session",
+                                    order.next,
+                                    order.waiting(),
+                                ));
+                                if let Some(session) = session.upgrade() {
+                                    session.fail();
+                                }
+                                return;
+                            }
+                            // a full pipe stops this loop, which fills the
+                            // packet queue and holds the next POSTs
+                            while let Some(payload) = order.pop_ready() {
+                                stats.next.store(order.next, Ordering::Release);
+                                stats.held.store(order.waiting(), Ordering::Release);
+                                if wr.write_all(&payload).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        None => packets_open = false,
+                    },
+                }
+            }
             // no more uploads: half-close the half the protocol reads, which
             // is its EOF. The write half stays open for the download.
             let _ = wr.shutdown().await;
@@ -1453,9 +1824,17 @@ fn xhttp_bridge(
         // Either direction ending ends the bridge and drops the other half of
         // it: a closed download must stop the uploads feeding it, and a
         // closed upload side must end the download task's read.
+        // A cancelled or failed session stops at once, releasing what it
+        // holds; a session dropped without either ends with its pipe.
+        let aborted = async move {
+            if aborted.wait_for(|aborted| *aborted).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             _ = up => {}
             _ = down => {}
+            _ = aborted => {}
         }
     });
     protocol_end
@@ -1508,6 +1887,8 @@ async fn xhttp_download_task(conn: AnyStream, session: Arc<XhttpSession>) {
             let mut scratch = [0u8; 1];
             while let Ok(n) = rd.read(&mut scratch).await && n > 0 {}
         } => true,
+        // the session failed on the upload side
+        _ = session.wait_aborted() => true,
     };
     drop(down);
     if cancelled {
@@ -1527,13 +1908,24 @@ const REUSED_UPLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(1
 /// like this every time the reference closes it, which is not an error. A
 /// pooled connection is shared by every session of the client, so each
 /// request is delivered to the session it names, not the first one.
+///
+/// When an answer cannot be written (Xray's HTTP/1.1 client pipelines
+/// packets and may reset the connection without reading them), the packets
+/// whose requests are already complete in `pending` are still delivered,
+/// unanswered; nothing more is read from the socket, and a packet that is
+/// not complete there is dropped. A packet lost on the way leaves a gap the
+/// session waits on until the client closes the GET, as Xray does
+/// (hub.go:350-355, :392-398; upload_queue.go:72-82, :112-117).
 async fn xhttp_upload_task(
     mut conn: AnyStream,
     mut pending: Vec<u8>,
     mut headers: Vec<(String, String)>,
+    mut seq: Option<String>,
     mut session: Arc<XhttpSession>,
     transport: Transport,
 ) {
+    // set once an answer could not be written: only `pending` is used after
+    let mut dead = false;
     loop {
         let framing = match request_framing(&headers) {
             Ok(framing) => framing,
@@ -1542,25 +1934,87 @@ async fn xhttp_upload_task(
                 return;
             }
         };
-        // The 200 first, before a byte of the body is read: a streamed upload
-        // reads its response head while the body is still going up, and an
-        // answer that waited for the body to end would deadlock stream-up
-        // against itself.
-        if conn
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .await
-            .is_err()
-        {
-            return;
+        match seq.take() {
+            // a streamed body cannot be complete in what is buffered
+            None if dead => return,
+            // stream-up
+            None => {
+                // The 200 first, before a byte of the body is read: a streamed
+                // upload reads its response head while the body is still going
+                // up, and an answer that waited for the body to end would
+                // deadlock stream-up against itself.
+                if conn
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                if conn.flush().await.is_err() {
+                    return;
+                }
+                if let Err(err) =
+                    pump_request_body(&mut conn, &mut pending, framing, &session).await
+                {
+                    crate::logging::debug(format_args!("xhttp upload: {err}"));
+                    return;
+                }
+            }
+            // packet-up: a permit, the whole body, queued by its seq, then
+            // the answer (Xray hub.go answers after `uploadQueue.Push`). The
+            // connection is not read while it waits for the permit.
+            Some(raw) => {
+                let Ok(_permit) = session.packet_permit(&raw).await else {
+                    if !dead {
+                        let _ = conn
+                            .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let _ = conn.flush().await;
+                    }
+                    return;
+                };
+                let mut sink = BodySink::Packet {
+                    body: Vec::new(),
+                    limit: transport.max_each_post,
+                    too_large: false,
+                };
+                // a dead connection reads nothing: a body not complete in
+                // `pending` ends here, undelivered
+                let pumped = if dead {
+                    pump_body(&mut tokio::io::empty(), &mut pending, framing, &mut sink).await
+                } else {
+                    pump_body(&mut conn, &mut pending, framing, &mut sink).await
+                };
+                if let Err(err) = pumped {
+                    if sink.too_large() && !dead {
+                        let _ = conn
+                            .write_all(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        let _ = conn.flush().await;
+                    }
+                    crate::logging::debug(format_args!("xhttp upload: {err}"));
+                    return;
+                }
+                let answer: &[u8] = match packet_status(&session, &raw, sink.into_body()).await {
+                    PacketStatus::Ok => b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                    PacketStatus::Failed => {
+                        b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+                    }
+                };
+                if !dead && (conn.write_all(answer).await.is_err() || conn.flush().await.is_err()) {
+                    crate::logging::debug(format_args!(
+                        "xhttp upload: the answer could not be written; delivering what is buffered"
+                    ));
+                    dead = true;
+                }
+            }
         }
-        if conn.flush().await.is_err() {
-            return;
-        }
-        if let Err(err) = pump_request_body(&mut conn, &mut pending, framing, &session).await {
-            crate::logging::debug(format_args!("xhttp upload: {err}"));
-            return;
-        }
-        match next_request(&mut conn, &mut pending).await {
+        let next = if dead {
+            Ok(take_buffered_request(&mut pending))
+        } else {
+            next_request(&mut conn, &mut pending).await
+        };
+        match next {
             Ok(Some(head)) => {
                 let end = match head_end(&head) {
                     Some(end) => end,
@@ -1568,22 +2022,26 @@ async fn xhttp_upload_task(
                 };
                 match parse_head(&head[..end]) {
                     Ok((_method, target, parsed)) => {
-                        let found = match transport.request_session_id(&target, &parsed) {
-                            Some(sid) => transport.find_session(&sid).await,
+                        let ids = transport.request_ids(&target, &parsed);
+                        let found = match &ids {
+                            Some((sid, _)) => transport.find_session(sid).await,
                             None => None,
                         };
                         let Some(found) = found else {
                             crate::logging::debug(format_args!(
                                 "xhttp upload: no session for {target:?}"
                             ));
-                            let _ = conn
-                                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                                .await;
-                            let _ = conn.flush().await;
+                            if !dead {
+                                let _ = conn
+                                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                    .await;
+                                let _ = conn.flush().await;
+                            }
                             return;
                         };
                         session = found;
                         headers = parsed;
+                        seq = ids.and_then(|(_, seq)| seq);
                     }
                     Err(err) => {
                         crate::logging::debug(format_args!("xhttp upload: {err}"));
@@ -1598,6 +2056,29 @@ async fn xhttp_upload_task(
                 crate::logging::debug(format_args!("xhttp upload: {err}"));
                 return;
             }
+        }
+    }
+}
+
+/// How a packet-up POST is answered.
+#[derive(Debug, PartialEq, Eq)]
+enum PacketStatus {
+    Ok,
+    /// 500, as Xray answers a seq it cannot parse and a push that failed.
+    Failed,
+}
+
+/// Parse the seq and queue the body.
+async fn packet_status(session: &XhttpSession, raw: &str, payload: Vec<u8>) -> PacketStatus {
+    let Some(seq) = parse_seq(raw) else {
+        crate::logging::debug(format_args!("xhttp upload: bad seq {raw:?}"));
+        return PacketStatus::Failed;
+    };
+    match session.push_packet(Packet { seq, payload }).await {
+        Ok(()) => PacketStatus::Ok,
+        Err(err) => {
+            crate::logging::debug(format_args!("xhttp upload: {err}"));
+            PacketStatus::Failed
         }
     }
 }
@@ -1664,8 +2145,67 @@ async fn xhttp_stream_one_task(
 async fn pump_request_body<R: AsyncRead + Unpin>(
     conn: &mut R,
     pending: &mut Vec<u8>,
-    mut state: ReqBody,
+    state: ReqBody,
     session: &XhttpSession,
+) -> io::Result<()> {
+    pump_body(conn, pending, state, &mut BodySink::Session(session)).await
+}
+
+/// Where a request body goes: streamed into the session, or collected as
+/// one packet-up body of at most `limit` bytes.
+enum BodySink<'a> {
+    Session(&'a XhttpSession),
+    Packet {
+        body: Vec<u8>,
+        limit: usize,
+        too_large: bool,
+    },
+}
+
+impl BodySink<'_> {
+    async fn take(&mut self, chunk: Vec<u8>) -> io::Result<()> {
+        match self {
+            BodySink::Session(session) => session.push(chunk).await,
+            BodySink::Packet {
+                body,
+                limit,
+                too_large,
+            } => {
+                if body.len() + chunk.len() > *limit {
+                    *too_large = true;
+                    return Err(io::Error::other(format!(
+                        "xhttp: packet-up body over sc_max_each_post_bytes ({limit})"
+                    )));
+                }
+                body.extend_from_slice(&chunk);
+                Ok(())
+            }
+        }
+    }
+
+    fn too_large(&self) -> bool {
+        matches!(
+            self,
+            BodySink::Packet {
+                too_large: true,
+                ..
+            }
+        )
+    }
+
+    fn into_body(self) -> Vec<u8> {
+        match self {
+            BodySink::Packet { body, .. } => body,
+            BodySink::Session(_) => Vec::new(),
+        }
+    }
+}
+
+async fn pump_body<R: AsyncRead + Unpin>(
+    conn: &mut R,
+    pending: &mut Vec<u8>,
+    mut state: ReqBody,
+    sink: &mut BodySink<'_>,
 ) -> io::Result<()> {
     loop {
         match state {
@@ -1676,7 +2216,7 @@ async fn pump_request_body<R: AsyncRead + Unpin>(
                 let take = (remaining as usize).min(pending.len());
                 let chunk: Vec<u8> = pending.drain(..take).collect();
                 let remaining = remaining - take as u64;
-                session.push(chunk).await?;
+                sink.take(chunk).await?;
                 state = if remaining == 0 {
                     ReqBody::Done
                 } else {
@@ -1700,7 +2240,7 @@ async fn pump_request_body<R: AsyncRead + Unpin>(
                 let take = (remaining as usize).min(pending.len());
                 let chunk: Vec<u8> = pending.drain(..take).collect();
                 let remaining = remaining - take as u64;
-                session.push(chunk).await?;
+                sink.take(chunk).await?;
                 state = if remaining == 0 {
                     ReqBody::ChunkCrlf
                 } else {
@@ -1811,6 +2351,14 @@ async fn read_line<R: AsyncRead + Unpin>(
         }
         pending.push(buf[0]);
     }
+}
+
+/// The next request head if it is already complete in `pending`; nothing is
+/// read.
+fn take_buffered_request(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let end = head_end(pending)?;
+    let rest = pending.split_off(end);
+    Some(std::mem::replace(pending, rest))
 }
 
 /// The next request head: from what the previous body left behind first, then
@@ -2029,8 +2577,8 @@ mod tests {
             Some("sid".to_string()),
             "the sequence segment does not eat the session id"
         );
-        assert!(t.seq_present(&["sid", "7"], None, &no_headers));
-        assert!(!t.seq_present(&["sid"], None, &no_headers));
+        assert!(t.seq_value(&["sid", "7"], None, &no_headers).is_some());
+        assert!(t.seq_value(&["sid"], None, &no_headers).is_none());
         assert_eq!(t.session_id(&[], None, &no_headers), None);
 
         // query placement: the session comes from its key, and with the
@@ -2042,14 +2590,26 @@ mod tests {
             Some("sid".to_string())
         );
         assert_eq!(t.session_id(&[], Some("x_session="), &no_headers), None);
-        assert!(!t.seq_present(&[], Some("x_session=sid"), &no_headers));
-        assert!(t.seq_present(&["3"], Some("x_session=sid"), &no_headers));
+        assert!(
+            t.seq_value(&[], Some("x_session=sid"), &no_headers)
+                .is_none()
+        );
+        assert!(
+            t.seq_value(&["3"], Some("x_session=sid"), &no_headers)
+                .is_some()
+        );
 
         // ...and a sequence in the query is found under its own key
         let t =
             transport(serde_json::json!({"session_placement": "query", "seq_placement": "query"}));
-        assert!(!t.seq_present(&[], Some("x_session=sid"), &no_headers));
-        assert!(t.seq_present(&[], Some("x_session=sid&x_seq=3"), &no_headers));
+        assert!(
+            t.seq_value(&[], Some("x_session=sid"), &no_headers)
+                .is_none()
+        );
+        assert!(
+            t.seq_value(&[], Some("x_session=sid&x_seq=3"), &no_headers)
+                .is_some()
+        );
 
         // header placement: the default key is the canonical X-Session
         let t = transport(
@@ -2065,7 +2625,7 @@ mod tests {
             "header names are case-insensitive, as on the wire"
         );
         assert_eq!(t.session_id(&[], None, &no_headers), None);
-        assert!(t.seq_present(&[], None, &header("X-Seq", "3")));
+        assert!(t.seq_value(&[], None, &header("X-Seq", "3")).is_some());
 
         // cookie placement, and a configured key beats the default one
         let t = transport(serde_json::json!({
@@ -2090,7 +2650,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             let framing = request_framing(&headers).expect("framing");
-            let (session, _up_rx, _down_tx) = XhttpSession::new();
+            let (session, _uplink, _down_tx) = XhttpSession::new(DEFAULT_MAX_BUFFERED_POSTS);
             let mut pending = raw;
             let mut conn = std::io::Cursor::new(Vec::new());
             pump_request_body(&mut conn, &mut pending, framing, &session)
@@ -2360,5 +2920,944 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    // ---- packet-up order (Xray splithttp/upload_queue.go) ----
+
+    fn packet(seq: u64, payload: &[u8]) -> Packet {
+        Packet {
+            seq,
+            payload: payload.to_vec(),
+        }
+    }
+
+    fn drain(order: &mut Reorder) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(payload) = order.pop_ready() {
+            out.extend_from_slice(&payload);
+        }
+        out
+    }
+
+    #[test]
+    fn reorder_delivers_by_seq() {
+        let mut order = Reorder::new(30);
+        order.insert(packet(2, b"c")).unwrap();
+        assert_eq!(drain(&mut order), b"", "seq 0 is missing");
+        order.insert(packet(1, b"b")).unwrap();
+        assert_eq!(drain(&mut order), b"");
+        order.insert(packet(0, b"a")).unwrap();
+        assert_eq!(drain(&mut order), b"abc");
+        // an empty body still takes its place
+        order.insert(packet(4, b"e")).unwrap();
+        order.insert(packet(3, b"")).unwrap();
+        assert_eq!(drain(&mut order), b"e");
+    }
+
+    #[test]
+    fn reorder_drops_duplicates_and_keeps_the_first_copy() {
+        let mut order = Reorder::new(30);
+        order.insert(packet(0, b"a")).unwrap();
+        assert_eq!(drain(&mut order), b"a");
+        // already delivered
+        order.insert(packet(0, b"A")).unwrap();
+        // held twice
+        order.insert(packet(2, b"c")).unwrap();
+        order.insert(packet(2, b"C")).unwrap();
+        order.insert(packet(1, b"b")).unwrap();
+        assert_eq!(drain(&mut order), b"bc");
+        assert!(order.held.is_empty());
+    }
+
+    /// Xray's limit (upload_queue.go:103-111, `len(h.heap) > maxPackets`
+    /// after popping one): `max + 1` may wait behind a gap, the
+    /// `max + 2`-th fails, however far ahead the seqs are. A duplicate of a
+    /// held seq does not count twice.
+    #[test]
+    fn reorder_fails_when_more_than_max_plus_one_wait() {
+        let mut order = Reorder::new(2);
+        for seq in [1, 50, u64::MAX, 50] {
+            order.insert(packet(seq, b"x")).unwrap();
+        }
+        assert_eq!(order.waiting(), 3);
+        assert_eq!(order.insert(packet(7, b"x")), Err(ReorderOverflow));
+        // the next one in order is never counted as waiting
+        let mut order = Reorder::new(2);
+        for seq in [1, 2, 3, 0] {
+            order.insert(packet(seq, b"x")).unwrap();
+        }
+        assert_eq!(drain(&mut order).len(), 4);
+    }
+
+    #[test]
+    fn reorder_takes_the_largest_seq_without_overflowing() {
+        let mut order = Reorder::new(30);
+        order.next = u64::MAX - 1;
+        order.insert(packet(u64::MAX, b"z")).unwrap();
+        order.insert(packet(u64::MAX - 1, b"y")).unwrap();
+        assert_eq!(drain(&mut order), b"yz");
+        assert_eq!(order.next, 0);
+    }
+
+    #[test]
+    fn a_seq_is_decimal_digits_as_parse_uint_takes_them() {
+        assert_eq!(parse_seq("0"), Some(0));
+        assert_eq!(parse_seq("007"), Some(7));
+        assert_eq!(parse_seq("18446744073709551615"), Some(u64::MAX));
+        for bad in ["", "-1", "+1", "1a", " 1", "18446744073709551616"] {
+            assert_eq!(parse_seq(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn packet_buffer_settings_default_as_xray() {
+        let t = xhttp_transport();
+        assert_eq!(t.max_buffered_posts, 30);
+        assert_eq!(t.max_each_post, 1_000_000);
+        let t = xhttp_transport_with(
+            serde_json::json!({"sc_max_buffered_posts": 0, "sc_max_each_post_bytes": "0"}),
+        );
+        assert_eq!((t.max_buffered_posts, t.max_each_post), (30, 1_000_000));
+        let t = xhttp_transport_with(
+            serde_json::json!({"sc_max_buffered_posts": 5, "sc_max_each_post_bytes": "1000-2000"}),
+        );
+        assert_eq!((t.max_buffered_posts, t.max_each_post), (5, 2000));
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_each_post_bytes": 4096}));
+        assert_eq!(t.max_each_post, 4096);
+        for bad in [
+            serde_json::json!({"sc_max_buffered_posts": -1}),
+            serde_json::json!({"sc_max_buffered_posts": "5"}),
+            serde_json::json!({"sc_max_each_post_bytes": "lots"}),
+        ] {
+            let mut transport = serde_json::json!({"type": "xhttp", "path": "/bench"});
+            for (k, v) in bad.as_object().unwrap() {
+                transport[k] = v.clone();
+            }
+            let obj = serde_json::json!({ "transport": transport });
+            assert!(
+                Transport::from_inbound(&obj, "inbounds[0]").is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    fn xhttp_transport_with(extra: serde_json::Value) -> Transport {
+        let mut transport = serde_json::json!({"type": "xhttp", "path": "/bench"});
+        for (k, v) in extra.as_object().expect("object") {
+            transport[k] = v.clone();
+        }
+        let obj = serde_json::json!({ "transport": transport });
+        Transport::from_inbound(&obj, "inbounds[0]")
+            .expect("read")
+            .expect("present")
+    }
+
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(300);
+    const LONG: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// One HTTP/1.1 packet-up POST on a connection of its own, attached to a
+    /// session that already has its download. The client end, for the answer.
+    async fn h1_post(t: &Transport, sid: &str, seq: &str, body: &[u8]) -> tokio::io::DuplexStream {
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let mut request = format!(
+            "POST /bench/{sid}/{seq} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        client.write_all(&request).await.unwrap();
+        // an upload that attaches hands out no stream of its own
+        assert!(t.accept(Box::new(server)).await.is_err());
+        client
+    }
+
+    /// The status of the answer on `client`, or `None` when none came in `wait`.
+    async fn h1_status(
+        client: &mut tokio::io::DuplexStream,
+        wait: std::time::Duration,
+    ) -> Option<u16> {
+        let mut head = Vec::new();
+        let got = tokio::time::timeout(wait, async {
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match client.read(&mut byte).await {
+                    Ok(1) => head.push(byte[0]),
+                    _ => return false,
+                }
+            }
+            true
+        })
+        .await;
+        if !matches!(got, Ok(true)) {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&head);
+        text.split(' ').nth(1).and_then(|code| code.parse().ok())
+    }
+
+    async fn read_some(stream: &mut AnyStream, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; n];
+        tokio::time::timeout(LONG, stream.read_exact(&mut buf))
+            .await
+            .expect("the protocol got too little")
+            .expect("read");
+        buf
+    }
+
+    async fn nothing_to_read(stream: &mut AnyStream) -> bool {
+        let mut buf = [0u8; 1];
+        tokio::time::timeout(SHORT, stream.read(&mut buf))
+            .await
+            .is_err()
+    }
+
+    /// POSTs that arrive out of order reach the protocol in seq order; a
+    /// missing seq holds the ones behind it (Xray waits for it as well), and
+    /// every POST is answered once it is queued, before it is delivered.
+    #[tokio::test]
+    async fn h1_packet_up_posts_are_delivered_in_seq_order() {
+        let t = xhttp_transport();
+        let (mut stream, _get) = xhttp_download_session(&t, "s1").await;
+        let mut c2 = h1_post(&t, "s1", "2", b"c").await;
+        assert_eq!(h1_status(&mut c2, LONG).await, Some(200));
+        let mut c1 = h1_post(&t, "s1", "1", b"b").await;
+        assert_eq!(h1_status(&mut c1, LONG).await, Some(200));
+        assert!(nothing_to_read(&mut stream).await, "seq 0 is still missing");
+        let mut c0 = h1_post(&t, "s1", "0", b"a").await;
+        assert_eq!(h1_status(&mut c0, LONG).await, Some(200));
+        assert_eq!(read_some(&mut stream, 3).await, b"abc");
+    }
+
+    #[tokio::test]
+    async fn h1_packet_up_duplicates_are_dropped() {
+        let t = xhttp_transport();
+        let (mut stream, _get) = xhttp_download_session(&t, "s1").await;
+        for (seq, body) in [
+            ("0", b"a"),
+            ("0", b"A"),
+            ("2", b"c"),
+            ("2", b"C"),
+            ("1", b"b"),
+        ] {
+            let mut c = h1_post(&t, "s1", seq, body).await;
+            assert_eq!(h1_status(&mut c, LONG).await, Some(200), "seq {seq}");
+        }
+        assert_eq!(read_some(&mut stream, 3).await, b"abc");
+        assert!(
+            nothing_to_read(&mut stream).await,
+            "a duplicate was delivered"
+        );
+    }
+
+    /// A seq that is not a uint64 gets 500 (Xray: ParseUint failed) and
+    /// leaves the session alone.
+    #[tokio::test]
+    async fn h1_packet_up_bad_seq_is_refused() {
+        let t = xhttp_transport();
+        let (mut stream, _get) = xhttp_download_session(&t, "s1").await;
+        for seq in ["x", "-1", "18446744073709551616"] {
+            let mut c = h1_post(&t, "s1", seq, b"junk").await;
+            assert_eq!(h1_status(&mut c, LONG).await, Some(500), "seq {seq}");
+        }
+        let mut c = h1_post(&t, "s1", "0", b"ok").await;
+        assert_eq!(h1_status(&mut c, LONG).await, Some(200));
+        assert_eq!(read_some(&mut stream, 2).await, b"ok");
+    }
+
+    /// A body over `sc_max_each_post_bytes` gets 413, as in Xray.
+    #[tokio::test]
+    async fn h1_packet_up_body_over_the_limit_is_refused() {
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_each_post_bytes": 8}));
+        let (mut stream, _get) = xhttp_download_session(&t, "s1").await;
+        let mut c = h1_post(&t, "s1", "0", b"123456789").await;
+        assert_eq!(h1_status(&mut c, LONG).await, Some(413));
+        let mut c = h1_post(&t, "s1", "0", b"12345678").await;
+        assert_eq!(h1_status(&mut c, LONG).await, Some(200));
+        assert_eq!(read_some(&mut stream, 8).await, b"12345678");
+    }
+
+    const PACKET: usize = 16 * 1024;
+
+    fn packet_body(i: usize) -> Vec<u8> {
+        vec![i as u8; PACKET]
+    }
+
+    /// Send `n` packets, each on its own connection, without waiting.
+    async fn h1_flood(t: &Transport, sid: &str, n: usize) -> Vec<tokio::io::DuplexStream> {
+        let mut clients = Vec::new();
+        for i in 0..n {
+            clients.push(h1_post(t, sid, &i.to_string(), &packet_body(i)).await);
+            tokio::task::yield_now().await;
+        }
+        clients
+    }
+
+    /// Which POSTs have their answer, by index; `None` when still held.
+    async fn h1_answers(clients: &mut [tokio::io::DuplexStream]) -> Vec<Option<u16>> {
+        let mut out = Vec::new();
+        for client in clients.iter_mut() {
+            out.push(h1_status(client, std::time::Duration::from_millis(50)).await);
+        }
+        out
+    }
+
+    /// More than `max + 1` packets behind a gap end the session with an
+    /// explicit error (Xray's "packet queue is too large"), and that
+    /// releases everything waiting: every POST is answered (200 if it was
+    /// queued first, else 500), the protocol's read fails and the GET ends.
+    #[tokio::test]
+    async fn h1_packet_up_too_many_behind_a_gap_end_the_session_and_release_all() {
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_buffered_posts": 2}));
+        let (mut stream, mut get) = xhttp_download_session(&t, "s1").await;
+        let settle = std::time::Duration::from_millis(50);
+        let mut clients = Vec::new();
+        // 0..=3 fill the pipe and 4 is stuck in the bridge (next is 5); 5
+        // never comes: 6 and 7 are queued, 8 and 9 hold the permits, 10 and
+        // 11 wait for one
+        for seq in [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11] {
+            clients.push((
+                seq,
+                h1_post(&t, "s1", &seq.to_string(), &packet_body(seq)).await,
+            ));
+            tokio::time::sleep(settle).await;
+        }
+        tokio::time::sleep(SHORT).await;
+        for (seq, client) in clients.iter_mut() {
+            let want = if *seq <= 7 { Some(200) } else { None };
+            assert_eq!(
+                h1_status(client, std::time::Duration::from_millis(50)).await,
+                want,
+                "POST {seq}"
+            );
+        }
+        // reading lets the bridge take 6, 7, 8, 9...: the fourth behind the
+        // gap ends the session
+        let mut got = Vec::new();
+        let err = tokio::time::timeout(LONG, async {
+            let mut buf = vec![0u8; PACKET];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => panic!("an overflow is not a clean EOF"),
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(err) => return err,
+                }
+            }
+        })
+        .await
+        .expect("stalled: the protocol never heard of the error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let delivered: Vec<u8> = (0..=4).flat_map(packet_body).collect();
+        assert_eq!(got, delivered, "only the packets in order before the gap");
+        for (seq, client) in clients.iter_mut() {
+            if *seq >= 8 {
+                let status = h1_status(client, LONG).await;
+                assert!(
+                    matches!(status, Some(200 | 500)),
+                    "POST {seq} was left waiting: {status:?}"
+                );
+            }
+        }
+        let mut rest = Vec::new();
+        tokio::time::timeout(LONG, get.read_to_end(&mut rest))
+            .await
+            .expect("stalled: the GET outlived the session")
+            .unwrap();
+        drop(stream);
+        assert!(t.sessions.lock().unwrap().is_empty());
+    }
+
+    /// A connection whose writes all fail and whose reads hand out the given
+    /// chunks, one per read, then EOF; it counts the reads that returned data.
+    struct DeadWrites {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncRead for DeadWrites {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            out: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if let Some(mut chunk) = self.chunks.pop_front() {
+                let n = chunk.len().min(out.remaining());
+                out.put_slice(&chunk[..n]);
+                if n < chunk.len() {
+                    self.chunks.push_front(chunk.split_off(n));
+                }
+                self.reads.fetch_add(1, Ordering::SeqCst);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for DeadWrites {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn small_post(seq: u64, body: &[u8]) -> Vec<u8> {
+        let mut request = format!(
+            "POST /bench/s1/{seq} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        request
+    }
+
+    /// Several POSTs arrive in one read and the first answer cannot be
+    /// written: the complete ones already buffered are still delivered, in
+    /// seq order; the incomplete one after them is not, and the socket is
+    /// not read again.
+    #[tokio::test]
+    async fn h1_packet_up_buffered_posts_survive_a_failed_answer() {
+        let t = xhttp_transport();
+        let (mut stream, _get) = xhttp_download_session(&t, "s1").await;
+        let mut first = Vec::new();
+        for (seq, body) in [(1, &b"b"[..]), (0, b"a"), (3, b"d"), (2, b"c")] {
+            first.extend_from_slice(&small_post(seq, body));
+        }
+        // seq 4 announces five bytes and only two are in this read
+        let incomplete = small_post(4, b"eeeee");
+        let cut = incomplete.len() - 3;
+        first.extend_from_slice(&incomplete[..cut]);
+        let mut rest = incomplete[cut..].to_vec();
+        rest.extend_from_slice(&small_post(5, b"f"));
+        assert!(first.len() <= 1024, "one read of the head buffer");
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let conn = DeadWrites {
+            chunks: [first, rest].into_iter().collect(),
+            reads: Arc::clone(&reads),
+        };
+        // an upload that attaches hands out no stream of its own
+        assert!(t.accept(Box::new(conn)).await.is_err());
+        assert_eq!(read_some(&mut stream, 4).await, b"abcd");
+        assert!(
+            nothing_to_read(&mut stream).await,
+            "an incomplete POST was delivered"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "the dead connection was read again"
+        );
+    }
+
+    /// Packets held behind a gap are released when the client closes the
+    /// GET: the protocol's read ends as a cancel, nothing is delivered, the
+    /// session leaves the table and a later POST finds none. Waiting POSTs
+    /// are covered by `h1_packet_up_cancel_releases_waiting_posts`.
+    #[tokio::test]
+    async fn h1_packet_up_held_behind_a_gap_are_released_when_the_get_closes() {
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_buffered_posts": 2}));
+        let (mut stream, get) = xhttp_download_session(&t, "s1").await;
+        for seq in ["1", "2", "3"] {
+            let mut c = h1_post(&t, "s1", seq, b"x").await;
+            assert_eq!(h1_status(&mut c, LONG).await, Some(200), "seq {seq}");
+        }
+        assert!(nothing_to_read(&mut stream).await, "seq 0 is missing");
+        drop(get);
+        let mut buf = [0u8; 8];
+        let err = tokio::time::timeout(LONG, stream.read(&mut buf))
+            .await
+            .expect("stalled: the GET closed and the protocol never heard")
+            .expect_err("a cancelled session is not a clean EOF");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        drop(stream);
+        assert!(t.sessions.lock().unwrap().is_empty());
+    }
+
+    /// With the consumer blocked: W POSTs queued, W holding permits, W
+    /// waiting for one -- and one more ends the session with an explicit
+    /// error. Every waiter gets 500, the GET ends, the protocol's read fails.
+    #[tokio::test]
+    async fn h1_packet_up_one_waiter_too_many_ends_the_session_and_releases_all() {
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_buffered_posts": 2}));
+        let (mut stream, mut get) = xhttp_download_session(&t, "s1").await;
+        let settle = std::time::Duration::from_millis(50);
+        let mut clients = Vec::new();
+        // 0..=3 fill the pipe, 4 is stuck in the bridge, 5 and 6 are queued,
+        // 7 and 8 hold the permits, 9 and 10 wait for one
+        for seq in 0..=10 {
+            clients.push(h1_post(&t, "s1", &seq.to_string(), &packet_body(seq)).await);
+            tokio::time::sleep(settle).await;
+        }
+        tokio::time::sleep(SHORT).await;
+        let first = h1_answers(&mut clients).await;
+        let want: Vec<Option<u16>> = (0..=10)
+            .map(|seq| if seq <= 6 { Some(200) } else { None })
+            .collect();
+        assert_eq!(first, want);
+        let mut over = h1_post(&t, "s1", "11", &packet_body(11)).await;
+        assert_eq!(h1_status(&mut over, LONG).await, Some(500), "POST 11");
+        for (seq, client) in clients.iter_mut().enumerate().skip(7) {
+            assert_eq!(h1_status(client, LONG).await, Some(500), "POST {seq}");
+        }
+        let mut rest = Vec::new();
+        tokio::time::timeout(LONG, get.read_to_end(&mut rest))
+            .await
+            .expect("stalled: the GET outlived the session")
+            .unwrap();
+        let mut got = Vec::new();
+        let err = tokio::time::timeout(LONG, async {
+            let mut buf = vec![0u8; PACKET];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => panic!("an overflow is not a clean EOF"),
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(err) => return err,
+                }
+            }
+        })
+        .await
+        .expect("stalled: the protocol never heard of the error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let piped: Vec<u8> = (0..=3).flat_map(packet_body).collect();
+        assert_eq!(got, piped, "what was in the pipe, nothing more");
+        drop(stream);
+        assert!(t.sessions.lock().unwrap().is_empty());
+    }
+
+    /// Xray's HTTP/1.1 client pipelines POSTs on pooled connections and may
+    /// reset one, which can lose packets for good; the session may then wait
+    /// on that gap, as Xray's does, until the client closes the GET. This
+    /// proves only that closing the GET releases the session -- it does not
+    /// prove the absence of stalls. The timeouts only detect a hang.
+    #[tokio::test]
+    async fn h1_packet_up_a_reset_upload_connection_is_released_when_the_get_closes() {
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_buffered_posts": 2}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut sessions) = mpsc::unbounded_channel::<AnyStream>();
+        let server = t.clone();
+        tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                let t = server.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(Accepted::Once(stream)) = t.accept(Box::new(conn)).await {
+                        let _ = tx.send(stream);
+                    }
+                });
+            }
+        });
+        let post = |seq: u64| {
+            let body = vec![seq as u8; 1024];
+            let mut request = format!(
+                "POST /bench/s1/{seq} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            request.extend_from_slice(&body);
+            request
+        };
+
+        let mut get = tokio::net::TcpStream::connect(addr).await.unwrap();
+        get.write_all(b"GET /bench/s1 HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut head = [0u8; 19];
+        get.read_exact(&mut head).await.unwrap();
+        let mut stream = tokio::time::timeout(LONG, sessions.recv())
+            .await
+            .expect("no session")
+            .expect("session");
+        let original = Arc::clone(t.sessions.lock().unwrap().get("s1").expect("listed"));
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => return None,
+                    Ok(_) => {}
+                    Err(err) => return Some(err.kind()),
+                }
+            }
+        });
+
+        // connection C: a far-ahead seq, then pipelined POSTs until the
+        // socket takes no more, then RST
+        let c = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = socket2::SockRef::from(&c).set_send_buffer_size(4096);
+        c.writable().await.unwrap();
+        for seq in 2..64 {
+            let request = post(seq);
+            match c.try_write(&request) {
+                Ok(n) if n == request.len() => {}
+                _ => break,
+            }
+        }
+        socket2::SockRef::from(&c)
+            .set_linger(Some(std::time::Duration::ZERO))
+            .unwrap();
+        drop(c);
+
+        // connection D: the gap
+        let mut d = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut gap = post(0);
+        gap.extend_from_slice(&post(1));
+        let _ = d.write_all(&gap).await;
+
+        // the session may end on its own (complete, or an overflow), or wait
+        // on a lost seq; then the client closes the GET
+        tokio::time::sleep(SHORT).await;
+        drop(get);
+        let ended = tokio::time::timeout(LONG, reader)
+            .await
+            .expect("hung: closing the GET did not release the session")
+            .unwrap();
+        assert!(
+            matches!(
+                ended,
+                Some(io::ErrorKind::InvalidData | io::ErrorKind::ConnectionAborted)
+            ),
+            "an explicit end, got {ended:?}"
+        );
+        // the stream was dropped with the reader task, before it resolved:
+        // the session it listed is gone
+        assert!(
+            !t.sessions
+                .lock()
+                .unwrap()
+                .values()
+                .any(|session| Arc::ptr_eq(session, &original)),
+            "the ended session is still listed"
+        );
+        // A POST that arrived after that births a new session of the same
+        // id (upload before GET); its stream waits in `sessions`, and is
+        // released with it.
+        drop(sessions);
+        tokio::time::timeout(LONG, async {
+            while !t.sessions.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a session born of a late POST outlived its stream");
+    }
+
+    /// A protocol that does not read holds the uploads: POSTs past what the
+    /// pipe and the packet queue keep are not answered, nothing is dropped,
+    /// and once the protocol reads, everything arrives in order.
+    #[tokio::test]
+    async fn h1_packet_up_a_full_queue_holds_further_posts() {
+        const N: usize = 16;
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_buffered_posts": 4}));
+        let (mut stream, _get) = xhttp_download_session(&t, "s1").await;
+        let mut clients = h1_flood(&t, "s1", N).await;
+        tokio::time::sleep(SHORT).await;
+        let first = h1_answers(&mut clients).await;
+        let answered = first.iter().filter(|s| s.is_some()).count();
+        assert!(first.iter().flatten().all(|&s| s == 200), "{first:?}");
+        // the pipe (4 packets), the one being written and the queue (4)
+        assert!(answered < N, "nothing held the uploads: {first:?}");
+        assert!(
+            answered <= 4 + 1 + 4,
+            "more queued than the limit: {first:?}"
+        );
+        for i in 0..N {
+            assert_eq!(
+                read_some(&mut stream, PACKET).await,
+                packet_body(i),
+                "packet {i}"
+            );
+        }
+        for (i, client) in clients.iter_mut().enumerate() {
+            if first[i].is_none() {
+                assert_eq!(h1_status(client, LONG).await, Some(200), "POST {i}");
+            }
+        }
+    }
+
+    /// The client cancelling its download releases the POSTs waiting for
+    /// room (500, like Xray's Push on a closed queue), and the protocol's
+    /// read fails as a cancel.
+    #[tokio::test]
+    async fn h1_packet_up_cancel_releases_waiting_posts() {
+        const N: usize = 16;
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_buffered_posts": 4}));
+        let (mut stream, get) = xhttp_download_session(&t, "s1").await;
+        let mut clients = h1_flood(&t, "s1", N).await;
+        tokio::time::sleep(SHORT).await;
+        let first = h1_answers(&mut clients).await;
+        assert!(
+            first.iter().any(Option::is_none),
+            "nothing waits: {first:?}"
+        );
+        drop(get);
+        for (i, client) in clients.iter_mut().enumerate() {
+            if first[i].is_none() {
+                assert_eq!(h1_status(client, LONG).await, Some(500), "POST {i}");
+            }
+        }
+        let err = tokio::time::timeout(LONG, async {
+            let mut buf = vec![0u8; PACKET];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => panic!("a cancelled session is not a clean EOF"),
+                    Ok(_) => continue,
+                    Err(err) => return err,
+                }
+            }
+        })
+        .await
+        .expect("the protocol never heard of the cancel");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionAborted);
+        drop(stream);
+        assert!(t.sessions.lock().unwrap().is_empty());
+    }
+
+    /// Stream-up is not reordered: its 200 goes out before the body, and
+    /// the body is streamed as it comes.
+    #[tokio::test]
+    async fn h1_stream_up_is_streamed_as_before() {
+        let t = xhttp_transport();
+        let (mut stream, _get) = xhttp_download_session(&t, "s1").await;
+        let (mut up, server) = tokio::io::duplex(1 << 16);
+        up.write_all(b"POST /bench/s1 HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(t.accept(Box::new(server)).await.is_err());
+        assert_eq!(h1_status(&mut up, LONG).await, Some(200));
+        up.write_all(b"5\r\nhello\r\n").await.unwrap();
+        assert_eq!(read_some(&mut stream, 5).await, b"hello");
+        up.write_all(b"6\r\n world\r\n").await.unwrap();
+        assert_eq!(read_some(&mut stream, 6).await, b" world");
+    }
+
+    /// An HTTP/2 XHTTP connection: the client half, and the protocol
+    /// streams of the sessions it opens.
+    async fn h2_stand(
+        t: Transport,
+    ) -> (
+        h2::client::SendRequest<Bytes>,
+        mpsc::UnboundedReceiver<AnyStream>,
+    ) {
+        let (client, server) = tokio::io::duplex(1 << 20);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let accepted = Accepted::xhttp_h2(Box::new(server), &t)
+                .await
+                .expect("h2 accept");
+            let _ = serve_sessions(accepted, move |stream| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(stream);
+                }
+            })
+            .await;
+        });
+        let (send_request, connection) = crate::outbound::transport::h2io::client_builder()
+            .handshake::<_, Bytes>(client)
+            .await
+            .expect("h2 handshake");
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        (send_request, rx)
+    }
+
+    async fn h2_request(
+        send: &mut h2::client::SendRequest<Bytes>,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> h2::client::ResponseFuture {
+        let ready = send.clone().ready().await.expect("h2 ready");
+        *send = ready;
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://x{path}"))
+            .body(())
+            .unwrap();
+        let (response, mut stream) = send
+            .send_request(request, body.is_none())
+            .expect("send request");
+        if let Some(body) = body {
+            stream
+                .send_data(Bytes::from(body), true)
+                .expect("send body");
+        }
+        response
+    }
+
+    /// The download GET for `sid` and the protocol stream it opens. The GET's
+    /// body is kept: dropping it would reset the stream, which is a cancel.
+    async fn h2_open_session(
+        send: &mut h2::client::SendRequest<Bytes>,
+        sessions: &mut mpsc::UnboundedReceiver<AnyStream>,
+        sid: &str,
+    ) -> (AnyStream, h2::RecvStream) {
+        let get = h2_request(send, "GET", &format!("/bench/{sid}"), None).await;
+        let response = tokio::time::timeout(LONG, get)
+            .await
+            .expect("no answer to the GET")
+            .expect("GET");
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let stream = tokio::time::timeout(LONG, sessions.recv())
+            .await
+            .expect("no session")
+            .expect("session");
+        (stream, response.into_body())
+    }
+
+    async fn h2_status(
+        response: &mut h2::client::ResponseFuture,
+        wait: std::time::Duration,
+    ) -> Option<u16> {
+        match tokio::time::timeout(wait, response).await {
+            Ok(Ok(response)) => Some(response.status().as_u16()),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_packet_up_posts_are_delivered_in_seq_order() {
+        let (mut send, mut sessions) = h2_stand(xhttp_transport()).await;
+        let (mut stream, _get) = h2_open_session(&mut send, &mut sessions, "s1").await;
+        for (seq, body) in [("2", b"c"), ("1", b"b"), ("1", b"B")] {
+            let mut post = h2_request(
+                &mut send,
+                "POST",
+                &format!("/bench/s1/{seq}"),
+                Some(body.to_vec()),
+            )
+            .await;
+            assert_eq!(h2_status(&mut post, LONG).await, Some(200), "seq {seq}");
+        }
+        assert!(nothing_to_read(&mut stream).await, "seq 0 is still missing");
+        let mut bad = h2_request(&mut send, "POST", "/bench/s1/x", Some(b"junk".to_vec())).await;
+        assert_eq!(h2_status(&mut bad, LONG).await, Some(500));
+        let mut post = h2_request(&mut send, "POST", "/bench/s1/0", Some(b"a".to_vec())).await;
+        assert_eq!(h2_status(&mut post, LONG).await, Some(200));
+        assert_eq!(read_some(&mut stream, 3).await, b"abc");
+        assert!(
+            nothing_to_read(&mut stream).await,
+            "a duplicate was delivered"
+        );
+    }
+
+    /// The W = 1 capacity of an HTTP/2 session with its consumer blocked:
+    /// the pipe (4), the bridge (1), the queue (1), one permit holder whose
+    /// body is read and one waiter whose body stays in the client. Each POST
+    /// goes out after the one before was taken: the permit is taken before
+    /// the body is read, so a burst would count bodies still on the way.
+    const H2_FULL: usize = 8;
+
+    async fn h2_fill(
+        send: &mut h2::client::SendRequest<Bytes>,
+        n: usize,
+    ) -> Vec<h2::client::ResponseFuture> {
+        let mut posts = Vec::new();
+        for i in 0..n {
+            posts.push(
+                h2_request(
+                    send,
+                    "POST",
+                    &format!("/bench/s1/{i}"),
+                    Some(packet_body(i)),
+                )
+                .await,
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(SHORT).await;
+        posts
+    }
+
+    /// Over HTTP/2 a full queue holds the POST answers the same way, and
+    /// reading lets them all through, in order.
+    #[tokio::test]
+    async fn h2_packet_up_a_full_queue_holds_further_posts() {
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_buffered_posts": 1}));
+        let (mut send, mut sessions) = h2_stand(t).await;
+        let (mut stream, _get) = h2_open_session(&mut send, &mut sessions, "s1").await;
+        let mut posts = h2_fill(&mut send, H2_FULL).await;
+        let mut first = Vec::new();
+        for post in posts.iter_mut() {
+            first.push(h2_status(post, std::time::Duration::from_millis(50)).await);
+        }
+        let want: Vec<Option<u16>> = (0..H2_FULL)
+            .map(|i| if i <= 5 { Some(200) } else { None })
+            .collect();
+        assert_eq!(first, want, "the holder and the waiter are not answered");
+        for i in 0..H2_FULL {
+            assert_eq!(
+                read_some(&mut stream, PACKET).await,
+                packet_body(i),
+                "packet {i}"
+            );
+        }
+        for (i, post) in posts.iter_mut().enumerate() {
+            if first[i].is_none() {
+                assert_eq!(h2_status(post, LONG).await, Some(200), "POST {i}");
+            }
+        }
+    }
+
+    /// One POST past that capacity ends the session with an explicit error:
+    /// it and the waiting ones get 500, the GET is reset, the protocol's
+    /// read fails after what was in the pipe.
+    #[tokio::test]
+    async fn h2_packet_up_one_waiter_too_many_ends_the_session_and_releases_all() {
+        let t = xhttp_transport_with(serde_json::json!({"sc_max_buffered_posts": 1}));
+        let (mut send, mut sessions) = h2_stand(t.clone()).await;
+        let (mut stream, mut get) = h2_open_session(&mut send, &mut sessions, "s1").await;
+        let mut posts = h2_fill(&mut send, H2_FULL).await;
+        let mut over = h2_request(
+            &mut send,
+            "POST",
+            &format!("/bench/s1/{H2_FULL}"),
+            Some(packet_body(H2_FULL)),
+        )
+        .await;
+        assert_eq!(
+            h2_status(&mut over, LONG).await,
+            Some(500),
+            "the POST too many"
+        );
+        for (i, post) in posts.iter_mut().enumerate().skip(6) {
+            assert_eq!(h2_status(post, LONG).await, Some(500), "POST {i}");
+        }
+        tokio::time::timeout(LONG, async {
+            while let Some(chunk) = get.data().await {
+                if chunk.is_err() {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("stalled: the GET outlived the session");
+        let mut got = Vec::new();
+        let err = tokio::time::timeout(LONG, async {
+            let mut buf = vec![0u8; PACKET];
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) => panic!("an overflow is not a clean EOF"),
+                    Ok(n) => got.extend_from_slice(&buf[..n]),
+                    Err(err) => return err,
+                }
+            }
+        })
+        .await
+        .expect("stalled: the protocol never heard of the error");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let piped: Vec<u8> = (0..=3).flat_map(packet_body).collect();
+        assert_eq!(got, piped, "what was in the pipe, nothing more");
+        drop(stream);
+        assert!(t.sessions.lock().unwrap().is_empty());
     }
 }
