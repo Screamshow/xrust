@@ -6101,20 +6101,20 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// VLESS `encryption` spec (SPEC 032): parse + padding validation mirror the
-/// reference client setup, so a malformed string fails at check time.
-fn validate_vless_encryption(obj: &Map<String, Value>) -> Result<(), String> {
+/// VLESS `encryption`: only the plain protocol is supported. The encryption
+/// layer is not wired into the outbound, so any other value would connect as
+/// plain VLESS and send the UUID in the clear; refuse it at check time.
+fn validate_vless_encryption(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let Some(enc) = obj.get("encryption").and_then(Value::as_str) else {
         return Ok(());
     };
     if enc.is_empty() || enc == "none" {
         return Ok(());
     }
-    let spec = crate::vless_enc::parse_client_encryption(enc)
-        .map_err(|e| format!("parse encryption: {e}"))?;
-    crate::vless_enc::parse_padding(&spec.padding)
-        .map_err(|e| format!("initialize encryption: {e}"))?;
-    Ok(())
+    let scheme = enc.split('.').next().unwrap_or(enc);
+    Err(format!(
+        "outbounds[{i}].encryption: VLESS encryption ({scheme}) is not supported; use \"none\""
+    ))
 }
 
 fn validate_anytls_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
@@ -7600,7 +7600,7 @@ fn validate_outbound(
         | "hysteria" | "naive" | "ssh" => {
             validate_plain_out_decode(i, ty, tag, obj)?;
             if ty == "vless" {
-                validate_vless_encryption(obj)?;
+                validate_vless_encryption(i, obj)?;
             }
         }
         "direct" => validate_direct_out_decode(i, tag, obj)?,
@@ -10670,6 +10670,33 @@ mod tests {
             err,
             "dns.client_subnet: netip.ParsePrefix(\"1.2.3.0/33\"): prefix length out of range"
         );
+    }
+
+    // VLESS-ENC-01: the encryption layer is not wired in; a configured
+    // encryption must fail at check time instead of running as plain VLESS.
+    #[test]
+    fn vless_encryption_other_than_none_is_refused() {
+        let vless = |encryption: Option<&str>| {
+            let mut out = json!({"type": "vless", "tag": "v", "server": "192.0.2.1",
+                "server_port": 443, "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"});
+            if let Some(encryption) = encryption {
+                out["encryption"] = json!(encryption);
+            }
+            json!({"outbounds": [out]})
+        };
+        for accepted in [None, Some(""), Some("none")] {
+            assert!(validate(&vless(accepted)).is_ok(), "{accepted:?}");
+        }
+        let key = "a".repeat(43);
+        for refused in [
+            format!("mlkem768x25519plus.native.0rtt.{key}"),
+            format!("mlkem768x25519plus.xorpub.1rtt.{key}"),
+            "aes-128-gcm".to_string(),
+        ] {
+            let err = validate(&vless(Some(&refused))).unwrap_err();
+            assert!(err.contains("outbounds[0].encryption"), "{err}");
+            assert!(err.contains("not supported"), "{err}");
+        }
     }
 
     #[test]
