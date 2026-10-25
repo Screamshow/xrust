@@ -548,7 +548,8 @@ async fn parse_socks_udp_datagram(data: &[u8]) -> Option<(SocketAddr, usize)> {
                     *service.resolve(host).await.ok()?.first()?
                 }
             };
-            (ip, end)
+            // the port follows the name; `end` already includes it
+            (ip, 5 + len)
         }
         _ => return None,
     };
@@ -1111,4 +1112,35 @@ fn proxy_auth_ok(head_text: &str, users: &[(String, String)]) -> bool {
         return users.iter().any(|(eu, ep)| eu == u && ep == p);
     }
     false
+}
+
+#[cfg(test)]
+mod socks_udp_tests {
+    use super::parse_socks_udp_datagram;
+
+    fn domain_datagram(host: &str, port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut datagram = vec![0, 0, 0, 0x03, host.len() as u8];
+        datagram.extend_from_slice(host.as_bytes());
+        datagram.extend_from_slice(&port.to_be_bytes());
+        datagram.extend_from_slice(payload);
+        datagram
+    }
+
+    // CQ-02: the domain branch returned an offset past the port, so the port
+    // was read from the payload, or past the end of a datagram without one.
+    #[tokio::test]
+    async fn a_domain_datagram_reads_its_own_port() {
+        let datagram = domain_datagram("192.0.2.7", 443, b"payload");
+        let (target, offset) = parse_socks_udp_datagram(&datagram).await.unwrap();
+        assert_eq!(target, "192.0.2.7:443".parse().unwrap());
+        assert_eq!(&datagram[offset..], b"payload");
+    }
+
+    #[tokio::test]
+    async fn an_empty_domain_datagram_does_not_panic() {
+        let datagram = domain_datagram("192.0.2.7", 53, b"");
+        let (target, offset) = parse_socks_udp_datagram(&datagram).await.unwrap();
+        assert_eq!(target, "192.0.2.7:53".parse().unwrap());
+        assert_eq!(offset, datagram.len());
+    }
 }
