@@ -835,3 +835,109 @@ async fn manual_delay_uses_the_requested_plain_http_endpoint() {
     target.await.unwrap();
     instance.shutdown_wait().await;
 }
+
+/// SEC-06: Forkop binds the controller to the LAN address without a secret.
+/// A web page (cross-origin fetch, WebSocket, DNS rebinding) must not be able
+/// to drive it; the router's own curl and LuCI on the same host still can.
+#[tokio::test]
+async fn no_secret_controller_refuses_foreign_browsers() {
+    let config = serde_json::json!({
+        "log": {"level": "error"},
+        "experimental": {"clash_api": {"external_controller": "127.0.0.1:0"}},
+        "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 0}],
+        "outbounds": [
+            {"type": "direct", "tag": "direct-out"},
+            {"type": "direct", "tag": "backup"},
+            {"type": "selector", "tag": "sel", "outbounds": ["backup", "direct-out"]}
+        ],
+        "route": {"final": "sel"}
+    });
+    let instance = core_runtime::start(&config).await.expect("start");
+    let addr = instance.clash_api_addr().expect("clash-api bound");
+    let get = |host: &str, extra: &str| {
+        format!("GET /connections HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n")
+    };
+
+    // DNS rebinding: a public name resolved to the router
+    let res = request(addr, &get("rebind.attacker.example:9090", "")).await;
+    assert_eq!(res.status, 403);
+    // drive-by page against the router address
+    let res = request(
+        addr,
+        &get("192.168.1.1:9090", "Origin: http://evil.example\r\n"),
+    )
+    .await;
+    assert_eq!(res.status, 403);
+    assert_eq!(res.header("access-control-allow-origin"), None);
+    let res = request(
+        addr,
+        "OPTIONS /proxies/sel HTTP/1.1\r\nHost: 192.168.1.1:9090\r\nOrigin: http://evil.example\r\n\
+         Access-Control-Request-Method: PUT\r\nAccess-Control-Request-Headers: content-type\r\n\r\n",
+    )
+    .await;
+    assert_eq!(res.header("access-control-allow-origin"), None);
+    assert_eq!(res.header("access-control-allow-methods"), None);
+    let upgrade = ws_request("/connections", "Origin: http://evil.example\r\n");
+    let res = request(addr, &upgrade.replace("Host: x", "Host: 192.168.1.1:9090")).await;
+    assert_eq!(res.status, 403);
+    let res = request(
+        addr,
+        "GET /proxies/sel/delay?url=http://127.0.0.1:1/ HTTP/1.1\r\nHost: 192.168.1.1:9090\r\n\
+         Sec-Fetch-Site: cross-site\r\n\r\n",
+    )
+    .await;
+    assert_eq!(res.status, 403);
+    let body = r#"{"name":"direct-out"}"#;
+    let res = request(
+        addr,
+        &format!(
+            "PUT /proxies/sel HTTP/1.1\r\nHost: 192.168.1.1:9090\r\nOrigin: http://evil.example\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert_eq!(res.status, 403);
+    let res = request(addr, &anonymous("/proxies/sel")).await;
+    assert_eq!(res.json()["now"], "backup", "the selector was not switched");
+
+    // the router's own curl: no Origin
+    let res = request(addr, &get("192.168.1.1:9090", "")).await;
+    assert_eq!(res.status, 200);
+    let res = request(addr, &get("127.0.0.1:9090", "")).await;
+    assert_eq!(res.status, 200);
+    // LuCI served from the same host, by address or by local name
+    for (host, origin) in [
+        ("192.168.1.1:9090", "http://192.168.1.1"),
+        ("openwrt.lan:9090", "http://openwrt.lan"),
+        ("[fd00::1]:9090", "http://[fd00::1]"),
+    ] {
+        let res = request(addr, &get(host, &format!("Origin: {origin}\r\n"))).await;
+        assert_eq!(res.status, 200, "{host} {origin}");
+        assert_eq!(res.header("access-control-allow-origin"), Some(origin));
+        let res = request(
+            addr,
+            &format!(
+                "OPTIONS /proxies/sel HTTP/1.1\r\nHost: {host}\r\nOrigin: {origin}\r\n\
+                 Access-Control-Request-Method: PUT\r\nAccess-Control-Request-Headers: content-type\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(res.status, 200);
+        assert_eq!(res.header("access-control-allow-origin"), Some(origin));
+    }
+    let upgrade = ws_request("/connections?interval=50", "Origin: http://192.168.1.1\r\n");
+    let res = request(addr, &upgrade.replace("Host: x", "Host: 192.168.1.1:9090")).await;
+    assert_eq!(res.status, 101);
+    let res = request(
+        addr,
+        &format!(
+            "PUT /proxies/sel HTTP/1.1\r\nHost: 192.168.1.1:9090\r\nOrigin: http://192.168.1.1\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ),
+    )
+    .await;
+    assert_eq!(res.status, 204);
+    instance.shutdown();
+}

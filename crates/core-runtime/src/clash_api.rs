@@ -111,7 +111,11 @@ impl ClashApi {
                 .collect(),
             _ => Vec::new(),
         };
-        let allow_origins = if allow_origins.is_empty() {
+        // Reference default is `*`. Without a secret that lets any web page
+        // the user opens drive the controller (SEC-06), so an unconfigured
+        // list stays empty there and only the controller's own host is
+        // granted (see `browser_forbidden`).
+        let allow_origins = if allow_origins.is_empty() && secret.is_some() {
             vec!["*".to_string()]
         } else {
             allow_origins
@@ -159,6 +163,11 @@ impl ClashApi {
             .await
             .with_context(|| "external controller listen error")?;
         let addr = listener.local_addr()?;
+        if self.secret.is_none() && !addr.ip().is_loopback() {
+            logging::warn(format_args!(
+                "clash-api: {addr} has no secret; any host that reaches it controls the proxy"
+            ));
+        }
         let handle = tokio::spawn(serve(listener, Arc::new(self), router));
         Ok((addr, handle))
     }
@@ -217,27 +226,109 @@ impl ClashApi {
         }
     }
 
-    /// `Access-Control-Allow-Origin` for this request, if any.
-    fn allowed_origin(&self, origin: Option<&str>) -> Option<String> {
+    /// `Access-Control-Allow-Origin` for this request, if any. `host` is the
+    /// request's `Host` header: without a secret a page served from the
+    /// controller's own host (LuCI on :80, the dashboard under /ui) is
+    /// granted even when the configured list does not name it.
+    fn allowed_origin(&self, origin: Option<&str>, host: Option<&str>) -> Option<String> {
         let origin = origin?;
-        self.allow_origins
+        match self
+            .allow_origins
             .iter()
             .find(|o| o.as_str() == "*" || o.as_str() == origin)
-            .map(|o| {
-                if o.as_str() == "*" {
-                    "*".to_string()
-                } else {
-                    origin.to_string()
-                }
-            })
+        {
+            Some(o) if o.as_str() == "*" => Some("*".to_string()),
+            Some(_) => Some(origin.to_string()),
+            None if self.secret.is_none()
+                && host.is_some_and(|host| {
+                    origin_host(origin).is_some_and(|o| o == authority_host(host))
+                }) =>
+            {
+                Some(origin.to_string())
+            }
+            None => None,
+        }
     }
+}
+
+/// SEC-06: without a secret anything that reaches the listener is trusted,
+/// so the browser — the one client a third-party page can steer — is held
+/// to the controller's own host. Refused: a `Host` that is not an address
+/// or a local name (DNS rebinding), an `Origin` that is neither configured
+/// nor the controller's host, and an origin-less cross-site request
+/// (`<img>`/no-cors) outside the static dashboard. Non-browser clients
+/// (curl from the router, LAN tools) send none of these and are unaffected;
+/// with a secret the reference behaviour is kept unchanged.
+fn browser_forbidden(
+    api: &ClashApi,
+    headers: &[(String, String)],
+    origin: Option<&str>,
+    static_route: bool,
+) -> bool {
+    if api.secret.is_some() {
+        return false;
+    }
+    let host = header_get(headers, "host");
+    if host.is_some_and(|host| !local_host_name(&authority_host(host))) {
+        return true;
+    }
+    match origin {
+        Some(origin) => api.allowed_origin(Some(origin), host).is_none(),
+        None => {
+            !static_route
+                && header_get(headers, "sec-fetch-site")
+                    .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"))
+        }
+    }
+}
+
+/// Host part of a `Host` header value (`h`, `h:port`, `[v6]:port`),
+/// lower-cased, without brackets or one trailing dot.
+fn authority_host(authority: &str) -> String {
+    let authority = authority.trim();
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split_once(']').map_or(rest, |(h, _)| h)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((h, port)) if !h.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => authority,
+        }
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
+    host.to_ascii_lowercase()
+}
+
+/// Host of a serialized `Origin` (`scheme://host[:port]`); `None` for
+/// `null` and non-HTTP schemes.
+fn origin_host(origin: &str) -> Option<String> {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host = authority_host(authority);
+    (!host.is_empty()).then_some(host)
+}
+
+/// Names a public DNS rebinding domain cannot take: IP literals,
+/// `localhost`, single-label names and the local suffixes routers hand out
+/// (`router.lan`, `host.local`, `*.home.arpa`, `*.internal`).
+fn local_host_name(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() || !host.contains('.') {
+        return true;
+    }
+    [".localhost", ".lan", ".local", ".home.arpa", ".internal"]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
 }
 
 /// Headers every response carries (reference cors middleware): `Vary: Origin`
 /// always, `Access-Control-Allow-Origin` when the request origin is allowed.
-fn cors_base(api: &ClashApi, origin: Option<&str>) -> Vec<String> {
+fn cors_base(api: &ClashApi, origin: Option<&str>, host: Option<&str>) -> Vec<String> {
     let mut headers = vec!["Vary: Origin".to_string()];
-    if let Some(value) = api.allowed_origin(origin) {
+    if let Some(value) = api.allowed_origin(origin, host) {
         headers.push(format!("Access-Control-Allow-Origin: {value}"));
     }
     headers
@@ -341,7 +432,22 @@ async fn handle_request(
     };
     let path = percent_decode(raw_path);
     let origin = header_get(&headers, "origin").map(str::to_string);
-    let cors = cors_base(api, origin.as_deref());
+    let host = header_get(&headers, "host");
+    let cors = cors_base(api, origin.as_deref(), host);
+    let (route, methods) = classify_with_ui(raw_path, api.external_ui.is_some());
+
+    let static_route = matches!(route, Route::Root | Route::UiRoot | Route::Static(_));
+    if browser_forbidden(api, &headers, origin.as_deref(), static_route) {
+        respond_json(
+            stream,
+            403,
+            "Forbidden",
+            &json!({"message": "Forbidden"}),
+            &[],
+        )
+        .await?;
+        return Ok(true);
+    }
 
     // Reference: the chi `cors.Handler` middleware intercepts preflight
     // requests before authentication and routing.
@@ -350,11 +456,9 @@ async fn handle_request(
     {
         let acrh = header_get(&headers, "access-control-request-headers");
         let acpn = header_get(&headers, "access-control-request-private-network");
-        preflight(stream, api, origin.as_deref(), acrm, acrh, acpn).await?;
+        preflight(stream, api, origin.as_deref(), host, acrm, acrh, acpn).await?;
         return Ok(true);
     }
-
-    let (route, methods) = classify_with_ui(raw_path, api.external_ui.is_some());
 
     // Unknown paths answer 404 outside the authenticated group (chi layout).
     if matches!(route, Route::Unknown) {
@@ -1635,6 +1739,7 @@ async fn preflight(
     stream: &mut TcpStream,
     api: &ClashApi,
     origin: Option<&str>,
+    host: Option<&str>,
     acrm: &str,
     acrh: Option<&str>,
     acpn: Option<&str>,
@@ -1650,8 +1755,9 @@ async fn preflight(
             .map(str::trim)
             .all(is_allowed_preflight_header)
     });
-    if api.allowed_origin(origin).is_some() && PREFLIGHT_METHODS.contains(&acrm) && headers_ok {
-        if let Some(value) = api.allowed_origin(origin) {
+    if api.allowed_origin(origin, host).is_some() && PREFLIGHT_METHODS.contains(&acrm) && headers_ok
+    {
+        if let Some(value) = api.allowed_origin(origin, host) {
             headers.push(format!("Access-Control-Allow-Origin: {value}"));
         }
         if let Some(list) = requested {
@@ -2040,19 +2146,143 @@ mod tests {
     fn origin_matching() {
         let wildcard = api(None);
         assert_eq!(
-            wildcard.allowed_origin(Some("http://x")).as_deref(),
+            wildcard.allowed_origin(Some("http://x"), None).as_deref(),
             Some("*")
         );
-        assert_eq!(wildcard.allowed_origin(None), None);
+        assert_eq!(wildcard.allowed_origin(None, None), None);
         let strict = ClashApi {
             allow_origins: vec!["http://allowed".into()],
             ..api(None)
         };
         assert_eq!(
-            strict.allowed_origin(Some("http://allowed")).as_deref(),
+            strict
+                .allowed_origin(Some("http://allowed"), None)
+                .as_deref(),
             Some("http://allowed")
         );
-        assert_eq!(strict.allowed_origin(Some("http://evil")), None);
+        assert_eq!(strict.allowed_origin(Some("http://evil"), None), None);
+    }
+
+    #[test]
+    fn browser_guard_without_secret() {
+        let open = ClashApi {
+            allow_origins: Vec::new(),
+            ..api(None)
+        };
+        let req = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // router-side curl and LAN tools: no Origin, address Host
+        let curl = req(&[("Host", "192.168.1.1:9090")]);
+        assert!(!browser_forbidden(&open, &curl, None, false));
+        assert!(!browser_forbidden(&open, &[], None, false));
+        // LuCI on :80 and the dashboard under /ui talk to their own host
+        for (host, origin) in [
+            ("192.168.1.1:9090", "http://192.168.1.1"),
+            ("openwrt.lan:9090", "http://OpenWrt.lan"),
+            ("[fd00::1]:9090", "https://[fd00::1]:8443"),
+            ("localhost:9090", "http://localhost:9090"),
+        ] {
+            let headers = req(&[("Host", host)]);
+            assert!(
+                !browser_forbidden(&open, &headers, Some(origin), false),
+                "{host}"
+            );
+            let granted = open.allowed_origin(Some(origin), Some(host));
+            assert_eq!(granted.as_deref(), Some(origin));
+        }
+        // DNS rebinding: a public name pointed at the router
+        let rebound = req(&[("Host", "rebind.attacker.example:9090")]);
+        assert!(browser_forbidden(&open, &rebound, None, false));
+        assert!(browser_forbidden(&open, &req(&[("Host", "")]), None, false));
+        // drive-by page against the router address
+        let lan = req(&[("Host", "192.168.1.1:9090")]);
+        assert!(browser_forbidden(
+            &open,
+            &lan,
+            Some("http://evil.example"),
+            false
+        ));
+        assert!(browser_forbidden(&open, &lan, Some("null"), false));
+        assert!(browser_forbidden(
+            &open,
+            &lan,
+            Some("http://192.168.1.10"),
+            false
+        ));
+        let evil = open.allowed_origin(Some("http://evil.example"), Some("192.168.1.1:9090"));
+        assert_eq!(evil, None);
+        let cross = req(&[
+            ("Host", "192.168.1.1:9090"),
+            ("Sec-Fetch-Site", "cross-site"),
+        ]);
+        assert!(browser_forbidden(&open, &cross, None, false));
+        assert!(!browser_forbidden(&open, &cross, None, true));
+        // an explicit list is still honoured without a secret
+        let listed = ClashApi {
+            allow_origins: vec!["http://yacd.example".into()],
+            ..api(None)
+        };
+        assert!(!browser_forbidden(
+            &listed,
+            &lan,
+            Some("http://yacd.example"),
+            false
+        ));
+        assert!(browser_forbidden(
+            &listed,
+            &lan,
+            Some("http://evil.example"),
+            false
+        ));
+        // with a secret the reference behaviour is untouched
+        let locked = api(Some("s3cr3t"));
+        let rebound = req(&[
+            ("Host", "rebind.attacker.example"),
+            ("Sec-Fetch-Site", "cross-site"),
+        ]);
+        assert!(!browser_forbidden(
+            &locked,
+            &rebound,
+            Some("http://evil.example"),
+            false
+        ));
+    }
+
+    #[test]
+    fn host_name_helpers() {
+        assert_eq!(authority_host("Router.LAN.:9090"), "router.lan");
+        assert_eq!(authority_host("[FD00::1]:9090"), "fd00::1");
+        assert_eq!(authority_host("fd00::1"), "fd00::1");
+        assert_eq!(
+            origin_host("http://192.168.1.1:80").as_deref(),
+            Some("192.168.1.1")
+        );
+        assert_eq!(origin_host("null"), None);
+        assert_eq!(origin_host("file://"), None);
+        let local = [
+            "192.168.1.1",
+            "fd00::1",
+            "localhost",
+            "x",
+            "openwrt.lan",
+            "a.home.arpa",
+        ];
+        for ok in local {
+            assert!(local_host_name(ok), "{ok}");
+        }
+        let public = [
+            "",
+            "evil.example",
+            "lan.evil.example",
+            "router.lan.evil.example",
+        ];
+        for bad in public {
+            assert!(!local_host_name(bad), "{bad}");
+        }
     }
 
     #[test]
