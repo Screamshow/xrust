@@ -48,7 +48,8 @@ pub struct CacheEntry {
 }
 
 pub enum CacheHit {
-    Fresh(Arc<[u8]>),
+    /// The answer and the whole seconds of TTL it has left.
+    Fresh(Arc<[u8]>, u32),
     /// Stale-but-servable: caller must trigger a background refresh.
     Stale(Arc<[u8]>),
 }
@@ -71,7 +72,8 @@ impl Cache {
         let entry = self.entries.get(key)?;
         let age = now.duration_since(entry.inserted);
         if age < entry.ttl {
-            return Some(CacheHit::Fresh(Arc::clone(&entry.raw)));
+            let remaining = (entry.ttl - age).as_secs().min(u32::MAX as u64) as u32;
+            return Some(CacheHit::Fresh(Arc::clone(&entry.raw), remaining));
         }
         if entry.optimistic_until.is_some_and(|until| now < until) {
             return Some(CacheHit::Stale(Arc::clone(&entry.raw)));
@@ -151,7 +153,7 @@ mod tests {
         // timestamp a hair later, and the 61-second probe then lands just under
         // the 61 seconds it meant to be, which is a test that fails at random.
         let now = Instant::now();
-        assert!(matches!(cache.get(&key(), now), Some(CacheHit::Fresh(_))));
+        assert!(matches!(cache.get(&key(), now), Some(CacheHit::Fresh(..))));
         assert!(cache.get(&key(), now + Duration::from_secs(61)).is_none());
     }
 
@@ -165,7 +167,7 @@ mod tests {
             Some(Duration::from_secs(300)),
         );
         let now = Instant::now();
-        assert!(matches!(cache.get(&key(), now), Some(CacheHit::Fresh(_))));
+        assert!(matches!(cache.get(&key(), now), Some(CacheHit::Fresh(..))));
         assert!(matches!(
             cache.get(&key(), now + Duration::from_secs(2)),
             Some(CacheHit::Stale(_))
@@ -210,7 +212,7 @@ mod tests {
         // touch the oldest insert
         assert!(matches!(
             cache.get(&probe("h0.test"), Instant::now()),
-            Some(CacheHit::Fresh(_))
+            Some(CacheHit::Fresh(..))
         ));
         let mut newest = key();
         newest.name = "h16.test".into();

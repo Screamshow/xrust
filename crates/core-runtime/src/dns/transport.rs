@@ -1155,7 +1155,20 @@ pub async fn exchange(
         match cfg.kind {
             // mdns has no server address: the router runs it before it gets here
             Kind::Mdns => Err(io::Error::other("dns: mdns server has no address")),
-            Kind::Udp => exchange_udp(dialer, cfg, addr, query).await,
+            Kind::Udp => {
+                let response = exchange_udp(dialer, cfg, addr, query).await?;
+                if !is_truncated(&response) {
+                    return Ok(response);
+                }
+                // reference `UDPTransport.Exchange`: a truncated answer is
+                // asked again over TCP, within the same timeout
+                crate::logging::debug(format_args!(
+                    "dns: {:?} response truncated, retrying with tcp",
+                    cfg.tag
+                ));
+                let stream = dialer.tcp(cfg, addr).await?;
+                exchange_stream(stream, query).await
+            }
             Kind::Tcp => {
                 let stream = dialer.tcp(cfg, addr).await?;
                 exchange_stream(stream, query).await
@@ -1196,6 +1209,11 @@ pub async fn exchange(
 }
 
 const DNS_HEADER_LEN: usize = 12;
+
+/// The TC bit of a DNS header.
+pub(crate) fn is_truncated(msg: &[u8]) -> bool {
+    msg.get(2).is_some_and(|flags| flags & 0x02 != 0)
+}
 
 /// A random DNS ID for one upstream query.
 pub(crate) fn random_id() -> io::Result<u16> {

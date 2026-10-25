@@ -649,10 +649,13 @@ impl DnsService {
             // the cache; re-recording identical bytes per hit cost a full
             // message parse. Just stamp the client id.
             match hit {
-                Some(CacheHit::Fresh(raw)) => return codec::set_id(&raw, info.id),
+                Some(CacheHit::Fresh(raw, remaining)) => {
+                    return self.cached_answer(&raw, remaining, info.id);
+                }
                 Some(CacheHit::Stale(raw)) => {
                     self.spawn_refresh(meta.clone(), query.to_vec(), allow_fakeip, key.clone());
-                    return codec::set_id(&raw, info.id);
+                    // reference `loadResponse`: a stale answer goes out with TTL 1
+                    return self.cached_answer(&raw, 1, info.id);
                 }
                 None => {}
             }
@@ -673,10 +676,10 @@ impl DnsService {
         let _guard = lock.lock().await;
         if use_cache && !skip_cache_read {
             let now = std::time::Instant::now();
-            if let Some(CacheHit::Fresh(raw)) =
+            if let Some(CacheHit::Fresh(raw, remaining)) =
                 self.cache.write().expect("dns cache").get(&key, now)
             {
-                return codec::set_id(&raw, info.id);
+                return self.cached_answer(&raw, remaining, info.id);
             }
         }
 
@@ -688,11 +691,12 @@ impl DnsService {
         // Reverse mapping is recorded only when the walk returns this answer.
 
         if use_cache && let Ok(meta_resp) = codec::response_meta(&rewritten) {
+            // a truncated answer is a partial one: never serve it from cache
             let cacheable = matches!(
                 meta_resp.rcode,
                 hickory_proto::op::ResponseCode::NoError
                     | hickory_proto::op::ResponseCode::NXDomain
-            );
+            ) && !transport::is_truncated(&rewritten);
             if cacheable {
                 let mut cache = self.cache.write().expect("dns cache");
                 // disable_expire pins entries (ttl checked against optimistic window only).
@@ -713,6 +717,19 @@ impl DnsService {
             }
         }
         codec::set_id(&rewritten, info.id)
+    }
+
+    /// A cached answer goes out with the TTL it has left, as the reference
+    /// serves it (`loadResponse`); a pinned (`disable_expire`) entry keeps
+    /// its own.
+    fn cached_answer(&self, raw: &[u8], remaining: u32, id: u16) -> std::io::Result<Vec<u8>> {
+        if self.disable_expire {
+            return codec::set_id(raw, id);
+        }
+        // the bytes decoded once when they were cached; should a re-encode
+        // fail all the same, the answer as stored beats no answer
+        let raw = codec::rewrite_ttl(raw, remaining).unwrap_or_else(|_| raw.to_vec());
+        codec::set_id(&raw, id)
     }
 
     fn spawn_refresh(
@@ -1846,5 +1863,147 @@ mod tests {
             Ok(_) => panic!("optimistic must conflict with disable_cache"),
         };
         assert!(err.contains("optimistic"), "{err}");
+    }
+
+    /// A udp server on `port` that answers every query with an empty TC=1
+    /// reply, next to a tcp server on the same port that answers in full.
+    async fn truncating_upstream() -> (
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        let (udp, tcp) = loop {
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = udp.local_addr().unwrap().port();
+            if let Ok(tcp) = tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                break (udp, tcp);
+            }
+        };
+        let port = udp.local_addr().unwrap().port();
+        let udp_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tcp_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = udp_count.clone();
+        let udp_worker = tokio::spawn(async move {
+            let mut buf = vec![0; 4096];
+            loop {
+                let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // the question echoed back as a reply with TC set, no answers
+                let mut reply = buf[..n].to_vec();
+                reply[2] |= 0x82;
+                udp.send_to(&reply, peer).await.unwrap();
+            }
+        });
+        let seen = tcp_count.clone();
+        let tcp_worker = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut stream, _) = tcp.accept().await.unwrap();
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut len = [0u8; 2];
+                stream.read_exact(&mut len).await.unwrap();
+                let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
+                stream.read_exact(&mut query).await.unwrap();
+                let (message, _) = codec::parse_query(&query).unwrap();
+                let raw = codec::synth_addresses(
+                    &message,
+                    &[
+                        "203.0.113.1".parse().unwrap(),
+                        "203.0.113.2".parse().unwrap(),
+                    ],
+                    60,
+                )
+                .unwrap();
+                let mut framed = (raw.len() as u16).to_be_bytes().to_vec();
+                framed.extend_from_slice(&raw);
+                stream.write_all(&framed).await.unwrap();
+            }
+        });
+        (port, udp_count, tcp_count, vec![udp_worker, tcp_worker])
+    }
+
+    #[tokio::test]
+    async fn a_truncated_udp_answer_is_retried_over_tcp_and_never_cached() {
+        let (port, udp_count, tcp_count, workers) = truncating_upstream().await;
+        let svc = Arc::new(
+            DnsService::build(&serde_json::json!({"dns":{
+                "servers":[{"type":"udp","tag":"real","server":"127.0.0.1","server_port":port}],
+                "final":"real"
+            }}))
+            .unwrap()
+            .unwrap(),
+        );
+        let full = vec![
+            "203.0.113.1".parse::<IpAddr>().unwrap(),
+            "203.0.113.2".parse::<IpAddr>().unwrap(),
+        ];
+        for id in [123, 456] {
+            let query = codec::build_query(id, "big.example", RecordType::A).unwrap();
+            let raw = svc
+                .exchange(&QueryMeta::default(), &query, true)
+                .await
+                .unwrap();
+            assert_eq!(codec::parse_message(&raw).unwrap().id, id);
+            assert!(
+                !tc_set(&raw),
+                "query {id}: a truncated answer reached the client"
+            );
+            assert_eq!(codec::answer_ips(&raw).unwrap(), full, "query {id}");
+        }
+        // the second query came from the cache, which holds the tcp answer
+        assert_eq!(udp_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(tcp_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for worker in workers {
+            worker.abort();
+        }
+    }
+
+    fn tc_set(raw: &[u8]) -> bool {
+        raw[2] & 0x02 != 0
+    }
+
+    #[tokio::test]
+    async fn a_cached_answer_goes_out_with_the_ttl_it_has_left() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let responder = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            loop {
+                let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+                let (message, _) = codec::parse_query(&buf[..n]).unwrap();
+                let raw = codec::synth_addresses(&message, &["203.0.113.7".parse().unwrap()], 60)
+                    .unwrap();
+                socket.send_to(&raw, peer).await.unwrap();
+            }
+        });
+        let svc = Arc::new(
+            DnsService::build(&serde_json::json!({"dns":{
+                "servers":[{"type":"udp","tag":"real","server":"127.0.0.1","server_port":port}],
+                "final":"real"
+            }}))
+            .unwrap()
+            .unwrap(),
+        );
+        let ttl = |raw: &[u8]| codec::parse_message(raw).unwrap().answers[0].ttl;
+        let query = codec::build_query(1, "ttl.example", RecordType::A).unwrap();
+        let first = svc
+            .exchange(&QueryMeta::default(), &query, true)
+            .await
+            .unwrap();
+        assert_eq!(ttl(&first), 60);
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        let query = codec::build_query(2, "ttl.example", RecordType::A).unwrap();
+        let cached = svc
+            .exchange(&QueryMeta::default(), &query, true)
+            .await
+            .unwrap();
+        // reference `loadResponse`: whole seconds left, rounded down
+        assert!(
+            (55..=57).contains(&ttl(&cached)),
+            "served ttl {} after 2.1 s of a 60 s answer",
+            ttl(&cached)
+        );
+        responder.abort();
     }
 }
