@@ -195,6 +195,7 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
     let raw = load_config(args).map_err(|e| format!("run: {e}"))?;
+    core_runtime::route::rule_set_remote::remove_legacy_tsrs_cache();
     #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
     allocstat::start();
     if let Ok(warnings) = core_config::check_str_warnings(&raw) {

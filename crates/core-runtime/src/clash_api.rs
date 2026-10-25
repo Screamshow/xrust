@@ -570,7 +570,7 @@ async fn handle_request(
             respond_redirect(stream, 301, "/ui/", &cors).await?;
         }
         Route::Version => {
-            let version = format!("tachyon-core {}", env!("CARGO_PKG_VERSION"));
+            let version = format!("Xrust {}", env!("CARGO_PKG_VERSION"));
             respond_json(
                 stream,
                 200,

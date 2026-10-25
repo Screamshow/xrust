@@ -40,16 +40,51 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Default path for caching mmap-able .tsrs binary images.
-/// On Linux/OpenWrt this points to `/tmp/tachyon-rulesets/` (tmpfs in RAM),
+/// On Linux/OpenWrt this points to `/tmp/xrust-rulesets/` (tmpfs in RAM),
 /// which prevents wearing down SPI flash storage.
 pub fn default_tsrs_cache_path(tag: &str) -> std::path::PathBuf {
     #[cfg(unix)]
     {
-        std::path::PathBuf::from(format!("/tmp/tachyon-rulesets/{tag}.tsrs"))
+        std::path::PathBuf::from(format!("/tmp/xrust-rulesets/{tag}.tsrs"))
     }
     #[cfg(not(unix))]
     {
-        std::env::temp_dir().join(format!("tachyon-rulesets/{tag}.tsrs"))
+        std::env::temp_dir().join(format!("xrust-rulesets/{tag}.tsrs"))
+    }
+}
+
+/// Cache directory of releases before the rename. Its images are rebuilt
+/// under the new path, so the old ones only hold tmpfs RAM until a reboot.
+#[cfg(unix)]
+const LEGACY_TSRS_CACHE_DIR: &str = "/tmp/tachyon-rulesets";
+
+/// Drop the cache directory older releases left in tmpfs. Best effort: only
+/// regular `.tsrs`/`.tmp` files go, and a symlinked directory is left alone.
+pub fn remove_legacy_tsrs_cache() {
+    #[cfg(unix)]
+    remove_tsrs_cache_dir(std::path::Path::new(LEGACY_TSRS_CACHE_DIR));
+}
+
+#[cfg(unix)]
+fn remove_tsrs_cache_dir(dir: &std::path::Path) {
+    if !std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let cache_image = matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("tsrs" | "tmp")
+        );
+        if cache_image && entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if std::fs::remove_dir(dir).is_ok() {
+        logging::info(format_args!("removed old rule-set cache {}", dir.display()));
     }
 }
 
@@ -96,7 +131,7 @@ pub struct RemoteSpec {
     pub delta_update: bool,
     /// Cache update interval (e.g. "1h"). Overrides update_interval when set.
     pub cache_interval: Duration,
-    /// Custom path to cache .tsrs binary file (default: /tmp/tachyon-rulesets/<tag>.tsrs).
+    /// Custom path to cache .tsrs binary file (default: /tmp/xrust-rulesets/<tag>.tsrs).
     pub cache_file: Option<String>,
     /// Mmap mode: "auto" | "mmap" | "memory".
     pub mode: crate::route::mmap_set::MmapMode,
@@ -777,6 +812,50 @@ pub(crate) fn write_tsrs_if_changed(path: &std::path::Path, bytes: &[u8]) -> io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_cache_removal_takes_only_cache_images() {
+        let root = std::env::temp_dir().join(format!("xrust-legacy-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let only_images = root.join("images");
+        std::fs::create_dir_all(&only_images).unwrap();
+        std::fs::write(only_images.join("a.tsrs"), b"TSRS").unwrap();
+        std::fs::write(only_images.join("a.tmp"), b"TSRS").unwrap();
+        remove_tsrs_cache_dir(&only_images);
+        assert!(!only_images.exists(), "an images-only directory is removed");
+
+        let mixed = root.join("mixed");
+        std::fs::create_dir_all(&mixed).unwrap();
+        std::fs::write(mixed.join("b.tsrs"), b"TSRS").unwrap();
+        std::fs::write(mixed.join("keep.txt"), b"other").unwrap();
+        remove_tsrs_cache_dir(&mixed);
+        assert!(!mixed.join("b.tsrs").exists());
+        assert!(mixed.join("keep.txt").exists(), "foreign files stay");
+
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("c.tsrs"), b"TSRS").unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        remove_tsrs_cache_dir(&link);
+        assert!(
+            target.join("c.tsrs").exists(),
+            "a symlinked directory is not followed"
+        );
+
+        remove_tsrs_cache_dir(&root.join("missing"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_cache_lives_under_the_xrust_directory() {
+        assert_eq!(
+            default_tsrs_cache_path("main"),
+            std::path::PathBuf::from("/tmp/xrust-rulesets/main.tsrs")
+        );
+    }
 
     #[test]
     fn unchanged_tsrs_keeps_file_and_changed_tsrs_preserves_old_mapping() {

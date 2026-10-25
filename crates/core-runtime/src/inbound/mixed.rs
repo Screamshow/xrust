@@ -593,7 +593,7 @@ async fn http(
         stream
             .write_all(
                 b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                  Proxy-Authenticate: Basic realm=\"tachyon\"\r\n\
+                  Proxy-Authenticate: Basic realm=\"xrust\"\r\n\
                   Content-Length: 0\r\n\r\n",
             )
             .await?;

@@ -242,7 +242,7 @@ async fn clash_api_rest_surface() {
     assert!(
         version["version"]
             .as_str()
-            .is_some_and(|v| v.starts_with("tachyon-core ")),
+            .is_some_and(|v| v.starts_with("Xrust ")),
         "{version}"
     );
     assert_eq!(version["premium"], true);
