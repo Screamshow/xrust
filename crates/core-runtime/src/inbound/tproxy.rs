@@ -119,6 +119,7 @@ impl Tproxy {
                 std::future::pending::<()>().await;
                 return;
             };
+            let listen_port = listener.local_addr().map_or(0, |addr| addr.port());
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
@@ -126,6 +127,12 @@ impl Tproxy {
                         let router = Arc::clone(&tcp_router);
                         let tag = tcp_tag.clone();
                         let destination = match stream.local_addr() {
+                            Ok(addr) if targets_own_listener(addr, listen_port) => {
+                                logging::warn(format_args!(
+                                    "tproxy[{tag}] {peer}: reject loopback connection to {addr}"
+                                ));
+                                continue;
+                            }
                             Ok(addr) => Target::Ip(addr),
                             Err(err) => {
                                 logging::error(format_args!(
@@ -162,6 +169,7 @@ impl Tproxy {
             let _stop_hub = StopHub(Arc::clone(&hub));
             let mut flows = tokio::task::JoinSet::new();
             let mut reply_sockets = HashMap::<_, std::sync::Weak<UdpSocket>>::new();
+            let listen_port = sock.local_addr().map_or(0, |addr| addr.port());
             let fallback = Target::Ip(match sock.local_addr() {
                 Ok(a) => a,
                 Err(_) => return,
@@ -195,6 +203,12 @@ impl Tproxy {
                             };
                             *a
                         });
+                        if targets_own_listener(dest, listen_port) {
+                            logging::debug(format_args!(
+                                "tproxy[{tag}] udp {source}: reject loopback packet to {dest}"
+                            ));
+                            continue;
+                        }
                         // one task per opening flow; its other datagrams queue
                         let Some(opener) = hub.offer(source, dest, &buf[..n]) else {
                             continue;
@@ -264,6 +278,25 @@ impl Tproxy {
             _ = udp_loop => {}
         }
     }
+}
+
+/// A destination on one of this host's own addresses at the listener's port
+/// is a direct connection to the inbound itself, not intercepted traffic (the
+/// LAN can reach `0.0.0.0:<port>` like any local service). Relaying it through
+/// `direct` dials the listener again from the host and recurses until file
+/// descriptors run out.
+fn targets_own_listener(destination: SocketAddr, listen_port: u16) -> bool {
+    if destination.port() != listen_port {
+        return false;
+    }
+    let ip = destination.ip().to_canonical();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || if_addrs::get_if_addrs().is_ok_and(|interfaces| {
+            interfaces
+                .iter()
+                .any(|interface| interface.ip().to_canonical() == ip)
+        })
 }
 
 struct StopHub(Arc<UdpHub>);
@@ -556,6 +589,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn own_listener_destination_is_detected() {
+        for own in [
+            "127.0.0.1:1602",
+            "127.0.0.2:1602",
+            "[::1]:1602",
+            "[::ffff:127.0.0.1]:1602",
+        ] {
+            assert!(targets_own_listener(own.parse().unwrap(), 1602), "{own}");
+        }
+        // other ports and TEST-NET-3 (never a host address) are intercepted traffic
+        for other in ["127.0.0.1:443", "203.0.113.7:1602", "[2001:db8::1]:1602"] {
+            assert!(
+                !targets_own_listener(other.parse().unwrap(), 1602),
+                "{other}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_connection_to_listener_is_not_relayed_to_itself() {
+        use tokio::io::AsyncReadExt;
+        // Sniffing waits for client bytes, so a relay loop gains one hop per
+        // timeout here instead of exhausting descriptors while the test runs.
+        let router = Router::new(&serde_json::json!({
+            "outbounds": [{"type": "direct", "tag": "direct"}],
+            "route": {
+                "rules": [{"action": "sniff", "inbound": ["tproxy-in"], "timeout": "200ms"}],
+                "final": "direct"
+            }
+        }))
+        .unwrap();
+        // A plain listener behaves like the transparent one for a connection
+        // addressed to it: its local address is the listener itself.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let inbound = Tproxy {
+            listener: Some(listener),
+            udp: None,
+            tag: "tproxy-in".to_string(),
+            router,
+            udp_timeout: DEFAULT_UDP_TIMEOUT,
+            udp_nat_max: MAX_UDP_FLOWS,
+        };
+        let server = tokio::spawn(inbound.serve());
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 16];
+        let outcome = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await;
+        server.abort();
+        assert!(
+            matches!(outcome, Ok(Ok(0)) | Ok(Err(_))),
+            "connection to the listener itself must be closed, not relayed: {outcome:?}"
+        );
     }
 
     #[tokio::test]
