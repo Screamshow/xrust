@@ -211,6 +211,123 @@ async fn direct_inbound_override_port_only() {
     instance.shutdown();
 }
 
+/// The kernel timer on the inbound's end of a loopback connection, as
+/// `/proc/net/tcp` shows it: `(kind, clock ticks left)`, where kind `2` is the
+/// keep-alive timer and `0` means no timer at all.
+#[cfg(target_os = "linux")]
+fn server_side_timer(server: SocketAddr, client: SocketAddr) -> Option<(u8, u64)> {
+    fn hex(addr: SocketAddr) -> String {
+        let SocketAddr::V4(v4) = addr else {
+            panic!("ipv4 only: {addr}");
+        };
+        format!(
+            "{:08X}:{:04X}",
+            u32::from_ne_bytes(v4.ip().octets()),
+            v4.port()
+        )
+    }
+    let (local, remote) = (hex(server), hex(client));
+    let table = std::fs::read_to_string("/proc/net/tcp").ok()?;
+    table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.get(1) != Some(&local.as_str()) || fields.get(2) != Some(&remote.as_str()) {
+            return None;
+        }
+        let (kind, when) = fields.get(5)?.split_once(':')?;
+        Some((
+            u8::from_str_radix(kind, 16).ok()?,
+            u64::from_str_radix(when, 16).ok()?,
+        ))
+    })
+}
+
+/// An accepted transparent connection is probed: a LAN client that vanishes
+/// must not leave its relay waiting forever on a socket that never errors.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn accepted_transparent_socket_has_keep_alive() {
+    let _g = test_guard().await;
+    let echo = spawn_echo().await;
+    let cfg = base_cfg(
+        json!([
+            {
+                "type": "direct",
+                "tag": "direct-in",
+                "listen": "127.0.0.1",
+                "listen_port": 0,
+                "override_address": "127.0.0.1",
+                "override_port": echo.port()
+            }
+        ]),
+        json!([{"type": "direct", "tag": "out"}]),
+        json!({"final": "out"}),
+    );
+    let instance = start_box(cfg).await;
+    let addr = inbound_addr(&instance, "direct-in");
+
+    let mut stream = TcpStream::connect(addr).await.expect("connect direct");
+    stream.write_all(b"keep-alive").await.expect("write");
+    let mut buf = [0u8; 64];
+    let n = stream.read(&mut buf).await.expect("read echo");
+    assert_eq!(&buf[..n], b"keep-alive");
+    let client = stream.local_addr().expect("client addr");
+
+    // the echo's own retransmit timer can show for a moment before the ACK
+    let mut timer = None;
+    for _ in 0..100 {
+        timer = server_side_timer(addr, client);
+        if matches!(timer, Some((2, _))) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (kind, ticks) = timer.expect("accepted socket in /proc/net/tcp");
+    assert_eq!(kind, 2, "accepted socket has no keep-alive timer");
+    // reference idle is 5 min: the first probe is minutes away, not seconds
+    // (ticks are USER_HZ, 100 on Linux)
+    assert!(ticks > 60 * 100, "keep-alive idle too short: {ticks} ticks");
+    instance.shutdown();
+}
+
+/// A mixed (SOCKS/HTTP) client is probed as well: the same vanished-client
+/// leak applies to the proxy port.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn accepted_mixed_socket_has_keep_alive() {
+    let _g = test_guard().await;
+    let cfg = base_cfg(
+        json!([
+            {
+                "type": "mixed",
+                "tag": "mixed-in",
+                "listen": "127.0.0.1",
+                "listen_port": 0
+            }
+        ]),
+        json!([{"type": "direct", "tag": "out"}]),
+        json!({"final": "out"}),
+    );
+    let instance = start_box(cfg).await;
+    let addr = inbound_addr(&instance, "mixed-in");
+
+    // nothing sent: the handshake is still pending, which is where an idle
+    // client sits too
+    let stream = TcpStream::connect(addr).await.expect("connect mixed");
+    let client = stream.local_addr().expect("client addr");
+    let mut timer = None;
+    for _ in 0..100 {
+        timer = server_side_timer(addr, client);
+        if matches!(timer, Some((2, _))) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (kind, _) = timer.expect("accepted socket in /proc/net/tcp");
+    assert_eq!(kind, 2, "accepted mixed socket has no keep-alive timer");
+    drop(stream);
+    instance.shutdown();
+}
+
 /// CAP_NET_ADMIN, as the linux kernel reports it. The privileged docker gate
 /// and the CI sudo step have it; plain GitHub runners do not.
 fn has_net_admin() -> bool {

@@ -73,6 +73,44 @@ pub(crate) fn bind_udp(addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     tokio::net::UdpSocket::from_std(std_socket)
 }
 
+/// Keep-alive on an accepted client socket, with the reference listener's
+/// values (`common/listener/listener_tcp.go`: `C.TCPKeepAliveInitial` 5 min,
+/// `C.TCPKeepAliveInterval` 75 s, the kernel's 9 probes). Without it a LAN
+/// client that vanishes (Wi-Fi drop, phone asleep) leaves a relay waiting on
+/// a socket that never errors while the upstream stays up; with it the kernel
+/// fails that socket about 5 min + 9 x 75 s ~ 16 min after the last word
+/// from the peer. The interval is long on purpose: probes wake phone radios.
+const ACCEPTED_KEEP_ALIVE_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+#[cfg_attr(
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "windows"
+    )),
+    allow(dead_code)
+)]
+const ACCEPTED_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(75);
+
+pub(crate) fn keep_alive_accepted(stream: &TcpStream) {
+    let params = socket2::TcpKeepalive::new().with_time(ACCEPTED_KEEP_ALIVE_IDLE);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
+    let params = params.with_interval(ACCEPTED_KEEP_ALIVE_INTERVAL);
+    if let Err(err) = socket2::SockRef::from(stream).set_tcp_keepalive(&params) {
+        // the connection still works, it just is not probed
+        logging::debug(format_args!("accepted socket keep-alive: {err}"));
+    }
+}
+
 /// An error from a serving loop: log it loudly and pause, never end the loop.
 ///
 /// Every inbound used to `return` on the first `accept` failure, which drops
@@ -1190,6 +1228,7 @@ pub(crate) async fn drive_transparent(
     tag: &str,
     router: &Arc<Router>,
 ) -> io::Result<()> {
+    keep_alive_accepted(&stream);
     drive_framed(ClientConn::http(stream), peer, destination, tag, router).await
 }
 

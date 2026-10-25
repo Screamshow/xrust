@@ -113,6 +113,7 @@ impl Mixed {
             match self.listener.accept().await {
                 Ok((stream, peer)) => {
                     let _ = stream.set_nodelay(true);
+                    super::keep_alive_accepted(&stream);
                     let router = Arc::clone(&self.router);
                     let users = self.users.clone();
                     let tag = self.tag.clone();
