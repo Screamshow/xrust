@@ -214,18 +214,23 @@ impl Db {
                 found = Some((m, ps));
             }
         }
-        if found.is_none() {
-            for cand in [4096usize, 65536, 8192, 16384, 32768] {
-                if data.len() < cand + PAGE_HEADER + META_BODY {
-                    continue;
-                }
-                if let Some(m) = parse_meta(&data[cand..cand + PAGE_HEADER + META_BODY])
-                    && m.page_size as usize == cand
-                    && data.len() % cand == 0
-                {
-                    found = Some((m, cand));
-                    break;
-                }
+        // bbolt alternates commits between the two meta pages; like `db.meta()`
+        // in the reference, the valid one with the higher txid is current.
+        let candidates = match found {
+            Some((_, ps)) => vec![ps],
+            None => vec![4096usize, 65536, 8192, 16384, 32768],
+        };
+        for cand in candidates {
+            if data.len() < cand + PAGE_HEADER + META_BODY {
+                continue;
+            }
+            if let Some(m) = parse_meta(&data[cand..cand + PAGE_HEADER + META_BODY])
+                && m.page_size as usize == cand
+                && data.len() % cand == 0
+                && found.is_none_or(|(meta0, _)| m.txid > meta0.txid)
+            {
+                found = Some((m, cand));
+                break;
             }
         }
         let (meta, page_size) = found.ok_or_else(|| err("no valid meta page"))?;
