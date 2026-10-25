@@ -67,6 +67,10 @@ impl Strategy {
     }
 }
 
+/// The result of one upstream exchange, shared by every query for the same
+/// name that arrived while it ran.
+type Flight = tokio::sync::OnceCell<Result<Arc<[u8]>, (std::io::ErrorKind, String)>>;
+
 pub struct DnsService {
     // Resolver tags are not identities: a reload can change the server behind
     // the same tag. Keep answer/bootstrap caches only for unchanged DNS policy.
@@ -79,10 +83,12 @@ pub struct DnsService {
     disable_expire: bool,
     optimistic_timeout: Option<Duration>,
     cache: RwLock<Cache>,
-    /// One lock per name that is being looked up right now; the value is a
-    /// `Weak` so a finished query stops keeping anything alive — dead entries
-    /// are purged on the next insert (the key itself owns an `Arc<str>`).
-    inflight: std::sync::Mutex<HashMap<CacheKey, Weak<tokio::sync::Mutex<()>>>>,
+    /// One shared exchange per name that is being looked up right now: every
+    /// query that arrives meanwhile takes its result, error included. The
+    /// value is a `Weak` so a finished query stops keeping anything alive —
+    /// dead entries are purged on the next insert (the key itself owns an
+    /// `Arc<str>`).
+    inflight: std::sync::Mutex<HashMap<CacheKey, Weak<Flight>>>,
     refreshing: std::sync::Mutex<HashSet<CacheKey>>,
     /// Positive transport-address cache; ports are applied by each caller.
     server_addrs: std::sync::Mutex<HashMap<ServerAddrKey, (IpAddr, Instant)>>,
@@ -661,30 +667,74 @@ impl DnsService {
             }
         }
 
-        let lock = {
+        // reference `beginExchange`: only a cached exchange waits for one in
+        // flight; an uncached one (the dns_failover probes) asks on its own
+        if !use_cache {
+            let raw = self
+                .fetch(&target, query, opts.rewrite_ttl, false, &key, optimistic)
+                .await?;
+            return codec::set_id(&raw, info.id);
+        }
+        let flight = {
             let mut inflight = self.inflight.lock().expect("dns inflight");
             inflight.retain(|_, weak| weak.strong_count() > 0);
             match inflight.get(&key).and_then(Weak::upgrade) {
-                Some(lock) => lock,
+                Some(flight) => flight,
                 None => {
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    inflight.insert(key.clone(), Arc::downgrade(&lock));
-                    lock
+                    let flight = Arc::new(Flight::new());
+                    inflight.insert(key.clone(), Arc::downgrade(&flight));
+                    flight
                 }
             }
         };
-        let _guard = lock.lock().await;
-        if use_cache && !skip_cache_read {
-            let now = std::time::Instant::now();
-            if let Some(CacheHit::Fresh(raw, remaining)) =
-                self.cache.write().expect("dns cache").get(&key, now)
-            {
-                return self.cached_answer(&raw, remaining, info.id);
-            }
-        }
+        // a cancelled leader hands the exchange to the next waiter
+        let (key, target, this) = (&key, &target, &flight);
+        let rewrite_ttl = opts.rewrite_ttl;
+        let shared = flight
+            .get_or_init(|| async move {
+                let result = async {
+                    if !skip_cache_read {
+                        let now = std::time::Instant::now();
+                        if let Some(CacheHit::Fresh(raw, remaining)) =
+                            self.cache.write().expect("dns cache").get(key, now)
+                        {
+                            return self.cached_answer(&raw, remaining, 0).map(Arc::from);
+                        }
+                    }
+                    self.fetch(target, query, rewrite_ttl, true, key, optimistic)
+                        .await
+                }
+                .await
+                .map_err(|err| (err.kind(), err.to_string()));
+                // whoever arrives from now on starts a new exchange; the
+                // queries already waiting share this result, error included
+                let mut inflight = self.inflight.lock().expect("dns inflight");
+                if inflight
+                    .get(key)
+                    .is_some_and(|weak| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(this)))
+                {
+                    inflight.remove(key);
+                }
+                result
+            })
+            .await
+            .clone();
+        let raw = shared.map_err(|(kind, msg)| std::io::Error::new(kind, msg))?;
+        codec::set_id(&raw, info.id)
+    }
 
-        let response = self.exchange_remote(&target, query).await?;
-        let rewritten: Arc<[u8]> = match opts.rewrite_ttl {
+    /// One upstream exchange, stored in the cache when `use_cache` allows.
+    async fn fetch(
+        self: &Arc<Self>,
+        target: &ServerConfig,
+        query: &[u8],
+        rewrite_ttl: Option<u32>,
+        use_cache: bool,
+        key: &CacheKey,
+        optimistic: Option<Duration>,
+    ) -> std::io::Result<Arc<[u8]>> {
+        let response = self.exchange_remote(target, query).await?;
+        let rewritten: Arc<[u8]> = match rewrite_ttl {
             Some(ttl) => codec::rewrite_ttl(&response, ttl)?.into(),
             None => response.into(),
         };
@@ -716,7 +766,7 @@ impl DnsService {
                 );
             }
         }
-        codec::set_id(&rewritten, info.id)
+        Ok(rewritten)
     }
 
     /// A cached answer goes out with the TTL it has left, as the reference
@@ -2005,5 +2055,107 @@ mod tests {
             ttl(&cached)
         );
         responder.abort();
+    }
+
+    /// A udp server that counts queries and answers none of the first `mute`.
+    async fn muted_upstream(
+        mute: usize,
+    ) -> (
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = count.clone();
+        let worker = tokio::spawn(async move {
+            let mut buf = [0; 512];
+            loop {
+                let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+                if seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < mute {
+                    continue;
+                }
+                let (message, _) = codec::parse_query(&buf[..n]).unwrap();
+                let raw = codec::synth_addresses(&message, &["203.0.113.7".parse().unwrap()], 60)
+                    .unwrap();
+                socket.send_to(&raw, peer).await.unwrap();
+            }
+        });
+        (port, count, worker)
+    }
+
+    #[tokio::test]
+    async fn concurrent_identical_queries_share_one_failed_exchange() {
+        let (port, count, worker) = muted_upstream(usize::MAX).await;
+        let svc = Arc::new(
+            DnsService::build(&serde_json::json!({"dns":{
+                "servers":[{"type":"udp","tag":"real","server":"127.0.0.1","server_port":port,
+                    "timeout":"300ms"}],
+                "final":"real"
+            }}))
+            .unwrap()
+            .unwrap(),
+        );
+        let started = Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for id in 1..=4u16 {
+            let svc = svc.clone();
+            tasks.spawn(async move {
+                let query = codec::build_query(id, "down.example", RecordType::A).unwrap();
+                let result = svc.exchange(&QueryMeta::default(), &query, true).await;
+                (result.is_err(), started.elapsed())
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let (failed, elapsed) = joined.unwrap();
+            assert!(failed);
+            // one 300 ms timeout for all of them, not one after another
+            assert!(
+                elapsed < Duration::from_millis(750),
+                "a waiting query failed after {elapsed:?}"
+            );
+        }
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn an_uncached_query_does_not_wait_behind_one_in_flight() {
+        // the first query is never answered; the probe after it should be
+        let (port, _, worker) = muted_upstream(1).await;
+        let svc = Arc::new(
+            DnsService::build(&serde_json::json!({"dns":{
+                "servers":[{"type":"udp","tag":"real","server":"127.0.0.1","server_port":port,
+                    "timeout":"1s"}],
+                "rules":[{"inbound":"probe","action":"route","server":"real","disable_cache":true}],
+                "final":"real"
+            }}))
+            .unwrap()
+            .unwrap(),
+        );
+        let stuck = {
+            let svc = svc.clone();
+            tokio::spawn(async move {
+                let query = codec::build_query(1, "example.com", RecordType::A).unwrap();
+                svc.exchange(&QueryMeta::default(), &query, true).await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let probe = QueryMeta {
+            inbound: Some("probe".into()),
+            ..Default::default()
+        };
+        let query = codec::build_query(2, "example.com", RecordType::A).unwrap();
+        let started = Instant::now();
+        let raw = svc.exchange(&probe, &query, true).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the uncached probe waited {:?} behind the stuck query",
+            started.elapsed()
+        );
+        assert_eq!(codec::parse_message(&raw).unwrap().id, 2);
+        assert!(stuck.await.unwrap().is_err());
+        worker.abort();
     }
 }
