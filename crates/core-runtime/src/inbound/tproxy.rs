@@ -6,7 +6,9 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
 
-use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, UdpHub};
+use crate::inbound::udp::{
+    DEFAULT_UDP_TIMEOUT, DatagramFrame, MAX_UDP_FLOWS, Reply, UdpHub, recv_with,
+};
 use crate::inbound::{Target, drive_transparent, network_includes_udp, parse_listen};
 use crate::logging;
 use crate::outbound::urltest::parse_duration;
@@ -24,6 +26,7 @@ pub struct Tproxy {
     tag: String,
     router: Arc<Router>,
     udp_timeout: std::time::Duration,
+    udp_nat_max: usize,
 }
 
 impl Tproxy {
@@ -67,6 +70,14 @@ impl Tproxy {
             DEFAULT_UDP_TIMEOUT,
             &format!("{at}: udp_timeout"),
         )?;
+        // sing-box `udp_nat_max`; 0 or absent keeps the default
+        let udp_nat_max = obj
+            .get("udp_nat_max")
+            .and_then(Value::as_u64)
+            .filter(|&max| max > 0)
+            .map_or(MAX_UDP_FLOWS, |max| {
+                usize::try_from(max).unwrap_or(usize::MAX)
+            });
 
         logging::info(format_args!(
             "inbound tproxy[{tag}] listening at {ip}:{bound_port} (tcp={}, udp={})",
@@ -79,6 +90,7 @@ impl Tproxy {
             tag: tag.to_string(),
             router,
             udp_timeout,
+            udp_nat_max,
         })
     }
 
@@ -99,6 +111,7 @@ impl Tproxy {
             tag,
             router,
             udp_timeout,
+            udp_nat_max,
         } = self;
         let (tcp_tag, tcp_router) = (tag.clone(), Arc::clone(&router));
         let tcp = async move {
@@ -140,7 +153,12 @@ impl Tproxy {
                 std::future::pending::<()>().await;
                 return;
             };
-            let hub = UdpHub::new(Arc::clone(&router), udp_timeout, DatagramFrame::Raw);
+            let hub = UdpHub::with_max_flows(
+                Arc::clone(&router),
+                udp_timeout,
+                DatagramFrame::Raw,
+                udp_nat_max,
+            );
             let _stop_hub = StopHub(Arc::clone(&hub));
             let mut flows = tokio::task::JoinSet::new();
             let mut reply_sockets = HashMap::<_, std::sync::Weak<UdpSocket>>::new();
@@ -217,19 +235,17 @@ impl Tproxy {
                             }
                             // Linux prefers this connected transparent socket
                             // over the listener for subsequent client packets.
-                            let mut payload = vec![0u8; 65_535];
+                            // An evicted flow frees this socket within a recheck.
+                            let recheck = udp_timeout.min(std::time::Duration::from_secs(30));
                             loop {
-                                let n = match tokio::time::timeout(
-                                    udp_timeout,
-                                    socket.recv(&mut payload),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(n)) => n,
+                                let received =
+                                    recv_with(&socket, |payload| hub.offer(source, dest, payload));
+                                let opener = match tokio::time::timeout(recheck, received).await {
+                                    Ok(Ok(opener)) => opener,
                                     Err(_) if hub.has_active_flow(source, dest) => continue,
                                     _ => break,
                                 };
-                                if let Some(opener) = hub.offer(source, dest, &payload[..n])
+                                if let Some(opener) = opener
                                     && opener
                                         .run(Reply::Socket(Arc::downgrade(&socket)), &tag)
                                         .await

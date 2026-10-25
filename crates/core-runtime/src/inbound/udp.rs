@@ -25,6 +25,38 @@ use crate::route::{ConnContext, Decision, Router};
 pub(crate) const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(120);
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Open flows one hub keeps; a new flow past it closes the one idle the
+/// longest. The same bound caps the flows opening at once. Reference
+/// `udpnat.New`: a 1024-entry LRU that closes what it evicts.
+pub(crate) const MAX_UDP_FLOWS: usize = 1024;
+
+thread_local! {
+    /// One 64 KiB receive buffer per worker thread for every flow's reader,
+    /// so an idle flow keeps no buffer and a busy one only its datagrams.
+    static RECV_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(vec![0u8; 64 * 1024]);
+}
+
+/// Receive one datagram on `sock` and hand its bytes to `take`, which must
+/// not await or receive again.
+pub(crate) async fn recv_with<R>(
+    sock: &UdpSocket,
+    mut take: impl FnMut(&[u8]) -> R,
+) -> io::Result<R> {
+    loop {
+        sock.readable().await?;
+        let got = RECV_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let buf = scratch.as_mut_slice();
+            sock.try_recv(buf).map(|n| take(&buf[..n]))
+        });
+        match got {
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => continue,
+            other => return other,
+        }
+    }
+}
+
 type FlowKey = (SocketAddr, SocketAddr);
 
 /// Packets held back while the outbound socket is not writable. The old
@@ -438,12 +470,23 @@ pub(crate) struct UdpHub {
     next_opener: AtomicU64,
     reverse_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     timeout: Duration,
+    /// [`MAX_UDP_FLOWS`] unless the inbound sets `udp_nat_max`
+    max_flows: usize,
     /// how replies are framed before they go back
     frame: DatagramFrame,
 }
 
 impl UdpHub {
     pub fn new(router: Arc<Router>, timeout: Duration, frame: DatagramFrame) -> Arc<Self> {
+        Self::with_max_flows(router, timeout, frame, MAX_UDP_FLOWS)
+    }
+
+    pub fn with_max_flows(
+        router: Arc<Router>,
+        timeout: Duration,
+        frame: DatagramFrame,
+        max_flows: usize,
+    ) -> Arc<Self> {
         let hub = Arc::new(Self {
             router,
             flows: RwLock::new(HashMap::new()),
@@ -459,6 +502,7 @@ impl UdpHub {
             } else {
                 timeout
             },
+            max_flows: max_flows.max(1),
             frame,
         });
         let sweeper = Arc::downgrade(&hub);
@@ -565,6 +609,9 @@ impl UdpHub {
         if let Some(entry) = pending.get_mut(&key) {
             entry.push(payload);
             return None;
+        }
+        if pending.len() >= self.max_flows {
+            return None; // too many opening at once: drop, the client retries
         }
         let id = self.next_opener.fetch_add(1, Ordering::Relaxed);
         pending.insert(
@@ -890,10 +937,23 @@ impl UdpHub {
             }
         };
         let flow = Arc::new(flow);
-        self.flows
-            .write()
-            .expect("flows")
-            .insert(key, Arc::clone(&flow));
+        let evicted = {
+            let mut flows = self.flows.write().expect("flows");
+            let oldest = if flows.len() >= self.max_flows && !flows.contains_key(&key) {
+                flows
+                    .iter()
+                    .min_by_key(|(_, flow)| flow.last_ms.load(Ordering::Relaxed))
+                    .map(|(oldest, _)| *oldest)
+            } else {
+                None
+            };
+            flows.insert(key, Arc::clone(&flow));
+            oldest.and_then(|oldest| flows.remove(&oldest))
+        };
+        // the close signal ends its reverse task and releases the socket
+        if let Some(tracker) = evicted.as_ref().and_then(|old| old.tracker.as_ref()) {
+            crate::clash_state::close(tracker.id());
+        }
         Ok(Opened::Flow(flow))
     }
 
@@ -1063,14 +1123,19 @@ fn spawn_reverse(
 ) -> tokio::task::AbortHandle {
     let tag = tag.to_string();
     tokio::spawn(async move {
-        let mut buf = vec![0u8; 64 * 1024];
+        // the datagram being replied, as large as the largest so far
+        let mut datagram = Vec::new();
         // framing buffer for non-Raw frames, kept across datagrams so the
-        // capacity survives; Raw replies borrow `buf` directly and never
+        // capacity survives; Raw replies borrow `datagram` directly and never
         // touch it
         let mut out = Vec::new();
         loop {
             let recv = tokio::select! {
-                result = tokio::time::timeout(idle, outbound.recv(&mut buf)) => result,
+                result = tokio::time::timeout(idle, recv_with(&outbound, |bytes| {
+                    datagram.clear();
+                    datagram.extend_from_slice(bytes);
+                    bytes.len()
+                })) => result,
                 _ = async {
                     if let Some(tracker) = &tracker { tracker.close_signal().wait().await; }
                     else { std::future::pending::<()>().await; }
@@ -1090,9 +1155,9 @@ fn spawn_reverse(
                         tracker.add_download(n as u64);
                     }
                     let framed: &[u8] = if frame == DatagramFrame::Raw {
-                        &buf[..n]
+                        &datagram
                     } else {
-                        frame.apply_into(key.1, &buf[..n], &mut out);
+                        frame.apply_into(key.1, &datagram, &mut out);
                         &out
                     };
                     if let Err(err) = reply.send(framed, source, key.1).await {
