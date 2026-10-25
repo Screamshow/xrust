@@ -25,6 +25,10 @@ SHORT_ID="${SHORT_ID:-6ba85179e30d4fc3}"
 SNI="${SNI:-localhost}"
 UUID="${UUID:-00000000-0000-0000-0000-000000000001}"
 PLAIN="${PLAIN:-0}"
+# MODE is the client's xhttp mode, SERVER_MODE the server's. Xray's server
+# refuses a mode other than its own unless that is "auto" (splithttp/hub.go).
+MODE="${MODE:-packet-up}"
+SERVER_MODE="${SERVER_MODE:-packet-up}"
 # WIRE=1 puts a logging relay between our client and Xray and writes what each
 # connection carried, as hex, to <outdir>/wire.log. When the far end reads more
 # than we meant to send, this is the only place the bytes can be told apart from
@@ -194,7 +198,7 @@ cat > "$WORK/server.json" <<JSON
     "settings": {"clients": [{"id": "$UUID"}], "decryption": "none"},
     "streamSettings": {
       "network": "xhttp",
-      "xhttpSettings": {"path": "$PATH_X", "mode": "packet-up", "host": "$SNI"$XMUX_SERVER},
+      "xhttpSettings": {"path": "$PATH_X", "mode": "$SERVER_MODE", "host": "$SNI"$XMUX_SERVER},
       "security": "$SECURITY",
       $TLS_BLOCK
     }
@@ -241,7 +245,7 @@ cat > "$WORK/client.json" <<JSON
     "server": "127.0.0.1", "server_port": $CLIENT_PORT,
     "uuid": "$UUID",
     "tls": $CLIENT_TLS,
-    "transport": {"type": "xhttp", "path": "$PATH_X", "host": "$SNI", "mode": "packet-up"$XMUX_CLIENT}
+    "transport": {"type": "xhttp", "path": "$PATH_X", "host": "$SNI", "mode": "$MODE"$XMUX_CLIENT}
   }],
   "route": {"final": "out"}
 }

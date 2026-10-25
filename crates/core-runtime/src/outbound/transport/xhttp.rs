@@ -918,7 +918,7 @@ impl XhttpConfig {
             return Ok(H2Connect::Skip);
         }
         let has_reality = tls.reality().is_some();
-        let mode = self.resolved_mode(true, true);
+        let mode = self.resolved_mode(has_reality);
         let authority = self.authority_for(tls.server_name(), server, port);
         let scheme = "https";
         let max_conns = self.pool.max_connections();
@@ -1023,15 +1023,14 @@ impl XhttpConfig {
         counter
     }
 
-    fn resolved_mode(&self, tls: bool, is_h2: bool) -> Mode {
+    /// The mode a session runs in. `auto` follows Xray (splithttp/dialer.go,
+    /// `mode == "auto"`): packet-up, or stream-one under REALITY. Xray picks
+    /// stream-up for REALITY with `downloadSettings`, which this client has not.
+    fn resolved_mode(&self, has_reality: bool) -> Mode {
         match self.mode {
-            // In reference sing-box (scratch/dialer.go:333), auto resolves to packet-up
-            // (stream-one is only for REALITY).
+            Mode::Auto if has_reality => Mode::StreamOne,
             Mode::Auto => Mode::PacketUp,
-            other => {
-                let _ = (tls, is_h2);
-                other
-            }
+            other => other,
         }
     }
 
@@ -1064,7 +1063,7 @@ pub(crate) async fn connect(
     let is_h2 = negotiated == Some(b"h2") || (has_reality && negotiated != Some(b"http/1.1"));
     let authority = cfg.authority_for("", server, port);
     let scheme = if secure { "https" } else { "http" };
-    let mode = cfg.resolved_mode(secure, is_h2);
+    let mode = cfg.resolved_mode(has_reality);
     crate::logging::debug(format_args!(
         "xhttp: connect {server}:{port} secure={secure} is_h2={is_h2} mode={mode:?}"
     ));
@@ -2501,6 +2500,27 @@ mod tests {
         assert!(!c.meta.x_obfs);
     }
 
+    /// `auto` per Xray (splithttp/dialer.go, `mode == "auto"`): packet-up,
+    /// stream-one under REALITY. Plain TLS or none is not REALITY, and an
+    /// explicit mode is kept either way.
+    #[test]
+    fn auto_mode_resolves_like_xray() {
+        for raw in [json!({}), json!({"mode": "auto"}), json!({"mode": ""})] {
+            let c = cfg(raw);
+            assert_eq!(c.resolved_mode(false), Mode::PacketUp);
+            assert_eq!(c.resolved_mode(true), Mode::StreamOne);
+        }
+        for (raw, mode) in [
+            ("packet-up", Mode::PacketUp),
+            ("stream-up", Mode::StreamUp),
+            ("stream-one", Mode::StreamOne),
+        ] {
+            let c = cfg(json!({ "mode": raw }));
+            assert_eq!(c.resolved_mode(false), mode, "{raw} without REALITY");
+            assert_eq!(c.resolved_mode(true), mode, "{raw} with REALITY");
+        }
+    }
+
     #[test]
     fn meta_header_key_defaults_are_asymmetric() {
         let c = cfg(json!({"session_placement": "header", "seq_placement": "cookie"}));
@@ -3143,6 +3163,86 @@ mod tests {
             assert!(p0.starts_with("/xhttp/"), "got {p0}");
             assert_eq!(b0, b"pingpong");
         }
+        drop(conn);
+        server.abort();
+    }
+
+    /// `auto` under REALITY is one bidirectional POST to the bare path: no
+    /// session id, no GET, a gRPC body, and the reply comes down its response.
+    #[tokio::test]
+    async fn wire_auto_over_reality_is_stream_one() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let timeout = std::time::Duration::from_secs(10);
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let c = cfg(json!({"mode": "auto", "path": "/xhttp"}));
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<(String, String, String)>();
+        let server = tokio::spawn(async move {
+            let mut h2_srv = crate::outbound::transport::h2io::server_builder()
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .expect("server h2 handshake");
+            while let Some(Ok((mut req, mut respond))) = h2_srv.accept().await {
+                let content_type = req
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let _ = seen_tx.send((
+                    req.method().to_string(),
+                    req.uri().path().to_string(),
+                    content_type,
+                ));
+                tokio::spawn(async move {
+                    let mut send = respond
+                        .send_response(
+                            http::Response::builder().status(200).body(()).unwrap(),
+                            false,
+                        )
+                        .expect("send response");
+                    // echo the body, then end with the request
+                    while let Some(Ok(chunk)) = req.body_mut().data().await {
+                        let _ = req.body_mut().flow_control().release_capacity(chunk.len());
+                        let _ = send.send_data(chunk, false);
+                    }
+                    let _ = send.send_data(Bytes::from_static(b"|end"), true);
+                });
+            }
+        });
+        let dialer: std::sync::Arc<super::Dialer> = std::sync::Arc::new(|| {
+            Box::pin(async { Err(io::Error::other("stream-one dials nothing more")) })
+        });
+        // `has_reality = true`: the session runs as it would under REALITY
+        let mut conn = tokio::time::timeout(
+            timeout,
+            super::connect(Box::new(client_io), true, true, "srv", 443, &c, dialer),
+        )
+        .await
+        .expect("connect timed out")
+        .expect("connect");
+        tokio::time::timeout(timeout, async {
+            conn.write_all(b"ping").await.expect("write");
+            conn.flush().await.expect("flush");
+            conn.shutdown().await.expect("half-close");
+            let mut got = Vec::new();
+            conn.read_to_end(&mut got).await.expect("read");
+            assert_eq!(got, b"ping|end");
+        })
+        .await
+        .expect("roundtrip timed out");
+        let (method, path, content_type) = seen_rx.recv().await.expect("one request");
+        assert_eq!(
+            (method.as_str(), path.as_str()),
+            // the bare path, with the slash Xray adds for path placement
+            // (splithttp/config.go GetNormalizedPath)
+            ("POST", "/xhttp/"),
+            "auto under REALITY must be stream-one"
+        );
+        assert_eq!(content_type, "application/grpc");
+        assert!(
+            seen_rx.try_recv().is_err(),
+            "stream-one is a single request"
+        );
         drop(conn);
         server.abort();
     }
