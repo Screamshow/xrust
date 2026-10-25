@@ -330,42 +330,43 @@ impl RuleSetCompiler {
         let header_len = HEADER_SIZE;
         let mut offset = header_len;
 
-        // Alignment helper
-        fn align_8(pos: usize) -> usize {
-            (pos + 7) & !7
+        // Every table starts on 16 bytes, the strictest entry alignment
+        // (`Ipv6Entry` holds a `u128`); the reader refuses a misaligned table.
+        fn align_16(pos: usize) -> usize {
+            (pos + 15) & !15
         }
 
-        offset = align_8(offset);
+        offset = align_16(offset);
         let domains_offset = offset as u32;
         let domains_count = domain_entries.len() as u32;
         offset += domain_entries.len() * std::mem::size_of::<DomainEntry>();
 
-        offset = align_8(offset);
+        offset = align_16(offset);
         let suffixes_offset = offset as u32;
         let suffixes_count = suffix_entries.len() as u32;
         offset += suffix_entries.len() * std::mem::size_of::<DomainEntry>();
 
-        offset = align_8(offset);
+        offset = align_16(offset);
         let keywords_offset = offset as u32;
         let keywords_count = keyword_entries.len() as u32;
         offset += keyword_entries.len() * std::mem::size_of::<DomainEntry>();
 
-        offset = align_8(offset);
+        offset = align_16(offset);
         let dest_v4_offset = offset as u32;
         let dest_v4_count = sorted_v4.len() as u32;
         offset += sorted_v4.len() * std::mem::size_of::<Ipv4Entry>();
 
-        offset = align_8(offset);
+        offset = align_16(offset);
         let dest_v6_offset = offset as u32;
         let dest_v6_count = sorted_v6.len() as u32;
         offset += sorted_v6.len() * std::mem::size_of::<Ipv6Entry>();
 
-        offset = align_8(offset);
+        offset = align_16(offset);
         let dest_ports_offset = offset as u32;
         let dest_ports_count = sorted_ports.len() as u32;
         offset += sorted_ports.len() * std::mem::size_of::<PortRangeEntry>();
 
-        offset = align_8(offset);
+        offset = align_16(offset);
         let string_table_offset = offset as u32;
         let string_table_len = string_table.len() as u32;
         offset += string_table.len();

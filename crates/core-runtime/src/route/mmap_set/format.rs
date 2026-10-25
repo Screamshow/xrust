@@ -65,12 +65,8 @@ pub struct DomainEntry {
 impl DomainEntry {
     pub fn as_str<'a>(&self, string_table: &'a [u8]) -> Option<&'a str> {
         let start = self.offset as usize;
-        let end = start + self.len as usize;
-        if end <= string_table.len() {
-            std::str::from_utf8(&string_table[start..end]).ok()
-        } else {
-            None
-        }
+        let end = start.checked_add(self.len as usize)?;
+        std::str::from_utf8(string_table.get(start..end)?).ok()
     }
 }
 

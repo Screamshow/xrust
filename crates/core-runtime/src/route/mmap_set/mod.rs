@@ -83,8 +83,10 @@ impl MmapRuleSet {
 
     /// Construct directly from in-memory compiled bytes.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        let _ = MmapView::parse(bytes)?;
+        // validate the page-aligned copy: the caller's slice may sit at any
+        // address, and `view` parses the copy anyway
         let buffer = MmapBuffer::from_bytes(bytes);
+        let _ = MmapView::parse(&buffer)?;
         Some(Self { buffer, path: None })
     }
 
@@ -218,5 +220,46 @@ mod tests {
             view.matches_ip("8.8.8.8".parse().unwrap()),
             "8.8.8.8 should be added"
         );
+    }
+
+    /// CQ-04: every table starts on its entry type's alignment. An
+    /// `Ipv6Entry` (u128) table on 8 bytes made every IPv6 match UB.
+    #[test]
+    fn tsrs_tables_are_aligned_for_their_entries() {
+        let mut compiler = RuleSetCompiler::new();
+        compiler.add_domain("a.example");
+        compiler.add_cidr("10.0.0.0/8");
+        compiler.add_cidr("2001:db8::/32");
+        compiler.add_port_range(80, 80);
+        let bytes = compiler.finish();
+        let header = super::format::Header::parse(&bytes).expect("header");
+        for (name, offset) in [
+            ("domains", header.domains_offset),
+            ("suffixes", header.suffixes_offset),
+            ("keywords", header.keywords_offset),
+            ("dest_v4", header.dest_v4_offset),
+            ("dest_v6", header.dest_v6_offset),
+            ("dest_ports", header.dest_ports_offset),
+        ] {
+            assert_eq!(offset % 16, 0, "{name} table at {offset}");
+        }
+        let set = MmapRuleSet::from_bytes(&bytes).expect("parse TSRS");
+        assert!(set.view().matches_ip("2001:db8::1".parse().unwrap()));
+        assert!(!set.view().matches_ip("2001:db9::1".parse().unwrap()));
+        assert!(set.view().matches_ip("10.1.2.3".parse().unwrap()));
+    }
+
+    /// CQ-04: a corrupt prefix length is skipped, not shifted out of range.
+    #[test]
+    fn tsrs_out_of_range_prefix_is_ignored() {
+        let mut compiler = RuleSetCompiler::new();
+        compiler.add_cidr("10.0.0.0/8");
+        let mut bytes = compiler.finish();
+        let header = super::format::Header::parse(&bytes).expect("header");
+        // `prefix_len` follows the 4-byte address
+        bytes[header.dest_v4_offset as usize + 4] = 40;
+        let set = MmapRuleSet::from_bytes(&bytes).expect("parse TSRS");
+        assert!(!set.view().matches_ip("10.1.2.3".parse().unwrap()));
+        assert!(!set.view().matches_ip("192.0.2.1".parse().unwrap()));
     }
 }

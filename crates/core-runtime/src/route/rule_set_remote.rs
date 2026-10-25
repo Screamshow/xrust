@@ -473,6 +473,16 @@ impl RemoteRuleSet {
         }
         let _ = is_start;
 
+        // A TSRS body is taken as-is only by a set that opted into it (`mmap`
+        // or `format: tsrs`). The reference has no such format, so for a
+        // `binary`/`source` set (all of Forkop's) the server cannot hand the
+        // engine a pre-built table in place of the declared one.
+        let accepts_tsrs = use_mmap || self.spec.format.as_deref() == Some("tsrs");
+        if !accepts_tsrs && response.body.starts_with(b"TSRS") {
+            return Err(io::Error::other(
+                "TSRS rule-set body refused: the set enables neither mmap nor format tsrs",
+            ));
+        }
         if response.body.starts_with(b"TSRS") {
             let already_identical = file_matches(&tsrs_path, &response.body);
             if !already_identical {
@@ -1139,6 +1149,39 @@ mod tests {
             "mmap rule set must match sub.mmap-fast.org"
         );
 
+        let _ = std::fs::remove_file(&cache_file);
+    }
+
+    /// CQ-04: a `binary`/`source` set (all of Forkop's) does not take a
+    /// pre-built TSRS image from the server in place of what it declared.
+    #[tokio::test]
+    async fn tsrs_body_is_refused_unless_the_set_opted_in() {
+        let router = router().await;
+        let image = crate::route::mmap_set::RuleSetCompiler::new()
+            .compile(&[json!({"domain_suffix": ["image.example"]})])
+            .expect("tsrs");
+        let (url, server) = serve(body_response(&image)).await;
+        let cache_file =
+            std::env::temp_dir().join(format!("rust-x-tsrs-refused-{}.tsrs", std::process::id()));
+        let _ = std::fs::remove_file(&cache_file);
+        for format in [Some("binary"), Some("source"), None] {
+            let mut set = remote("rs", &url);
+            set.spec.format = format.map(str::to_string);
+            set.spec.cache_file = Some(cache_file.to_string_lossy().to_string());
+            let error = set.fetch(&router, false, None).await.unwrap_err();
+            assert!(error.to_string().contains("TSRS"), "{format:?}: {error}");
+            assert!(set.set.mmap().is_none(), "{format:?}");
+            assert!(!cache_file.exists(), "{format:?}: the image was written");
+        }
+        // a set that opted into mmap still takes it
+        let mut set = remote("rs", &url);
+        set.spec.mmap = true;
+        set.spec.cache_file = Some(cache_file.to_string_lossy().to_string());
+        set.fetch(&router, false, None)
+            .await
+            .expect("an mmap set takes TSRS");
+        assert!(set.set.mmap().is_some());
+        server.abort();
         let _ = std::fs::remove_file(&cache_file);
     }
 

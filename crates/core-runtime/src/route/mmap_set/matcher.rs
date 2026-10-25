@@ -21,13 +21,16 @@ impl<'a> MmapView<'a> {
     pub fn parse(bytes: &'a [u8]) -> Option<Self> {
         let header = Header::parse(bytes)?;
 
-        // Safety: all entries are Plain Old Data (repr(C)) and offsets are validated against total len.
-        let string_start = header.string_table_offset as usize;
-        let string_end = string_start + header.string_table_len as usize;
-        if string_end > bytes.len() {
+        // Safety: all entries are Plain Old Data (repr(C)); every table is
+        // checked against the buffer length and its type's alignment before
+        // a typed slice is formed (`slice_at`). The offsets come from the
+        // file, which may be corrupt or hostile.
+        if !(bytes.as_ptr() as *const Header).is_aligned() {
             return None;
         }
-        let string_table = &bytes[string_start..string_end];
+        let string_start = header.string_table_offset as usize;
+        let string_end = string_start.checked_add(header.string_table_len as usize)?;
+        let string_table = bytes.get(string_start..string_end)?;
 
         let domains = Self::slice_at::<DomainEntry>(
             bytes,
@@ -65,8 +68,7 @@ impl<'a> MmapView<'a> {
             header.dest_ports_count as usize,
         )?;
 
-        // Return parsed view
-        // Store header reference
+        // Length checked by `Header::parse`, alignment above.
         let header_ref = unsafe { &*(bytes.as_ptr() as *const Header) };
 
         Some(Self {
@@ -85,11 +87,16 @@ impl<'a> MmapView<'a> {
         if count == 0 {
             return Some(&[]);
         }
-        let byte_len = count * std::mem::size_of::<T>();
-        if offset + byte_len > bytes.len() {
+        // checked: on 32-bit targets `count * size` wraps for a hostile count
+        let byte_len = count.checked_mul(std::mem::size_of::<T>())?;
+        let end = offset.checked_add(byte_len)?;
+        let table = bytes.get(offset..end)?;
+        // `u128` in `Ipv6Entry` needs 16 on 64-bit targets; a misaligned
+        // `&[T]` is undefined behaviour even where the CPU tolerates it
+        let ptr = table.as_ptr() as *const T;
+        if !ptr.is_aligned() {
             return None;
         }
-        let ptr = bytes[offset..].as_ptr() as *const T;
         Some(unsafe { std::slice::from_raw_parts(ptr, count) })
     }
 
@@ -179,7 +186,9 @@ impl<'a> MmapView<'a> {
         match ip {
             IpAddr::V4(v4) => {
                 let target = u32::from(v4);
-                for entry in self.dest_v4 {
+                // a prefix over 32 only comes from a corrupt file: skip it
+                // rather than shift out of range
+                for entry in self.dest_v4.iter().filter(|e| e.prefix_len <= 32) {
                     let mask = if entry.prefix_len == 0 {
                         0
                     } else {
@@ -193,7 +202,7 @@ impl<'a> MmapView<'a> {
             }
             IpAddr::V6(v6) => {
                 let target = u128::from(v6);
-                for entry in self.dest_v6 {
+                for entry in self.dest_v6.iter().filter(|e| e.prefix_len <= 128) {
                     let mask = if entry.prefix_len == 0 {
                         0
                     } else {
