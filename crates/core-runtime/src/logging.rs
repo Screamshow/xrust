@@ -30,7 +30,9 @@ impl Level {
             "debug" => Some(Level::Debug),
             "info" => Some(Level::Info),
             "warn" | "warning" => Some(Level::Warn),
-            "error" | "fatal" => Some(Level::Error),
+            // fatal and panic are quieter than error in the reference; the
+            // filter has no such levels, so they keep error-level output.
+            "error" | "fatal" | "panic" => Some(Level::Error),
             _ => None,
         }
     }

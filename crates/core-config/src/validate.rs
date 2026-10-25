@@ -31,7 +31,8 @@ const KNOWN_TOP_LEVEL: &[&str] = &[
 ];
 
 const KNOWN_LOG_FIELDS: &[&str] = &["disabled", "level", "timestamp", "output", "time"];
-const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error", "fatal"];
+/// reference `log.ParseLevel`: every level sing-box accepts in `log.level`.
+const LOG_LEVELS: &[&str] = &["trace", "debug", "info", "warn", "error", "fatal", "panic"];
 
 /// reference `option.NTPOptions` = ServerOptions + DialerOptions + own fields.
 const KNOWN_NTP_FIELDS: &[&str] = &[
@@ -10668,6 +10669,22 @@ mod tests {
         assert_eq!(
             err,
             "dns.client_subnet: netip.ParsePrefix(\"1.2.3.0/33\"): prefix length out of range"
+        );
+    }
+
+    #[test]
+    fn log_levels_match_the_reference() {
+        for level in ["trace", "debug", "info", "warn", "error", "fatal", "panic"] {
+            let cfg = json!({
+                "log": {"level": level},
+                "outbounds": [{"type": "direct", "tag": "d"}],
+            });
+            assert!(validate(&cfg).is_ok(), "log.level {level} must be accepted");
+        }
+        let err = validate(&json!({"log": {"level": "verbose"}})).unwrap_err();
+        assert!(
+            err.contains("unknown log level: verbose"),
+            "unexpected: {err}"
         );
     }
 

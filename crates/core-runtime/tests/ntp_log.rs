@@ -108,6 +108,21 @@ async fn log_output_file_receives_lines() {
 }
 
 #[tokio::test]
+async fn log_panic_level_starts() {
+    let _g = test_guard().await;
+    let cfg = json!({
+        "log": {"level": "panic"},
+        "inbounds": [],
+        "outbounds": [{"type": "direct", "tag": "out"}],
+        "route": {"final": "out"}
+    });
+    let instance = core_runtime::start(&cfg)
+        .await
+        .expect("panic is a reference log level");
+    instance.shutdown();
+}
+
+#[tokio::test]
 async fn log_unknown_level_rejected_at_start() {
     let _g = test_guard().await;
     let cfg = json!({
