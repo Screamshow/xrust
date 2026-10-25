@@ -37,6 +37,8 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | MEM-07 | Rule sets: SRS загружается через промежуточные копии, пик ×2–3 | P1 | частично исправлено, проверено (промежуточный `Vec<Value>` остаётся) | `fc143dc9a2207816db6fe06d1ad6c4fb01d0b415` |
 | MEM-08 | cache.db: flush клонирует всё дерево | P1 | исправлено, проверено (только клонирование при сериализации) | `cc6c8829108d5428b06246a4b5410bfcc5f53abc` |
 | RS-01 | Правило rule set только с `domain_regex` совпадает с любым соединением; в смешанных правилах regex игнорируется | P1 | исправлено, проверено | `79fb8be31263157aabd07c7c5c1419528c4e40f0`, `08d35a3814dac7d528d9d1e1a8a9ee336cce647c`, `9c688b2e9c28f8b78dba7833f1ccc71e2e13f5ed` |
+| SEC-08 / CQ-11 | DNS: ответ upstream не сверяется с запросом, ID предсказуем | P1 | исправлено, ожидает независимой проверки | `2506df64e37b5a119c10724a5e7d6287f5e837d8` |
+| CQ-12 | bbolt: бесконечная рекурсия на повреждённом cache.db | P1 | исправлено, ожидает независимой проверки | `41c8be591e4c8a664a480498f1aec47192923761` |
 
 ## Задачи
 
@@ -1557,3 +1559,118 @@ PID основной службы и контрольные суммы `/etc/con
 - Блокирующих замечаний больше не обнаружено.
 - **Границы:** legacy, ARM, полный CI, пакетное обновление и полный жизненный цикл Forkop не проверялись. Живые sing-box и Xray не запускались; сравнения используют сохранённые ожидаемые ответы.
 - **Этой проверкой не закрываются:** ограничения готовых TSRS и старого автокэша `.tsrs` до полного обновления; CLI `rule-set match` без `domain_regex`; остальные различия синтаксиса Go и Rust regex; правила только с необработанными полями (например, `process_name`).
+
+### SEC-08 / CQ-11 — DNS: ответ upstream не сверяется с запросом, ID предсказуем
+
+- **Приоритет:** P1.
+- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Коммит:** [`2506df64e37b5a119c10724a5e7d6287f5e837d8`](https://github.com/Screamshow/xrust/commit/2506df64e37b5a119c10724a5e7d6287f5e837d8).
+- **Файлы:** `crates/core-runtime/src/dns/{transport.rs,mod.rs}`, новый `crates/core-runtime/tests/dns_response_matching.rs`, `crates/core-runtime/tests/{dns_quic_h3.rs,dns_resolver.rs,dns_logical.rs}`.
+
+#### Причина
+
+- **UDP** (`dns/transport.rs:1163-1214`, `exchange_udp`): первая датаграмма на подключённом сокете принималась без проверки ID, вопроса и бита QR; таймер `timeout(1500ms)` перезапускался на каждой принятой датаграмме.
+- **TCP / DoT** (`:1216-1233`, `exchange_stream`): первое сообщение принималось как есть.
+- **DoH (h2, h1), DoQ, H3** (`:1235+`, `:1517`, `:1579`): ID 0 (как в эталоне), тело возвращалось без проверки вопроса.
+- **ID upstream** (`dns/mod.rs:804`, `exchange_remote`): уходил ID клиента; `rand_id` (`:1305-1309`) — последовательный `AtomicU16` для bootstrap и `resolve`.
+- ID клиента в ответе уже восстанавливался (`codec::set_id` в `exchange_target`, и при попадании в кэш).
+
+#### Эталон (sing-box `824dbcfb4dd0a95921840b1737b950cde590241e`)
+
+- `dns/transport/udp.go:147-153` — `writeQuery` подставляет `queryId`; `:158-172` — некорректные датаграммы отбрасываются, чтение продолжается.
+- `dns/transport/multiplexer.go:357-387` — последовательный `queryId++` на запрос; `:452-462`, `:420-428` — ответы с неизвестным ID игнорируются, ID запроса восстанавливается; `:161-200` — `exchangeSingle` ID не проверяет; вопрос эталон не проверяет нигде.
+- `dns/transport/https.go:212-214`, `quic/http3.go:158` — ID 0; ответ (`https.go:242-262`) без проверки ID и вопроса. `dns/client.go:291,389` — ID клиента восстанавливается.
+- miekg/dns v1.1.72 и проверка `checkResponse` стандартного резолвера Go (бит ответа, ID, вопрос: имя без учёта регистра, тип, класс) — по памяти исполнителя, офлайн не сверялись. Итог: xrust строже эталона (проверка вопроса и QR, случайные ID).
+
+#### Исправление
+
+- Всё в `transport::exchange`, поэтому действует для всех вызывающих (сервис, участники групп, bootstrap `lookup_via`).
+- `response_matches(query, resp, check_id)` разбирает «сырой» ответ без выделений: полный 12-байтовый заголовок с QR, тот же ID (при `check_id`), тот же первый вопрос — имя (ASCII без учёта регистра по меткам, безопасно для 0x20), тип и класс. Указатель сжатия или метка длиннее 63 в начале вопроса, имя длиннее 255, qdcount 0 или усечённое сообщение — несовпадение.
+- **UDP:** несовпадающая датаграмма отбрасывается (debug-лог), ожидание продолжается; таймер повтора — абсолютный срок (`timeout_at`), поэтому поддельные датаграммы не сдвигают повторы; интервал 1,5 с, 3 попытки и общий `cfg.timeout` прежние.
+- **TCP / DoT:** чтение кадров до совпадающего в пределах прежнего `cfg.timeout`.
+- **После любого пути:** итоговая проверка (для DoH/DoQ/H3 — только вопрос); несовпадение — ошибка `dns: response does not match the query`; затем в ответ записывается ID вызывающего.
+- **ID:** для `Udp | Tcp | Tls` на провод уходит свежий случайный ID из `getrandom::fill` (`random_id()`); при ошибке RNG обмен завершается ошибкой, предсказуемой замены нет. DoH/DoQ/H3 сохраняют ID 0 (TLS, поток на запрос; эталон так же). `rand_id()` в `mod.rs` берёт значение из `random_id()`.
+- Запрос короче 12 байт — ошибка `dns: short query`.
+- Новые лимиты, изменения кэша, таймаутов и соединений не вводились.
+
+#### Изменения поведения
+
+- Ответы с чужим ID, другим вопросом или без бита QR отбрасываются; если правильного ответа нет — прежний таймаут.
+- На провод UDP/TCP/TLS уходит случайный ID, а не ID клиента.
+- **Изменение тестов из-за более строгой проверки:** в `tests/dns_logical.rs` поддельный upstream возвращал запрос без бита QR — теперь он отвечает как сервер (тот же ID и вопрос, QR установлен); `tests/dns_resolver.rs` сравнивает запрос без поля ID (`raw[2..]`); в `dns/mod.rs` тестовый `bootstrap_fixture` отвечает совпадающим ответом без записи, чтобы по-прежнему быстро завершаться ошибкой декодирования; `tests/dns_quic_h3.rs` проверяет ID 0 на проводе и ID вызывающего в ответе.
+
+#### Проверки разработки
+
+- Сборки в постоянном месте candidate (рабочее дерево), отрицательные контроли — в baseline (`2144127` + новые тесты).
+
+| Команда (`cargo test --locked -p core-runtime`) | legacy | rust-x |
+|---|---|---|
+| `rustfmt --edition 2024 --check` (изменённые файлы) | чисто | — |
+| `clippy --all-targets --features legacy-protocols -- -D warnings` | чисто | в изменённых файлах DNS предупреждений нет |
+| `--test dns_response_matching` | 10 passed | 10 passed |
+| `--test dns_quic_h3` / `dns_logical` / `dns_hosts` / `dns_reverse_mapping` / `udp_dns_sniff` | 3 / 1 / 3 / 3 / 3 passed | 3 / 1 / 3 / 3 / 3 passed |
+| `--test dns_resolver` | 19 passed | 18 passed, 1 failed (`tcp_transport_uses_the_detour_outbound` — socks нет в rust-x, так же на `HEAD`) |
+| `--test routing` / `hot_reload` / `udp_sniff` / `inbounds` | 13 / 11 / 8 / 12 passed | 13 / 11 / 8 / 12 passed |
+| `--lib dns::` (включая модульные `response_matching_checks_reply_bit_id_and_question`, `random_ids_are_not_a_counter`) | 66 passed | 66 passed |
+
+- **Отрицательные контроли (baseline, legacy):** `dns_response_matching` — 2 passed, 8 failed: падают `udp_forged_reply_is_dropped_and_the_real_one_returned`, `udp_only_forged_replies_end_in_the_usual_timeout`, `udp_wire_ids_are_random_and_never_the_caller_id`, `udp_parallel_queries_each_get_their_own_answer`, `service_restores_the_client_id_after_a_forged_reply`, `tcp_forged_messages_are_skipped`, `tcp_only_forged_messages_end_in_the_usual_timeout`, `doh_answer_must_match_the_question`; проходят, как и ожидалось, `udp_matching_answer_is_accepted_with_the_caller_id`, `udp_question_name_case_does_not_matter`. `dns_quic_h3` — 0 passed, 3 failed (`doq_answer_to_another_question_is_refused`, `doq_transport_queries_a_local_server`, `h3_transport_queries_a_local_server` — старый транспорт возвращает ID 0 вместо ID вызывающего).
+
+#### Ограничения
+
+- В `main` не слито, не выпущено.
+- Поведение miekg/dns и резолвера Go описано по памяти, офлайн не сверялось.
+- OpenWrt, реальные DNS-серверы, DoH/DoQ против внешних серверов и полный CI не проверялись.
+- **Соседние находки (не исправлялись):** нет повтора по TCP при бите TC в UDP-ответе (эталон повторяет, `udp.go:105-108`); ICMP port-unreachable на подключённом UDP-сокете сразу прерывает обмен — подделанный ICMP может вызвать отказ (без отравления).
+
+### CQ-12 — bbolt: бесконечная рекурсия на повреждённом cache.db
+
+- **Приоритет:** P1.
+- **Статус:** исправлено, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Коммит:** [`41c8be591e4c8a664a480498f1aec47192923761`](https://github.com/Screamshow/xrust/commit/41c8be591e4c8a664a480498f1aec47192923761).
+- **Файлы:** `crates/core-experimental/src/bbolt.rs` (только чтение; writer не менялся), `crates/core-runtime/src/cache_file.rs` (путь открытия и `read_all`), новые `crates/core-experimental/tests/corrupt_pages.rs` (10 тестов), `crates/core-runtime/tests/cache_file_corrupt.rs` (2 теста).
+
+#### Причина
+
+- `bbolt.rs` `find_in_page` (`:215`), `all_elems` (`:282`), `find_bucket_in` (`:350`) рекурсивно следовали дочерним страницам без учёта прочитанных и без ограничения глубины: страница, указывающая на себя, или цикл страниц — переполнение стека (exit 134); поддерево с несколькими родителями — обход на каждом пути (экспоненциально), `load_page` (`:309`) копировал каждую страницу.
+- `load_page` не сверял номер страницы с `meta.pgid`; на подобранном номере `start + page_size` переполнялось (паника в debug, перенос на 32-битном release). Число элементов не сверялось с размером страницы, элементы могли перекрываться.
+
+#### Исправление
+
+- Ключи и значения заимствуются из образа файла, `load_page` возвращает срез.
+- Каждый вызов (`get`, `has_bucket`, `bucket_names`, `bucket_page_raw`) ведёт множество прочитанных страниц, включая overflow; повторное попадание — ошибка `page N reached twice (page cycle or shared subtree)`. В корректном файле bbolt каждая страница принадлежит одному узлу, поэтому это ловит самоссылки, циклы, общие поддеревья и страницу внутри overflow другой страницы, а также ограничивает работу.
+- Номер страницы: `2 <= pgid` и `pgid + overflow < meta.pgid`, вся арифметика размеров проверяемая (важно для 32-бит MIPS); корень meta ниже 2 отвергается при открытии.
+- Глубина — не более 64 уровней ветвей на дерево bucket (bbolt держит не менее 2 детей на ветвь, реальная глубина ≈ log2 числа страниц; обе фикстуры — глубины 2). Множество посещённых страниц само по себе не останавливает длинную цепочку из разных страниц с одним потомком, поэтому нужен лимит глубины.
+- Таблица элементов должна помещаться в страницу, ключи и значения страницы не могут в сумме превышать её размер, перекрытие — ошибка `page elements overlap`; один вызов возвращает не больше размера файла.
+- Обе фикстуры (`tests/spikes/bbolt/golden.db`, записан Go bbolt, с inline-bucket; `cache-file-v0026.db`) проходят новые проверки.
+- `cache_file`: список bucket читается один раз; нечитаемый корень — прежний путь `read failed (...); starting empty`, рантайм стартует без кэша; повреждённый bucket пропускается с предупреждением `bucket B unreadable (...); skipped`, остальные загружаются. Файл не удаляется, не переименовывается и не пишется при открытии. Flush не менялся: повреждённый файл, как и раньше, заменяется при следующей записи (по интервалу или размеру буфера при наличии изменений, при остановке `lib.rs:209`; при заданном `cache_id`, которого нет в файле, изменения есть сразу).
+
+#### Изменения поведения
+
+- Номера страниц за `meta.pgid`, корень ниже 2, overflow за пределом, перекрывающиеся элементы, более 64 уровней — теперь ошибки `InvalidData`, а не падение, зависание или молчаливое чтение.
+- Повреждённый bucket пропускается, а не добавляется пустым.
+- Если нечитаем список bucket верхнего уровня, весь кэш стартует пустым (раньше могли загрузиться известные bucket до повреждённой страницы).
+
+#### Проверки разработки
+
+- Сборки в candidate (`2144127` + файлы CQ-12, файлы DNS на тот момент возвращены к `HEAD`), отрицательные контроли — в baseline (`2144127` + новые тесты).
+
+| Команда | Результат |
+|---|---|
+| `rustfmt --edition 2024 --check` (4 файла) | чисто |
+| `clippy --locked -p core-experimental -p core-runtime --all-targets --features core-runtime/legacy-protocols -- -D warnings` | чисто (после исправления `explicit_counter_loop` в тесте) |
+| `cargo test -p core-experimental` | lib 1, `corrupt_pages` 10, `golden_roundtrip` 2, `writer_bytes` 1 — passed |
+| core-runtime, оба профиля: `--lib cache_file` / `cache_file` / `cache_file_compat` / `cache_file_corrupt` / `cache_file_flush_alloc` / `cache_file_interop` | 1 / 10 / 5 (+1 ignored) / 2 / 1 / 1 passed |
+| core-runtime, оба профиля: `fakeip_persistence` / `selector_persistence` / `hot_reload` | 6 / 1 / 11 passed |
+
+- **Отрицательные контроли (baseline, каждый тест отдельно — переполнение стека роняет весь бинарник):** все 12 новых тестов падают: переполнение стека (SIGABRT) — `self_referencing_branch_is_an_error`, `page_cycle_inside_a_bucket_is_an_error`, `deep_page_chains_are_bounded`, `page_cycle_at_the_root_starts_empty_and_keeps_the_file`, `damaged_bucket_is_skipped_and_the_rest_loads`; `attempt to add with overflow` — `child_page_ids_outside_the_tree_are_errors`; неверный результат — `shared_subtrees_fail_fast`, `overflow_past_the_high_water_mark_is_an_error`, `root_on_a_meta_page_is_refused_at_open`, `a_page_inside_another_pages_overflow_is_an_error`, `overlapping_elements_are_an_error`, `element_count_past_the_page_is_an_error`.
+
+#### Ограничения
+
+- В `main` не слито, не выпущено.
+- OpenWrt, 32-битные цели и полный CI не проверялись.
+- **Соседние находки (не исправлялись):**
+  1. Читатель всегда берёт meta-страницу 0, если она корректна, и не учитывает txid; bbolt выбирает более новую. В файле, записанном sing-box, meta 0 может быть старой транзакцией, чьи страницы уже переиспользованы; теперь это ошибка или устаревшие данные, а не падение.
+  2. Нет fsync перед rename при flush (CQ-13): после отключения питания возможен «рваный» файл; теперь он обрабатывается без падения.
+  3. Поиск обходит детей подряд, а не по ключу ветви — влияет только на скорость.
+  4. Имена bucket читаются как lossy UTF-8; bucket с некорректным UTF-8 теперь логируется и пропускается.
+  5. Writer кладёт маленькие и пустые bucket на отдельные страницы, где bbolt хранил бы их inline; совместимость сохраняется.
