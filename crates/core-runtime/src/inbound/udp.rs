@@ -46,6 +46,12 @@ const MAX_SNIFF_DATAGRAMS: usize = 8;
 /// 1 MiB per opening flow (about 24 KiB at a 1500-byte MTU).
 const MAX_OPENING_DATAGRAMS: usize = 16;
 
+/// `hijack-dns` exchanges one hub runs at once; a query past it is dropped
+/// and the client's resolver retries. Each holds a task and, toward a UDP
+/// server, a socket and a 64 KiB buffer for up to the server timeout. Above
+/// dnsmasq's default `dns-forward-max` (150), so a forwarder is not cut.
+const MAX_DNS_HIJACKS: usize = 256;
+
 /// What [`UdpHub::open_flow`] made of a flow's datagrams so far.
 enum Opened {
     Flow(Arc<Flow>),
@@ -385,10 +391,15 @@ impl FlowOpener {
             if let FlowKind::Dns = flow.kind {
                 // one exchange per query, as before: a slow answer must not
                 // hold the next query of the same tuple
+                let Ok(slot) = Arc::clone(&self.hub.dns_slots).try_acquire_owned() else {
+                    logging::debug(format_args!("udp hijack-dns {tag} {source}: busy, dropped"));
+                    continue;
+                };
                 let hub = Arc::clone(&self.hub);
                 let reply = reply.clone();
                 let tag = tag.to_string();
                 tokio::spawn(async move {
+                    let _slot = slot;
                     if let Err(err) = hub.hijack_one(reply, source, dest, &payload, &tag).await {
                         logging::debug(format_args!("udp hijack-dns {tag} {source}: {err}"));
                     }
@@ -422,6 +433,8 @@ pub(crate) struct UdpHub {
     pending: Mutex<HashMap<FlowKey, PendingFlow>>,
     /// `pending.len()`, readable without the lock on the fast path
     pending_count: AtomicUsize,
+    /// [`MAX_DNS_HIJACKS`] permits, one per running `hijack-dns` exchange
+    dns_slots: Arc<tokio::sync::Semaphore>,
     next_opener: AtomicU64,
     reverse_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     timeout: Duration,
@@ -438,6 +451,7 @@ impl UdpHub {
             held: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             pending_count: AtomicUsize::new(0),
+            dns_slots: Arc::new(tokio::sync::Semaphore::new(MAX_DNS_HIJACKS)),
             next_opener: AtomicU64::new(0),
             reverse_tasks: Mutex::new(Vec::new()),
             timeout: if timeout.is_zero() {
