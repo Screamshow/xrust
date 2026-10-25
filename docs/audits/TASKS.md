@@ -39,6 +39,7 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | RS-01 | Правило rule set только с `domain_regex` совпадает с любым соединением; в смешанных правилах regex игнорируется | P1 | исправлено, проверено | `79fb8be31263157aabd07c7c5c1419528c4e40f0`, `08d35a3814dac7d528d9d1e1a8a9ee336cce647c`, `9c688b2e9c28f8b78dba7833f1ccc71e2e13f5ed` |
 | SEC-08 / CQ-11 | DNS: ответ upstream не сверяется с запросом, ID предсказуем | P1 | исправлено, проверено | `2506df64e37b5a119c10724a5e7d6287f5e837d8` |
 | CQ-12 | bbolt: бесконечная рекурсия на повреждённом cache.db | P1 | исправлено, проверено | `41c8be591e4c8a664a480498f1aec47192923761` |
+| CQ-13 (частично) | cache.db: запись без fsync файла и каталога — исправлена только долговечность записи | P1 | исправлено (частично), ожидает независимой проверки | `6c7d0da0c6a481d091a0e681c4805517a09c8804` |
 
 ## Задачи
 
@@ -1686,3 +1687,54 @@ PID основной службы и контрольные суммы `/etc/con
 - **OpenWrt 25.12.5 x86_64:** 26/26 — `corrupt_pages` 10, `cache_file_corrupt` 2, `dns_response_matching` 11 (с независимым тестом), `dns_quic_h3` 3. Проверены повреждённые деревья, сохранность файла и исправного bucket; DNS ID/question/QR, параллельные запросы, восстановление ID вызывающего, TCP, отрицательные DoH/DoQ и корректный H3. Отдельные release musl-бинарники запускались из `/tmp`. Пакеты, PID службы и контрольные суммы UCI `forkop`/`dhcp` и `config.json` до и после совпали.
 - **Границы:** legacy, ARM, полный CI, пакетное обновление, WAN/LAN/nft и полный жизненный цикл службы не проверялись. Отдельных отрицательных стендов DoT/H3 не было. Исходники miekg/dns и Go не сверялись — эквивалентность им не заявляется. Полный фаззинг bbolt не выполнялся.
 - **Остаются отдельными вопросами:** txid при выборе meta-страницы, fsync (CQ-13), повтор по TCP при усечённом UDP-ответе, прерывание UDP-обмена подделанным ICMP.
+
+### CQ-13 (частично) — долговечность записи cache.db
+
+- **Приоритет:** P1.
+- **Статус:** исправлено частично, ожидает независимой проверки. В `main` не слито, не выпущено.
+- **Объём:** исправлена только долговечность атомарной замены cache.db. **Не закрываются:** flush под блокировками и в асинхронных потоках, flush при каждой смене selector, тела rule set внутри cache.db, полные перезаписи раз в минуту при `store_fakeip`, выбор meta-страницы по txid.
+- **Коммит:** [`6c7d0da0c6a481d091a0e681c4805517a09c8804`](https://github.com/Screamshow/xrust/commit/6c7d0da0c6a481d091a0e681c4805517a09c8804).
+- **Файлы:** `crates/core-experimental/src/bbolt.rs` (новая `encode_ref`; `write_ref` прежний, без синхронизации), `crates/core-runtime/src/cache_file.rs` (`flush`, `replace_synced`, `sync_dir`, тесты `durable_flush_tests`).
+
+#### Причина
+
+- `cache_file.rs:320-322`: `flush` писал `<path>.db.tmp` через `bbolt::write_ref` (`fs::write`, `bbolt.rs:758`) и делал `rename` без синхронизации файла и каталога. После отключения питания cache.db мог оказаться пустым или «рваным» (rename попадает на диск раньше данных) либо rename терялся.
+
+#### Исправление
+
+- `flush`: образ из `bbolt::encode_ref` → `File::create(tmp)`, `write_all`, `sync_all` → `rename(tmp, path)` → `sync_all` родительского каталога (Unix). Пустой родитель (голое имя `cache.db`) — текущий каталог `.`; `dir/cache.db` — `dir`. Синхронизация добавлена только для cache.db; другие вызовы общего writer не меняются. Формат, байты, периодичность и условия flush прежние.
+- **Ошибка до или во время rename:** cache.db не тронут, временный файл удаляется (раньше оставался), ошибка возвращается, `dirty`, `pending` и `last_flush` не меняются — следующий flush повторяет запись целиком.
+- **Ошибка синхронизации каталога после rename:** возвращается как `replaced, but directory sync failed: …`; прежний файл уже заменён, отката нет и он не заявляется; `dirty` остаётся установленным, поэтому следующий flush перезаписывает файл и снова синхронизирует каталог.
+- `EINVAL` и `ENOTSUP` от fsync каталога считаются успехом — для файловых систем, которые не умеют синхронизировать каталоги (иначе `dirty` никогда бы не сбрасывался и каждый `put` вёл бы к полной перезаписи).
+- Тестовый шов `sync_hook` (`#[cfg(all(test, unix))]`) записывает синхронизированные каталоги и может отказать в следующей синхронизации; в обычной сборке отсутствует.
+
+#### Изменения поведения
+
+- Каждый flush cache.db делает два fsync (файл и каталог). На tmpfs (путь Forkop X по умолчанию `/tmp/sing-box/cache.db`) это почти бесплатно; на flash (jffs2, ubifs, f2fs, ext4 на eMMC) fsync образа в несколько МБ может занимать десятки–сотни мс и добавляется к существующей стоимости flush (CQ-13, не исправлена).
+- При ошибке до rename временный файл теперь удаляется.
+
+#### Проверки разработки
+
+- Сборки в candidate (рабочее дерево; файлы параллельной задачи XHTTP на время прогона возвращены к `HEAD`), отрицательный контроль — в baseline.
+
+| Команда | Результат |
+|---|---|
+| `rustfmt --edition 2024 --check` (2 файла) | чисто |
+| `clippy --locked -p core-experimental -p core-runtime --all-targets --features core-runtime/legacy-protocols -- -D warnings` | чисто; в rust-x новых предупреждений нет |
+| `--lib cache_file::` (оба профиля; включая 5 новых `durable_flush_tests`) | 6 passed |
+| rust-x: `cache_file` / `cache_file_compat` / `cache_file_corrupt` / `cache_file_flush_alloc` / `cache_file_interop` / `fakeip_persistence` / `hot_reload` | 10 / 5 (+1 ignored) / 2 / 1 / 1 / 6 / 11 passed |
+| `cargo test -p core-experimental` | lib 1, `corrupt_pages` 10, `golden_roundtrip` 2, `writer_bytes` 1 — passed |
+
+- **strace** (`strace -f -e trace=openat,write,fsync,fdatasync,rename,renameat,renameat2` на тестовом бинарнике):
+  - абсолютный путь: `openat(".../cache.db.tmp", O_WRONLY|O_CREAT|O_TRUNC)` → `fsync` файла → `rename(".../cache.db.tmp", ".../cache.db")` → `openat(<каталог>, O_RDONLY)` → `fsync` каталога;
+  - относительный путь (дочерний процесс с `current_dir` во временном каталоге): `cache.db.tmp` → `fsync` → `rename("cache.db.tmp","cache.db")` → `openat(".")` → `fsync`; затем то же для `dir/cache.db` с `openat("dir")`.
+- **Отрицательный контроль** (baseline `26f105b` + новый `cache_file.rs`, `flush` возвращён к `fs::write` + `rename`): падают `flush_syncs_the_parent_directory`, `directory_sync_error_is_reported_and_retried`, `relative_path_flush_syncs_the_right_directory`; проходят, как и ожидалось, `error_before_rename_keeps_old_file_and_retries` и `parent_of_a_bare_name_is_the_current_directory` (защищают от регрессий).
+
+#### Ограничения
+
+- В `main` не слито, не выпущено.
+- Настоящий обрыв питания не проверялся: тесты проверяют только порядок вызовов и обработку ошибок.
+- Ошибка записи временного файла после успешного создания (например, ENOSPC) отдельным тестом не проверялась; путь удаления тот же.
+- Если процесс прерывается посреди записи, оставшийся временный файл при старте не удаляется (как и раньше).
+- OpenWrt и полный CI не проверялись.
+- **Соседние находки (не исправлялись):** запись через tmp + rename без fsync файла и каталога в `route/rule_set_remote.rs:150, :406, :484, :759` (кэш rule set и TSRS) и в `outbound/tailscale/service.rs:83` (файл состояния); `outbound/tailscale/control.rs:366-370` уже делает синхронизацию файла, rename и синхронизацию каталога — позже можно вынести общий помощник.
