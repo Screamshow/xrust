@@ -58,7 +58,8 @@ P0–P3 по аудиту от 2026-10-23. Работа идёт в ветке `
 | CQ-10 | DNS hijack: задача и буфер 64 КиБ на запрос без ограничения | P1 | исправлено, ожидает независимой проверки | `ce13ae856fce788b24b6afa9687cdd4e2037e387` |
 | MEM-02 / CQ-07 / CN-12 | UDP NAT: 64–128 КиБ на поток, лимита потоков нет | P0 | исправлено, ожидает независимой проверки | `d65865c0db337831a0cea6964c47d26712ee10ba` |
 | SEC-09 | VLESS encryption 0-RTT: повтор nonce | P1 | не достижимо: слой шифрования не подключён к outbound; не исправлялось | — |
-| VLESS-ENC-01 | VLESS `encryption` принимается и молча игнорируется: узел работает без шифрования, UUID уходит открытым текстом | P1 (новая находка) | не исправлено, препятствие выпуску — требует решения владельца | — |
+| VLESS-ENC-01 | VLESS `encryption` принимался и молча игнорировался: узел работал без шифрования, UUID уходил открытым текстом | P1 (новая находка) | исправлено явным отказом (решение владельца), ожидает независимой проверки | `2ba4dd69001b72f483705d2695e2cc6044c631ff`, forkop-x `09fab917a739d02bb66501f9f1e524a926059b58` |
+| PQV-01 | REALITY `pqv` (`mldsa65Verify`) молча терялся при импорте и в ручных ссылках | P1 (новая находка) | исправлено явным отказом на Rust X, ожидает независимой проверки | forkop-x `31ba1b67e1d834cabd04650102440be381b33ffd` |
 
 ## Задачи
 
@@ -2077,6 +2078,38 @@ PID основной службы и контрольные суммы `/etc/con
 
 - Не запускались: legacy-профиль целиком, OpenWrt, исполнение на ARM, полный CI, tproxy UDP от начала до конца (нужен CAP_NET_ADMIN).
 
+### VLESS-ENC-01 и PQV-01 — явный отказ (снимок xrust `2ba4dd6`, forkop-x `31ba1b67`)
+
+- **Решение владельца:** явный отказ, без реализации VLESS encryption и ML-DSA.
+- **Rust X** `2ba4dd69001b72f483705d2695e2cc6044c631ff`: `encryption` допускается только отсутствующим, пустым или `none`; иначе `check` и запуск дают `outbounds[N].encryption: VLESS encryption (<схема>) is not supported; use "none"`. При reload такой конфиг отклоняется общим путём отклонения конфигурации с сохранением текущего runtime; отдельно это не тестировалось.
+- **Forkop X** `09fab917a739d02bb66501f9f1e524a926059b58`: на Rust X узлы подписки с `encryption`, отличным от `none`, пропускаются с предупреждением по правилам FX-01; раздел без узлов не применяется («… skipped subscription outbounds with unsupported protocols: vless encryption (N). Settings were not applied»), прежний конфиг не заменяется, переход в Direct не происходит; ручная ссылка и JSON-outbound дают явную ошибку. Go-ядра не менялись.
+- **Forkop X** `31ba1b67e1d834cabd04650102440be381b33ffd` (`pqv`): параметр сохраняется при импорте (ссылка подписки, Xray JSON `mldsa65Verify`) и при экспорте ссылки как служебная метка Forkop; на Rust X узлы подписки пропускаются с предупреждением, раздел без узлов не применяется, ручная ссылка даёт ошибку. Для остальных ядер метка удаляется, outbound совпадает с узлом без `pqv`.
+- **Проверки:**
+  - xrust: новый тест `vless_encryption_other_than_none_is_refused` падает на `9c2d375` (конфиг принимается) и проходит после; `core-config` — только 108 известных падений проверок legacy-протоколов. Бинарником x86_64-musl: `check` без `encryption` и с `none` — rc=0, с `mlkem768x25519plus…` — rc=1 с текстом выше.
+  - forkop-x: `tests/rust_x_vless_encryption.sh` и `tests/rust_x_reality_pqv.sh` падают до исправлений и проходят после; 16 соседних тестов (`subscription_*`, `urltest_groups`, `xhttp_capabilities`, `filtered_outbound_runtime`, `byedpi_removed`, `rust_x_tls12_fingerprints`, `hysteria2_certificate_pins`, `log_hygiene`, `package_contract`, `subscription_pin_compatibility.uc`, `reality_xhttp.uc`) проходят.
+- **Не проверено:** OpenWrt, LuCI, применение через службу с живым runtime.
+
+### Постквантовые механизмы клиента (проверка `2ba4dd6`)
+
+| Механизм | Итог | Основание |
+|---|---|---|
+| VLESS Encryption (`mlkem768x25519plus…`) | не поддерживается | слой не подключён к outbound; с `2ba4dd6` явно отвергается |
+| X25519MLKEM768 в TLS/REALITY | работает | interop с Xray 26.10.21 (`1b1647c`, REALITY `83f621788ca8`), VLESS + REALITY + Vision, `encryption` = none, dest `www.google.com:443`, отпечатки chrome и firefox: в открытом ServerHello группа `0x11ec` длиной 1120; Xray (`show`) — «is using X25519MLKEM768 … true»; 1 МиБ через туннель побайтно совпал. Клиент выводит ключи только из группы ServerHello, без запасного пути |
+| ML-DSA-65 (`mldsa65Verify`) | не поддерживается | кода нет; Xray — «using ML-DSA-65 … false»; Forkop с `31ba1b67` отказывает на Rust X |
+
+- **Ограничения X25519MLKEM768:** в REALITY группу выбирает dest-сайт (Xray копирует его ServerHello), поэтому гибрид будет только с dest, выбирающим X25519MLKEM768; HelloRetryRequest Rust X не поддерживает; проверены только x86_64, chrome/firefox и один dest. Контроль с локальным dest на OpenSSL 3.0 не удался из-за стенда (Xray: `padding: -4`), классический X25519-путь этим прогоном не проверен.
+
+### Итоговые проверки замороженного кандидата (xrust `2ba4dd6`)
+
+| Проверка | Результат |
+|---|---|
+| `cargo test --workspace --no-default-features --features rust-x --no-fail-fast` | 1411 passed, 138 failed, 16 ignored; набор упавших тот же, что на `fc3a80a`/`d35d7b7` (исключённые из rust-x протоколы), новых нет |
+| `cargo clippy --workspace --all-targets --no-default-features --features rust-x` | только 14 прежних предупреждений `dead_code` |
+| release `x86_64-unknown-linux-musl` | собран, 12 701 744 байт |
+| release `aarch64-unknown-linux-musl` | собран, 10 064 984 байт |
+
+- Кандидат заморожен для независимой приёмки: xrust `dev` и forkop-x `dev` на SHA этого раздела и следующей за ним записи журнала. Не запускались: legacy-профиль целиком, OpenWrt, исполнение на ARM, полный CI.
+
 ## Интеграционные проверки
 
 ### Клиентская интеграция Forkop X + Rust X (Codex)
@@ -2262,5 +2295,6 @@ CQ-01, CQ-03, CQ-06, CQ-11, CQ-12, SEC-01, SEC-02, SEC-04, SEC-05, SEC-07, SEC-0
 ### Без ID в аудите
 
 - Forkop X не разбирал `pinSHA256` в ссылках Hysteria2: пин молча терялся (часть SEC-02 на стороне Forkop). Исправлено в forkop-x `61c129ec`, ожидает независимой проверки.
-- VLESS `encryption` принимается конфигурацией и молча игнорируется (VLESS-ENC-01, см. сводку): не исправлено, требует решения владельца.
+- VLESS `encryption` принимался конфигурацией и молча игнорировался (VLESS-ENC-01): исправлено явным отказом (`2ba4dd6`, forkop-x `09fab917`), ожидает проверки.
+- REALITY `pqv` терялся в Forkop (PQV-01): исправлено явным отказом на Rust X (forkop-x `31ba1b67`), ожидает проверки.
 - Выбор meta-страницы bbolt (соседняя находка CQ-12) закрыт коммитом `fc3a80a` (CQ-13).
