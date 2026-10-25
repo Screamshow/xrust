@@ -380,12 +380,35 @@ async fn serve(listener: TcpListener, api: Arc<ClashApi>, router: Arc<Router>) {
                     }
                 });
             }
-            Err(e) => {
-                logging::debug(format_args!("clash-api: accept error: {e}"));
-                return;
-            }
+            // `EMFILE` and friends clear up; returning here would drop the
+            // socket and leave the controller dark until a restart.
+            Err(e) => crate::inbound::serve_stalled("clash-api accept", &e).await,
         }
     }
+}
+
+/// How long a client may take to deliver a request head, including the idle
+/// gap before the next request on a kept-alive connection. The reference
+/// `http.Server` sets no limit, so a LAN peer that connects and stays silent
+/// pins a task and a descriptor for good. Ten seconds is ample for LuCI, curl
+/// and dashboards (a common `ReadHeaderTimeout`). Covering the keep-alive gap
+/// too keeps idle connections from piling up; HTTP clients reopen a closed
+/// idle connection on their own. Responses, WebSocket streams and delay
+/// probes are not covered by it.
+/// `TACHYON_CLASH_API_HEADER_TIMEOUT_MS` overrides it.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn header_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        if let Ok(val) = std::env::var("TACHYON_CLASH_API_HEADER_TIMEOUT_MS")
+            && let Ok(ms) = val.parse::<u64>()
+            && ms > 0
+        {
+            return Duration::from_millis(ms);
+        }
+        HEADER_TIMEOUT
+    })
 }
 
 /// One client connection: the reference `http.Server` keeps it alive, so
@@ -396,7 +419,10 @@ async fn handle_conn(
     router: &Arc<Router>,
 ) -> std::io::Result<()> {
     loop {
-        let Some(head) = read_head(&mut stream).await? else {
+        let Ok(head) = tokio::time::timeout(header_timeout(), read_head(&mut stream)).await else {
+            return Ok(());
+        };
+        let Some(head) = head? else {
             return Ok(());
         };
         if !handle_request(&mut stream, api, router, &head).await? {
