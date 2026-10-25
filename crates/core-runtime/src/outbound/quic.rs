@@ -1125,17 +1125,32 @@ impl VarintReader {
 /// count, so a single-fragment packet -- the overwhelmingly common case --
 /// travels through without a copy at all; only the multi-fragment reassembly
 /// copies, and then once, into the contiguous output.
+///
+/// Only a few packets are held in assembly (upstream Hysteria keeps one):
+/// a new packet past [`DEFRAG_MAX_PENDING`] drops the oldest unfinished one,
+/// and a packet whose fragments add up past the largest UDP payload is
+/// dropped, so a lossy or hostile peer cannot grow the session's memory.
 pub(crate) struct Defragger {
-    // packet_id → (total, slots)
-    items: std::collections::HashMap<u16, FragSlots>,
+    // unfinished packets, oldest first
+    items: std::collections::VecDeque<PendingPacket>,
 }
 
-type FragSlots = (u8, Vec<Option<bytes::Bytes>>);
+/// Unfinished packets one session keeps.
+const DEFRAG_MAX_PENDING: usize = 4;
+/// Largest reassembled packet: one UDP payload.
+const DEFRAG_MAX_BYTES: usize = 0xffff;
+
+struct PendingPacket {
+    id: u16,
+    slots: Vec<Option<bytes::Bytes>>,
+    received: usize,
+    size: usize,
+}
 
 impl Defragger {
     pub fn new() -> Self {
         Self {
-            items: std::collections::HashMap::new(),
+            items: std::collections::VecDeque::new(),
         }
     }
 
@@ -1153,23 +1168,47 @@ impl Defragger {
         if frag_id >= frag_total {
             return None;
         }
-        let entry = self
-            .items
-            .entry(packet_id)
-            .or_insert_with(|| (frag_total, vec![None; frag_total as usize]));
-        if entry.0 != frag_total {
-            *entry = (frag_total, vec![None; frag_total as usize]);
-        }
-        entry.1[frag_id as usize] = Some(data);
-        if entry.1.iter().all(Option::is_some) {
-            let (_, slots) = self.items.remove(&packet_id)?;
-            let mut out = bytes::BytesMut::new();
-            for slot in slots {
-                out.extend_from_slice(&slot?);
+        let found = self.items.iter().position(|p| p.id == packet_id);
+        let at = match found {
+            Some(at) if self.items[at].slots.len() == usize::from(frag_total) => at,
+            found => {
+                // a reused id with another fragment count starts over
+                if let Some(at) = found {
+                    self.items.remove(at);
+                }
+                if self.items.len() >= DEFRAG_MAX_PENDING {
+                    self.items.pop_front();
+                }
+                self.items.push_back(PendingPacket {
+                    id: packet_id,
+                    slots: vec![None; usize::from(frag_total)],
+                    received: 0,
+                    size: 0,
+                });
+                self.items.len() - 1
             }
-            return Some(out.freeze());
+        };
+        let item = &mut self.items[at];
+        let slot = &mut item.slots[usize::from(frag_id)];
+        if slot.is_some() {
+            return None;
         }
-        None
+        item.size += data.len();
+        if item.size > DEFRAG_MAX_BYTES {
+            self.items.remove(at);
+            return None;
+        }
+        *slot = Some(data);
+        item.received += 1;
+        if item.received < item.slots.len() {
+            return None;
+        }
+        let item = self.items.remove(at)?;
+        let mut out = bytes::BytesMut::with_capacity(item.size);
+        for slot in item.slots {
+            out.extend_from_slice(&slot?);
+        }
+        Some(out.freeze())
     }
 }
 
@@ -1355,5 +1394,46 @@ mod tests {
             d.feed(2, 1, 2, bytes::Bytes::from_static(b"cd")),
             Some(bytes::Bytes::from_static(b"abcd"))
         );
+    }
+
+    #[test]
+    fn defragger_bounds_unfinished_packets() {
+        let frag = bytes::Bytes::from(vec![0u8; 1200]);
+        // every packet loses its second fragment
+        let mut d = Defragger::new();
+        for id in 0..=u16::MAX {
+            assert_eq!(d.feed(id, 0, 2, frag.clone()), None);
+        }
+        assert!(
+            d.items.len() <= 4,
+            "{} unfinished packets kept",
+            d.items.len()
+        );
+        // a stale fragment is not joined to a later packet under the same id
+        let mut d = Defragger::new();
+        d.feed(5, 0, 2, bytes::Bytes::from_static(b"old"));
+        for id in 6..1000 {
+            d.feed(id, 0, 2, frag.clone());
+        }
+        assert_eq!(d.feed(5, 1, 2, bytes::Bytes::from_static(b"new")), None);
+        // fragments adding up past one UDP payload are not kept
+        let mut d = Defragger::new();
+        for i in 0..55 {
+            d.feed(9, i, 255, frag.clone());
+        }
+        assert!(d.items.is_empty(), "an oversize packet is kept in assembly");
+        // interleaved packets still complete
+        let mut d = Defragger::new();
+        assert_eq!(d.feed(1, 0, 2, bytes::Bytes::from_static(b"a")), None);
+        assert_eq!(d.feed(2, 1, 2, bytes::Bytes::from_static(b"d")), None);
+        assert_eq!(
+            d.feed(2, 0, 2, bytes::Bytes::from_static(b"c")).as_deref(),
+            Some(&b"cd"[..])
+        );
+        assert_eq!(
+            d.feed(1, 1, 2, bytes::Bytes::from_static(b"b")).as_deref(),
+            Some(&b"ab"[..])
+        );
+        assert!(d.items.is_empty());
     }
 }
