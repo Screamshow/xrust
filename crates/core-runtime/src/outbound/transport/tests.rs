@@ -569,3 +569,37 @@ async fn a_masked_frame_bigger_than_the_buffer_still_reads_out_whole() {
     assert_eq!(got.len(), LEN, "the masking key must still be applied");
     assert!(got == payload, "and the payload must come back in order");
 }
+
+/// A websocket waiting for its socket holds no buffers: an empty read buffer
+/// and an empty write queue go back to the pool, and the stream takes them
+/// again when traffic resumes, with every byte arriving whole and in order.
+#[tokio::test]
+async fn an_idle_stream_parks_its_buffers_and_traffic_resumes_intact() {
+    use tokio::io::AsyncWriteExt;
+    let (client, server) = tokio::io::duplex(512 * 1024);
+    let mut ws = WsStream::new(Box::new(client));
+    let mut peer = WsStream::server(Box::new(server));
+    for round in 0..3u8 {
+        let big: Vec<u8> = (0..150_000usize).map(|i| (i % 253) as u8 ^ round).collect();
+        ws.write_all(&big).await.expect("write");
+        ws.flush().await.expect("flush");
+        let mut got = vec![0u8; big.len()];
+        peer.read_exact(&mut got).await.expect("read");
+        assert!(got == big, "round {round}: upload differs");
+        peer.write_all(&big[..70_000]).await.expect("reply");
+        peer.flush().await.expect("flush reply");
+        let mut back = vec![0u8; 70_000];
+        ws.read_exact(&mut back).await.expect("read reply");
+        assert!(back[..] == big[..70_000], "round {round}: download differs");
+
+        let mut one = [0u8; 1];
+        for end in [&mut ws, &mut peer] {
+            let idle =
+                tokio::time::timeout(std::time::Duration::from_millis(20), end.read(&mut one))
+                    .await;
+            assert!(idle.is_err(), "nothing was sent, the read must wait");
+            assert_eq!(end.rbuf.capacity(), 0, "idle stream kept its read buffer");
+            assert_eq!(end.wbuf.capacity(), 0, "idle stream kept its write queue");
+        }
+    }
+}

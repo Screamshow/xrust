@@ -639,10 +639,10 @@ async fn httpupgrade_handshake(
 pub(crate) struct WsStream {
     inner: AnyStream,
     /// bytes off the wire not consumed yet: `rbuf[rpos..]`, its length being the
-    /// filled part. Allocated once at [`WS_READ`] and grown only if it ever fills
-    /// up: a buffer that follows the traffic means a realloc, and every realloc
-    /// over glibc's mmap threshold is a fresh mmap and munmap pair on the hot
-    /// path.
+    /// filled part. [`WS_READ`] big and grown only if it ever fills up: a buffer
+    /// that follows the traffic means a realloc, and every realloc over glibc's
+    /// mmap threshold is a fresh mmap and munmap pair on the hot path. While the
+    /// socket has nothing to read, an empty buffer goes back to [`WS_READ_POOL`].
     rbuf: Vec<u8>,
     rpos: usize,
     /// payload of the data frame being handed out that is still to come, its
@@ -654,7 +654,8 @@ pub(crate) struct WsStream {
     /// Payload of a ping awaiting a pong reply.
     pong: Option<Vec<u8>>,
     /// Whole frames waiting to go out (data, pongs, close), and how much of
-    /// them is written. Frames are only ever appended whole.
+    /// them is written. Frames are only ever appended whole. Parked in
+    /// [`WS_WRITE_POOL`] with the read buffer when it is empty.
     wbuf: Vec<u8>,
     wpos: usize,
     /// Caller bytes consumed by the data frame currently flushing.
@@ -668,6 +669,10 @@ pub(crate) struct WsStream {
 
 /// What one read asks the socket for at least.
 const WS_READ: usize = 32 * 1024;
+
+/// Buffers of websocket streams that wait for their socket, as in the TLS stack.
+static WS_READ_POOL: crate::bufpool::Pool = crate::bufpool::Pool::new();
+static WS_WRITE_POOL: crate::bufpool::Pool = crate::bufpool::Pool::new();
 
 /// Enough for any frame header, and no more: the biggest one is a 14-byte extended
 /// length. A read at a frame boundary asks for just this, so the payload is never
@@ -748,7 +753,7 @@ impl WsStream {
         Self {
             mask_out,
             inner,
-            rbuf: Vec::with_capacity(WS_READ),
+            rbuf: Vec::new(),
             rpos: 0,
             left: 0,
             mask: None,
@@ -767,6 +772,9 @@ impl WsStream {
         // Only a masked payload fills this buffer, and a server never masks: what
         // gets staged here is a frame header, or the head of a payload when a mask
         // is in play. So the common case has room and never reallocates.
+        if self.rbuf.capacity() == 0 {
+            self.rbuf = WS_READ_POOL.take();
+        }
         if self.rbuf.len() == self.rbuf.capacity() {
             if self.rpos > 0 {
                 let end = self.rbuf.len();
@@ -801,6 +809,18 @@ impl WsStream {
         Poll::Ready(Ok(true))
     }
 
+    /// While the socket has nothing to read, hand back the buffers that hold
+    /// nothing: no frame head or masked payload staged, no frame queued.
+    fn park_buffers(&mut self) {
+        if self.rpos == self.rbuf.len() {
+            WS_READ_POOL.give(std::mem::take(&mut self.rbuf));
+            self.rpos = 0;
+        }
+        if self.wbuf.is_empty() {
+            WS_WRITE_POOL.give(std::mem::take(&mut self.wbuf));
+        }
+    }
+
     /// Drain the queued frames into the socket.
     fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.wpos < self.wbuf.len() {
@@ -826,6 +846,9 @@ impl WsStream {
             let _ = random_bytes(&mut mask);
         }
         let len = payload.len();
+        if self.wbuf.capacity() == 0 {
+            self.wbuf = WS_WRITE_POOL.take();
+        }
         self.wbuf.reserve(14 + len);
         self.wbuf.push(0x80 | opcode);
         let masked_bit = if self.mask_out { 0x80 } else { 0 };
@@ -856,6 +879,21 @@ impl AsyncRead for WsStream {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let me = &mut *self;
+        let polled = me.poll_read_frames(cx, out);
+        if polled.is_pending() {
+            me.park_buffers();
+        }
+        polled
+    }
+}
+
+impl WsStream {
+    fn poll_read_frames(
+        &mut self,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self;
         loop {
             if me.eof {
                 return Poll::Ready(Ok(()));

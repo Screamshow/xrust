@@ -1,3 +1,4 @@
+pub(crate) mod bufpool;
 pub mod cache_file;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;

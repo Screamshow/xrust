@@ -13,6 +13,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::bufpool::Pool;
 use core_tls::client::{Connection, Record};
 
 /// How much the raw buffer grows by when it needs room. A record is at most
@@ -20,39 +21,9 @@ use core_tls::client::{Connection, Record};
 /// that is not pathological.
 const CHUNK: usize = 64 * 1024;
 
-/// Buffers of connections that are waiting for their socket. A connection
-/// hands its buffers back when a read goes Pending with nothing left in them
-/// and takes one again on its next read or write: a busy connection gets the
-/// same memory back without a new allocation, and an idle one holds none.
-/// Each pool keeps at most `POOL_KEEP` buffers.
-struct Pool(std::sync::Mutex<Vec<Vec<u8>>>);
-
-const POOL_KEEP: usize = 8;
-/// read buffers, `CHUNK` each
-static READ_POOL: Pool = Pool(std::sync::Mutex::new(Vec::new()));
-/// sealed-record buffers, one record each
-static WRITE_POOL: Pool = Pool(std::sync::Mutex::new(Vec::new()));
-
-impl Pool {
-    fn take(&self) -> Vec<u8> {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop()
-            .unwrap_or_default()
-    }
-
-    fn give(&self, mut buf: Vec<u8>) {
-        if buf.capacity() == 0 {
-            return;
-        }
-        buf.clear();
-        let mut pool = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if pool.len() < POOL_KEEP {
-            pool.push(buf);
-        }
-    }
-}
+/// Read buffers (`CHUNK` each) and sealed-record buffers (one record each).
+static READ_POOL: Pool = Pool::new();
+static WRITE_POOL: Pool = Pool::new();
 
 /// TLS over `S`, established by us rather than by a library.
 pub struct FingerprintStream<S> {
