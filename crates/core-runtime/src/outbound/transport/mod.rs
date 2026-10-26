@@ -1,6 +1,7 @@
 //! v2ray-style stream transports (ws, httpupgrade, grpc, http) and the
 //! shared outbound dial tail: TCP → optional TLS → transport → protocol.
 
+mod browser;
 pub(crate) mod grpc;
 pub(crate) mod h1io;
 pub(crate) mod h2io;

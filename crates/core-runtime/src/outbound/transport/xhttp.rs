@@ -616,6 +616,18 @@ type H2Fresh = (
 
 /// HTTP/2 handshake on a fresh connection whose reads are tracked for the
 /// keep-alive.
+/// What Go's HTTP/2 client adds to every request it sends: it asks for gzip
+/// unless the caller did (`requestedGzip` in x/net http2).
+fn go_h2_request(mut req: http::Request<()>) -> http::Request<()> {
+    if !req.headers().contains_key(http::header::ACCEPT_ENCODING) {
+        req.headers_mut().insert(
+            http::header::ACCEPT_ENCODING,
+            http::HeaderValue::from_static("gzip"),
+        );
+    }
+    req
+}
+
 async fn h2_handshake(stream: AnyStream) -> io::Result<H2Fresh> {
     let clock = std::sync::Arc::new(ReadClock::new());
     let io = ReadActivity {
@@ -805,7 +817,7 @@ impl XhttpConfig {
                 true,
             )?;
             let (response, send) = send_req
-                .send_request(request, false)
+                .send_request(go_h2_request(request), false)
                 .map_err(|e| io::Error::other(format!("xhttp: send_request: {e}")))?;
             let stream: AnyStream = Box::new(super::h2io::H2Io {
                 h2: super::h2io::H2Stream::shared(response, send),
@@ -826,7 +838,7 @@ impl XhttpConfig {
             false,
         )?;
         let (get_resp, _get_send) = send_req
-            .send_request(get_req, true)
+            .send_request(go_h2_request(get_req), true)
             .map_err(|e| io::Error::other(format!("xhttp: h2 GET send_request: {e}")))?;
         this.spawn_h2_download_stream(get_resp);
 
@@ -845,7 +857,7 @@ impl XhttpConfig {
                     .await
                     .map_err(|e| io::Error::other(format!("xhttp: h2 upload ready: {e}")))?;
                 let (up_resp, up_send) = up_client
-                    .send_request(up_req, false)
+                    .send_request(go_h2_request(up_req), false)
                     .map_err(|e| io::Error::other(format!("xhttp: h2 upload send_request: {e}")))?;
                 let failure = Failure::default();
                 this.up = Up::H2Stream(Box::new(H2StreamUp {
@@ -1283,6 +1295,12 @@ impl PostWriter {
             .await
             .map_err(|e| io::Error::other(format!("xhttp: h2 post ready: {e}")))?;
         let end_of_stream = payload.is_empty();
+        let mut req = go_h2_request(req);
+        if !end_of_stream {
+            // Go's client states the length of a body it knows
+            req.headers_mut()
+                .insert(http::header::CONTENT_LENGTH, payload.len().into());
+        }
         let (response, mut send) = client
             .send_request(req, end_of_stream)
             .map_err(|e| io::Error::other(format!("xhttp: h2 post send_request: {e}")))?;
@@ -2048,21 +2066,27 @@ impl XhttpConfig {
                 }
                 XPlacement::QueryInHeader => extra_headers.push((
                     m.x_header.clone(),
-                    format!("{scheme}://{authority}{path}?{}={pad}", m.x_key),
+                    format!(
+                        "{scheme}://{authority}{}?{}={pad}",
+                        self.base_path(),
+                        m.x_key
+                    ),
                 )),
             }
         } else if !pad.is_empty() {
-            // Legacy Xray: padding as ?x_padding= inside a Referer header. The
-            // filler is a literal '0' rather than the configured method's
-            // characters, because the server validates the *length* and the byte
-            // is free -- and the reference is explicit that this exact default is
-            // the one that has been live-verified against Xray. A zero length
-            // sends no header at all, which is also what the reference does.
+            // Padding as ?x_padding= inside a Referer header, as Xray sends it
+            // (`FillStreamRequest`/`FillPacketRequest`): `X`s, on the request
+            // URL as it stands before the session and seq are put in, so the
+            // bare path. The server checks only the length. The filler is no
+            // longer `0`: HPACK's Huffman code gives `0` five bits and `X`
+            // eight, so `0`s made every HEADERS frame a third shorter than
+            // Xray's for the same padding length.
             extra_headers.push((
                 "referer".to_string(),
                 format!(
-                    "{scheme}://{authority}{path}?x_padding={}",
-                    "0".repeat(pad.len())
+                    "{scheme}://{authority}{}?x_padding={}",
+                    self.base_path(),
+                    "X".repeat(pad.len())
                 ),
             ));
         }
@@ -2081,22 +2105,28 @@ impl XhttpConfig {
             }
             builder = builder.header(name.as_str(), value.as_str());
         }
+        // Xray's `GetRequestHeader`: with no User-Agent configured, the
+        // request is a Chrome `fetch` (`TryDefaultHeadersWith(header,
+        // "fetch")`); one configured keeps the request as it is.
+        if !self
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        {
+            for (name, value) in super::browser::chrome_fetch_headers() {
+                builder = builder.header(*name, value.as_str());
+            }
+        }
         for (name, value) in extra_headers {
             builder = builder.header(name.as_str(), value);
         }
         // A streamed body (stream-one, stream-up) announces itself as gRPC by
-        // default — reference `applyGRPCHeader` — and reverse proxies key
-        // response streaming on that. A packet-up upload is not a stream: the
-        // reference sends a plain `application/octet-stream` there, which is what
-        // its HTTP client puts on a body it is given, so that is what goes on the
-        // wire. Announcing gRPC on a per-packet upload is a claim nobody made.
-        if has_body && !self.no_grpc_header {
-            let content_type = if seq.is_some() || self.mode == Mode::PacketUp {
-                "application/octet-stream"
-            } else {
-                "application/grpc"
-            };
-            builder = builder.header("content-type", content_type);
+        // default (Xray `FillStreamRequest`), and reverse proxies key response
+        // streaming on that. A packet-up upload carries no content type at all:
+        // Xray's `FillPacketRequest` sets none and Go's client adds none.
+        let packet = seq.is_some() || self.mode == Mode::PacketUp;
+        if has_body && !self.no_grpc_header && !packet {
+            builder = builder.header("content-type", "application/grpc");
         }
         builder
             .body(())
@@ -2609,43 +2639,18 @@ mod tests {
             .build_request("https", "srv:443", "GET", Some("SID"), None, false)
             .unwrap();
         let referer = req.headers().get("referer").unwrap();
+        // Xray pads the request URL before the session goes in: the bare path
         assert!(
             referer
                 .to_str()
                 .unwrap()
-                .starts_with("https://srv:443/x/SID?x_padding=")
+                .starts_with("https://srv:443/x/?x_padding=")
         );
         let pad = referer.to_str().unwrap().rsplit('=').next().unwrap();
         assert_eq!(pad.len(), 50);
-        // the legacy default fills with '0', not the obfs method's characters: the
-        // server validates the length, and '0' is the byte the reference's
-        // live-verified default uses
-        assert!(pad.bytes().all(|b| b == b'0'));
-    }
-
-    /// A packet-up upload is a packet, not a stream: the reference sends
-    /// `application/octet-stream` there and reserves the gRPC content type for
-    /// the streamed modes, and a production node refused ours until it did.
-    #[test]
-    fn a_packet_up_upload_is_octet_stream_and_a_stream_is_grpc() {
-        for mode in ["packet-up", "auto"] {
-            let packet = cfg(json!({"mode": mode}));
-            let req = packet
-                .build_request("https", "srv:443", "POST", Some("SID"), Some("0"), true)
-                .unwrap();
-            assert_eq!(
-                req.headers().get("content-type").unwrap(),
-                "application/octet-stream"
-            );
-        }
-        let stream = cfg(json!({"mode": "stream-one"}));
-        let req = stream
-            .build_request("https", "srv:443", "POST", None, None, true)
-            .unwrap();
-        assert_eq!(
-            req.headers().get("content-type").unwrap(),
-            "application/grpc"
-        );
+        // `X`s, as Xray's `GeneratePadding` writes them: HPACK codes `X` in
+        // eight bits, so the HEADERS frame is as long as Xray's
+        assert!(pad.bytes().all(|b| b == b'X'));
     }
 
     /// Xray appends the session and seq to its normalized path, which ends
@@ -2669,6 +2674,60 @@ mod tests {
         assert_eq!(path(&header, Some("SID"), Some("7")), "/xh/7");
         let slash = cfg(json!({"path": "/xh/"}));
         assert_eq!(path(&slash, Some("SID"), Some("7")), "/xh/SID/7");
+    }
+
+    /// With no User-Agent configured, the request carries Xray's Chrome
+    /// `fetch` headers; a configured one leaves the request alone.
+    #[test]
+    fn requests_carry_xrays_browser_headers() {
+        let c = cfg(json!({}));
+        let req = c
+            .build_request("https", "srv:443", "GET", Some("SID"), None, false)
+            .unwrap();
+        let ua = req.headers().get("user-agent").unwrap().to_str().unwrap();
+        assert!(
+            ua.starts_with("Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
+            "{ua}"
+        );
+        for name in [
+            "sec-ch-ua",
+            "sec-ch-ua-mobile",
+            "sec-ch-ua-platform",
+            "sec-fetch-mode",
+            "sec-fetch-dest",
+            "sec-fetch-site",
+            "priority",
+            "accept",
+        ] {
+            assert!(req.headers().contains_key(name), "{name}");
+        }
+        let own = cfg(json!({"headers": {"User-Agent": "mine"}}));
+        let req = own
+            .build_request("https", "srv:443", "GET", Some("SID"), None, false)
+            .unwrap();
+        assert_eq!(req.headers().get("user-agent").unwrap(), "mine");
+        assert!(!req.headers().contains_key("sec-ch-ua"));
+    }
+
+    /// A packet-up upload carries no content type, as Xray's
+    /// `FillPacketRequest` sends it; a streamed body is announced as gRPC.
+    #[test]
+    fn a_packet_up_upload_has_no_content_type_and_a_stream_is_grpc() {
+        for mode in ["packet-up", "auto"] {
+            let packet = cfg(json!({"mode": mode}));
+            let req = packet
+                .build_request("https", "srv:443", "POST", Some("SID"), Some("0"), true)
+                .unwrap();
+            assert!(req.headers().get("content-type").is_none());
+        }
+        let stream = cfg(json!({"mode": "stream-one"}));
+        let req = stream
+            .build_request("https", "srv:443", "POST", None, None, true)
+            .unwrap();
+        assert_eq!(
+            req.headers().get("content-type").unwrap(),
+            "application/grpc"
+        );
     }
 
     #[test]
