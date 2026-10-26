@@ -12,7 +12,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CORPUS="$ROOT/tests/golden"
 REF="${SING_BOX_REF:?set SING_BOX_REF to the reference sing-box binary}"
-CORE="${XRUST_BIN:-${TACHYON_CORE_BIN:-}}"
+CORE="${XRUST_BIN:-}"
 if [[ -z "$CORE" ]]; then
   for candidate in \
     "$ROOT/target/debug/xrust" \
