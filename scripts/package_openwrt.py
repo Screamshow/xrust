@@ -72,16 +72,11 @@ def main():
                         architecture=arch, source_commit=a.source_commit,
                         binary_bytes=len(binary), binary_sha256=hashlib.sha256(binary).hexdigest(),
                         configuration_baseline='1.14.2', packed=False)
-        wrapper = f'''#!/bin/sh
-if [ "$1" = version ]; then
-    echo 'sing-box version 1.14.2-rust-x.{a.version}'
-    echo 'Xrust: {a.version}; configuration compatibility baseline: 1.14.2'
-    echo 'Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2'
-    echo 'Tags: with_utls,with_clash_api,with_tailscale'
-    exit 0
-fi
+        # The binary, installed under the sing-box name, prints the version
+        # block Forkop X reads itself.
+        wrapper = b'''#!/bin/sh
 exec /usr/lib/rust-x/sing-box "$@"
-'''.encode()
+'''
         files = [('usr/lib/rust-x/sing-box', binary, 0o755), ('usr/bin/sing-box', wrapper, 0o755),
                  ('usr/share/rust-x/build.json', (json.dumps(metadata, indent=2)+'\n').encode(), 0o644)]
         for path in ['etc/init.d/sing-box', 'etc/config/sing-box']:

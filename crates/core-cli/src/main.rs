@@ -52,11 +52,15 @@ mod rule_set;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Compatibility contract: Forkop X parses `sing-box version X` (generator.uc)
-/// and recognises this core by the `-rust-x.` suffix (older builds reported
-/// `-tachyon.`, which Forkop X still accepts).
-/// When invoked through the `sing-box` name we print upstream-shaped output;
-/// under our own name we print xrust output.
+/// The sing-box configuration this core is compatible with. Forkop X reads it
+/// from the version line to decide which sing-box features to configure.
+const CONFIG_BASELINE: &str = "1.14.2";
+
+/// Compatibility contract: Forkop X parses `sing-box version X` (generator.uc),
+/// recognises this core by the `-rust-x.` suffix, and reads the `Features:`
+/// (runtime.uc) and `Tags:` (ui.uc) lines.
+/// When invoked through the `sing-box` name we print that block, the same one
+/// the OpenWrt package has always shown; under our own name, `xrust <version>`.
 fn bin_invoked_as_sing_box() -> bool {
     std::env::args()
         .next()
@@ -69,10 +73,16 @@ fn bin_invoked_as_sing_box() -> bool {
 }
 
 fn version_line() -> String {
+    let version = env!("CARGO_PKG_VERSION");
     if bin_invoked_as_sing_box() {
-        format!("sing-box version v{}-rust-x.0\n", env!("CARGO_PKG_VERSION"))
+        format!(
+            "sing-box version {CONFIG_BASELINE}-rust-x.{version}\n\
+             Xrust: {version}; configuration compatibility baseline: {CONFIG_BASELINE}\n\
+             Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2\n\
+             Tags: with_utls,with_clash_api,with_tailscale\n"
+        )
     } else {
-        format!("xrust {}\n", env!("CARGO_PKG_VERSION"))
+        format!("xrust {version}\n")
     }
 }
 

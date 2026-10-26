@@ -165,6 +165,40 @@ fn version_is_the_shape_forkop_parses() {
     );
 }
 
+/// Run as `sing-box`, as the OpenWrt package installs it, the binary prints
+/// the block Forkop X parses: the version line with the configuration
+/// baseline and the `-rust-x.` suffix, then the features and tags lines.
+#[test]
+fn version_as_sing_box_is_the_block_forkop_parses() {
+    let dir = std::env::temp_dir().join(format!("xrust-as-sing-box-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let link = dir.join("sing-box");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_xrust"), &link).expect("symlink");
+    let output = Command::new(&link)
+        .arg("version")
+        .output()
+        .expect("run version");
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_dir(&dir);
+    assert!(output.status.success());
+    let said = String::from_utf8_lossy(&output.stdout);
+    let version = env!("CARGO_PKG_VERSION");
+    let lines: Vec<&str> = said.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!("sing-box version 1.14.2-rust-x.{version}"),
+        "{said}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("Features:") && l.contains("transport.xhttp")),
+        "{said}"
+    );
+    assert!(lines.iter().any(|l| l.starts_with("Tags:")), "{said}");
+}
+
 #[test]
 fn openwrt_cli_invocations() {
     let port = free_port();
