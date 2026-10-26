@@ -246,6 +246,13 @@ impl Transport {
         match &self.kind {
             Kind::Grpc { .. } => &[b"h2"],
             Kind::Xhttp(_) => &[b"h2", b"http/1.1"],
+            // the upgrade is an HTTP/1.1 request: a server offered h2 takes it
+            // and then hangs up on the GET. Both references ask for http/1.1
+            // alone when the config names nothing (sing-box
+            // `transport/v2raywebsocket/client.go` and `v2rayhttpupgrade/
+            // client.go`, Xray `websocket/dialer.go` and `httpupgrade/
+            // dialer.go`, `tls.WithNextProto("http/1.1")`).
+            Kind::Ws { .. } | Kind::HttpUpgrade { .. } => &[b"http/1.1"],
             Kind::Http { .. } if secure => &[b"h2"],
             _ => &[],
         }

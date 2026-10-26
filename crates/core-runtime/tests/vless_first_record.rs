@@ -598,12 +598,8 @@ async fn exercise(outbound: Value, echoes: &Echoes, label: &str, udp: bool) {
 }
 
 fn xray_tls() -> Value {
-    xray_tls_alpn(&["h2", "http/1.1"])
-}
-
-fn xray_tls_alpn(alpn: &[&str]) -> Value {
     let certs = certs_dir();
-    json!({"serverName": "localhost", "alpn": alpn, "certificates": [{
+    json!({"serverName": "localhost", "alpn": ["h2", "http/1.1"], "certificates": [{
         "certificateFile": format!("{certs}/localhost.crt"),
         "keyFile": format!("{certs}/localhost.key")
     }]})
@@ -648,12 +644,20 @@ async fn interop_with_xray_as_the_server() {
     cases.push((
         "ws+tls".to_string(),
         "",
-        // a ws server answers HTTP/1.1 only; offered h2 by a Chrome hello it
-        // would take it and then hang up on the upgrade request
-        json!({"network": "ws", "security": "tls", "tlsSettings": xray_tls_alpn(&["http/1.1"]),
+        // the server offers h2 too: a client that asks for it gets it and
+        // the upgrade request fails, so ours asks for http/1.1 only
+        json!({"network": "ws", "security": "tls", "tlsSettings": xray_tls(),
             "wsSettings": {"path": "/ws"}}),
         chrome.clone(),
         Some(json!({"type": "ws", "path": "/ws"})),
+    ));
+    cases.push((
+        "httpupgrade+tls".to_string(),
+        "",
+        json!({"network": "httpupgrade", "security": "tls", "tlsSettings": xray_tls(),
+            "httpupgradeSettings": {"path": "/up"}}),
+        chrome.clone(),
+        Some(json!({"type": "httpupgrade", "path": "/up"})),
     ));
     cases.push((
         "grpc+tls".to_string(),
@@ -819,5 +823,123 @@ async fn interop_with_sing_box_as_the_server() {
             "{label}: sing-box did not start"
         );
         exercise(outbound, &echoes, &format!("sing-box {label}"), true).await;
+    }
+}
+
+// ---- what the hello offers ----
+
+/// The ALPN protocols a ClientHello offers.
+fn hello_alpn(hello: &[u8]) -> Vec<String> {
+    // record header, handshake header, version, random
+    let mut at = 5 + 4 + 2 + 32;
+    at += 1 + hello[at] as usize;
+    at += 2 + u16::from_be_bytes([hello[at], hello[at + 1]]) as usize;
+    at += 1 + hello[at] as usize;
+    let end = at + 2 + u16::from_be_bytes([hello[at], hello[at + 1]]) as usize;
+    at += 2;
+    while at + 4 <= end {
+        let kind = u16::from_be_bytes([hello[at], hello[at + 1]]);
+        let len = u16::from_be_bytes([hello[at + 2], hello[at + 3]]) as usize;
+        let body = &hello[at + 4..at + 4 + len];
+        if kind == 16 {
+            let mut names = Vec::new();
+            let mut i = 2;
+            while i < body.len() {
+                let n = body[i] as usize;
+                names.push(String::from_utf8_lossy(&body[i + 1..i + 1 + n]).into_owned());
+                i += 1 + n;
+            }
+            return names;
+        }
+        at += 4 + len;
+    }
+    Vec::new()
+}
+
+/// The ClientHello our client sends for an outbound, read off a listener
+/// that never answers.
+async fn first_hello(outbound: Value) -> Vec<u8> {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut outbound = outbound;
+    outbound["server_port"] = json!(port);
+    let vless =
+        core_runtime::outbound::secure::Vless::build(outbound.as_object().unwrap(), "up").unwrap();
+    let dial = tokio::spawn(async move {
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            vless.connect(&Target::Domain("example.com".to_string(), 443)),
+        )
+        .await;
+    });
+    let (mut socket, _) = listener.accept().await.unwrap();
+    let mut head = [0u8; 5];
+    socket.read_exact(&mut head).await.unwrap();
+    let mut hello = head.to_vec();
+    hello.resize(5 + u16::from_be_bytes([head[3], head[4]]) as usize, 0);
+    socket.read_exact(&mut hello[5..]).await.unwrap();
+    drop(socket);
+    let _ = dial.await;
+    hello
+}
+
+/// ws and httpupgrade over TLS offer `http/1.1` alone when the config names
+/// no ALPN, as sing-box and Xray do; gRPC keeps `h2`, plain TLS the
+/// fingerprint's own pair, and a configured ALPN wins.
+#[tokio::test]
+async fn upgrade_transports_offer_http1_alone() {
+    let tls = json!({"enabled": true, "server_name": "localhost", "insecure": true,
+        "utls": {"enabled": true, "fingerprint": "chrome"}});
+    let cases = [
+        (
+            Some(json!({"type": "ws", "path": "/ws"})),
+            None,
+            vec!["http/1.1"],
+        ),
+        (
+            Some(json!({"type": "ws", "path": "/ws", "max_early_data": 2048})),
+            None,
+            vec!["http/1.1"],
+        ),
+        (
+            Some(json!({"type": "httpupgrade", "path": "/up"})),
+            None,
+            vec!["http/1.1"],
+        ),
+        (
+            Some(json!({"type": "grpc", "service_name": "svc"})),
+            None,
+            vec!["h2"],
+        ),
+        (None, None, vec!["h2", "http/1.1"]),
+        (
+            Some(json!({"type": "ws", "path": "/ws"})),
+            Some(json!(["h2", "http/1.1"])),
+            vec!["h2", "http/1.1"],
+        ),
+    ];
+    for (transport, alpn, want) in cases {
+        for fingerprinted in [true, false] {
+            let mut tls = tls.clone();
+            if !fingerprinted {
+                tls.as_object_mut().unwrap().remove("utls");
+            }
+            if let Some(alpn) = &alpn {
+                tls["alpn"] = alpn.clone();
+            }
+            let mut outbound = json!({"type": "vless", "tag": "up", "server": "127.0.0.1",
+                "server_port": 1, "uuid": UUID_TEXT, "tls": tls});
+            if let Some(transport) = &transport {
+                outbound["transport"] = transport.clone();
+            }
+            let hello = first_hello(outbound).await;
+            let label = format!("{transport:?} alpn={alpn:?} utls={fingerprinted}");
+            if !fingerprinted && transport.is_none() && alpn.is_none() {
+                // rustls with nothing configured sends no ALPN at all
+                assert!(hello_alpn(&hello).is_empty(), "{label}");
+                continue;
+            }
+            assert_eq!(hello_alpn(&hello), want, "{label}");
+        }
     }
 }
