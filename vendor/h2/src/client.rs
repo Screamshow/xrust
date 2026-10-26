@@ -334,6 +334,12 @@ pub struct Builder {
     /// Initial `Settings` frame to send as part of the handshake.
     settings: Settings,
 
+    /// xrust: write like Go's x/net http2 client, see `go_client_writes`
+    go_client_writes: bool,
+
+    /// xrust: see `window_update_min_refresh`
+    recv_min_refresh: Option<u32>,
+
     /// The stream ID of the first (lowest) stream. Subsequent streams will use
     /// monotonically increasing stream IDs.
     stream_id: StreamId,
@@ -666,6 +672,8 @@ impl Builder {
             initial_target_connection_window_size: None,
             initial_max_send_streams: usize::MAX,
             settings: Default::default(),
+            go_client_writes: false,
+            recv_min_refresh: None,
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
@@ -1118,6 +1126,25 @@ impl Builder {
         self
     }
 
+    /// xrust: write the way Go's x/net http2 client writes, which is what an
+    /// Xray client puts on the wire: the connection preface, the initial
+    /// SETTINGS and the connection WINDOW_UPDATE leave in one write during the
+    /// handshake, and after it every frame is written and flushed on its own
+    /// (Go flushes after each HEADERS and each DATA frame it writes).
+    pub fn go_client_writes(&mut self, enabled: bool) -> &mut Self {
+        self.go_client_writes = enabled;
+        self
+    }
+
+    /// xrust: send a WINDOW_UPDATE as soon as `bytes` of received data are
+    /// released (or the peer's window drops below that), for the connection
+    /// and every stream, like Go's x/net http2 (`inflowMinRefresh`, 4 KiB),
+    /// instead of after a fraction of the window.
+    pub fn window_update_min_refresh(&mut self, bytes: Option<u32>) -> &mut Self {
+        self.recv_min_refresh = bytes;
+        self
+    }
+
     /// Sets the header table size.
     ///
     /// This setting informs the peer of the maximum size of the header compression
@@ -1312,14 +1339,16 @@ where
 
 // ===== impl Connection =====
 
+/// The client connection preface.
+const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
 async fn bind_connection<T>(io: &mut T) -> Result<(), crate::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     tracing::debug!("binding client connection");
 
-    let msg: &'static [u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-    io.write_all(msg).await.map_err(crate::Error::from_io)?;
+    io.write_all(PREFACE).await.map_err(crate::Error::from_io)?;
 
     tracing::debug!("client connection bound");
 
@@ -1335,10 +1364,16 @@ where
         mut io: T,
         builder: Builder,
     ) -> Result<(SendRequest<B>, Connection<T, B>), crate::Error> {
-        bind_connection(&mut io).await?;
+        if !builder.go_client_writes {
+            bind_connection(&mut io).await?;
+        }
 
         // Create the codec
         let mut codec = Codec::new(io);
+        if builder.go_client_writes {
+            // the preface goes out in one write with SETTINGS, below
+            codec.buffer_raw(PREFACE);
+        }
 
         if let Some(max) = builder.settings.max_frame_size() {
             codec.set_max_recv_frame_size(max as usize);
@@ -1367,6 +1402,7 @@ where
                 data_frame_budget: builder
                     .data_frame_budget
                     .resolve(builder.initial_target_connection_window_size),
+                recv_min_refresh: builder.recv_min_refresh,
             },
         );
         let send_request = SendRequest {
@@ -1377,6 +1413,15 @@ where
         let mut connection = Connection { inner };
         if let Some(sz) = builder.initial_target_connection_window_size {
             connection.set_target_window_size(sz);
+        }
+
+        if builder.go_client_writes {
+            // preface, SETTINGS and the connection WINDOW_UPDATE: one write,
+            // flushed before any request, as Go's `newClientConn` does
+            std::future::poll_fn(|cx| connection.inner.poll_flush_handshake(cx))
+                .await
+                .map_err(crate::Error::from)?;
+            connection.inner.set_frame_per_write(true);
         }
 
         Ok((send_request, connection))

@@ -83,6 +83,9 @@ pub struct Config {
     ///
     /// Default 25600 bytes
     pub data_frame_budget: usize,
+
+    /// xrust: see `FlowControl::set_min_refresh`
+    pub recv_min_refresh: Option<WindowSize>,
 }
 
 trait DebugStructExt<'a, 'b> {

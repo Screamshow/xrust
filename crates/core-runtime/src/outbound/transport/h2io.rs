@@ -68,6 +68,8 @@ pub(crate) struct H2Stream {
     pub(crate) pending_len: usize,
     /// Encoded bytes waiting on flow-control capacity.
     out: Bytes,
+    /// the most a write stages at once, and so the largest DATA frame it makes
+    write_chunk: usize,
     report: usize,
     eof: bool,
     /// `None` when a shared owner drives the connection, as mux does
@@ -84,6 +86,13 @@ impl H2Stream {
     }
 
     /// A stream that borrows a connection task owned by a session pool.
+    /// Stage at most `chunk` bytes per write, so each DATA frame carries no
+    /// more than that.
+    pub(crate) fn with_write_chunk(mut self, chunk: usize) -> Self {
+        self.write_chunk = chunk.clamp(1, WRITE_CHUNK);
+        self
+    }
+
     pub(crate) fn shared(response: ResponseFuture, send: h2::SendStream<Bytes>) -> Self {
         Self::build(response, send, None)
     }
@@ -98,6 +107,7 @@ impl H2Stream {
             pending: VecDeque::new(),
             pending_len: 0,
             out: Bytes::new(),
+            write_chunk: WRITE_CHUNK,
             report: 0,
             eof: true,
             conn_task: None,
@@ -121,6 +131,7 @@ impl H2Stream {
             pending: VecDeque::new(),
             pending_len: 0,
             out: Bytes::new(),
+            write_chunk: WRITE_CHUNK,
             report: 0,
             eof: false,
             conn_task,
@@ -150,6 +161,7 @@ impl H2Stream {
             pending: VecDeque::new(),
             pending_len: 0,
             out: Bytes::new(),
+            write_chunk: WRITE_CHUNK,
             report: 0,
             eof: false,
             conn_task,
@@ -464,7 +476,7 @@ impl AsyncWrite for H2Io {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
             }
-            let take = buf.len().min(WRITE_CHUNK);
+            let take = buf.len().min(self.h2.write_chunk);
             self.h2
                 .stage_bytes(Bytes::copy_from_slice(&buf[..take]), take);
         }

@@ -1537,6 +1537,7 @@ where
                                 .builder
                                 .data_frame_budget
                                 .resolve(self.builder.initial_target_connection_window_size),
+                            recv_min_refresh: None,
                         },
                     );
 

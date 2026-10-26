@@ -52,6 +52,14 @@ struct Encoder<B> {
 
     /// Min buffer required to attempt to write a frame
     min_buffer_capacity: usize,
+
+    /// xrust: accept one frame per write, as Go's x/net http2 client writes
+    /// and flushes every frame on its own (see `set_frame_per_write`)
+    frame_per_write: bool,
+
+    /// xrust: what is buffered is WINDOW_UPDATE frames only: Go writes the
+    /// connection's and the stream's update together before it flushes
+    only_window_updates: bool,
 }
 
 #[derive(Debug)]
@@ -100,6 +108,8 @@ where
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
                 chain_threshold,
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
+                frame_per_write: false,
+                only_window_updates: false,
             },
         }
     }
@@ -125,6 +135,19 @@ where
     /// underlying I/O object.
     pub(crate) fn has_capacity(&self) -> bool {
         self.encoder.has_capacity()
+    }
+
+    /// xrust: write and flush every frame on its own instead of gathering
+    /// what is ready into one write. Go's x/net http2 client does this, so
+    /// over TLS each of its frames is a record of its own.
+    pub(crate) fn set_frame_per_write(&mut self, on: bool) {
+        self.encoder.frame_per_write = on;
+    }
+
+    /// xrust: buffer bytes that are not a frame -- the client connection
+    /// preface -- ahead of the frames that follow, so they share a write.
+    pub(crate) fn buffer_raw(&mut self, data: &[u8]) {
+        self.encoder.buf.get_mut().extend_from_slice(data);
     }
 
     /// Buffer a frame.
@@ -229,6 +252,10 @@ where
 
         tracing::debug!(frame = ?item, "send");
 
+        let window_update = matches!(item, Frame::WindowUpdate(_));
+        self.only_window_updates =
+            window_update && (self.buf.get_ref().is_empty() || self.only_window_updates);
+
         match item {
             Frame::Data(mut v) => {
                 // Ensure that the payload is not greater than the max frame.
@@ -308,6 +335,9 @@ where
     }
 
     fn has_capacity(&self) -> bool {
+        if self.frame_per_write && !self.buf.get_ref().is_empty() && !self.only_window_updates {
+            return false;
+        }
         self.next.is_none()
             && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
                 >= self.min_buffer_capacity)

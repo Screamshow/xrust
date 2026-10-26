@@ -84,6 +84,8 @@ pub(crate) struct Config {
     pub local_error_reset_streams_max: Option<usize>,
     pub settings: frame::Settings,
     pub data_frame_budget: usize,
+    /// xrust: see `FlowControl::set_min_refresh`
+    pub recv_min_refresh: Option<WindowSize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +147,7 @@ where
                     .map(|max| max as usize),
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 data_frame_budget: config.data_frame_budget,
+                recv_min_refresh: config.recv_min_refresh,
             }
         }
         let streams = Streams::new(streams_config(&config));
@@ -276,6 +279,18 @@ where
         // If we poll() and realize that there are no streams or references
         // then we can close the connection by transitioning to GOAWAY
         self.inner.streams.has_streams_or_other_references()
+    }
+
+    /// xrust: write out what the handshake buffered (preface, SETTINGS and
+    /// the connection WINDOW_UPDATE) before any request is sent.
+    pub(crate) fn poll_flush_handshake(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
+        ready!(self.inner.streams.poll_complete(cx, &mut self.codec))?;
+        Poll::Ready(Ok(()))
+    }
+
+    /// xrust: see `FramedWrite::set_frame_per_write`.
+    pub(crate) fn set_frame_per_write(&mut self, on: bool) {
+        self.codec.set_frame_per_write(on);
     }
 
     pub(crate) fn take_user_pings(&mut self) -> Option<UserPings> {

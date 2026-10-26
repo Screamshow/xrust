@@ -1,6 +1,7 @@
 //! TLS record lengths of a bulk upload over the HTTP/2 transports (gRPC and
 //! XHTTP stream-one), our client against our server, with a forwarder in
-//! between that reads the record headers the client sends.
+//! between that reads the record headers the client sends. Both copy what
+//! Xray's client puts on the wire, which differs between the two.
 //!
 //! Go's crypto/tls cuts what Xray's http2 framer buffers into full records:
 //! 16401 bytes on the wire (16384 of plaintext, the type byte and the tag),
@@ -188,9 +189,118 @@ async fn grpc_uploads_in_full_records() {
     assert_full_records("grpc", &lengths);
 }
 
+/// XHTTP is Go's x/net http2 client in Xray, which writes the streamed body
+/// as it reads it -- 8 KiB at a time from Xray -- one DATA frame a write:
+/// 8218-byte records, not full ones.
 #[tokio::test]
-async fn xhttp_stream_one_uploads_in_full_records() {
+async fn xhttp_stream_one_uploads_in_8_kib_frames() {
     let lengths =
         upload_records(json!({"type": "xhttp", "path": "/xh", "mode": "stream-one"})).await;
-    assert_full_records("xhttp stream-one", &lengths);
+    let big: Vec<usize> = lengths.iter().copied().filter(|l| *l >= 1000).collect();
+    let frames = big.iter().filter(|l| **l == 8218).count();
+    assert!(
+        frames >= 900 && frames * 10 >= big.len() * 9,
+        "{frames} 8 KiB frames of {} large records: {lengths:?}",
+        big.len()
+    );
+}
+
+/// Reads two bytes from whoever connects, sends `total` bytes, then closes.
+async fn spawn_source(total: usize) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind source");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // take the client's first bytes, or the close resets
+                let mut go = [0u8; 2];
+                if stream.read_exact(&mut go).await.is_err() {
+                    return;
+                }
+                let chunk = vec![0x33u8; 1 << 16];
+                let mut left = total;
+                while left > 0 {
+                    let n = left.min(chunk.len());
+                    if stream.write_all(&chunk[..n]).await.is_err() {
+                        return;
+                    }
+                    left -= n;
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// The client's records while it downloads 2 MiB over XHTTP `mode`.
+async fn download_records(mode: &str) -> Vec<usize> {
+    const TOTAL: usize = 2 << 20;
+    let transport = json!({"type": "xhttp", "path": "/xh", "mode": mode});
+    let server = core_runtime::start(&json!({
+        "log": {"level": "error"},
+        "inbounds": [{"type": "vless", "tag": "in", "listen": "127.0.0.1", "listen_port": 0,
+            "users": [{"uuid": UUID}], "transport": transport,
+            "tls": {"enabled": true, "certificate_path": cert_file("localhost.crt"),
+                "key_path": cert_file("localhost.key"), "alpn": ["h2"]}}],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"final": "direct"}
+    }))
+    .await
+    .expect("start server");
+    let (front, records) = record_forwarder(inbound_addr(&server, "in")).await;
+    let client = core_runtime::start(&json!({
+        "log": {"level": "error"},
+        "inbounds": [{"type": "mixed", "tag": "mixed", "listen": "127.0.0.1", "listen_port": 0}],
+        "outbounds": [{"type": "vless", "tag": "up", "server": "127.0.0.1",
+            "server_port": front.port(), "uuid": UUID, "transport": transport,
+            "tls": {"enabled": true, "server_name": "localhost", "insecure": true,
+                "utls": {"enabled": true, "fingerprint": "chrome"}}}],
+        "route": {"final": "up"}
+    }))
+    .await
+    .expect("start client");
+    let source = spawn_source(TOTAL).await;
+    let mut stream = socks_connect(inbound_addr(&client, "mixed"), source).await;
+    stream.write_all(b"go").await.expect("first bytes");
+    let mut got = vec![0u8; TOTAL];
+    tokio::time::timeout(Duration::from_secs(30), stream.read_exact(&mut got))
+        .await
+        .expect("the download")
+        .expect("read");
+    client.shutdown();
+    server.shutdown();
+    let records = records.lock().unwrap().clone();
+    records
+        .into_iter()
+        .filter(|(kind, _)| *kind == 23)
+        .map(|(_, len)| len)
+        .collect()
+}
+
+/// Go's x/net http2 client, Xray's on XHTTP: the preface, a SETTINGS frame
+/// of four entries and the connection WINDOW_UPDATE leave in the first
+/// record after the handshake (87 bytes: 24 + 33 + 13, the type byte and the
+/// tag); while it downloads, it acknowledges with a WINDOW_UPDATE for the
+/// connection and one for the stream in one record (43 bytes), not one alone.
+/// How often depends on the server's frames: Xray's give one every 8 KiB.
+#[tokio::test]
+async fn xhttp_starts_and_acknowledges_like_go() {
+    for mode in ["stream-one", "packet-up"] {
+        let lengths = download_records(mode).await;
+        // the client's Finished, then the h2 start
+        assert_eq!(&lengths[..2], &[53, 87], "{mode}: {lengths:?}");
+        // past the start, what the client sends while it downloads: window
+        // updates, in pairs; once the stream is over only the connection's is
+        // left, as with Go
+        let acks: Vec<usize> = lengths[2..]
+            .iter()
+            .copied()
+            .filter(|l| *l == 30 || *l == 43)
+            .collect();
+        let pairs = acks.iter().filter(|l| **l == 43).count();
+        assert!(
+            pairs * 2 > acks.len(),
+            "{mode}: window updates mostly alone: {lengths:?}"
+        );
+    }
 }

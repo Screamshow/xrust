@@ -12,6 +12,9 @@ use std::time::Instant;
 
 #[derive(Debug)]
 pub(super) struct Recv {
+    /// xrust: see `FlowControl::set_min_refresh`
+    min_refresh: Option<WindowSize>,
+
     /// Initial window size of remote initiated streams
     init_window_sz: WindowSize,
 
@@ -98,8 +101,10 @@ impl Recv {
         flow.inc_window(DEFAULT_INITIAL_WINDOW_SIZE)
             .expect("invalid initial remote window size");
         flow.assign_capacity(DEFAULT_INITIAL_WINDOW_SIZE).unwrap();
+        flow.set_min_refresh(config.recv_min_refresh);
 
         Recv {
+            min_refresh: config.recv_min_refresh,
             init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
             flow,
             in_flight_data: 0 as WindowSize,
@@ -115,6 +120,11 @@ impl Recv {
             is_push_enabled: config.local_push_enabled,
             is_extended_connect_protocol_enabled: config.extended_connect_protocol_enabled,
         }
+    }
+
+    /// xrust: see `FlowControl::set_min_refresh`
+    pub fn min_refresh(&self) -> Option<WindowSize> {
+        self.min_refresh
     }
 
     /// Returns the initial receive window size
@@ -1319,6 +1329,7 @@ mod tests {
             remote_max_initiated: None,
             local_max_error_reset_streams: None,
             data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
+            recv_min_refresh: None,
         };
         let mut recv = Recv::new(peer::Dyn::Server, &config);
         let mut store = Store::new();

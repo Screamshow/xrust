@@ -311,6 +311,9 @@ where
             me.actions.send.init_window_sz(),
             me.actions.recv.init_window_sz(),
         );
+        stream
+            .recv_flow
+            .set_min_refresh(me.actions.recv.min_refresh());
 
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;

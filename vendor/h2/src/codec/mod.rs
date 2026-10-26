@@ -144,6 +144,16 @@ where
         self.framed_write().has_capacity()
     }
 
+    /// xrust: see `FramedWrite::set_frame_per_write`.
+    pub(crate) fn set_frame_per_write(&mut self, on: bool) {
+        self.framed_write().set_frame_per_write(on)
+    }
+
+    /// xrust: see `FramedWrite::buffer_raw`.
+    pub(crate) fn buffer_raw(&mut self, data: &[u8]) {
+        self.framed_write().buffer_raw(data)
+    }
+
     /// Buffer a frame.
     ///
     /// `poll_ready` must be called first to ensure that a frame may be

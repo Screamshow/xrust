@@ -616,6 +616,12 @@ type H2Fresh = (
 
 /// HTTP/2 handshake on a fresh connection whose reads are tracked for the
 /// keep-alive.
+/// How much of a streamed body (stream-one, stream-up) goes into one DATA
+/// frame: Xray hands its HTTP client the upload in 8 KiB buffers, and Go
+/// writes each read of the body as a frame of its own, so every chunk of a
+/// bulk upload is an 8201-byte frame and an 8218-byte TLS record.
+const GO_BODY_CHUNK: usize = 8 * 1024;
+
 /// What Go's HTTP/2 client adds to every request it sends: it asks for gzip
 /// unless the caller did (`requestedGzip` in x/net http2).
 fn go_h2_request(mut req: http::Request<()>) -> http::Request<()> {
@@ -635,6 +641,14 @@ async fn h2_handshake(stream: AnyStream) -> io::Result<H2Fresh> {
         clock: clock.clone(),
     };
     let (send_request, connection) = super::h2io::client_builder()
+        // what Xray's client (Go's x/net http2) puts on the wire: SETTINGS
+        // with push off, its window, frame size and header list size; the
+        // preface, SETTINGS and window update in one write; then one write
+        // per frame; window updates every 4 KiB read
+        .enable_push(false)
+        .max_header_list_size(10 << 20)
+        .go_client_writes(true)
+        .window_update_min_refresh(Some(4 << 10))
         .handshake(io)
         .await
         .map_err(|e| io::Error::other(format!("xhttp: h2 handshake: {e}")))?;
@@ -820,7 +834,7 @@ impl XhttpConfig {
                 .send_request(go_h2_request(request), false)
                 .map_err(|e| io::Error::other(format!("xhttp: send_request: {e}")))?;
             let stream: AnyStream = Box::new(super::h2io::H2Io {
-                h2: super::h2io::H2Stream::shared(response, send),
+                h2: super::h2io::H2Stream::shared(response, send).with_write_chunk(GO_BODY_CHUNK),
             });
             return Ok(Box::new(TrackedStream {
                 inner: stream,
@@ -862,7 +876,8 @@ impl XhttpConfig {
                 let failure = Failure::default();
                 this.up = Up::H2Stream(Box::new(H2StreamUp {
                     io: super::h2io::H2Io {
-                        h2: super::h2io::H2Stream::upload_only(up_send),
+                        h2: super::h2io::H2Stream::upload_only(up_send)
+                            .with_write_chunk(GO_BODY_CHUNK),
                     },
                     failure: failure.clone(),
                 }));

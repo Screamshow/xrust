@@ -46,6 +46,11 @@ pub struct FlowControl {
     /// This can go negative if a user declares a smaller target window than
     /// the peer knows about.
     available: Window,
+
+    /// xrust: send a WINDOW_UPDATE once this many bytes are unclaimed (or
+    /// the peer's window is smaller than that), as Go's x/net http2 does
+    /// with its 4 KiB `inflowMinRefresh`, instead of a fraction of the window
+    min_refresh: Option<WindowSize>,
 }
 
 impl FlowControl {
@@ -53,7 +58,13 @@ impl FlowControl {
         FlowControl {
             window_size: Window(0),
             available: Window(0),
+            min_refresh: None,
         }
+    }
+
+    /// xrust: see `min_refresh`.
+    pub fn set_min_refresh(&mut self, min_refresh: Option<WindowSize>) {
+        self.min_refresh = min_refresh;
     }
 
     /// Returns the window size as known by the peer
@@ -98,7 +109,10 @@ impl FlowControl {
         }
 
         let unclaimed = available.0 - self.window_size.0;
-        let threshold = self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR;
+        let threshold = match self.min_refresh {
+            Some(min) => (min as i32).min(self.window_size.0.max(0)),
+            None => self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR,
+        };
 
         if unclaimed < threshold {
             None
