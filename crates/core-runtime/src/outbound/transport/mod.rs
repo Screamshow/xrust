@@ -276,10 +276,9 @@ impl Transport {
         }
     }
 
-    /// Dial the full outbound stream: TCP → optional TLS → transport.
-    /// `early` is the first protocol write; a transport that can carry it in
-    /// its handshake (ws early data) takes as much as it declared and reports
-    /// the count so the caller writes only the rest.
+    /// Dial the full outbound stream: TCP → optional TLS → transport. A ws
+    /// transport with early data stops before the upgrade request, which goes
+    /// out with the first write (see `LazyWs`).
     ///
     /// `dial` is here for the transports that need more than the one connection
     /// they were handed. HTTP/1.1 does not multiplex, so XHTTP opens a second
@@ -294,12 +293,11 @@ impl Transport {
         tls: Option<&TlsOptions>,
         server: &str,
         port: u16,
-        early: &[u8],
         dial: &crate::outbound::dial::DialOptions,
-    ) -> io::Result<(AnyStream, usize)> {
+    ) -> io::Result<AnyStream> {
         if let Kind::Xhttp(cfg) = &self.kind {
             match cfg.connect_h2_stream(tls, server, port, dial).await? {
-                xhttp::H2Connect::Stream(stream) => return Ok((stream, 0)),
+                xhttp::H2Connect::Stream(stream) => return Ok(stream),
                 xhttp::H2Connect::Fallback(stream) => {
                     let has_reality = tls.and_then(|t| t.reality()).is_some();
                     let dialer = self.dialer(tls, server, port, dial);
@@ -313,14 +311,14 @@ impl Transport {
                         dialer,
                     )
                     .await?;
-                    return Ok((stream, 0));
+                    return Ok(stream);
                 }
                 xhttp::H2Connect::Skip => {}
             }
         }
 
         let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
-        self.connect(tcp, tls, server, port, early, dial).await
+        self.connect(tcp, tls, server, port, dial).await
     }
 
     pub(crate) async fn connect(
@@ -329,9 +327,8 @@ impl Transport {
         tls: Option<&TlsOptions>,
         server: &str,
         port: u16,
-        early: &[u8],
         dial: &crate::outbound::dial::DialOptions,
-    ) -> io::Result<(AnyStream, usize)> {
+    ) -> io::Result<AnyStream> {
         let tls_forced = self.h1_forced_tls(tls);
         let tls = tls_forced.as_ref().or(tls);
         let default_alpn = self.default_alpn(tls.is_some());
@@ -339,8 +336,8 @@ impl Transport {
             Some(tls) => tls.wrap_with_defaults(tcp, default_alpn).await?,
             None => Box::new(tcp),
         };
-        let (stream, consumed) = match &self.kind {
-            Kind::None => (stream, 0),
+        let stream = match &self.kind {
+            Kind::None => stream,
             Kind::Ws {
                 path,
                 host,
@@ -352,11 +349,27 @@ impl Transport {
                     .as_deref()
                     .or_else(|| headers_host(headers))
                     .unwrap_or(server);
-                let early_data = EarlyData {
-                    max: *max_early_data,
-                    header_name: early_data_header_name,
-                };
-                ws_handshake(stream, path, host, headers, early, early_data).await?
+                if *max_early_data > 0 {
+                    // the upgrade waits for the first write, which rides in it
+                    Box::new(LazyWs::new(
+                        stream,
+                        WsRequest {
+                            path: path.clone(),
+                            host: host.to_string(),
+                            headers: headers.clone(),
+                            max_early_data: *max_early_data,
+                            early_data_header_name: early_data_header_name.clone(),
+                        },
+                    ))
+                } else {
+                    let no_early = EarlyData {
+                        max: 0,
+                        header_name: early_data_header_name,
+                    };
+                    ws_handshake(stream, path, host, headers, &[], no_early)
+                        .await?
+                        .0
+                }
             }
             Kind::HttpUpgrade {
                 path,
@@ -367,22 +380,18 @@ impl Transport {
                     .as_deref()
                     .or_else(|| headers_host(headers))
                     .unwrap_or(server);
-                (httpupgrade_handshake(stream, path, host, headers).await?, 0)
+                httpupgrade_handshake(stream, path, host, headers).await?
             }
             Kind::Grpc { service_name } => {
                 let sni = tls.map(TlsOptions::server_name).unwrap_or(server);
-                (
-                    grpc::connect(stream, service_name, &authority(sni, port), tls.is_some())
-                        .await?,
-                    0,
-                )
+                grpc::connect(stream, service_name, &authority(sni, port), tls.is_some()).await?
             }
             Kind::Http {
                 host,
                 path,
                 method,
                 headers,
-            } => (
+            } => {
                 http::connect(
                     stream,
                     tls.is_some(),
@@ -393,27 +402,23 @@ impl Transport {
                     method,
                     headers,
                 )
-                .await?,
-                0,
-            ),
+                .await?
+            }
             Kind::Xhttp(cfg) => {
                 let dialer = self.dialer(tls, server, port, dial);
-                (
-                    xhttp::connect(
-                        stream,
-                        tls.is_some(),
-                        tls.and_then(|t| t.reality()).is_some(),
-                        server,
-                        port,
-                        cfg,
-                        dialer,
-                    )
-                    .await?,
-                    0,
+                xhttp::connect(
+                    stream,
+                    tls.is_some(),
+                    tls.and_then(|t| t.reality()).is_some(),
+                    server,
+                    port,
+                    cfg,
+                    dialer,
                 )
+                .await?
             }
         };
-        Ok((stream, consumed))
+        Ok(stream)
     }
 
     /// A closure that opens one more connection to the same server with the same
@@ -523,12 +528,8 @@ struct EarlyData<'a> {
 /// early data to the path, which an Xray server rejects as a wrong path, and
 /// Forkop X writes `ed=` links with no header name for Xray servers.
 ///
-/// A longer first write is split, as sing-box's client does: the first
-/// `max_early_data` bytes go early and the caller sends the rest as a normal
-/// frame. Xray's client sends nothing early then, but both servers simply
-/// put whatever the header decodes to in front of the frames that follow,
-/// with no length check (sing-box `server.go`, Xray `hub.go`), so the split
-/// works against both and still saves the round trip.
+/// `LazyWs` hands this the whole first write or nothing; a longer `early` is
+/// cut at `max_early_data` and the caller sends the rest as a frame.
 async fn ws_handshake(
     mut stream: AnyStream,
     path: &str,
@@ -603,6 +604,175 @@ async fn ws_handshake(
         return Err(io::Error::other("ws handshake: bad Sec-WebSocket-Accept"));
     }
     Ok((Box::new(WsStream::new(stream)), carried))
+}
+
+/// What a deferred ws upgrade request needs, owned.
+struct WsRequest {
+    path: String,
+    host: String,
+    headers: Vec<(String, String)>,
+    max_early_data: usize,
+    early_data_header_name: String,
+}
+
+type Upgrade = Pin<Box<dyn Future<Output = io::Result<(AnyStream, usize)>> + Send>>;
+
+enum Lazy {
+    /// TCP and TLS are up; the upgrade request waits for the first write
+    Waiting(AnyStream, WsRequest),
+    /// the upgrade is on its way, carrying this many bytes of the first write
+    Upgrading(Upgrade),
+    Open(AnyStream),
+    Failed,
+}
+
+/// A ws connection with early data, opened the way both references open it:
+/// the upgrade request goes out with the first write and carries it when it
+/// fits in `max_early_data` (Xray `delayDialConn`, `websocket/dialer.go`;
+/// sing-box `EarlyWebsocketConn`, `transport/v2raywebsocket/conn.go`, which
+/// also sends the first `max_early_data` bytes of a longer write early). The protocol head waits for the
+/// first payload above this, so the upgrade request carries both, and for a
+/// destination that talks first it carries the head alone once the wait is
+/// over. TCP and TLS are connected up front, as sing-box does, so a dead
+/// server still fails the dial rather than the first write.
+struct LazyWs {
+    state: Lazy,
+    /// the upgrade finished from a flush or a read: the write that started it
+    /// is owed this many bytes
+    owed: Option<usize>,
+    /// a read that arrived before the upgrade
+    reader: Option<std::task::Waker>,
+}
+
+impl LazyWs {
+    fn new(stream: AnyStream, request: WsRequest) -> Self {
+        Self {
+            state: Lazy::Waiting(stream, request),
+            owed: None,
+            reader: None,
+        }
+    }
+
+    /// Drive the upgrade in flight; ready once the connection is open.
+    fn poll_upgrade(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Lazy::Upgrading(upgrade) = &mut self.state else {
+            return Poll::Ready(Ok(()));
+        };
+        let result = ready!(upgrade.as_mut().poll(cx));
+        if let Some(reader) = self.reader.take() {
+            reader.wake();
+        }
+        match result {
+            Ok((stream, carried)) => {
+                self.state = Lazy::Open(stream);
+                self.owed = Some(carried);
+                Poll::Ready(Ok(()))
+            }
+            Err(error) => {
+                self.state = Lazy::Failed;
+                Poll::Ready(Err(error))
+            }
+        }
+    }
+
+    fn failed() -> io::Error {
+        io::Error::new(io::ErrorKind::BrokenPipe, "ws upgrade failed")
+    }
+}
+
+impl AsyncRead for LazyWs {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_upgrade(cx))?;
+        match &mut this.state {
+            Lazy::Open(stream) => Pin::new(stream).poll_read(cx, buf),
+            Lazy::Failed => Poll::Ready(Err(Self::failed())),
+            // nothing comes back before the request went out
+            _ => {
+                this.reader = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl AsyncWrite for LazyWs {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if let Lazy::Waiting(..) = this.state {
+            if buf.is_empty() {
+                return Poll::Ready(Ok(0));
+            }
+            let Lazy::Waiting(stream, request) = std::mem::replace(&mut this.state, Lazy::Failed)
+            else {
+                unreachable!()
+            };
+            // all of the first write or none of it, as Xray's client does: a
+            // server reading the protocol head from the first read alone gets
+            // a cut-off head from a split one (Xray's trojan inbound takes
+            // anything under 58 bytes for a fallback), so a longer write goes
+            // as a normal frame after a plain upgrade
+            let early = if buf.len() <= request.max_early_data {
+                buf.to_vec()
+            } else {
+                Vec::new()
+            };
+            this.state = Lazy::Upgrading(Box::pin(async move {
+                let early_data = EarlyData {
+                    max: request.max_early_data,
+                    header_name: &request.early_data_header_name,
+                };
+                ws_handshake(
+                    stream,
+                    &request.path,
+                    &request.host,
+                    &request.headers,
+                    &early,
+                    early_data,
+                )
+                .await
+            }));
+        }
+        ready!(this.poll_upgrade(cx))?;
+        if let Some(carried) = this.owed.take().filter(|&n| n > 0) {
+            // the write that started the upgrade rode in it
+            return Poll::Ready(Ok(carried));
+        }
+        match &mut this.state {
+            Lazy::Open(stream) => Pin::new(stream).poll_write(cx, buf),
+            _ => Poll::Ready(Err(Self::failed())),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_upgrade(cx))?;
+        match &mut this.state {
+            Lazy::Open(stream) => Pin::new(stream).poll_flush(cx),
+            Lazy::Waiting(..) => Poll::Ready(Ok(())),
+            _ => Poll::Ready(Err(Self::failed())),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_upgrade(cx))?;
+        match &mut this.state {
+            Lazy::Open(stream) => Pin::new(stream).poll_shutdown(cx),
+            // closed before any write: no upgrade request at all, as with
+            // both references
+            Lazy::Waiting(stream, _) => Pin::new(stream).poll_shutdown(cx),
+            _ => Poll::Ready(Ok(())),
+        }
+    }
 }
 
 async fn httpupgrade_handshake(

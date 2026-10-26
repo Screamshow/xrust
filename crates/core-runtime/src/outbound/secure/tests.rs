@@ -432,21 +432,6 @@ mod trojan {
         assert!(*shut.lock().unwrap());
     }
 
-    /// ws early data took the whole head into the upgrade request.
-    #[tokio::test]
-    async fn a_head_carried_by_early_data_is_not_sent_again() {
-        let writes = Arc::new(Mutex::new(Vec::new()));
-        let wire = Wire {
-            writes: Arc::clone(&writes),
-            answer: Vec::new(),
-            shut: Arc::new(Mutex::new(false)),
-        };
-        let mut stream =
-            TrojanStream::with_wait(Box::new(wire), Vec::new(), Duration::from_millis(100));
-        stream.write_all(b"payload").await.unwrap();
-        assert_eq!(writes.lock().unwrap().clone(), vec![b"payload".to_vec()]);
-    }
-
     /// `trojan.WritePacket`/`ReadPacket`: socksaddr, length, CRLF, payload.
     #[tokio::test]
     async fn udp_packets_carry_address_length_and_crlf() {

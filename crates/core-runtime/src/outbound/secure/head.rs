@@ -47,26 +47,12 @@ pub(crate) struct PendingHead {
 }
 
 impl PendingHead {
-    /// `head` waits up to `wait` for the first payload. An empty `head` (ws
-    /// early data carried all of it) means there is nothing left to send.
+    /// `head` waits up to `wait` for the first payload.
     pub(crate) fn new(head: Vec<u8>, wait: Duration, first_write: usize) -> Self {
-        if head.is_empty() {
-            return Self::sent();
-        }
         Self {
             state: State::Waiting(head),
             first_write,
             deadline: Some(Box::pin(tokio::time::sleep(wait))),
-            flush_head: false,
-        }
-    }
-
-    /// Nothing to send: every call passes straight through.
-    pub(crate) fn sent() -> Self {
-        Self {
-            state: State::Done,
-            first_write: 0,
-            deadline: None,
             flush_head: false,
         }
     }

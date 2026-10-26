@@ -8,6 +8,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 
 /// Reads the upgrade request, replies 101 and hands the request head back.
@@ -61,17 +62,25 @@ async fn connect_transport(
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect");
-    let (stream, consumed) = transport
+    let lazy = matches!(transport.kind, Kind::Ws { max_early_data, .. } if max_early_data > 0);
+    let mut stream = transport
         .connect(
             tcp,
             None,
             "example.com",
             port,
-            early,
             &crate::outbound::dial::DialOptions::default(),
         )
         .await
         .expect("handshake");
+    // with early data the upgrade request goes out with the first write
+    let consumed = if lazy {
+        tokio::io::AsyncWriteExt::write(&mut stream, early)
+            .await
+            .expect("first write")
+    } else {
+        0
+    };
     drop(stream);
     (server.await.expect("join"), consumed)
 }
@@ -162,41 +171,26 @@ async fn without_the_budget_nothing_rides_along() {
     }
 }
 
+/// A first write over the budget goes as a frame after a plain upgrade, as
+/// Xray's client sends it: a server that reads the protocol head from the
+/// first read alone would get a cut-off one from a split.
 #[tokio::test]
-async fn an_empty_first_write_sends_a_plain_upgrade() {
-    for name in [SWP, ""] {
-        let (head, consumed) = connect_with(2048, name, b"").await;
-        assert_eq!(consumed, 0);
-        assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "got:\n{head}");
-        assert!(!head.contains(SWP), "got:\n{head}");
-    }
-}
-
-/// Over the budget the first `max_early_data` bytes go early and the caller
-/// writes the rest as a frame (sing-box splits; it does not drop the lot).
-#[tokio::test]
-async fn only_the_budget_rides_along() {
+async fn a_first_write_over_the_budget_rides_in_no_header() {
     let payload = b"0123456789abcdef";
-    for (max, carried) in [(10, 10), (15, 15), (16, 16), (17, 16)] {
-        let (head, consumed) = connect_with(max, SWP, payload).await;
-        assert_eq!(consumed, carried, "max {max}");
-        assert!(
-            head.contains(&format!(
-                "Sec-WebSocket-Protocol: {}\r\n",
-                raw_url(&payload[..carried])
-            )),
-            "max {max}, got:\n{head}"
-        );
-        let (head, consumed) = connect_with(max, "", payload).await;
-        assert_eq!(consumed, carried, "no name, max {max}");
-        assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "got:\n{head}");
-        assert!(
-            head.contains(&format!(
-                "Sec-WebSocket-Protocol: {}\r\n",
-                raw_url(&payload[..carried])
-            )),
-            "no name, max {max}, got:\n{head}"
-        );
+    for (max, early) in [(10, false), (15, false), (16, true), (17, true)] {
+        for name in [SWP, ""] {
+            let (head, consumed) = connect_with(max, name, payload).await;
+            assert_eq!(consumed, payload.len(), "max {max}");
+            assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "got:\n{head}");
+            assert_eq!(
+                head.contains(&format!("Sec-WebSocket-Protocol: {}\r\n", raw_url(payload))),
+                early,
+                "max {max}, got:\n{head}"
+            );
+            if !early {
+                assert!(!head.contains(SWP), "max {max}, got:\n{head}");
+            }
+        }
     }
 }
 
@@ -435,7 +429,6 @@ async fn a_host_header_is_written_once() {
                 None,
                 "example.com",
                 port,
-                b"",
                 &crate::outbound::dial::DialOptions::default(),
             )
             .await
@@ -602,4 +595,174 @@ async fn an_idle_stream_parks_its_buffers_and_traffic_resumes_intact() {
             assert_eq!(end.wbuf.capacity(), 0, "idle stream kept its write queue");
         }
     }
+}
+
+fn lazy_request(max: usize) -> WsRequest {
+    WsRequest {
+        path: "/t".to_string(),
+        host: "example.com".to_string(),
+        headers: Vec::new(),
+        max_early_data: max,
+        early_data_header_name: String::new(),
+    }
+}
+
+/// Reads one upgrade request off `server`, answers 101 and returns the
+/// request head with the early data it carried.
+async fn answer_upgrade(server: &mut tokio::io::DuplexStream) -> (String, Vec<u8>) {
+    use base64::Engine as _;
+    use tokio::io::AsyncWriteExt;
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        if server.read(&mut byte).await.expect("read request") == 0 {
+            break;
+        }
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).expect("utf8");
+    let key = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+        .expect("key")
+        .to_string();
+    let early = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Sec-WebSocket-Protocol: "))
+        .map(|v| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(v)
+                .expect("base64url")
+        })
+        .unwrap_or_default();
+    let mut hash = Sha1::new();
+    hash.update(key.as_bytes());
+    hash.update(WS_GUID);
+    let accept = base64_std(&hash.finalize());
+    server
+        .write_all(
+            format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                 Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("answer");
+    (head, early)
+}
+
+/// One masked client frame off `server`: its payload.
+async fn read_frame(server: &mut tokio::io::DuplexStream) -> Vec<u8> {
+    let mut head = [0u8; 2];
+    server.read_exact(&mut head).await.expect("frame head");
+    let mut len = usize::from(head[1] & 0x7f);
+    if len == 126 {
+        let mut ext = [0u8; 2];
+        server.read_exact(&mut ext).await.expect("len");
+        len = usize::from(u16::from_be_bytes(ext));
+    }
+    let mut mask = [0u8; 4];
+    server.read_exact(&mut mask).await.expect("mask");
+    let mut payload = vec![0u8; len];
+    server.read_exact(&mut payload).await.expect("payload");
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b ^= mask[i % 4];
+    }
+    payload
+}
+
+/// With early data the upgrade request waits for the first write and carries
+/// it when it fits the budget; a longer one follows as a frame. Nothing goes
+/// out before that write.
+#[tokio::test]
+async fn early_data_upgrade_waits_for_the_first_write() {
+    use tokio::io::AsyncWriteExt;
+    for (max, len) in [(2048usize, 300usize), (299, 300), (300, 300)] {
+        let (client, mut server) = tokio::io::duplex(1 << 16);
+        let mut ws = LazyWs::new(Box::new(client), lazy_request(max));
+        let mut probe = [0u8; 1];
+        let quiet = tokio::time::timeout(Duration::from_millis(100), server.read(&mut probe)).await;
+        assert!(quiet.is_err(), "no request before the first write");
+        let first: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+        let write = {
+            let first = first.clone();
+            async move {
+                ws.write_all(&first).await.expect("first write");
+                ws.flush().await.expect("flush");
+                ws
+            }
+        };
+        let serve = async {
+            let (head, early) = answer_upgrade(&mut server).await;
+            assert!(head.starts_with("GET /t HTTP/1.1\r\n"), "{head}");
+            let rest = if early.len() < len {
+                read_frame(&mut server).await
+            } else {
+                Vec::new()
+            };
+            (early, rest)
+        };
+        let (_ws, (early, rest)) = tokio::join!(write, serve);
+        // all of the first write or none of it
+        let carried = if len <= max { len } else { 0 };
+        assert_eq!(early, &first[..carried], "max {max}");
+        assert_eq!(rest, &first[carried..], "max {max}");
+    }
+}
+
+/// A read before the first write waits for it, then sees the server's bytes.
+#[tokio::test]
+async fn a_read_waits_for_the_upgrade() {
+    use tokio::io::AsyncWriteExt;
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let ws = LazyWs::new(Box::new(client), lazy_request(2048));
+    let (mut rd, mut wr) = tokio::io::split(ws);
+    let reader = tokio::spawn(async move {
+        let mut got = [0u8; 2];
+        rd.read_exact(&mut got).await.expect("read");
+        got
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!reader.is_finished());
+    let (written, (_, early)) = tokio::join!(wr.write_all(b"head"), answer_upgrade(&mut server));
+    written.expect("write");
+    assert_eq!(early, b"head");
+    server
+        .write_all(&[0x82, 2, b'o', b'k'])
+        .await
+        .expect("frame");
+    assert_eq!(&reader.await.expect("join"), b"ok");
+}
+
+/// Closed before any write: no upgrade request, the transport just ends.
+#[tokio::test]
+async fn closing_before_the_first_write_sends_no_request() {
+    use tokio::io::AsyncWriteExt;
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let mut ws = LazyWs::new(Box::new(client), lazy_request(2048));
+    ws.shutdown().await.expect("shutdown");
+    let mut got = Vec::new();
+    server.read_to_end(&mut got).await.expect("read");
+    assert!(got.is_empty());
+}
+
+/// A refused upgrade fails the write that carried it, and later reads.
+#[tokio::test]
+async fn a_refused_upgrade_fails_the_first_write() {
+    use tokio::io::AsyncWriteExt;
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let mut ws = LazyWs::new(Box::new(client), lazy_request(2048));
+    let serve = async move {
+        let mut buf = [0u8; 1024];
+        let _ = server.read(&mut buf).await;
+        let _ = server
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        server
+    };
+    let (result, _server) = tokio::join!(ws.write_all(b"head"), serve);
+    assert!(result.is_err());
+    let mut buf = [0u8; 4];
+    assert!(ws.read(&mut buf).await.is_err());
 }

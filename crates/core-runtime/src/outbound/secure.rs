@@ -160,21 +160,15 @@ impl Vless {
 
     async fn dial(&self, command: u8, target: &Target) -> io::Result<AnyStream> {
         let header = request_head(&self.uuid, command, target, self.vision)?;
-        // a ws transport with early data carries the request in the upgrade head
-        let (mut stream, consumed) = self
+        // a ws transport with early data sends its upgrade request with the
+        // first write below, so the head and first payload ride in it
+        let mut stream = self
             .transport
-            .connect_or_dial(
-                self.tls.as_ref(),
-                &self.server,
-                self.port,
-                &header,
-                &self.dial,
-            )
+            .connect_or_dial(self.tls.as_ref(), &self.server, self.port, &self.dial)
             .await?;
         if self.vision {
             crate::inbound::disable_tls_read_batching(&mut stream);
         }
-        let rest = &header[consumed..];
         // The head waits for the first payload and both go in one write, as
         // Xray's client sends them (`proxy/vless/outbound`: the head goes into
         // a `BufferedWriter`, the first payload read within 500 ms is written
@@ -198,7 +192,7 @@ impl Vless {
         // no data rather than `ErrReadTimeout`, so the branch never runs. A
         // client that leaves before its first byte gets nothing sent at all,
         // also as with Xray.
-        let request = PendingHead::new(rest.to_vec(), VLESS_FIRST_PAYLOAD_WAIT, VLESS_FIRST_WRITE);
+        let request = PendingHead::new(header, VLESS_FIRST_PAYLOAD_WAIT, VLESS_FIRST_WRITE);
         let framed: AnyStream = Box::new(VlessStream {
             inner: stream,
             request,
@@ -489,11 +483,11 @@ impl Trojan {
             return Err(io::Error::other("trojan requires TLS"));
         };
         let header = trojan_request_head(&self.password_hash, command, target)?;
-        let (stream, consumed) = self
+        let stream = self
             .transport
-            .connect_or_dial(Some(tls), &self.server, self.port, &header, &self.dial)
+            .connect_or_dial(Some(tls), &self.server, self.port, &self.dial)
             .await?;
-        Ok(TrojanStream::new(stream, header[consumed..].to_vec()))
+        Ok(TrojanStream::new(stream, header))
     }
 }
 
