@@ -14,6 +14,8 @@ STRICT=0 SING_BOX_REF=/path/to/sing-box bash tests/differential/run.sh
 Rules:
 
 - valid corpus (`lx/`, `tachyon/`): **both** binaries must exit 0;
+- `removed/` (protocols Xrust does not ship): the reference must exit 0 and
+  `xrust` must reject the config;
 - `invalid/`: reference must reject and `xrust` must reject too
   (semantic validation, F1). With `STRICT=0` an `xrust` acceptance is
   downgraded to a `GAP` report instead of a failure.

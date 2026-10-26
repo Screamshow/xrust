@@ -12,7 +12,7 @@ Sources:
 |---|---|
 | `lx/` | `Leadaxe/sing-box-lx` → `lx-test/config/` (XHTTP, AWG2/3, chain) |
 | `tachyon/` | shape of configs emitted by Tachyon `generator.uc`; includes `f1-exit-gate.json` (live router-main minus F2/F3 fields: hysteria2, xhttp, REALITY, rule_set rules) |
-| `ext/` | Xrust-only extensions (currently `fptn` token outbounds); **not** run through the reference — `sing-box check` rejects `type: fptn` as an unknown outbound type, so the differential harness skips this dir |
+| `removed/` | valid reference configs for protocols Xrust does not ship (Naive, VMess, TUIC, AnyTLS, Snell, …): the reference must accept them and `xrust check` must reject them as excluded from Rust X |
 | `live/` | `router-main.json`: sanitized dump (hosts/uuids/passwords/reality keys replaced) of a live router's `/etc/sing-box/config.json` — F1 exit-gate target; uses F2/F3 fields (xhttp/grpc transports, REALITY, rule_set), so it is NOT part of the `check` corpus yet |
 | `invalid/` | empirically verified rejections against sing-box-lx v1.14.2-lx.3 (plus `fptn-*` cases rejected by the reference as unknown outbound type) |
 

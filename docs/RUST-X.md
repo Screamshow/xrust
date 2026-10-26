@@ -7,7 +7,7 @@ Other platform code inherited from upstream is not a supported build target.
 Firefox/Safari and Chrome for XHTTP now use our Sing-Box X 1.0.3 captures.
 See [the uTLS refresh report](RUST-X-UTLS-2026-10-10.md).
 
-The explicit `rust-x` release build excludes Naive, VMess, Trojan, Shadowsocks, TUIC, AnyTLS,
+Xrust does not ship Naive, VMess, Trojan, Shadowsocks, TUIC, AnyTLS,
 Snell, ShadowTLS, FPTN, outbound SOCKS and OpenVPN. Config `check` rejects
 these types. SOCKS4/4a client requests are rejected; SOCKS5 and HTTP mixed
 inbounds remain available for Forkop DirectProxy.
@@ -17,21 +17,20 @@ Hysteria2, WireGuard/AmneziaWG, MASQUE, Tailscale, DNS, SRS, TProxy, Redirect,
 TUN, direct, selectors/urltest and Clash API remain enabled.
 
 Release build: `cargo build --locked -p core-cli --no-default-features --features rust-x --release --target x86_64-unknown-linux-musl`.
-Ordinary Cargo builds include the retained upstream protocol set by default
-through `legacy-protocols`. This keeps upstream development and protocol tests
-available without changing the reduced Forkop package profile. Cargo features
-are additive: `--features rust-x` alone does not disable the default protocols;
-release builds must also pass `--no-default-features`.
-Profile tests: `cargo test -p core-config --no-default-features --features rust-x --test rust_x_profile`.
+There is a single protocol profile: the default features build the same core
+as the release command. `rust-x` stays as an alias of `full`, so packaging
+scripts that pass `--no-default-features --features rust-x` keep working.
+Profile tests: `cargo test -p core-config --test rust_x_profile`.
 
-Protocol source is retained rather than deleted. Keep fork-specific fixes in
-focused commits and port upstream changes without replacing our DNS, routing,
-monitoring or OpenWrt behavior. The default profile restores protocols already
-present in this fork; it does not automatically import newer upstream protocols.
+The removed protocols used to sit behind an optional `legacy-protocols` Cargo
+feature; that feature and the modules only it compiled were deleted, and can
+be recovered from git history if needed. Keep fork-specific fixes in focused
+commits and port upstream changes without replacing our DNS, routing,
+monitoring or OpenWrt behavior; upstream protocols outside this profile are
+not imported.
 
 Shared helpers under VMess/Shadowsocks/FPTN remain in the source because
-retained protocols use them. Release LTO removes unreachable implementations;
-independent removed modules and OpenVPN/Snell-only dependencies are feature-gated.
+retained protocols use them. Release LTO removes unreachable implementations.
 OpenWrt APK/IPK packaging and installation checks are described in
 [OpenWrt packages](OPENWRT-PACKAGES.md).
 
