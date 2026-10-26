@@ -978,6 +978,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClosingTls<S> {
         std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,

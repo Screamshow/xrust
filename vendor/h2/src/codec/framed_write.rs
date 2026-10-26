@@ -63,15 +63,19 @@ enum Next<B> {
 /// Initialize the connection with this amount of write buffer.
 const DEFAULT_BUFFER_CAPACITY: usize = 128 * 1_024;
 
-/// Chain payloads bigger than this when vectored I/O is enabled. The remote
-/// will never advertise a max frame size less than this (well, the spec says
-/// the max frame size can't be less than 16kb, so not even close).
-const CHAIN_THRESHOLD: usize = 256;
+/// Chain payloads bigger than this when vectored I/O is enabled.
+///
+/// xrust: DATA frames under 32 KiB are copied into the write buffer, frame
+/// header and all, the way Go's http2 framer writes into its 32 KiB
+/// `bufio.Writer`. Chained, every 16 KiB frame went out as its own write --
+/// the header and the first bytes, then the rest -- and a TLS stream that
+/// seals each write into a record drew pairs of 1041 and 15386 bytes, or a
+/// full record and a 9-byte tail, where Go's client sends full 16401-byte
+/// records back to back.
+const CHAIN_THRESHOLD: usize = 32 * 1024;
 
 /// Chain payloads bigger than this when vectored I/O is **not** enabled.
-/// A larger value in this scenario will reduce the number of small and
-/// fragmented data being sent, and hereby improve the throughput.
-const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
+const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 32 * 1024;
 
 // TODO: Make generic
 impl<T, B> FramedWrite<T, B>

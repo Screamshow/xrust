@@ -168,24 +168,38 @@ impl Sealer {
         payload: &[u8],
         out: &mut Vec<u8>,
     ) -> io::Result<()> {
+        self.seal_parts_into(kind, &[payload], out)
+    }
+
+    /// The same, for a plaintext given in pieces: they go into one record, in
+    /// order, as if they had been one slice.
+    pub fn seal_parts_into(
+        &mut self,
+        kind: ContentType,
+        parts: &[&[u8]],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let size: usize = parts.iter().map(|p| p.len()).sum();
         // Checked here rather than left to the arithmetic below: the length in
         // the header is a u16, so an oversized payload wraps round to a short
         // one and the peer reads a truncated record out of the middle of a long
         // ciphertext -- which arrives as a tag that does not verify.
-        if payload.len() > MAX_FRAGMENT {
+        if size > MAX_FRAGMENT {
             return Err(err("plaintext over the record length limit"));
         }
         if self.seq == u64::MAX {
             return Err(err("record sequence number exhausted"));
         }
-        let length = (payload.len() + 1 + 16) as u16;
+        let length = (size + 1 + 16) as u16;
         let aad = header(ContentType::ApplicationData, length);
         let nonce = self.keys.nonce(self.seq);
         let start = out.len();
         out.reserve(5 + usize::from(length));
         out.extend_from_slice(&aad);
         // the inner plaintext: the content, then its type
-        out.extend_from_slice(payload);
+        for part in parts {
+            out.extend_from_slice(part);
+        }
         out.push(kind as u8);
         if let Some(aead) = &self.aead {
             let tag = aead.seal(&nonce, &aad, &mut out[start + 5..]);

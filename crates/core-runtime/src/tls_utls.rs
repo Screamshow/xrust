@@ -114,6 +114,39 @@ impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
         Poll::Ready(Ok(()))
     }
 
+    /// Seal `parts` into one record and write it out; ready with the
+    /// plaintext it carried once the whole record is with the transport.
+    /// A record left half way out by an earlier call goes first, and its
+    /// count is what that call is owed.
+    fn poll_seal(&mut self, cx: &mut Context<'_>, parts: &[&[u8]]) -> Poll<io::Result<usize>> {
+        loop {
+            let Some(pos) = self.out else {
+                if self.wbuf.capacity() == 0 {
+                    self.wbuf = WRITE_POOL.take();
+                }
+                self.wbuf.clear();
+                self.connection
+                    .write_record_parts_into(parts, &mut self.wbuf)?;
+                self.out = Some(0);
+                self.pending_plaintext = parts.iter().map(|p| p.len()).sum();
+                continue;
+            };
+            match Pin::new(&mut self.inner).poll_write(cx, &self.wbuf[pos..]) {
+                Poll::Ready(Ok(n)) => {
+                    let pos = pos + n;
+                    if pos == self.wbuf.len() {
+                        self.out = None;
+                        let written = std::mem::take(&mut self.pending_plaintext);
+                        return Poll::Ready(Ok(written));
+                    }
+                    self.out = Some(pos);
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
     /// Seal close_notify into `wbuf`, to go out with `poll_drain`.
     fn queue_close_notify(&mut self) -> io::Result<()> {
         self.close_notify_sent = true;
@@ -347,33 +380,50 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
         // writes it in pieces: `write_record` refuses more, and the number handed
         // back has to be what really left.
         let take = buf.len().min(core_tls::record::MAX_FRAGMENT);
-        loop {
-            let Some(pos) = me.out else {
-                if me.wbuf.capacity() == 0 {
-                    me.wbuf = WRITE_POOL.take();
-                }
-                me.wbuf.clear();
-                if let Err(e) = me.connection.write_record_into(&buf[..take], &mut me.wbuf) {
-                    return Poll::Ready(Err(e));
-                }
-                me.out = Some(0);
-                me.pending_plaintext = take;
-                continue;
-            };
-            match Pin::new(&mut me.inner).poll_write(cx, &me.wbuf[pos..]) {
-                Poll::Ready(Ok(n)) => {
-                    let pos = pos + n;
-                    if pos == me.wbuf.len() {
-                        me.out = None;
-                        let written = std::mem::take(&mut me.pending_plaintext);
-                        return Poll::Ready(Ok(written));
-                    }
-                    me.out = Some(pos);
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
+        me.poll_seal(cx, &[&buf[..take]])
+    }
+
+    /// The pieces go into one record up to a record's worth, as Go's
+    /// `crypto/tls` puts one buffered write into one: h2 hands over a frame
+    /// header and its payload apart (`vendor/h2` `FramedWrite::flush`), and
+    /// sealed one by one they made pairs of 1041 and 15386 bytes where Xray
+    /// sends 16401.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        if bufs.iter().all(|b| b.is_empty()) {
+            return Poll::Ready(Ok(0));
         }
+        if me.write_closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        if me.direct_write {
+            return Pin::new(&mut me.inner).poll_write_vectored(cx, bufs);
+        }
+        const MOST: usize = 16;
+        let mut parts: [&[u8]; MOST] = [&[]; MOST];
+        let mut count = 0;
+        let mut room = core_tls::record::MAX_FRAGMENT;
+        for buf in bufs {
+            if count == MOST || room == 0 {
+                break;
+            }
+            let take = buf.len().min(room);
+            if take == 0 {
+                continue;
+            }
+            parts[count] = &buf[..take];
+            count += 1;
+            room -= take;
+        }
+        me.poll_seal(cx, &parts[..count])
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -771,6 +821,46 @@ mod read_batching_tests {
                 "direct write: {write}"
             );
         }
+    }
+
+    /// A vectored write puts its pieces into one record, up to a record's
+    /// worth: an h2 frame header and its 16375-byte payload leave as one
+    /// 16401-byte record, as from Go's `crypto/tls`, not as two.
+    #[tokio::test]
+    async fn vectored_pieces_share_one_record() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut stream = connected(|mut tls| async move {
+            tls.write_all(b"go").await.unwrap();
+            let mut got = vec![0u8; 9 + 16375 + 100];
+            tls.read_exact(&mut got).await.unwrap();
+            let _ = tx.send(got);
+        })
+        .await;
+        let mut go = [0u8; 2];
+        stream.read_exact(&mut go).await.unwrap();
+        assert!(stream.is_write_vectored());
+        let header = [1u8; 9];
+        let payload = vec![2u8; 16375];
+        let tail = vec![3u8; 100];
+        let bufs = [
+            io::IoSlice::new(&header),
+            io::IoSlice::new(&payload),
+            io::IoSlice::new(&tail),
+        ];
+        let n = stream.write_vectored(&bufs).await.unwrap();
+        assert_eq!(n, 16384, "one record's worth");
+        assert_eq!(stream.wbuf.len(), 5 + 16384 + 1 + 16, "one full record");
+        assert_eq!(u16::from_be_bytes([stream.wbuf[3], stream.wbuf[4]]), 16401);
+        // the rest of the last piece follows in the next record
+        stream
+            .write_all(&tail[100 - (9 + 16375 + 100 - n)..])
+            .await
+            .unwrap();
+        let got = rx.await.unwrap();
+        let mut want = header.to_vec();
+        want.extend_from_slice(&payload);
+        want.extend_from_slice(&tail);
+        assert_eq!(got, want);
     }
 
     /// A write after shutdown is refused and puts nothing on the wire; the

@@ -570,6 +570,18 @@ impl Connection {
             .seal_into(ContentType::ApplicationData, data, out)
     }
 
+    /// [`Connection::write_record_into`] for a plaintext in pieces: one
+    /// record holding them all, in order.
+    pub fn write_record_parts_into(
+        &mut self,
+        parts: &[&[u8]],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        out.clear();
+        self.sealer
+            .seal_parts_into(ContentType::ApplicationData, parts, out)
+    }
+
     /// A `close_notify` alert (warning level, as Go's `crypto/tls` sends it)
     /// sealed into `out`: what a client says before it closes its side.
     pub fn close_notify_into(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
