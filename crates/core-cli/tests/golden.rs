@@ -1,9 +1,9 @@
 //! Golden corpus contract:
-//! every config under `../tests/golden/{lx,tachyon,ext}` must pass
+//! every config under `../tests/golden/{lx,tachyon}` must pass
 //! `core_config::check_str` (schema + semantic validation), and every config
-//! under `../tests/golden/invalid` must fail it. `ext/` holds Xrust
-//! extensions (e.g. `fptn` token outbounds) that the reference sing-box
-//! rejects as unknown types, so the differential harness skips that dir.
+//! under `../tests/golden/invalid` must fail it. `removed/` holds configs the
+//! reference accepts for protocols this core does not ship; they must fail
+//! with the "excluded from Rust X" error.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -44,12 +44,10 @@ fn corpus_files(dir_name: &str) -> Vec<PathBuf> {
     files
 }
 
-#[cfg(feature = "legacy-protocols")]
 /// Corpus entries the current platform rejects by design: `routing_mark` and
 /// the other dialer gates exist on Linux only (common/dialer.New).
 const PLATFORM_SKIPPED: &[&str] = &["tachyon/f1-exit-gate.json"];
 
-#[cfg(feature = "legacy-protocols")]
 fn assert_accepts(dir_name: &str) {
     use_workspace_cwd();
     for file in corpus_files(dir_name) {
@@ -81,22 +79,31 @@ fn assert_rejects(dir_name: &str) {
     }
 }
 
-#[cfg(feature = "legacy-protocols")]
 #[test]
 fn golden_lx_configs_pass_check() {
     assert_accepts("lx");
 }
 
-#[cfg(feature = "legacy-protocols")]
 #[test]
 fn golden_tachyon_configs_pass_check() {
     assert_accepts("tachyon");
 }
 
-#[cfg(feature = "legacy-protocols")]
 #[test]
-fn golden_ext_configs_pass_check() {
-    assert_accepts("ext");
+fn golden_removed_protocol_configs_fail_check() {
+    use_workspace_cwd();
+    for file in corpus_files("removed") {
+        let raw =
+            fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+        match core_config::check_str(&raw) {
+            Ok(()) => panic!("check accepted removed protocol {}", file.display()),
+            Err(e) => assert!(
+                e.contains("excluded from Rust X"),
+                "{}: {e}",
+                file.display()
+            ),
+        }
+    }
 }
 
 #[test]

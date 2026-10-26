@@ -31,37 +31,15 @@ pub use rule::{
 use crate::dns::{self, QueryMeta};
 use crate::inbound::Conn;
 use crate::logging;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::anytls::AnyTls;
 use crate::outbound::block::Block;
 use crate::outbound::chain::Chain;
 use crate::outbound::direct::Direct;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::fptn::Fptn;
 use crate::outbound::hysteria2::Hysteria2;
 use crate::outbound::masque::Masque;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::naive::Naive;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::openvpn::OpenVpn;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::proxy::Socks;
 use crate::outbound::proxy::{HttpOut, Selector};
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::secure::Trojan;
 use crate::outbound::secure::Vless;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::shadowsocks::stream::Shadowsocks;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::shadowtls::ShadowTls;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::snell::Snell;
 use crate::outbound::tailscale::Tailscale;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::tuic::Tuic;
 use crate::outbound::urltest::Urltest;
-#[cfg(feature = "legacy-protocols")]
-use crate::outbound::vmess::Vmess;
 use crate::outbound::wireguard::WireGuard;
 
 /// Result of a completed rule walk for one connection.
@@ -259,36 +237,14 @@ fn outbound_setup_budgets(root: &Value) -> anyhow::Result<Vec<std::time::Duratio
 pub enum Outbound {
     Direct(Direct),
     Block(Block),
-    #[cfg(feature = "legacy-protocols")]
-    Socks(Socks),
     Http(HttpOut),
-    #[cfg(feature = "legacy-protocols")]
-    Shadowsocks(Shadowsocks),
     Vless(Vless),
-    #[cfg(feature = "legacy-protocols")]
-    Trojan(Trojan),
-    #[cfg(feature = "legacy-protocols")]
-    Vmess(Vmess),
     Hysteria2(Hysteria2),
-    #[cfg(feature = "legacy-protocols")]
-    Fptn(Fptn),
     Masque(Masque),
-    #[cfg(feature = "legacy-protocols")]
-    Snell(Snell),
-    #[cfg(feature = "legacy-protocols")]
-    Tuic(Tuic),
     WireGuard(WireGuard),
-    #[cfg(feature = "legacy-protocols")]
-    OpenVpn(OpenVpn),
-    #[cfg(feature = "legacy-protocols")]
-    Naive(Naive),
-    #[cfg(feature = "legacy-protocols")]
-    AnyTls(AnyTls),
     Urltest(Urltest),
     Selector(Selector),
     Chain(Chain),
-    #[cfg(feature = "legacy-protocols")]
-    ShadowTls(ShadowTls),
     Tailscale(Tailscale),
 }
 
@@ -303,39 +259,14 @@ impl Outbound {
                 .connect(target)
                 .await
                 .map(|s| Conn::Plain(Box::new(s))),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Socks(socks) => socks.connect(target).await.map(Conn::Plain),
             Outbound::Http(http) => http.connect(target).await.map(Conn::Plain),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Shadowsocks(ss) => ss
-                .connect(target)
-                .await
-                .map(|(reader, writer)| Conn::Shadowsocks(Box::new(reader), writer)),
             Outbound::Vless(vless) => vless.connect(target).await.map(Conn::Plain),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Trojan(trojan) => trojan.connect(target).await.map(Conn::Plain),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Vmess(vmess) => vmess.connect(target).await.map(Conn::Plain),
             Outbound::Hysteria2(hy2) => hy2.connect(target).await.map(Conn::Plain),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Fptn(fptn) => fptn.connect(target).await.map(Conn::Plain),
             Outbound::Masque(masque) => masque.connect(target).await.map(Conn::Plain),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Snell(snell) => snell.connect(target).await.map(Conn::Plain),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Tuic(tuic) => tuic.connect(target).await.map(Conn::Plain),
             Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::OpenVpn(ovpn) => ovpn.connect(target).await.map(Conn::Plain),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Naive(naive) => naive.connect(target).await.map(Conn::Plain),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::AnyTls(anytls) => anytls.connect(target).await.map(Conn::Plain),
             Outbound::Urltest(urltest) => urltest.connect(router, target).await,
             Outbound::Selector(selector) => selector.connect(router, target).await,
             Outbound::Chain(chain) => chain.connect(router, target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::ShadowTls(stls) => stls.connect(target).await.map(Conn::Plain),
             Outbound::Tailscale(ts) => ts.connect(target).await.map(Conn::Plain),
         }
     }
@@ -348,28 +279,10 @@ impl Outbound {
     ) -> io::Result<tokio::net::UdpSocket> {
         match self {
             Outbound::Direct(direct) => direct.connect_udp(target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Socks(socks) => socks.connect_udp(target).await,
             Outbound::Hysteria2(hy2) => hy2.connect_udp(target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Fptn(fptn) => fptn.connect_udp(target).await,
             Outbound::Masque(masque) => masque.connect_udp(target).await,
             Outbound::Vless(vless) => vless.connect_udp(target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Vmess(vmess) => vmess.connect_udp(target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Trojan(trojan) => trojan.connect_udp(target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Snell(snell) => snell.connect_udp(target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Tuic(tuic) => tuic.connect_udp(target).await,
             Outbound::WireGuard(wg) => wg.connect_udp(target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::OpenVpn(ovpn) => ovpn.connect_udp(target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Naive(naive) => naive.connect_udp(target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::AnyTls(anytls) => anytls.connect_udp(target).await,
             Outbound::Block(_) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
                 "blocked by outbound",
@@ -377,8 +290,6 @@ impl Outbound {
             Outbound::Selector(selector) => selector.connect_udp(router, target).await,
             Outbound::Urltest(urltest) => urltest.connect_udp(router, target).await,
             Outbound::Chain(chain) => chain.connect_udp(router, target).await,
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::ShadowTls(stls) => stls.connect_udp(target).await,
             Outbound::Tailscale(ts) => ts.connect_udp(target).await,
             _ => Err(io::Error::other("udp not supported by this outbound")),
         }
@@ -401,21 +312,7 @@ impl Outbound {
         match self {
             Outbound::Direct(d) => apply(&mut d.dial),
             Outbound::Vless(v) => apply(&mut v.dial),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Trojan(t) => apply(&mut t.dial),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Shadowsocks(s) => apply(&mut s.dial),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Vmess(m) => apply(&mut m.dial),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Socks(s) => apply(&mut s.dial),
             Outbound::Http(h) => apply(&mut h.dial),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::ShadowTls(s) => apply(&mut s.dial),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Naive(n) => apply(&mut n.dial),
-            #[cfg(feature = "legacy-protocols")]
-            Outbound::Snell(s) => apply(&mut s.dial),
             _ => {}
         }
     }
@@ -431,33 +328,13 @@ impl Outbound {
         match ty {
             "direct" => Ok(Outbound::Direct(Direct::build(obj, at)?)),
             "block" => Ok(Outbound::Block(Block)),
-            #[cfg(feature = "legacy-protocols")]
-            "socks" => Ok(Outbound::Socks(Socks::build(obj, at)?)),
             "http" => Ok(Outbound::Http(HttpOut::build(obj, at)?)),
-            #[cfg(feature = "legacy-protocols")]
-            "shadowsocks" => Ok(Outbound::Shadowsocks(Shadowsocks::build(obj, at)?)),
             "vless" => Ok(Outbound::Vless(Vless::build(obj, at)?)),
-            #[cfg(feature = "legacy-protocols")]
-            "trojan" => Ok(Outbound::Trojan(Trojan::build(obj, at)?)),
-            #[cfg(feature = "legacy-protocols")]
-            "vmess" => Ok(Outbound::Vmess(Vmess::build(obj, at)?)),
             "hysteria2" => Ok(Outbound::Hysteria2(Hysteria2::build(obj, at)?)),
-            #[cfg(feature = "legacy-protocols")]
-            "fptn" => Ok(Outbound::Fptn(Fptn::build(obj, at)?)),
             "masque" => Ok(Outbound::Masque(Masque::build(obj, at)?)),
-            #[cfg(feature = "legacy-protocols")]
-            "snell" => Ok(Outbound::Snell(Snell::build(obj, at)?)),
-            #[cfg(feature = "legacy-protocols")]
-            "tuic" => Ok(Outbound::Tuic(Tuic::build(obj, at)?)),
-            #[cfg(feature = "legacy-protocols")]
-            "naive" => Ok(Outbound::Naive(Naive::build(obj, at)?)),
-            #[cfg(feature = "legacy-protocols")]
-            "anytls" => Ok(Outbound::AnyTls(AnyTls::build(obj, at)?)),
             "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),
             "selector" => Ok(Outbound::Selector(Selector::build(obj, at)?)),
             "chain" => Ok(Outbound::Chain(Chain::build(obj, at)?)),
-            #[cfg(feature = "legacy-protocols")]
-            "shadowtls" => Ok(Outbound::ShadowTls(ShadowTls::build(obj, at)?)),
             other => Err(anyhow::anyhow!(
                 "{at}: outbound type {other:?} not implemented yet"
             )),
@@ -1010,8 +887,6 @@ impl RouterInner {
                 .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
             let outbound = match ty {
                 "wireguard" => Outbound::WireGuard(WireGuard::build(map, &at)?),
-                #[cfg(feature = "legacy-protocols")]
-                "openvpn-client" => Outbound::OpenVpn(OpenVpn::build(map, &at)?),
                 "openconnect" => anyhow::bail!(
                     "{at}: openconnect client is not implemented yet (config check parity only)"
                 ),

@@ -4,7 +4,6 @@
 pub(crate) mod grpc;
 pub(crate) mod h1io;
 pub(crate) mod h2io;
-pub(crate) mod h3io;
 mod http;
 pub(crate) mod xhttp;
 pub(crate) mod xmux;

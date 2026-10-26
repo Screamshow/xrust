@@ -167,38 +167,6 @@ async fn mixed_socks4_user_check() {
     i.shutdown();
 }
 
-#[cfg(feature = "legacy-protocols")]
-#[tokio::test]
-async fn socks_inbound_takes_socks4_and_5_refuses_http() {
-    let _g = test_guard().await;
-    let echo = spawn_echo().await;
-    let i = start("socks", Value::Null).await;
-    let addr = addr_of(&i);
-
-    let mut v4 = connect(addr).await;
-    v4.write_all(&socks4_req(echo.port(), [127, 0, 0, 1], "", None))
-        .await
-        .expect("write");
-    assert_eq!(read_n(&mut v4, 8).await[1], 90);
-    echo_roundtrip(&mut v4).await;
-
-    let mut v5 = connect(addr).await;
-    v5.write_all(&[5, 1, 0]).await.expect("write");
-    assert_eq!(read_n(&mut v5, 2).await, [5, 0]);
-    let mut req = vec![5, 1, 0, 1, 127, 0, 0, 1];
-    req.extend_from_slice(&echo.port().to_be_bytes());
-    v5.write_all(&req).await.expect("write");
-    assert_eq!(read_n(&mut v5, 10).await[1], 0);
-    echo_roundtrip(&mut v5).await;
-
-    let mut http = connect(addr).await;
-    http.write_all(b"GET http://127.0.0.1/ HTTP/1.1\r\nHost: x\r\n\r\n")
-        .await
-        .expect("write");
-    expect_closed(&mut http).await;
-    i.shutdown();
-}
-
 #[tokio::test]
 async fn http_inbound_connect_refuses_socks() {
     let _g = test_guard().await;

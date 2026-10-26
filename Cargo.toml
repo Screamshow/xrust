@@ -28,7 +28,6 @@ repository = "https://github.com/Screamshow/xrust"
 rust-version = "1.89"
 
 [workspace.dependencies]
-argon2 = "0.5"
 blake2 = { version = "0.10", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
@@ -49,8 +48,6 @@ cfb-mode = "0.8"
 chacha20poly1305 = "0.10"
 ml-kem = "0.2"
 ctr = "0.9"
-# constant-time tag compares for the snell batch opener
-subtle = "2.6"
 rand_core = "0.6"
 getrandom = "0.3"
 h2 = "0.4"

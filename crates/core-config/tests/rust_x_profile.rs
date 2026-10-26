@@ -1,7 +1,6 @@
 use core_config::check_str;
 
 #[test]
-#[cfg(not(feature = "legacy-protocols"))]
 fn rust_x_rejects_removed_protocols_at_check_time() {
     for protocol in [
         "naive",
@@ -27,18 +26,6 @@ fn rust_x_rejects_removed_protocols_at_check_time() {
     }
     let error = check_str(r#"{"outbounds":[{"type":"socks"}]}"#).unwrap_err();
     assert!(error.contains("excluded from Rust X"));
-}
-
-#[test]
-#[cfg(feature = "legacy-protocols")]
-fn default_build_accepts_retained_upstream_protocols() {
-    for outbound in [
-        serde_json::json!({"type":"trojan","server":"127.0.0.1","server_port":443,"password":"test"}),
-        serde_json::json!({"type":"vmess","server":"127.0.0.1","server_port":443,"uuid":"00000000-0000-0000-0000-000000000001"}),
-        serde_json::json!({"type":"socks","server":"127.0.0.1","server_port":1080}),
-    ] {
-        check_str(&serde_json::json!({"outbounds":[outbound]}).to_string()).unwrap();
-    }
 }
 
 #[test]

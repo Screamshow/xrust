@@ -4289,7 +4289,6 @@ fn validate_network_namespaces(value: &Value) -> Result<(), String> {
 }
 
 pub fn validate(root: &Value) -> Result<(), String> {
-    #[cfg(not(feature = "legacy-protocols"))]
     for section in ["inbounds", "outbounds", "endpoints"] {
         if let Some(entries) = root.get(section).and_then(Value::as_array) {
             for (i, entry) in entries.iter().enumerate() {
@@ -10531,14 +10530,13 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn a_server_inbound_with_a_transport_is_refused_not_ignored() {
         // measured on the router: a vless+ws inbound started, bound its port,
         // and then every client hung, because nothing on this side reads
         // `transport`. A migrated xray server config is mostly that field, so
         // it has to fail at startup instead.
-        for ty in ["vless", "vmess", "trojan"] {
+        for ty in ["vless"] {
             let cfg = json!({
                 "inbounds": [{
                     "type": ty,
@@ -10882,7 +10880,6 @@ mod tests {
         assert!(err.contains("unknown inbound type: wireguard"));
     }
 
-    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn accepts_valid_router_shape() {
         let cfg = json!({
@@ -10891,8 +10888,8 @@ mod tests {
             "inbounds": [{"type": "mixed", "tag": "m", "listen": "127.0.0.1", "listen_port": 2080}],
             "outbounds": [
                 {"type": "direct", "tag": "direct-out"},
-                {"type": "shadowsocks", "tag": "n", "server": "e.com", "server_port": 443,
-                 "method": "2022-blake3-aes-128-gcm", "password": "MTIzNDU2Nzg5MGFiY2RlZg=="}
+                {"type": "vless", "tag": "n", "server": "e.com", "server_port": 443,
+                 "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"}
             ],
             "route": {"rules": [{"action": "route", "outbound": "n"}], "final": "direct-out"}
         });
@@ -11476,80 +11473,6 @@ mod tests {
         assert!(err.contains("realm.xyz"), "{err}");
     }
 
-    #[cfg(feature = "legacy-protocols")]
-    #[test]
-    fn tuic_out_unknown_field() {
-        let err = validate(&json!({
-            "outbounds": [{
-                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
-                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
-                "tls": {"enabled": true, "insecure": true}, "auth_timeout": "5s"
-            }]
-        }))
-        .unwrap_err();
-        assert!(err.contains("auth_timeout"), "{err}");
-    }
-
-    #[cfg(feature = "legacy-protocols")]
-    #[test]
-    fn tuic_out_bad_cc() {
-        let err = validate(&json!({
-            "outbounds": [{
-                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
-                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
-                "tls": {"enabled": true, "insecure": true}, "congestion_control": "weird"
-            }]
-        }))
-        .unwrap_err();
-        assert!(
-            err.contains("unknown congestion control algorithm: weird"),
-            "{err}"
-        );
-    }
-
-    #[cfg(feature = "legacy-protocols")]
-    #[test]
-    fn tuic_out_bad_relay() {
-        let err = validate(&json!({
-            "outbounds": [{
-                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
-                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
-                "tls": {"enabled": true, "insecure": true}, "udp_relay_mode": "weird"
-            }]
-        }))
-        .unwrap_err();
-        assert!(err.contains("unknown udp_relay_mode"), "{err}");
-    }
-
-    #[cfg(feature = "legacy-protocols")]
-    #[test]
-    fn tuic_out_ovs_conflict() {
-        let err = validate(&json!({
-            "outbounds": [{
-                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
-                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
-                "tls": {"enabled": true, "insecure": true},
-                "udp_over_stream": true, "udp_relay_mode": "native"
-            }]
-        }))
-        .unwrap_err();
-        assert!(err.contains("udp_over_stream is conflict"), "{err}");
-    }
-
-    #[cfg(feature = "legacy-protocols")]
-    #[test]
-    fn tuic_out_bad_heartbeat() {
-        let err = validate(&json!({
-            "outbounds": [{
-                "type": "tuic", "tag": "t", "server": "1.2.3.4", "server_port": 443,
-                "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "x",
-                "tls": {"enabled": true, "insecure": true}, "heartbeat": "bogus"
-            }]
-        }))
-        .unwrap_err();
-        assert!(err.contains("time: invalid duration"), "{err}");
-    }
-
     #[test]
     fn hy2_in_unknown_field() {
         let err = validate(&json!({
@@ -11573,20 +11496,6 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("missing certificate"), "{err}");
-    }
-
-    #[cfg(feature = "legacy-protocols")]
-    #[test]
-    fn tuic_in_unknown_field() {
-        let err = validate(&json!({
-            "inbounds": [{
-                "type": "tuic", "tag": "t", "listen": "127.0.0.1", "listen_port": 8443,
-                "tls": {"enabled": true, "certificate_path": "x", "key_path": "y"},
-                "up_mbps": 10
-            }]
-        }))
-        .unwrap_err();
-        assert!(err.contains("up_mbps"), "{err}");
     }
 
     #[test]
@@ -11625,18 +11534,14 @@ mod tests {
         assert!(validate_masquerade(&json!({"type": "string", "status_code": 302}), "at").is_ok());
     }
 
-    #[cfg(feature = "legacy-protocols")]
     #[test]
-    fn valid_hy2_tuic_shapes() {
+    fn valid_hy2_shapes() {
         let cfg = json!({
             "log": {"level": "error"},
             "inbounds": [{"type": "mixed", "tag": "m", "listen": "127.0.0.1", "listen_port": 2080}],
             "outbounds": [
                 {"type": "hysteria2", "tag": "hy2", "server": "127.0.0.1", "server_port": 8443,
                  "up_mbps": 10, "down_mbps": 10, "password": "x",
-                 "tls": {"enabled": true, "insecure": true}},
-                {"type": "tuic", "tag": "tuic", "server": "127.0.0.1", "server_port": 443,
-                 "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "s",
                  "tls": {"enabled": true, "insecure": true}},
                 {"type": "direct", "tag": "direct"}
             ],
@@ -11973,108 +11878,6 @@ mod tests {
 
         let err = masque_err(json!({"ip": "bogus", "vhttp": "bad"}));
         assert!(err.contains("invalid vhttp: bad"), "{err}");
-    }
-
-    #[cfg(feature = "legacy-protocols")]
-    #[test]
-    fn fptn_extra_fields_and_obfuscation_rules() {
-        let server_form = |extra: Value| {
-            let mut ob = json!({
-                "type": "fptn", "tag": "x", "server": "1.2.3.4", "server_port": 443,
-                "username": "u", "password": "p"
-            });
-            if let (Some(dst), Some(src)) = (ob.as_object_mut(), extra.as_object()) {
-                for (k, v) in src {
-                    dst.insert(k.clone(), v.clone());
-                }
-            }
-            validate(&json!({"outbounds": [ob]})).unwrap_err()
-        };
-        let token_form = |extra: Value| {
-            let mut ob = json!({"type": "fptn", "tag": "x", "token": "fptn:zz"});
-            if let (Some(dst), Some(src)) = (ob.as_object_mut(), extra.as_object()) {
-                for (k, v) in src {
-                    dst.insert(k.clone(), v.clone());
-                }
-            }
-            validate(&json!({"outbounds": [ob]})).unwrap_err()
-        };
-
-        // Both forms accept the runtime knobs.
-        assert!(
-            validate(&json!({"outbounds": [{
-                "type": "fptn", "tag": "x", "server": "1.2.3.4", "server_port": 443,
-                "username": "u", "password": "p", "sni": "sni.example", "mtu": 1400,
-                "network_list": ["tcp"], "obfuscation": "tls"
-            }]}))
-            .is_ok()
-        );
-        assert!(
-            validate(&json!({"outbounds": [{
-                "type": "fptn", "tag": "x", "token": "fptn:zz",
-                "sni": "sni.example", "mtu": 1400, "network_list": "udp",
-                "obfuscation": "none"
-            }]}))
-            .is_ok()
-        );
-
-        let err = server_form(json!({"obfuscation": "bogus"}));
-        assert!(
-            err.contains("outbounds[0].obfuscation: invalid value"),
-            "{err}"
-        );
-        let err = token_form(json!({"obfuscation": 1}));
-        assert!(
-            err.contains("outbounds[0].obfuscation: must be a string"),
-            "{err}"
-        );
-        // Reality profiles: alias, official enum name, strategy number.
-        for obf in [
-            "reality",
-            "reality_chrome149",
-            "kSniRealityModeFirefox151",
-            "reality_safari26_5",
-            "24",
-            "101",
-        ] {
-            assert!(
-                validate(&json!({"outbounds": [{
-                    "type": "fptn", "tag": "x", "token": "fptn:zz",
-                    "sni": "www.cloudflare.com", "obfuscation": obf
-                }]}))
-                .is_ok(),
-                "{obf}"
-            );
-        }
-        // Deprecated reality mode 1 is rejected with a pointer to mode 2.
-        for obf in ["kSniRealityMode", "2"] {
-            let err = token_form(json!({"obfuscation": obf}));
-            assert!(err.contains("reality mode 1"), "{err}");
-        }
-        // Reality needs a capture-length SNI when one is set explicitly.
-        let err = server_form(json!({"obfuscation": "reality", "sni": "ab"}));
-        assert!(err.contains("4..=64"), "{err}");
-        let err = token_form(json!({"obfuscation": "reality_chrome145", "sni": ""}));
-        assert!(err.contains("4..=64"), "{err}");
-        let err = server_form(json!({"sni": 5}));
-        assert!(err.contains("outbounds[0].sni: must be a string"), "{err}");
-        let err = server_form(json!({"mtu": "big"}));
-        assert!(
-            err.contains("outbounds[0].mtu: must be an integer"),
-            "{err}"
-        );
-        let err = server_form(json!({"network_list": ["icmp"]}));
-        assert!(
-            err.contains("outbounds[0].network_list: unknown network: icmp"),
-            "{err}"
-        );
-        let err = server_form(json!({"network_list": [1]}));
-        assert!(
-            err.contains("FPTNOutboundOptions.network_list"),
-            "expected FPTN struct name in {err}"
-        );
-        let err = token_form(json!({"fptn_unknown": 1}));
-        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]
@@ -12794,19 +12597,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn empty_tag_falls_back_to_index() {
         let json = |raw: &str| lx_json(raw);
         // reference box.go: an untagged entry is named by its index
-        assert_eq!(
-            validate(&json(r#"{"inbounds":[{"type":"shadowtls"}]}"#)).unwrap_err(),
-            "initialize inbound[0] shadowtls[0]: missing default handshake information"
-        );
-        assert_eq!(
-            validate(&json(r#"{"outbounds":[{"type":"anytls"}]}"#)).unwrap_err(),
-            "initialize outbound[0] anytls[0]: TLS required"
-        );
         assert_eq!(
             validate(&json(r#"{"dns":{"servers":[{"type":"h3"}]}}"#)).unwrap_err(),
             "initialize DNS server[0] h3[0]: missing server_name or insecure=true"
@@ -13011,7 +12805,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "legacy-protocols")]
     /// The same validation the QUIC server inbounds get has to run for the proxy
     /// ones too: a `tls` block on a vless inbound that `check` does not look at
     /// is a block the runtime may refuse with words the reference never says.
@@ -13019,17 +12812,10 @@ mod tests {
     fn server_tls_is_validated_on_every_inbound_that_accepts_it() {
         let certificate = cert_fixture("localhost.crt");
         let key = cert_fixture("localhost.key");
-        for ty in ["vless", "vmess", "trojan", "shadowsocks", "mixed"] {
-            // shadowsocks reads its own fields before the tls block, so it
-            // needs the two that make it a shadowsocks server at all
-            let extra = if ty == "shadowsocks" {
-                r#""method":"aes-128-gcm","password":"hunter2","#
-            } else {
-                ""
-            };
+        for ty in ["vless", "mixed"] {
             let inbound = |tls: &str| {
                 lx_json(&format!(
-                    r#"{{"inbounds":[{{"type":"{ty}",{extra}"tls":{tls}}}]}}"#
+                    r#"{{"inbounds":[{{"type":"{ty}","tls":{tls}}}]}}"#
                 ))
             };
             let missing = format!("initialize inbound[0] {ty}[0]: missing certificate");
@@ -13060,58 +12846,6 @@ mod tests {
                 "{ty} took a tls block that is not an object"
             );
         }
-    }
-
-    #[cfg(feature = "legacy-protocols")]
-    #[test]
-    fn tuic_inbound_uuid_is_an_init_check() {
-        let json = |raw: &str| lx_json(raw);
-        // the server TLS config is built before the user list is walked
-        assert_eq!(
-            validate(&json(
-                r#"{"inbounds":[{"type":"tuic","users":[{"uuid":"x"}],"tls":{"enabled":true}}]}"#
-            ))
-            .unwrap_err(),
-            "initialize inbound[0] tuic[0]: missing certificate"
-        );
-        let tls = format!(
-            r#""tls":{{"enabled":true,"certificate_path":"{}","key_path":"{}"}}"#,
-            cert_fixture("localhost.crt"),
-            cert_fixture("localhost.key")
-        );
-        assert!(
-            validate(&json(&format!(
-                r#"{{"inbounds":[{{"type":"tuic","users":[{{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],{tls}}}]}}"#
-            )))
-            .is_ok(),
-            "a valid certificate pair and uuid must pass"
-        );
-        assert_eq!(
-            validate(&json(&format!(
-                r#"{{"inbounds":[{{"type":"tuic","users":[{{"uuid":"x"}}],{tls}}}]}}"#
-            )))
-            .unwrap_err(),
-            "initialize inbound[0] tuic[0]: invalid uuid for user 0: uuid: incorrect UUID length"
-        );
-        assert_eq!(
-            validate(&json(&format!(
-                r#"{{"inbounds":[{{"type":"tuic","users":[{{"name":"n"}}],{tls}}}]}}"#
-            )))
-            .unwrap_err(),
-            "initialize inbound[0] tuic[0]: missing uuid for user 0"
-        );
-        // the user list is still a decode-time shape check
-        assert_eq!(
-            validate(&json(r#"{"inbounds":[{"type":"tuic","users":5}]}"#)).unwrap_err(),
-            "inbounds[0].users: json: cannot unmarshal number into Go struct field TUICInboundOptions.users of type []option.TUICUser"
-        );
-        assert_eq!(
-            validate(&json(
-                r#"{"inbounds":[{"type":"tuic","users":[{"uuid":"x","nope":1}]}]}"#
-            ))
-            .unwrap_err(),
-            r#"inbounds[0].users[0].nope: json: unknown field "nope""#
-        );
     }
 
     #[test]
@@ -13204,18 +12938,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn inbound_containers_and_field_kinds() {
         let json = |raw: &str| lx_json(raw);
         // container fields fail on their own kind, with the embedding container
-        assert_eq!(
-            validate(&json(
-                r#"{"inbounds":[{"type":"tuic","users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"tls":1}]}"#
-            ))
-            .unwrap_err(),
-            "inbounds[0].tls: json: cannot unmarshal number into Go struct field TUICInboundOptions.InboundTLSOptionsContainer.tls of type option.InboundTLSOptions"
-        );
         assert_eq!(
             validate(&json(
                 r#"{"inbounds":[{"type":"mixed","listen":"127.0.0.1","listen_port":2080,"users":1}]}"#
@@ -13223,53 +12949,23 @@ mod tests {
             .unwrap_err(),
             "inbounds[0].users: json: cannot unmarshal number into Go struct field HTTPMixedInboundOptions.users of type []auth.User"
         );
-        assert_eq!(
-            validate(&json(
-                r#"{"inbounds":[{"type":"vmess","users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"multiplex":1}]}"#
-            ))
-            .unwrap_err(),
-            "inbounds[0].multiplex: json: cannot unmarshal number into Go struct field VMessInboundOptions.multiplex of type option.InboundMultiplexOptions"
-        );
-        // NetworkList and badoption.Listable[string] report differently
-        assert_eq!(
-            validate(&json(
-                r#"{"inbounds":[{"type":"shadowsocks","method":"aes-128-gcm","password":"p","network":1}]}"#
-            ))
-            .unwrap_err(),
-            "inbounds[0].network: json: cannot unmarshal number into Go struct field ShadowsocksInboundOptions.network of type string"
-        );
-        assert_eq!(
-            validate(&json(
-                r#"{"inbounds":[{"type":"anytls","users":[{"password":"p"}],"tls":{"enabled":true,"insecure":true},"padding_scheme":[1]}]}"#
-            ))
-            .unwrap_err(),
-            "inbounds[0].padding_scheme: (json: cannot unmarshal array into Go value of type string | [0]: json: cannot unmarshal number into Go value of type string)"
-        );
-        // the QUIC options live under their container path
-        assert_eq!(
-            validate(&json(
-                r#"{"inbounds":[{"type":"tuic","users":[{"uuid":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"tls":{"enabled":true,"insecure":true},"idle_timeout":1}]}"#
-            ))
-            .unwrap_err(),
-            "inbounds[0].idle_timeout: json: cannot unmarshal number into Go struct field TUICInboundOptions.QUICOptions.HTTP2Options.idle_timeout of type string"
-        );
         // the dialer gates of common/dialer.New (the mark is Linux-only)
         let routing_mark =
-            json(r#"{"outbounds":[{"type":"socks","server":"a.com","routing_mark":1}]}"#);
+            json(r#"{"outbounds":[{"type":"http","server":"a.com","routing_mark":1}]}"#);
         if cfg!(target_os = "linux") {
             assert!(validate(&routing_mark).is_ok());
         } else {
             assert_eq!(
                 validate(&routing_mark).unwrap_err(),
-                "initialize outbound[0] socks[0]: `routing_mark` is only supported on Linux"
+                "initialize outbound[0] http[0]: `routing_mark` is only supported on Linux"
             );
         }
         assert_eq!(
             validate(&json(
-                r#"{"outbounds":[{"type":"socks","server":"a.com","network_strategy":"default","tcp_fast_open":true}]}"#
+                r#"{"outbounds":[{"type":"http","server":"a.com","network_strategy":"default","tcp_fast_open":true}]}"#
             ))
             .unwrap_err(),
-            "initialize outbound[0] socks[0]: `network_strategy` is conflict with `bind_interface`, `inet4_bind_address`, `inet6_bind_address` and `tcp_fast_open`"
+            "initialize outbound[0] http[0]: `network_strategy` is conflict with `bind_interface`, `inet4_bind_address`, `inet6_bind_address` and `tcp_fast_open`"
         );
         // the group member lists decode before the init pass
         assert_eq!(
@@ -17262,7 +16958,6 @@ fn oc_base64_strict_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-#[cfg(feature = "legacy-protocols")]
 mod endpoint_probe_parity_tests {
     use super::validate;
     use serde_json::Value;
@@ -17461,295 +17156,6 @@ mod endpoint_probe_parity_tests {
     }
 
     #[test]
-    fn parity_ovpn_c_addr_bad() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"address":"notprefix"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].address: (netip.ParsePrefix("notprefix"): no '/' | json: cannot unmarshal string into Go value of type []netip.Prefix)"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_badfield_nested() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"nope":1}}]}"#)).unwrap_err();
-        assert_eq!(err, r#"endpoints[0].tls.nope: json: unknown field "nope""#);
-    }
-
-    #[test]
-    fn parity_ovpn_c_conflict() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","servers":[{"server":"1.2.3.4"}]}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: `server` is conflict with `servers`"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_full_static() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: ClientOptions.DataChannel.Cipher is required in static_key mode"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_legacy_outbound() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"openvpn","tag":"ovpn","server":"1.2.3.4","server_port":1194}]}"#)).unwrap_err();
-        assert_eq!(err, r#"outbounds[0]: unknown outbound type: openvpn"#);
-    }
-
-    #[test]
-    fn parity_ovpn_c_mode_num() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":5}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].mode: json: cannot unmarshal number into Go struct field OpenVPNClientEndpointOptions.mode of type string"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_mtu_str() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mtu":"abc"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].mtu: json: cannot unmarshal string into Go struct field OpenVPNClientEndpointOptions.OpenVPNEndpointOptions.mtu of type uint32"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_net_badenum() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"network":"bogus"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_no_tag_badfield() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","server":"1.2.3.4","nope":1}]}"#)).unwrap_err();
-        assert_eq!(err, r#"endpoints[0].nope: json: unknown field "nope""#);
-    }
-
-    #[test]
-    fn parity_ovpn_c_notag() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","server":"1.2.3.4","server_port":1194,"tls":{}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[0]: missing `tls` options"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_servers_bad() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","servers":[{"server":"1.2.3.4","server_port":"x"}]}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].servers[0].server_port: json: cannot unmarshal string into Go struct field OpenVPNRemoteOptions.servers.ServerOptions.server_port of type uint16"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_static_addr() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"]}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `peer_address` for the IPv4 tunnel address in `static_key` mode"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_static_addr_key() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"static_key":"<static>"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `peer_address` for the IPv4 tunnel address in `static_key` mode"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_static_full2() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cipher":"aes-128-cbc"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: ClientOptions.DataChannel.Cipher must use a canonical OpenVPN cipher name"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_static_kd_tls() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaa","key_direction":"bogus","tls":null}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: unsupported key direction: bogus (expected "server" or "client")"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_static_peer() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `static_key` or `static_key_path`"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_static_tlsemt() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaa","tls":{}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.DataChannel.Cipher is required in static_key mode"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_static_tlsset() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaa","tls":{"server_name":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: `tls` options are not supported in `static_key` mode"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_tls_ca() {
-        let result = validate(&cfg(
-            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#,
-        ));
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[test]
-    fn parity_ovpn_c_tls_ca_addr() {
-        let result = validate(&cfg(
-            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"address":["10.8.0.6/24"]}]}"#,
-        ));
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[test]
-    fn parity_ovpn_c_tls_cert() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"address":["10.8.0.6/24"]}]}"#)).unwrap_err();
-        assert_eq!(err, r#"endpoints[0].tls.key: json: unknown field "key""#);
-    }
-
-    #[test]
-    fn parity_ovpn_c_tls_empty() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_tls_empty_cwrap() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"control_wrap":{}}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: missing `tls` options"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_tls_full() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"insecure":true},"address":["10.8.0.6/24"]}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].tls.insecure: json: unknown field "insecure""#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_tls_netbad() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"network":"bogus","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"address":["10.8.0.6/24"]}]}"#)).unwrap_err();
-        assert_eq!(err, r#"endpoints[0].tls.key: json: unknown field "key""#);
-    }
-
-    #[test]
-    fn parity_ovpn_c_tls_num() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":5}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].tls: json: cannot unmarshal number into Go struct field OpenVPNClientEndpointOptions.tls of type option.OpenVPNOutboundTLSOptions"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_c_unknown_nested_s0() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","servers":[{"server":"1.2.3.4","nope":1}]}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].servers[0].nope: json: unknown field "nope""#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_client_badmode() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"bogus"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: unsupported mode: bogus (expected "tls" or "static_key")"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_client_min() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_client_noserver() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `server` or `servers`"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_client_servers() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","servers":[{"server":"1.2.3.4","server_port":1194}]}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_client_static() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `address` in `static_key` mode"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_client_tls() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"tls"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
-        );
-    }
-
-    #[test]
-    fn parity_ovpn_client_unknown() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"unknown_field":1}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].unknown_field: json: unknown field "unknown_field""#
-        );
-    }
-
-    #[test]
     fn parity_ovpn_s_full_static() {
         let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"mode":"static_key","address":["10.8.0.1/24"],"peer_address":"10.8.0.2","static_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#)).unwrap_err();
         assert_eq!(
@@ -17872,343 +17278,6 @@ mod endpoint_probe_parity_tests {
     }
 
     #[test]
-    fn parity_q_c_allow_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"allow_compression":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: invalid allow-compression value"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_allow_no_lz4() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"allow_compression":"no","compression":"lz4","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: allow-compression no conflicts with statically enabled compression"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_authretry() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"auth_retry":"bogus","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: ClientOptions.Authentication.AuthRetry must be none, nointeract, or interact"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_badkey_material() {
-        let result = validate(&cfg(
-            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"garbage"}}]}"#,
-        ));
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[test]
-    fn parity_q_c_bindnum() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"bind_interface":5}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].bind_interface: json: cannot unmarshal number into Go struct field OpenVPNClientEndpointOptions.DialerOptions.AbstractDialerOptions.bind_interface of type string"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_certkey_mismatch() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","client_certificate":"y"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: certificate and key must both be set or both omitted"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_cipher_vs_auth() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"data_ciphers":["bogus"],"auth_retry":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.DataChannel.Ciphers[0] must use a canonical OpenVPN cipher name"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_comp_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"compression":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: unsupported compression option: compress bogus"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_cto_bad() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"connect_timeout":"zz"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].connect_timeout: time: invalid duration "zz""#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_ddr() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"domain_resolver":"nosuch"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: missing `tls` options"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_eku_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_eku":"bogus"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: unsupported remote-cert-eku value: bogus"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_eku_dot() {
-        let result = validate(&cfg(
-            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_eku":"1.2.999.1"}}]}"#,
-        ));
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[test]
-    fn parity_q_c_expanded_none() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_tls":"bogus"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: invalid `tls.remote_certificate_tls`: bogus"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_frag_tcp() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"network":"tcp","fragment":100,"tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: option is not supported yet: fragment with tcp remote"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_groups_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","groups":"BOGUS"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: unsupported tls-groups name: BOGUS"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_grouptoken_empty() {
-        let result = validate(&cfg(
-            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","groups":""}}]}"#,
-        ));
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[test]
-    fn parity_q_c_kd_static_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaa","key_direction":"bogus"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: unsupported key direction: bogus (expected "server" or "client")"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_kd_tls_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"key_direction":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: `key_direction` is only supported in `static_key` mode; use `tls.control_wrap.direction` for `tls_auth`"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_ku_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_ku":["zz"]}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: strconv.ParseUint: parsing "zz": invalid syntax"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_ku_empty() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_ku":[""]}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: empty key usage hex"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_ku_nohex() {
-        let result = validate(&cfg(
-            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","remote_certificate_ku":["AB"]}}]}"#,
-        ));
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[test]
-    fn parity_q_c_netbogus_tls() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"network":"bogus","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: unsupported openvpn protocol"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_netstrat() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"network_strategy":"bogus"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].network_strategy: unknown network strategy: bogus"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_noport() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_noport2() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: option is not supported yet: empty remote port at index 0"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_ns_bad() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","ns_certificate_type":"bogus"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.TLS.NSCertificateType must be server or client"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_ping_half() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"ping_interval":"0.5s","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.Timing.PingInterval must be zero or at least 1s"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_ping_num() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"ping_interval":5,"tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].ping_interval: json: cannot unmarshal number into Go struct field OpenVPNClientEndpointOptions.ping_interval of type string"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_prof_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","certificate_profile":"bogus"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: unknown tls-cert-profile value: bogus"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_reneg_conf() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"renegotiate_interval":"3600s","renegotiate_disabled":true,"tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.Timing.RenegotiationInterval conflicts with RenegotiationDisabled"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_reneg_neg() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"renegotiate_interval":"-1s","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.Timing.RenegotiationInterval must not be negative"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_rmarkneg() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"routing_mark":-1}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].routing_mark: invalid number or string mark: json: cannot unmarshal number into Go value of type string"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_snatype_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n","server_name_type":"bogus"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: ClientOptions.TLS.VerifyX509Type must be subject, name, or name-prefix"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_tlscipher_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","cipher":"BOGUS"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: unsupported tls-cipher name: BOGUS"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_tlsversion_maxbad() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","version_min":"1.3","version_max":"1.2"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: tls-version-min bigger than tls-version-max"#
-        );
-    }
-
-    #[test]
-    fn parity_q_c_vermin_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","version_min":"9.9"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[o]: unknown tls-version parameter: 9.9"#
-        );
-    }
-
-    #[test]
-    fn parity_q_cipher_upper() {
-        let result = validate(&cfg(
-            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mode":"static_key","address":["10.8.0.2/24"],"peer_address":"10.8.0.1","static_key":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cipher":"AES-128-CBC"}]}"#,
-        ));
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[test]
-    fn parity_q_cwrap_bad() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","client_key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n","control_wrap":{"nope":1}}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].tls.control_wrap.nope: json: unknown field "nope""#
-        );
-    }
-
-    #[test]
     fn parity_q_oc_bindnum() {
         let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"example.com","bind_interface":5}]}"#)).unwrap_err();
         assert_eq!(
@@ -18227,36 +17296,9 @@ mod endpoint_probe_parity_tests {
     }
 
     #[test]
-    fn parity_q_peer_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"peer_address":"bogus","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].peer_address: ParseAddr("bogus"): unable to parse IP"#
-        );
-    }
-
-    #[test]
-    fn parity_q_peer_empty() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"peer_address":"","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].peer_address: ParseAddr(""): unable to parse IP"#
-        );
-    }
-
-    #[test]
     fn parity_q_push_bad() {
         let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":"127.0.0.1","listen_port":1194,"address":["10.8.0.1/24"],"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n","key":"-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgu/LscQrPjs/jAXaB\noqn00aUbJD5H5b5aCmn4xfIzjhKhRANCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpg\nN0WxquuVIPbMbFMYARGvmSUHh+DEu3KR+CHCkJRurp4b+cbQn14M+ZVm\n-----END PRIVATE KEY-----\n"},"push":{"nope":1}}]}"#)).unwrap_err();
         assert_eq!(err, r#"endpoints[0].push.nope: json: unknown field "nope""#);
-    }
-
-    #[test]
-    fn parity_q_route_gw_bad() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"d"}],"endpoints":[{"type":"openvpn-client","tag":"o","server":"1.2.3.4","server_port":1194,"route_gateway":"zz","tls":{"certificate":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].route_gateway: ParseAddr("zz"): unable to parse IP"#
-        );
     }
 
     #[test]
@@ -18410,23 +17452,6 @@ mod endpoint_probe_parity_tests {
     }
 
     #[test]
-    fn parity_q_tls_ca_only() {
-        let result = validate(&cfg(
-            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"-----BEGIN CERTIFICATE-----\nMIIBRjCB7qADAgECAhQH9Vr8fWuip/rOWYKeozPEichRSjAKBggqhkjOPQQDAjAU\nMRIwEAYDVQQDDAlsb2NhbGhvc3QwHhcNMjYwOTIyMTkwNDM5WhcNMzYwOTIwMTkw\nNDM5WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAASd8JJPvCrfrRP7JOZcbn30AzTYmfpgN0WxquuVIPbMbFMYARGvmSUHh+DE\nu3KR+CHCkJRurp4b+cbQn14M+ZVmox4wHDAaBgNVHREEEzARgglsb2NhbGhvc3SH\nBH8AAAEwCgYIKoZIzj0EAwIDRwAwRAIgfwHG/s+ea0AknE0TTE0cpJlngSFUMWsN\nk3fPLif9HHYCICbBbJOH0nhIxC50+OHBGLQpy2R50rct6tQ+lv7eWCnh\n-----END CERTIFICATE-----\n"}}]}"#,
-        ));
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[test]
-    fn parity_q_tls_sni_only() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"server_name":"x"}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: tls mode: either certificate-authority or peer-fingerprint must be configured"#
-        );
-    }
-
-    #[test]
     fn parity_q_ts_ssh_false() {
         let result = validate(&cfg(
             r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","ssh_server":false}]}"#,
@@ -18444,59 +17469,6 @@ mod endpoint_probe_parity_tests {
     }
 
     #[test]
-    fn parity_r_addr_arrelem() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"address":["ok/24"]}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].address: (json: cannot unmarshal array into Go value of type **netip.Prefix | netip.ParsePrefix("ok/24"): ParseAddr("ok"): unable to parse IP)"#
-        );
-    }
-
-    #[test]
-    fn parity_r_c_ping() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"ping_interval":"abc"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].ping_interval: time: invalid duration "abc""#
-        );
-    }
-
-    #[test]
-    fn parity_r_c_routes_elem() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"routes":["bad"]}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].routes: (json: cannot unmarshal array into Go value of type **netip.Prefix | netip.ParsePrefix("bad"): no '/')"#
-        );
-    }
-
-    #[test]
-    fn parity_r_cwrap_empty() {
-        let result = validate(&cfg(
-            r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"certificate":"x","control_wrap":{}}}]}"#,
-        ));
-        assert!(result.is_ok(), "{:?}", result.err());
-    }
-
-    #[test]
-    fn parity_r_fingerprint() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"tls":{"peer_fingerprint":["zz"]}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: ClientOptions.TLS.PeerFingerprint[0] must be canonical lowercase hex"#
-        );
-    }
-
-    #[test]
-    fn parity_r_kd_bogus() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"key_direction":"bogus"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
-        );
-    }
-
-    #[test]
     fn parity_r_listen_str() {
         let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-server","tag":"ovpns","listen":5,"listen_port":1194}]}"#)).unwrap_err();
         assert_eq!(
@@ -18506,29 +17478,11 @@ mod endpoint_probe_parity_tests {
     }
 
     #[test]
-    fn parity_r_mssfix() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"mss_fix_disabled":true}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"initialize endpoint[0] openvpn-client[ovpn]: missing `tls` options"#
-        );
-    }
-
-    #[test]
     fn parity_r_oc_form_str() {
         let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openconnect","tag":"oc","server":"x","form_entries":"y"}]}"#)).unwrap_err();
         assert_eq!(
             err,
             r#"endpoints[0].form_entries: json: cannot unmarshal string into Go struct field OpenConnectEndpointOptions.form_entries of type []option.OpenConnectFormEntryOptions"#
-        );
-    }
-
-    #[test]
-    fn parity_r_pullfilters_str() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"pull_filters":"x"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].pull_filters: json: cannot unmarshal string into Go struct field OpenVPNClientEndpointOptions.pull_filters of type []option.OpenVPNPullFilterOptions"#
         );
     }
 
@@ -18547,33 +17501,6 @@ mod endpoint_probe_parity_tests {
         assert_eq!(
             err,
             r#"endpoints[0].push.dns: (json: cannot unmarshal array into Go value of type **netip.Addr | ParseAddr("notaddr"): unable to parse IP)"#
-        );
-    }
-
-    #[test]
-    fn parity_r_servers_str() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"servers":"x"}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].servers: json: cannot unmarshal string into Go struct field OpenVPNClientEndpointOptions.servers of type []option.OpenVPNRemoteOptions"#
-        );
-    }
-
-    #[test]
-    fn parity_r_statickey_num() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"static_key":5}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].static_key: (json: cannot unmarshal number into Go value of type string | json: cannot unmarshal number into Go value of type []string)"#
-        );
-    }
-
-    #[test]
-    fn parity_r_statickey_obj() {
-        let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"openvpn-client","tag":"ovpn","server":"1.2.3.4","server_port":1194,"static_key":{"a":1}}]}"#)).unwrap_err();
-        assert_eq!(
-            err,
-            r#"endpoints[0].static_key: (json: cannot unmarshal object into Go value of type string | json: cannot unmarshal object into Go value of type []string)"#
         );
     }
 

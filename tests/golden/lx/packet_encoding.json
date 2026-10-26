@@ -36,24 +36,6 @@
       "server_port": 443,
       "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
       "packet_encoding": "packetaddr"
-    },
-    {
-      "type": "vmess",
-      "tag": "vmess-xudp",
-      "server": "example.com",
-      "server_port": 443,
-      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
-      "security": "auto",
-      "packet_encoding": "xudp"
-    },
-    {
-      "type": "vmess",
-      "tag": "vmess-packetaddr",
-      "server": "example.com",
-      "server_port": 443,
-      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
-      "security": "auto",
-      "packet_encoding": "packetaddr"
     }
   ],
   "route": { "final": "vless-xudp", "default_domain_resolver": "u" }

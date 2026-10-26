@@ -12,9 +12,10 @@ name = "xrust"
 path = "src/main.rs"
 
 [features]
-legacy-protocols = ["core-runtime/legacy-protocols", "core-config/legacy-protocols"]
+default = ["full"]
+# Kept as an alias: packaging and test scripts build with
+# `--no-default-features --features rust-x`.
 rust-x = ["full"]
-default = ["full", "legacy-protocols"]
 full = [
     "core-config/full",
     "core-runtime/full",

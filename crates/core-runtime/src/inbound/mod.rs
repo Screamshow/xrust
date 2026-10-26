@@ -14,31 +14,17 @@ use crate::logging;
 use crate::outbound::shadowsocks::stream::{SsReader, SsWriter};
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
-#[cfg(feature = "legacy-protocols")]
-pub mod anytls;
 pub mod direct;
-#[cfg(feature = "legacy-protocols")]
-pub mod fptn;
 pub mod hysteria2;
 pub mod mixed;
 pub mod mux;
-#[cfg(feature = "legacy-protocols")]
-pub mod naive;
 pub mod proxy;
 pub mod redirect;
-#[cfg(feature = "legacy-protocols")]
-pub mod shadowsocks;
-#[cfg(feature = "legacy-protocols")]
-pub mod shadowtls;
 pub mod tls;
 pub mod tproxy;
 pub(crate) mod transport;
-#[cfg(feature = "legacy-protocols")]
-pub mod tuic;
 pub mod tun;
 pub(crate) mod udp;
-#[cfg(feature = "legacy-protocols")]
-pub mod vmess;
 
 #[cfg(target_os = "linux")]
 mod relay;

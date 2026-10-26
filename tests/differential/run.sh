@@ -4,6 +4,8 @@
 # usage: SING_BOX_REF=/path/to/sing-box [XRUST_BIN=/path/to/xrust] [STRICT=1] run.sh
 #
 #   valid dirs (lx, tachyon): both binaries must exit 0.
+#   removed dir: configs for protocols this core does not ship; the
+#   reference must exit 0 and xrust must refuse them.
 #   invalid dir: reference must exit non-zero; xrust must exit non-zero
 #   too (semantic validation, F1) — enforced only when STRICT=1, otherwise a
 #   known gap is reported without failing the run.
@@ -43,7 +45,7 @@ is_linux_only() {
 }
 
 check_pair() {
-  local file="$1" expect="$2"  # expect: ok | reject
+  local file="$1" expect="$2"  # expect: ok | reject | removed
   local ref_out core_out ref_code core_code
   ref_out="$("$REF" check -c "$file" 2>&1)"; ref_code=$?
   core_out="$("$CORE" check -c "$file" 2>&1)"; core_code=$?
@@ -67,6 +69,13 @@ check_pair() {
       fail=$((fail+1)); echo "FAIL  $file (expect both accept; ref=$ref_code core=$core_code)"
       [[ $ref_ok -eq 0 ]] && { echo "  ref:  $ref_out"; }
       [[ $core_ok -eq 0 ]] && { echo "  core: $core_out"; }
+    fi
+  elif [[ "$expect" == "removed" ]]; then
+    if [[ $ref_ok -eq 1 && $core_ok -eq 0 ]]; then
+      pass=$((pass+1)); echo "PASS  $file (removed protocol: core rejects)"
+    else
+      fail=$((fail+1)); echo "FAIL  $file (expect ref accept, core reject; ref=$ref_code core=$core_code)"
+      [[ $ref_ok -eq 0 ]] && { echo "  ref:  $ref_out"; }
     fi
   else # expect: reject
     if [[ $ref_ok -eq 1 ]]; then
@@ -92,6 +101,9 @@ echo
 shopt -s nullglob
 for file in "$CORPUS"/lx/*.json "$CORPUS"/tachyon/*.json; do
   check_pair "$file" ok
+done
+for file in "$CORPUS"/removed/*.json; do
+  check_pair "$file" removed
 done
 for file in "$CORPUS"/invalid/*.json; do
   check_pair "$file" reject

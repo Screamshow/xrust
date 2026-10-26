@@ -1481,36 +1481,14 @@ fn clash_type_name(outbound: &Outbound) -> &'static str {
         Outbound::Direct(_) => "Direct",
         // Reference maps TypeBlock to its clash display name "Reject".
         Outbound::Block(_) => "Reject",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::Socks(_) => "SOCKS",
         Outbound::Http(_) => "HTTP",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::Shadowsocks(_) => "Shadowsocks",
         Outbound::Vless(_) => "VLESS",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::Trojan(_) => "Trojan",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::Vmess(_) => "VMess",
         Outbound::Hysteria2(_) => "Hysteria2",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::Fptn(_) => "FPTN",
         Outbound::Masque(_) => "MASQUE",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::Snell(_) => "Snell",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::Tuic(_) => "TUIC",
         Outbound::WireGuard(_) => "WireGuard",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::OpenVpn(_) => "OpenVPN",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::Naive(_) => "NaiveProxy",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::AnyTls(_) => "AnyTLS",
         Outbound::Urltest(_) => "URLTest",
         Outbound::Selector(_) => "Selector",
         Outbound::Chain(_) => "Chain",
-        #[cfg(feature = "legacy-protocols")]
-        Outbound::ShadowTls(_) => "ShadowTLS",
         Outbound::Tailscale(_) => "Tailscale",
     }
 }

@@ -14,9 +14,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
-const PASSWORD: &str = "hunter2";
-/// the 2022 pre-shared key is base64 of sixteen `A`s
-const KEY_2022: &str = "QUFBQUFBQUFBQUFBQUFBQQ==";
 
 async fn spawn_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
@@ -248,38 +245,4 @@ server_test!(
                   "transport": {"type": "xhttp", "path": "/bench"},
                   "tls": {"enabled": true, "server_name": "localhost", "insecure": true,
                           "alpn": ["http/1.1"]}})
-);
-
-server_test!(
-    trojan_server_serves_the_reference_client,
-    "trojan",
-    "trojan",
-    json!({"users": [{"name": "u", "password": PASSWORD}]}),
-    |port| json!({"type": "trojan", "tag": "up", "server": "127.0.0.1", "server_port": port, "password": PASSWORD})
-);
-
-server_test!(
-    vmess_server_serves_the_reference_client,
-    "vmess",
-    "vmess",
-    json!({"users": [{"name": "u", "uuid": UUID}]}),
-    |port| json!({"type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port, "uuid": UUID})
-);
-
-server_test!(
-    shadowsocks_2022_server_serves_the_reference_client,
-    "shadowsocks+2022",
-    "shadowsocks",
-    json!({"method": "2022-blake3-aes-128-gcm", "password": KEY_2022}),
-    |port| json!({"type": "shadowsocks", "tag": "up", "server": "127.0.0.1", "server_port": port,
-                  "method": "2022-blake3-aes-128-gcm", "password": KEY_2022})
-);
-
-server_test!(
-    shadowsocks_legacy_server_serves_the_reference_client,
-    "shadowsocks+legacy",
-    "shadowsocks",
-    json!({"method": "aes-128-gcm", "password": PASSWORD}),
-    |port| json!({"type": "shadowsocks", "tag": "up", "server": "127.0.0.1", "server_port": port,
-                  "method": "aes-128-gcm", "password": PASSWORD})
 );

@@ -120,29 +120,6 @@ impl Cipher {
             ))
         }
     }
-
-    pub(crate) fn open(&self, counter: u64, buf: &mut Vec<u8>) -> io::Result<()> {
-        if buf.len() < 16 {
-            return Err(io::Error::other("chunk too short"));
-        }
-        let split = buf.len() - 16;
-        let mut tag = [0u8; 16];
-        tag.copy_from_slice(&buf[split..]);
-        buf.truncate(split);
-        let nonce = counter_nonce(counter);
-        let ok = match self {
-            Cipher::Aes(cipher) => cipher.open(&nonce, &[], buf, &tag),
-            Cipher::ChaCha(cipher) => cipher.open(&nonce, &[], buf, &tag),
-        };
-        if ok {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "chunk auth failed",
-            ))
-        }
-    }
 }
 
 /// 12-byte little-endian operation counter.

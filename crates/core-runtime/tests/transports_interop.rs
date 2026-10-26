@@ -1,4 +1,4 @@
-//! Transport interop: vless/vmess/trojan over ws, httpupgrade, grpc and http
+//! Transport interop: vless over ws, httpupgrade, grpc and http
 //! against the reference sing-box server. Skipped unless SING_BOX_REF is set
 //! (the Docker gate and CI always set it).
 //!
@@ -227,34 +227,6 @@ async fn interop_transports() {
             json!({
                 "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
                 "uuid": VLESS_UUID, "transport": hu(),
-                "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
-            }),
-        )
-    })
-    .await;
-    assert_transport(&ref_bin, "vmess+ws", |port| {
-        (
-            json!({
-                "type": "vmess", "listen": "127.0.0.1", "listen_port": port,
-                "users": [{"name": "u", "uuid": VLESS_UUID}], "transport": ws()
-            }),
-            json!({
-                "type": "vmess", "tag": "up", "server": "127.0.0.1", "server_port": port,
-                "uuid": VLESS_UUID, "transport": ws()
-            }),
-        )
-    })
-    .await;
-    assert_transport(&ref_bin, "trojan+ws+tls", |port| {
-        (
-            json!({
-                "type": "trojan", "listen": "127.0.0.1", "listen_port": port,
-                "users": [{"password": "trojan-secret"}], "transport": ws(),
-                "tls": {"enabled": true, "certificate": CERT_PEM, "key": KEY_PEM}
-            }),
-            json!({
-                "type": "trojan", "tag": "up", "server": "127.0.0.1", "server_port": port,
-                "password": "trojan-secret", "transport": ws(),
                 "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
             }),
         )

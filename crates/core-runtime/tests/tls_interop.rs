@@ -1,4 +1,4 @@
-//! TLS-based outbound interop: vless + trojan against the reference
+//! TLS-based outbound interop: vless against the reference
 //! sing-box acting as TLS server (test cert fixture, insecure client).
 //! Skipped unless SING_BOX_REF is set (docker gate and CI set it).
 
@@ -127,9 +127,6 @@ async fn assert_outbound(
     let echo = spawn_echo().await;
     let users = match inbound_type {
         "vless" => json!([{"uuid": VLESS_UUID}]),
-        "trojan" => json!([{"password": "trojan-secret"}]),
-        "anytls" => json!([{"password": "anytls-secret"}]),
-        "naive" => json!([{"username": "naive-user", "password": "naive-secret"}]),
         other => panic!("unsupported inbound type {other}"),
     };
     let _server = start_ref(
@@ -177,63 +174,6 @@ async fn interop_vless_tls() {
         json!({
             "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
             "uuid": VLESS_UUID,
-            "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
-        })
-    })
-    .await;
-}
-
-/// Both were on the roadmap as full parity with nothing but `check` behind
-/// them -- which is exactly how the vless Vision flow went unnoticed until the
-/// reference was actually run. These run the reference as the server.
-#[tokio::test]
-async fn interop_anytls_tls() {
-    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
-        return;
-    };
-    assert_outbound(&ref_bin.to_string_lossy(), "anytls", "anytls+tls", |port| {
-        json!({
-            "type": "anytls", "tag": "up", "server": "127.0.0.1", "server_port": port,
-            "password": "anytls-secret",
-            "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
-        })
-    })
-    .await;
-}
-
-/// Naive is two things on top of an HTTP/2 CONNECT: the `Padding` header the
-/// reference answers 400 without, and the eight-block framing its `naiveH2Conn`
-/// embeds. Both are here, and the reference's own naive inbound is the judge.
-#[tokio::test]
-async fn interop_naive_tls() {
-    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
-        return;
-    };
-    // the reference refuses `insecure` on a naive outbound (and so do we), so
-    // the test certificate is trusted as a CA instead
-    assert_outbound(&ref_bin.to_string_lossy(), "naive", "naive+tls", |port| {
-        json!({
-            "type": "naive", "tag": "up", "server": "127.0.0.1", "server_port": port,
-            "username": "naive-user", "password": "naive-secret",
-            "tls": {
-                "enabled": true,
-                "server_name": "localhost",
-                "certificate_path": format!("{}/../../tests/golden/certs/localhost.crt", env!("CARGO_MANIFEST_DIR"))
-            }
-        })
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn interop_trojan_tls() {
-    let Some(ref_bin) = std::env::var_os("SING_BOX_REF") else {
-        return;
-    };
-    assert_outbound(&ref_bin.to_string_lossy(), "trojan", "trojan+tls", |port| {
-        json!({
-            "type": "trojan", "tag": "up", "server": "127.0.0.1", "server_port": port,
-            "password": "trojan-secret",
             "tls": {"enabled": true, "server_name": "localhost", "insecure": true}
         })
     })

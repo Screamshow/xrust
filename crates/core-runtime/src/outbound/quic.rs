@@ -1,6 +1,6 @@
-//! Shared QUIC plumbing for hysteria2 / tuic: transport options, endpoint
-//! construction without ring-gated helpers, salamander obfs relay, varint and
-//! sing address codecs, padding, and a stream duplex adapter.
+//! Shared QUIC plumbing for hysteria2: transport options, endpoint
+//! construction without ring-gated helpers, salamander obfs relay, varint
+//! codec, padding, and a stream duplex adapter.
 
 use std::collections::HashMap;
 use std::io;
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use quinn::VarInt;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::inbound::Target;
 use crate::logging;
@@ -24,8 +24,6 @@ use crate::outbound::urltest::parse_duration;
 pub(crate) const MBPS_TO_BPS: u64 = 125_000;
 /// Reference `protocol.MaxUDPSize` (hy2).
 pub(crate) const HY2_MAX_UDP: usize = 4096;
-/// TUIC max datagram payload (0xffff).
-pub(crate) const TUIC_MAX_UDP: usize = 0xffff;
 
 const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
@@ -92,8 +90,6 @@ impl Drop for PoolLease {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CongestionKind {
     Bbr,
-    Cubic,
-    NewReno,
 }
 
 /// Parsed `QUICOutFields` with per-protocol defaults applied at build time.
@@ -229,14 +225,12 @@ impl QuicTunnelOptions {
         transport.ack_frequency_config(Some(ack));
         transport.congestion_controller_factory(match congestion {
             CongestionKind::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
-            CongestionKind::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
-            CongestionKind::NewReno => Arc::new(quinn::congestion::NewRenoConfig::default()),
         });
         (endpoint, transport)
     }
 }
 
-/// Per-protocol QUIC defaults (reference hysteria / tuic clients).
+/// Per-protocol QUIC defaults (reference hysteria client).
 pub(crate) struct QuicTunnelDefaults {
     pub idle_timeout: Duration,
     pub keep_alive_period: Duration,
@@ -255,25 +249,6 @@ impl QuicTunnelDefaults {
             keep_alive_period: Duration::from_secs(10),
             stream_receive_window: Some(8 * 1024 * 1024),
             connection_receive_window: Some(20 * 1024 * 1024),
-            max_concurrent_streams: None,
-            initial_packet_size: None,
-            disable_path_mtu_discovery: false,
-        }
-    }
-
-    /// tuic: idle 30s, no keepalive unless set, cubic, uni 1<<60.
-    ///
-    /// The receive windows stay at quinn's defaults. Raising them to hysteria2's
-    /// 8 MiB / 20 MiB was tried and measured worse: one stream got faster, and
-    /// eight got slower (0.88x -> 0.73x of the reference, CPU 1.15x -> 1.37x).
-    /// A bigger credit means a bigger burst, and on the two cores this runs on the
-    /// burst arrives as reordering and scheduler work rather than throughput.
-    pub fn tuic() -> Self {
-        Self {
-            idle_timeout: Duration::from_secs(30),
-            keep_alive_period: Duration::ZERO,
-            stream_receive_window: None,
-            connection_receive_window: None,
             max_concurrent_streams: None,
             initial_packet_size: None,
             disable_path_mtu_discovery: false,
@@ -373,128 +348,6 @@ pub(crate) fn dest_string(target: &Target) -> String {
                 format!("{host}:{port}")
             }
         }
-    }
-}
-
-/// sing `AddressSerializer` family bytes for tuic.
-pub(crate) fn sing_addr_port_len(target: &Target) -> usize {
-    match target {
-        Target::Ip(SocketAddr::V4(_)) => 1 + 4 + 2,
-        Target::Ip(SocketAddr::V6(_)) => 1 + 16 + 2,
-        Target::Domain(h, _) => 1 + 1 + h.len() + 2,
-    }
-}
-
-/// Encode a valid address+port (tuic `WriteAddrPort`).
-pub(crate) fn put_sing_addr_port(out: &mut Vec<u8>, target: &Target) {
-    match target {
-        Target::Ip(SocketAddr::V4(a)) => {
-            out.push(0x01);
-            out.extend_from_slice(&a.ip().octets());
-            out.extend_from_slice(&a.port().to_be_bytes());
-        }
-        Target::Ip(SocketAddr::V6(a)) => {
-            out.push(0x02);
-            out.extend_from_slice(&a.ip().octets());
-            out.extend_from_slice(&a.port().to_be_bytes());
-        }
-        Target::Domain(h, p) => {
-            out.push(0x00);
-            out.push(h.len() as u8);
-            out.extend_from_slice(h.as_bytes());
-            out.extend_from_slice(&p.to_be_bytes());
-        }
-    }
-}
-
-/// Empty address (tuic continuation fragments): single `0xff`, no port.
-pub(crate) fn put_sing_addr_empty(out: &mut Vec<u8>) {
-    out.push(0xff);
-}
-
-pub(crate) fn parse_sing_addr_port(slice: &[u8]) -> Option<(Target, usize)> {
-    if slice.is_empty() {
-        return None;
-    }
-    match slice[0] {
-        0x01 => {
-            if slice.len() < 7 {
-                return None;
-            }
-            let ip = std::net::Ipv4Addr::new(slice[1], slice[2], slice[3], slice[4]);
-            let port = u16::from_be_bytes([slice[5], slice[6]]);
-            Some((
-                Target::Ip(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port))),
-                7,
-            ))
-        }
-        0x02 => {
-            if slice.len() < 19 {
-                return None;
-            }
-            let mut ip_bytes = [0u8; 16];
-            ip_bytes.copy_from_slice(&slice[1..17]);
-            let ip = std::net::Ipv6Addr::from(ip_bytes);
-            let port = u16::from_be_bytes([slice[17], slice[18]]);
-            Some((
-                Target::Ip(SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, 0))),
-                19,
-            ))
-        }
-        0x00 => {
-            if slice.len() < 2 {
-                return None;
-            }
-            let len = slice[1] as usize;
-            if slice.len() < 2 + len + 2 {
-                return None;
-            }
-            let host = std::str::from_utf8(&slice[2..2 + len]).ok()?;
-            let port = u16::from_be_bytes([slice[2 + len], slice[3 + len]]);
-            Some((Target::Domain(host.to_string(), port), 4 + len))
-        }
-        _ => None,
-    }
-}
-
-pub(crate) async fn read_sing_addr_port<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> io::Result<Target> {
-    let mut atype = [0u8; 1];
-    reader.read_exact(&mut atype).await?;
-    match atype[0] {
-        0x01 => {
-            let mut buf = [0u8; 6];
-            reader.read_exact(&mut buf).await?;
-            let ip = std::net::Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
-            let port = u16::from_be_bytes([buf[4], buf[5]]);
-            Ok(Target::Ip(SocketAddr::V4(std::net::SocketAddrV4::new(
-                ip, port,
-            ))))
-        }
-        0x02 => {
-            let mut buf = [0u8; 18];
-            reader.read_exact(&mut buf).await?;
-            let mut ip_bytes = [0u8; 16];
-            ip_bytes.copy_from_slice(&buf[..16]);
-            let ip = std::net::Ipv6Addr::from(ip_bytes);
-            let port = u16::from_be_bytes([buf[16], buf[17]]);
-            Ok(Target::Ip(SocketAddr::V6(std::net::SocketAddrV6::new(
-                ip, port, 0, 0,
-            ))))
-        }
-        0x00 => {
-            let mut len = [0u8; 1];
-            reader.read_exact(&mut len).await?;
-            let mut host = vec![0u8; len[0] as usize];
-            reader.read_exact(&mut host).await?;
-            let mut port_buf = [0u8; 2];
-            reader.read_exact(&mut port_buf).await?;
-            let port = u16::from_be_bytes(port_buf);
-            let host_str = String::from_utf8(host).map_err(io::Error::other)?;
-            Ok(Target::Domain(host_str, port))
-        }
-        other => Err(io::Error::other(format!("invalid address family: {other}"))),
     }
 }
 
@@ -1146,7 +999,7 @@ impl VarintReader {
     }
 }
 
-/// Per-session fragment reassembler (hy2 / tuic PACKET frames).
+/// Per-session fragment reassembler (hy2 PACKET frames).
 ///
 /// Fragments are `Bytes`: a slice of the datagram is shared by reference
 /// count, so a single-fragment packet -- the overwhelmingly common case --
@@ -1364,24 +1217,6 @@ mod tests {
         assert_eq!(opened, payload);
         assert!(salamander_open(pw, &sealed[..4]).is_none());
         assert!(salamander_open(b"wrong", &sealed).unwrap() != payload);
-    }
-
-    #[test]
-    fn sing_addr_encodes() {
-        let mut out = Vec::new();
-        put_sing_addr_port(&mut out, &Target::Domain("example.com".into(), 443));
-        assert_eq!(out[0], 0x00);
-        assert_eq!(out[1], b"example.com".len() as u8);
-        assert_eq!(out.len(), 1 + 1 + 11 + 2);
-
-        let mut out = Vec::new();
-        put_sing_addr_port(&mut out, &Target::Ip("1.2.3.4:53".parse().unwrap()));
-        assert_eq!(out[0], 0x01);
-        assert_eq!(out.len(), 1 + 4 + 2);
-
-        let mut out = Vec::new();
-        put_sing_addr_empty(&mut out);
-        assert_eq!(out, vec![0xff]);
     }
 
     #[test]

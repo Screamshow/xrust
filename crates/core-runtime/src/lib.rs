@@ -325,8 +325,6 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
         match ty {
             "mixed" | "socks" | "http" => {
                 let flavor = match ty {
-                    #[cfg(feature = "legacy-protocols")]
-                    "socks" => inbound::mixed::Flavor::Socks,
                     "http" => inbound::mixed::Flavor::Http,
                     _ => inbound::mixed::Flavor::Mixed,
                 };
@@ -369,33 +367,6 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));
             }
-            #[cfg(feature = "legacy-protocols")]
-            "trojan" => {
-                let inbound = inbound::proxy::Trojan::bind(obj, Arc::clone(&router))
-                    .await
-                    .with_context(|| format!("inbounds[{i}]: trojan"))?;
-                let addr = inbound.local_addr()?;
-                inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
-            }
-            #[cfg(feature = "legacy-protocols")]
-            "vmess" => {
-                let inbound = inbound::vmess::Vmess::bind(obj, Arc::clone(&router))
-                    .await
-                    .with_context(|| format!("inbounds[{i}]: vmess"))?;
-                let addr = inbound.local_addr()?;
-                inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
-            }
-            #[cfg(feature = "legacy-protocols")]
-            "shadowsocks" => {
-                let inbound = inbound::shadowsocks::Shadowsocks::bind(obj, Arc::clone(&router))
-                    .await
-                    .with_context(|| format!("inbounds[{i}]: shadowsocks"))?;
-                let addr = inbound.local_addr()?;
-                inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
-            }
             "tun" => {
                 let inbound = inbound::tun::Tun::bind(obj, Arc::clone(&router))
                     .await
@@ -404,55 +375,10 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));
             }
-            #[cfg(feature = "legacy-protocols")]
-            "anytls" => {
-                let inbound = inbound::anytls::AnyTls::bind(obj, Arc::clone(&router))
-                    .await
-                    .with_context(|| format!("inbounds[{i}]: anytls"))?;
-                let addr = inbound.local_addr()?;
-                inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
-            }
-            #[cfg(feature = "legacy-protocols")]
-            "naive" => {
-                let inbound = inbound::naive::Naive::bind(obj, Arc::clone(&router))
-                    .await
-                    .with_context(|| format!("inbounds[{i}]: naive"))?;
-                let addr = inbound.local_addr()?;
-                inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
-            }
-            #[cfg(feature = "legacy-protocols")]
-            "shadowtls" => {
-                let inbound = inbound::shadowtls::ShadowTls::bind(obj, Arc::clone(&router))
-                    .await
-                    .with_context(|| format!("inbounds[{i}]: shadowtls"))?;
-                let addr = inbound.local_addr()?;
-                inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
-            }
-            #[cfg(feature = "legacy-protocols")]
-            "fptn" => {
-                let inbound = inbound::fptn::Fptn::bind(obj, Arc::clone(&router))
-                    .await
-                    .with_context(|| format!("inbounds[{i}]: fptn"))?;
-                let addr = inbound.local_addr()?;
-                inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
-            }
             "hysteria2" => {
                 let inbound = inbound::hysteria2::Hysteria2::bind(obj, Arc::clone(&router))
                     .await
                     .with_context(|| format!("inbounds[{i}]: hysteria2"))?;
-                let addr = inbound.local_addr()?;
-                inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
-            }
-            #[cfg(feature = "legacy-protocols")]
-            "tuic" => {
-                let inbound = inbound::tuic::Tuic::bind(obj, Arc::clone(&router))
-                    .await
-                    .with_context(|| format!("inbounds[{i}]: tuic"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));

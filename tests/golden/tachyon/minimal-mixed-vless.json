@@ -13,12 +13,11 @@
   "outbounds": [
     { "type": "direct", "tag": "direct-out" },
     {
-      "type": "shadowsocks",
+      "type": "vless",
       "tag": "node-1",
       "server": "example.com",
       "server_port": 443,
-      "method": "2022-blake3-aes-128-gcm",
-      "password": "MTIzNDU2Nzg5MGFiY2RlZg=="
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"
     }
   ],
   "route": {
