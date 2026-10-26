@@ -63,9 +63,21 @@ cargo build --locked -p core-cli --no-default-features --features rust-x \
 при fat LTO generic-инстанциации RustCrypto (`AesGcm<Aes128>`,
 `ChaCha20Poly1305`) компилируются в крейтах-потребителях и попадают под
 `"s"`, а per-package `opt-level = 3` для `aes`, `aes-gcm`, `ghash`,
-`chacha20`… на них не влияет (BLD-07). На ARM собственного GCM-цикла пока нет,
-AES-GCM идёт через крейты RustCrypto с ARM-cfg, поэтому вывод по скорости
-даёт только замер на устройстве.
+`chacha20`… на них не влияет (BLD-07).
+
+Что на aarch64 под чем работает:
+
+- **AES-GCM** — собственный бэкенд `core-crypto::fastgcm::v8` на интринсиках
+  `aese`/`pmull`, выбирается при наличии `aes` и `pmull` в HWCAP. Именно его
+  держит `core-crypto` на 3. Чего на ARM нет, так это чередования GHASH с
+  раундами AES: PERF-02 сделан только для x86_64.
+- **ChaCha20-Poly1305** — через крейты RustCrypto (`chacha20`,
+  `chacha20poly1305`) с `--cfg chacha20_force_neon`; собственный `fastchacha`
+  существует только для x86_64. Его generic-инстанциации компилируются в
+  крейтах-потребителях, то есть под `"s"`. Это главный риск, и падение
+  NEON-сложений 2025 → 334 с ним согласуется.
+
+Вывод по скорости всё равно даёт только замер на устройстве.
 
 ## Что в обеих сборках одинаково
 

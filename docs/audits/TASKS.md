@@ -2500,5 +2500,8 @@ cargo build --locked -p core-cli --no-default-features --features rust-x \
 Замечание по BLD-07 остаётся в силе: per-package `opt-level = 3` при fat LTO
 не гарантирует скорость криптографии — generic-инстанциации RustCrypto
 компилируются в крейтах-потребителях и попадают под `"s"`. `core-crypto` на 3
-держит собственные `fastgcm`/`fastchacha` (замерено на x86_64), но на ARM
-собственного GCM-цикла нет, поэтому вывод даёт только замер на устройстве.
+держит собственный AES-GCM: на aarch64 это `fastgcm::v8` на интринсиках
+`aese`/`pmull` (чередования GHASH с раундами AES, как в PERF-02 для x86, там
+нет). ChaCha20-Poly1305 на aarch64 идёт через крейты RustCrypto — `fastchacha`
+только для x86_64 — и остаётся под `"s"`, поэтому вывод даёт только замер на
+устройстве.
