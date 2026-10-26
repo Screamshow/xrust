@@ -287,10 +287,10 @@ mod trojan {
 
     /// Keeps every write call apart, so a head that went out on its own shows
     /// up as a chunk of its own. Reads hand out `answer` once, then wait.
-    struct Wire {
-        writes: Arc<Mutex<Vec<Vec<u8>>>>,
-        answer: Vec<u8>,
-        shut: Arc<Mutex<bool>>,
+    pub(super) struct Wire {
+        pub(super) writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        pub(super) answer: Vec<u8>,
+        pub(super) shut: Arc<Mutex<bool>>,
     }
 
     impl AsyncRead for Wire {
@@ -302,8 +302,9 @@ mod trojan {
             if self.answer.is_empty() {
                 return Poll::Pending;
             }
-            let answer = std::mem::take(&mut self.answer);
-            buf.put_slice(&answer);
+            let take = self.answer.len().min(buf.remaining());
+            buf.put_slice(&self.answer[..take]);
+            self.answer.drain(..take);
             Poll::Ready(Ok(()))
         }
     }
@@ -491,5 +492,117 @@ mod trojan {
             .err()
             .unwrap();
         assert!(err.to_string().contains("requires TLS"), "{err}");
+    }
+}
+
+/// The VLESS request head over a stream that keeps every write apart.
+mod vless_head {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::super::{PendingHead, VLESS_FIRST_WRITE, VlessStream};
+    use super::UUID;
+    use super::trojan::Wire;
+    use crate::outbound::vision::{VisionStream, empty_frame};
+
+    type Writes = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    /// What `Vless::dial` builds for Vision on a stream transport: the UUID
+    /// rides with the head, and the padded empty frame follows it when it
+    /// goes alone.
+    fn vision(answer: &[u8], wait: Duration) -> (VisionStream, Vec<u8>, Writes) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let wire = Wire {
+            writes: Arc::clone(&writes),
+            answer: answer.to_vec(),
+            shut: Arc::new(Mutex::new(false)),
+        };
+        let mut head = super::vision_request_head();
+        head.extend_from_slice(&UUID);
+        let vless = VlessStream {
+            inner: Box::new(wire),
+            request: PendingHead::new(head.clone(), wait, VLESS_FIRST_WRITE)
+                .with_alone_tail(empty_frame()),
+            header_pending: true,
+            need: 2,
+            buf: Vec::new(),
+        };
+        (
+            VisionStream::with_uuid_sent(Box::new(vless), UUID, true),
+            head,
+            writes,
+        )
+    }
+
+    /// `[command][content:u16][padding:u16][content][zeros]`, all of `data`
+    fn frame(data: &[u8]) -> (u8, Vec<u8>, usize) {
+        let content = u16::from_be_bytes([data[1], data[2]]) as usize;
+        let padding = u16::from_be_bytes([data[3], data[4]]) as usize;
+        assert_eq!(data.len(), 5 + content + padding);
+        assert!(data[5 + content..].iter().all(|b| *b == 0));
+        (data[0], data[5..5 + content].to_vec(), padding)
+    }
+
+    /// Nothing written within the wait: one write with the head, the UUID and
+    /// an empty Continue frame padded 900 to 1399 bytes; the frames after it
+    /// carry no UUID.
+    #[tokio::test]
+    async fn a_silent_vision_client_sends_the_head_with_a_padded_empty_frame() {
+        let mut answer = vec![0x00, 0x00];
+        answer.extend_from_slice(&UUID);
+        answer.extend_from_slice(&[0x01, 0x00, 0x03, 0x00, 0x00]);
+        answer.extend_from_slice(b"220");
+        let (mut stream, head, writes) = vision(&answer, Duration::from_millis(50));
+        let mut banner = [0u8; 3];
+        stream.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"220");
+        stream.write_all(b"EHLO").await.unwrap();
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(&writes[0][..head.len()], &head[..]);
+        let (command, content, padding) = frame(&writes[0][head.len()..]);
+        assert_eq!((command, content.len()), (0x00, 0));
+        assert!((900..1400).contains(&padding), "{padding}");
+        let (command, content, _) = frame(&writes[1]);
+        assert_eq!((command, &content[..]), (0x00, &b"EHLO"[..]));
+    }
+
+    /// A client that closes without a byte: the same head and empty frame.
+    #[tokio::test]
+    async fn closing_a_vision_client_before_any_payload_sends_the_padded_head() {
+        let (mut stream, head, writes) = vision(b"", Duration::from_secs(30));
+        stream.shutdown().await.unwrap();
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        let (command, content, _) = frame(&writes[0][head.len()..]);
+        assert_eq!((command, content.len()), (0x00, 0));
+    }
+
+    /// A first payload larger than Xray's 8 KiB write buffer: the head and as
+    /// much as fits leave in one 8192-byte write, the rest after it.
+    #[tokio::test]
+    async fn a_large_first_payload_fills_one_xray_sized_write() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let wire = Wire {
+            writes: Arc::clone(&writes),
+            answer: Vec::new(),
+            shut: Arc::new(Mutex::new(false)),
+        };
+        let head = super::request_head();
+        let mut stream = VlessStream {
+            inner: Box::new(wire),
+            request: PendingHead::new(head.clone(), Duration::from_secs(30), VLESS_FIRST_WRITE),
+            header_pending: true,
+            need: 2,
+            buf: Vec::new(),
+        };
+        let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        stream.write_all(&payload).await.unwrap();
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(writes[0].len(), 8192);
+        assert_eq!(&writes[0][..head.len()], &head[..]);
+        assert_eq!(&writes.concat()[head.len()..], &payload[..]);
     }
 }

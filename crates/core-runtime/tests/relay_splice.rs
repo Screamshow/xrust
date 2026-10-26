@@ -325,3 +325,173 @@ async fn splice_survives_a_peer_that_vanishes_mid_transfer() {
         .await
         .expect("relay must not hang after the peer is gone");
 }
+
+// ---- a plain vless client over a bare socket ----
+
+const VLESS_UUID: &str = "b831381d-6324-4d53-ad4f-8cda48b30811";
+
+/// A plain vless upstream connected to a local listener, and the accepted end.
+async fn vless_upstream() -> (core_runtime::inbound::AnyStream, TcpStream, Vec<u8>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let outbound = serde_json::json!({
+        "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
+        "uuid": VLESS_UUID
+    });
+    let vless =
+        core_runtime::outbound::secure::Vless::build(outbound.as_object().expect("object"), "up")
+            .expect("build");
+    let target = core_runtime::inbound::Target::Domain("example.com".into(), 80);
+    let (upstream, accepted) = tokio::join!(vless.connect(&target), listener.accept());
+    let mut head = vec![0x00];
+    head.extend_from_slice(&[
+        0xb8, 0x31, 0x38, 0x1d, 0x63, 0x24, 0x4d, 0x53, 0xad, 0x4f, 0x8c, 0xda, 0x48, 0xb3, 0x08,
+        0x11,
+    ]);
+    head.extend_from_slice(&[0x00, 0x01, 0x00, 0x50, 0x02, 11]);
+    head.extend_from_slice(b"example.com");
+    (
+        upstream.expect("connect"),
+        accepted.expect("accept").0,
+        head,
+    )
+}
+
+/// The request head waits for the caller's first bytes and leaves with them,
+/// then the kernel moves the rest: nothing reaches the server before the caller
+/// talks, and every byte arrives once.
+#[tokio::test]
+async fn plain_vless_head_leaves_with_the_first_bytes_before_the_splice() {
+    let (relay_client, mut caller) = pair().await;
+    let (upstream, mut server, head) = vless_upstream().await;
+    let tracker = clash_state::ConnHandle::open(meta("vless-splice.example.com:80"));
+    let relay = tokio::spawn(async move {
+        pump_conn_tracked(relay_client, Conn::Plain(upstream), &[], Some(&tracker)).await
+    });
+
+    let mut probe = [0u8; 1];
+    let early = tokio::time::timeout(Duration::from_millis(200), server.read(&mut probe)).await;
+    assert!(early.is_err(), "the head must wait for the first payload");
+    caller.write_all(b"hello").await.expect("caller write");
+    let mut first = vec![0u8; head.len() + 5];
+    tokio::time::timeout(Duration::from_millis(300), server.read_exact(&mut first))
+        .await
+        .expect("head and payload together, long before the wait is over")
+        .expect("server read");
+    assert_eq!(&first[..head.len()], &head[..]);
+    assert_eq!(&first[head.len()..], b"hello");
+
+    const UP: usize = 4 * 1024 * 1024 + 3;
+    const DOWN: usize = 4 * 1024 * 1024 + 1;
+    let up = pattern(UP, 21);
+    let down = pattern(DOWN, 22);
+    let (mut server_r, mut server_w) = server.into_split();
+    let server_task = tokio::spawn({
+        let down = down.clone();
+        async move {
+            let write = async move {
+                server_w
+                    .write_all(&[0x00, 0x00])
+                    .await
+                    .expect("answer head");
+                server_w.write_all(&down).await.expect("server write");
+                server_w.shutdown().await.expect("server shutdown");
+            };
+            let read = async move {
+                let mut got = Vec::new();
+                server_r.read_to_end(&mut got).await.expect("server read");
+                got
+            };
+            tokio::join!(write, read).1
+        }
+    });
+    let (mut caller_r, mut caller_w) = caller.into_split();
+    let write = {
+        let up = up.clone();
+        async move {
+            caller_w.write_all(&up).await.expect("caller write");
+            caller_w.shutdown().await.expect("caller shutdown");
+        }
+    };
+    let read = async move {
+        let mut got = Vec::new();
+        caller_r.read_to_end(&mut got).await.expect("caller read");
+        got
+    };
+    let ((), got_down) = tokio::time::timeout(LIMIT, async { tokio::join!(write, read) })
+        .await
+        .expect("caller side timed out");
+    let got_up = tokio::time::timeout(LIMIT, server_task)
+        .await
+        .expect("server side timed out")
+        .expect("server task");
+    assert!(got_up == up, "upload corrupted");
+    assert!(got_down == down, "download corrupted");
+    tokio::time::timeout(LIMIT, relay)
+        .await
+        .expect("relay finished")
+        .expect("relay task")
+        .expect("relay result");
+}
+
+/// A destination that talks first: the head goes alone once Xray's 500 ms
+/// wait is over, and the server's banner comes back through the relay.
+#[tokio::test]
+async fn plain_vless_head_goes_alone_after_the_wait_when_the_caller_is_silent() {
+    let (relay_client, mut caller) = pair().await;
+    let (upstream, mut server, head) = vless_upstream().await;
+    let started = std::time::Instant::now();
+    let relay = tokio::spawn(async move {
+        pump_conn_tracked(relay_client, Conn::Plain(upstream), &[], None).await
+    });
+    let mut got = vec![0u8; head.len()];
+    tokio::time::timeout(Duration::from_secs(5), server.read_exact(&mut got))
+        .await
+        .expect("the head after the wait")
+        .expect("server read");
+    assert!(started.elapsed() >= Duration::from_millis(450));
+    assert_eq!(got, head);
+    server
+        .write_all(b"\x00\x00SSH-2.0-banner\r\n")
+        .await
+        .expect("banner");
+    let mut banner = [0u8; 16];
+    tokio::time::timeout(Duration::from_secs(5), caller.read_exact(&mut banner))
+        .await
+        .expect("banner in time")
+        .expect("caller read");
+    assert_eq!(&banner, b"SSH-2.0-banner\r\n");
+    caller.write_all(b"ok").await.expect("caller write");
+    let mut reply = [0u8; 2];
+    server.read_exact(&mut reply).await.expect("server read");
+    assert_eq!(&reply, b"ok");
+    drop(caller);
+    drop(server);
+    let _ = tokio::time::timeout(LIMIT, relay).await;
+}
+
+/// A sniffed prefix is the first payload: it leaves with the head.
+#[tokio::test]
+async fn plain_vless_head_leaves_with_the_sniffed_prefix() {
+    let (relay_client, caller) = pair().await;
+    let (upstream, mut server, head) = vless_upstream().await;
+    let relay = tokio::spawn(async move {
+        pump_conn_tracked(
+            relay_client,
+            Conn::Plain(upstream),
+            b"\x16\x03\x01hello",
+            None,
+        )
+        .await
+    });
+    let mut first = vec![0u8; head.len() + 8];
+    tokio::time::timeout(Duration::from_millis(300), server.read_exact(&mut first))
+        .await
+        .expect("no wait with a prefix at hand")
+        .expect("server read");
+    assert_eq!(&first[..head.len()], &head[..]);
+    assert_eq!(&first[head.len()..], b"\x16\x03\x01hello");
+    drop(caller);
+    drop(server);
+    let _ = tokio::time::timeout(LIMIT, relay).await;
+}

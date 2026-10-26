@@ -632,7 +632,28 @@ where
             // connection view off) it used to be skipped entirely because
             // nothing to count meant no splice at all.
             #[cfg(target_os = "linux")]
+            let mut prefix = prefix;
+            #[cfg(target_os = "linux")]
             if let Some(client_tcp) = client_raw_tcp(&client) {
+                // a plain vless client over a bare socket: its request head
+                // waits for the first payload, which the kernel relay cannot
+                // pair with it, so that one write happens here
+                if let Some(vless) = (*upstream)
+                    .as_any_mut()
+                    .downcast_mut::<crate::outbound::secure::VlessStream>()
+                    .filter(|vless| vless.raw_capable())
+                {
+                    let sent = if prefix.is_empty() {
+                        vless.send_head_from(client_tcp).await?
+                    } else {
+                        vless.write_all(prefix).await?;
+                        vless.flush().await?;
+                        std::mem::take(&mut prefix).len()
+                    };
+                    if let Some(tracker) = tracker {
+                        tracker.add_upload(sent as u64);
+                    }
+                }
                 let up = &*upstream as &dyn std::any::Any;
                 if let Some(upstream_tcp) = up.downcast_ref::<TcpStream>() {
                     return relay::relay(client_tcp, upstream_tcp, prefix, tracker, false, half)

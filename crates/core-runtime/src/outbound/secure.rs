@@ -2,7 +2,7 @@ use std::io;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::mux;
@@ -10,6 +10,9 @@ use crate::outbound::packet::{CMD_MUX, CMD_TCP, PacketEncoding, spawn_packet_bri
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::transport::Transport;
 use crate::tls_client::TlsOptions;
+
+mod head;
+use head::PendingHead;
 
 /// vless address block: port first, then ATYP (1=v4, 2=domain, 3=v6) + addr.
 fn encode_vless_target(target: &Target) -> io::Result<Vec<u8>> {
@@ -168,52 +171,77 @@ impl Vless {
                 &self.dial,
             )
             .await?;
-        // The request head goes out on its own, ahead of any payload.
-        //
-        // This used to be glued to the caller's first write, because a transport
-        // that turns writes into packets -- XHTTP packet-up, one sequenced POST per
-        // write -- would otherwise deliver the head as a packet with nothing in it.
-        // That reasoning was wrong, and the cost was a corrupted tunnel on Xray
-        // 26.9: a POST carrying the head *and* the first payload is read back twice,
-        // so the far end receives the payload two times. Xray 25.9 tolerates it,
-        // which is exactly why it looked healthy for as long as it did.
-        //
-        // Measured against a real Xray with the stand in tests/spikes/xhttp, one
-        // 13-byte payload and a 26-byte head:
-        //
-        // | client | Xray 25.9 | Xray 26.9 |
-        // |---|---|---|
-        // | sing-box-lx 1.14.2-lx.11 | `firstLen = 26`, passes | `firstLen = 26`, passes |
-        // | glued head + payload | `firstLen = 39`, passes | `firstLen = 156`, fails |
-        //
-        // The reference splits them and reads `firstLen` back equal to the head on
-        // both versions, so splitting is the shape both accept. Over a plain TCP or
-        // TLS stream the bytes on the wire are identical either way -- only the POST
-        // framing changes -- and the server parses the head out of the byte stream
-        // rather than deciding where the request ends from the first packet.
         if self.vision {
             crate::inbound::disable_tls_read_batching(&mut stream);
         }
-        if !header[consumed..].is_empty() {
-            stream.write_all(&header[consumed..]).await?;
+        let rest = &header[consumed..];
+        // Vision's UUID travels with the head when there is one left to send,
+        // so the frame that follows -- a payload or the padded empty one -- is
+        // the same bytes Xray's `VisionWriter` puts behind it
+        let mut uuid_sent = false;
+        let request = if rest.is_empty() {
+            // ws early data carried all of it in the upgrade request
+            PendingHead::sent()
+        } else if self.transport.is_xhttp() {
+            // XHTTP keeps the head on a write of its own. In packet-up every
+            // write is a sequenced POST, and a POST carrying the head *and* the
+            // first payload was read back twice by Xray 26.9, so the far end got
+            // the payload two times (measured with tests/spikes/xhttp: one
+            // 13-byte payload and a 26-byte head, `firstLen = 156` and a broken
+            // tunnel glued, `firstLen = 26` and a healthy one split, which is also
+            // what sing-box sends there). The head is inside the HTTP body of
+            // an encrypted request in every XHTTP mode, so its size does not
+            // stand alone as a record the way it does on a stream transport.
+            stream.write_all(rest).await?;
             stream.flush().await?;
-        }
+            PendingHead::sent()
+        } else {
+            // Everywhere else the head waits for the first payload and both go
+            // in one write, as Xray's client sends them (`proxy/vless/outbound`:
+            // the head goes into a `BufferedWriter`, the first payload read
+            // within 500 ms is written behind it, `SetBuffered(false)` flushes
+            // both). Over TLS one write is one record, so the head alone would
+            // be a first application-data record of a few dozen bytes, a shape no
+            // browser sends; on ws, gRPC and the rest it would be a frame or a
+            // message of its own. A destination that talks first gets the head
+            // when the wait is over, with Vision's padded empty frame behind it
+            // ("Insert padding with empty content to camouflage VLESS header").
+            let mut head = rest.to_vec();
+            let mut alone_tail = Vec::new();
+            if self.vision {
+                head.extend_from_slice(&self.uuid);
+                uuid_sent = true;
+                alone_tail = crate::outbound::vision::empty_frame();
+            }
+            PendingHead::new(head, VLESS_FIRST_PAYLOAD_WAIT, VLESS_FIRST_WRITE)
+                .with_alone_tail(alone_tail)
+        };
         let framed: AnyStream = Box::new(VlessStream {
             inner: stream,
+            request,
             header_pending: true,
             need: 2,
             buf: Vec::new(),
         });
         if self.vision {
             // Vision frames the payload that follows the request header
-            Ok(Box::new(crate::outbound::vision::VisionStream::new(
-                framed, self.uuid,
-            )))
+            Ok(Box::new(
+                crate::outbound::vision::VisionStream::with_uuid_sent(framed, self.uuid, uuid_sent),
+            ))
         } else {
             Ok(framed)
         }
     }
 }
+
+/// How long the request head waits for the first payload: Xray's client reads
+/// once with this timeout (`ReadMultiBufferTimeout(500ms)`) before it flushes.
+const VLESS_FIRST_PAYLOAD_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The most the head's write carries, head included: Xray's `BufferedWriter`
+/// flushes its one `buf.Size` buffer when it fills, so a larger first payload
+/// leaves in an 8 KiB write and then the rest.
+const VLESS_FIRST_WRITE: usize = 8192;
 
 /// `[version][uuid][addonsLen][addons][command][addr][port]`, reference
 /// `WriteRequest`. The flow travels in the addons as protobuf field 1, and a
@@ -247,6 +275,8 @@ fn request_head(
 /// the first upstream write, so it is consumed transparently on first read.
 pub struct VlessStream {
     inner: AnyStream,
+    /// the request head, until the first payload (or the deadline) takes it
+    request: PendingHead,
     header_pending: bool,
     need: usize,
     buf: Vec<u8>,
@@ -268,10 +298,52 @@ impl VlessStream {
     /// the relay can then eat the head itself and hand the rest to the kernel.
     #[cfg(target_os = "linux")]
     pub(crate) fn raw_pending(&self) -> Option<&tokio::net::TcpStream> {
-        if !self.header_pending || !self.buf.is_empty() {
+        if !self.request.is_sent() || !self.header_pending || !self.buf.is_empty() {
             return None;
         }
         (&*self.inner as &dyn std::any::Any).downcast_ref::<tokio::net::TcpStream>()
+    }
+
+    /// Whether `raw_pending` will hand out the socket once the request head is
+    /// out: the transport is a bare socket and nothing was read yet.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn raw_capable(&self) -> bool {
+        self.header_pending
+            && self.buf.is_empty()
+            && self.inner.as_any().is::<tokio::net::TcpStream>()
+    }
+
+    /// Send the request head the way a write would, taking the first payload
+    /// straight off the client socket: the kernel relay that follows cannot
+    /// pair them. Returns how many client bytes went with the head.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn send_head_from(
+        &mut self,
+        client: &tokio::net::TcpStream,
+    ) -> io::Result<usize> {
+        let Some(until) = self.request.waiting_until() else {
+            return Ok(0);
+        };
+        let mut first = vec![0u8; VLESS_FIRST_WRITE];
+        let got = loop {
+            match tokio::time::timeout_at(until, client.readable()).await {
+                Err(_) => break 0,
+                Ok(ready) => ready?,
+            }
+            match client.try_read(&mut first) {
+                Ok(n) => break n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) => return Err(error),
+            }
+        };
+        if got == 0 {
+            // the wait is over or the client is done: the head goes alone
+            self.request.start_alone();
+        } else {
+            self.write_all(&first[..got]).await?;
+        }
+        self.flush().await?;
+        Ok(got)
     }
 
     /// The stream underneath, once the response head is consumed.
@@ -288,6 +360,7 @@ impl tokio::io::AsyncRead for VlessStream {
         out: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         let this = &mut *self;
+        std::task::ready!(this.request.poll_before_read(&mut this.inner, cx))?;
         if this.header_pending {
             let mut probe = [0u8; 1];
             while this.buf.len() < this.need {
@@ -326,25 +399,26 @@ impl tokio::io::AsyncWrite for VlessStream {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
-        // The request head has already gone out, on its own write, so there is
-        // nothing left to queue here and a plain passthrough is right: buffering
-        // the caller's first write to pair it with the head is what this type used
-        // to do, and it is what doubled the packet on Xray 26.9.
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        // the first payload joins the request head; after that, a passthrough
+        let this = self.get_mut();
+        this.request.poll_write(&mut this.inner, cx, buf)
     }
 
     fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        let this = self.get_mut();
+        this.request.poll_flush(&mut this.inner, cx)
     }
 
     fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        std::task::ready!(this.request.poll_before_shutdown(&mut this.inner, cx))?;
+        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -464,19 +538,6 @@ pub(crate) const TROJAN_FIRST_PAYLOAD_WAIT: std::time::Duration =
 /// its TLS layer too.
 const TROJAN_FIRST_WRITE: usize = core_tls::record::MAX_FRAGMENT;
 
-enum TrojanHead {
-    /// Not written yet; joins the first payload, or goes alone at the deadline.
-    Waiting(Vec<u8>),
-    /// On its way: `buf[pos..]` is left, and `claimed` bytes of it are the
-    /// caller's payload (0 when the head went alone).
-    Writing {
-        buf: Vec<u8>,
-        pos: usize,
-        claimed: usize,
-    },
-    Sent,
-}
-
 /// A trojan connection whose request head waits for the first payload, like
 /// both references: sing-box's `ClientConn.Write` prepends the head to the first
 /// write, and Xray buffers the head with the first payload and flushes them
@@ -485,10 +546,7 @@ enum TrojanHead {
 /// application-data record would be a shape no browser produces.
 pub(crate) struct TrojanStream {
     inner: AnyStream,
-    head: TrojanHead,
-    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
-    /// the head went out from the read side and still needs a flush
-    flush_head: bool,
+    head: PendingHead,
 }
 
 impl TrojanStream {
@@ -499,45 +557,7 @@ impl TrojanStream {
     pub(crate) fn with_wait(inner: AnyStream, head: Vec<u8>, wait: std::time::Duration) -> Self {
         Self {
             inner,
-            head: if head.is_empty() {
-                // ws early data carried all of it in the upgrade request
-                TrojanHead::Sent
-            } else {
-                TrojanHead::Waiting(head)
-            },
-            deadline: Box::pin(tokio::time::sleep(wait)),
-            flush_head: false,
-        }
-    }
-
-    /// Write out the head in flight; ready with the payload bytes it carried.
-    fn poll_head(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<usize>> {
-        let TrojanHead::Writing { buf, pos, claimed } = &mut self.head else {
-            return std::task::Poll::Ready(Ok(0));
-        };
-        while *pos < buf.len() {
-            let n = std::task::ready!(
-                std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[*pos..])
-            )?;
-            if n == 0 {
-                return std::task::Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-            }
-            *pos += n;
-        }
-        let claimed = *claimed;
-        self.head = TrojanHead::Sent;
-        std::task::Poll::Ready(Ok(claimed))
-    }
-
-    /// Send the head alone (the wait is over, or the stream is closing).
-    fn start_head_alone(&mut self) {
-        if let TrojanHead::Waiting(head) = &mut self.head {
-            let buf = std::mem::take(head);
-            self.head = TrojanHead::Writing {
-                buf,
-                pos: 0,
-                claimed: 0,
-            };
+            head: PendingHead::new(head, wait, TROJAN_FIRST_WRITE),
         }
     }
 }
@@ -548,28 +568,8 @@ impl tokio::io::AsyncRead for TrojanStream {
         cx: &mut std::task::Context<'_>,
         out: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<io::Result<()>> {
-        use std::future::Future;
         let this = self.get_mut();
-        loop {
-            match &this.head {
-                // nothing can come back before the server has the head
-                TrojanHead::Waiting(_) => {
-                    std::task::ready!(this.deadline.as_mut().poll(cx));
-                    this.start_head_alone();
-                }
-                TrojanHead::Writing { claimed: 0, .. } => {
-                    std::task::ready!(this.poll_head(cx))?;
-                    this.flush_head = true;
-                }
-                // a write is carrying the head with its payload: that write
-                // finishes it, and reading meanwhile is fine
-                _ => break,
-            }
-        }
-        if this.flush_head {
-            std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_flush(cx))?;
-            this.flush_head = false;
-        }
+        std::task::ready!(this.head.poll_before_read(&mut this.inner, cx))?;
         std::pin::Pin::new(&mut this.inner).poll_read(cx, out)
     }
 }
@@ -581,36 +581,7 @@ impl tokio::io::AsyncWrite for TrojanStream {
         buf: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         let this = self.get_mut();
-        loop {
-            match &mut this.head {
-                TrojanHead::Sent => {
-                    return std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
-                }
-                TrojanHead::Waiting(head) => {
-                    if buf.is_empty() {
-                        return std::task::Poll::Ready(Ok(0));
-                    }
-                    let take = buf
-                        .len()
-                        .min(TROJAN_FIRST_WRITE.saturating_sub(head.len()).max(1));
-                    let mut joined = std::mem::take(head);
-                    joined.extend_from_slice(&buf[..take]);
-                    this.head = TrojanHead::Writing {
-                        buf: joined,
-                        pos: 0,
-                        claimed: take,
-                    };
-                }
-                TrojanHead::Writing { .. } => {
-                    let claimed = std::task::ready!(this.poll_head(cx))?;
-                    if claimed > 0 {
-                        // this write's payload went out with the head
-                        return std::task::Poll::Ready(Ok(claimed));
-                    }
-                    // the head went alone; `buf` follows it as usual
-                }
-            }
-        }
+        this.head.poll_write(&mut this.inner, cx, buf)
     }
 
     fn poll_flush(
@@ -618,11 +589,7 @@ impl tokio::io::AsyncWrite for TrojanStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         let this = self.get_mut();
-        if matches!(this.head, TrojanHead::Writing { claimed: 0, .. }) {
-            std::task::ready!(this.poll_head(cx))?;
-        }
-        this.flush_head = false;
-        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+        this.head.poll_flush(&mut this.inner, cx)
     }
 
     fn poll_shutdown(
@@ -630,11 +597,7 @@ impl tokio::io::AsyncWrite for TrojanStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
         let this = self.get_mut();
-        // Xray sends the head even when the client closed without a byte
-        this.start_head_alone();
-        if matches!(this.head, TrojanHead::Writing { .. }) {
-            std::task::ready!(this.poll_head(cx))?;
-        }
+        std::task::ready!(this.head.poll_before_shutdown(&mut this.inner, cx))?;
         std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
