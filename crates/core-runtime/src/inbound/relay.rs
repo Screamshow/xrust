@@ -23,7 +23,9 @@ use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 use tokio::net::TcpStream;
 
-use super::{AnyStream, Counted, PooledBuffer, TransferState, take_buf, transfer_one_direction};
+use super::{
+    AnyStream, Counted, HalfOpen, PooledBuffer, TransferState, take_buf, transfer_one_direction,
+};
 use crate::clash_state::ConnHandle;
 
 /// Largest bytes asked from one splice, and the size a busy pipe grows to. One
@@ -226,6 +228,7 @@ pub(crate) async fn relay(
     prefix: &[u8],
     tracker: Option<&ConnHandle>,
     vless_head: bool,
+    half: &HalfOpen,
 ) -> io::Result<()> {
     if !prefix.is_empty() {
         write_all(upstream, prefix).await?;
@@ -235,16 +238,24 @@ pub(crate) async fn relay(
     }
     let both = async {
         tokio::try_join!(
-            one_way(client, upstream, false, |n| {
-                if let Some(tracker) = tracker {
-                    tracker.add_upload(n)
-                }
-            }),
-            one_way(upstream, client, vless_head, |n| {
-                if let Some(tracker) = tracker {
-                    tracker.add_download(n)
-                }
-            }),
+            async {
+                one_way(client, upstream, false, |n| {
+                    if let Some(tracker) = tracker {
+                        tracker.add_upload(n)
+                    }
+                })
+                .await
+                .inspect(|()| half.finish())
+            },
+            async {
+                one_way(upstream, client, vless_head, |n| {
+                    if let Some(tracker) = tracker {
+                        tracker.add_download(n)
+                    }
+                })
+                .await
+                .inspect(|()| half.finish())
+            },
         )
         .map(|_| ())
     };
@@ -431,6 +442,7 @@ pub(crate) async fn relay_vision<S>(
     client: &mut S,
     upstream: &mut AnyStream,
     tracker: Option<&ConnHandle>,
+    half: &HalfOpen,
 ) -> io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Unpin + std::any::Any,
@@ -454,6 +466,9 @@ where
             tracker,
             &mut spliced,
         )?;
+        if res_up.is_ready() || res_down.is_ready() {
+            half.finish();
+        }
         ready!(res_up);
         ready!(res_down);
         Poll::Ready(Ok::<(), io::Error>(()))

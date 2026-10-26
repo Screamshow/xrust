@@ -352,7 +352,13 @@ async fn run(version: [u8; 2], direct: bool, up: Vec<u8>, down: Vec<u8>) -> (u8,
     let id = tracker.id().to_string();
     let relay = tokio::spawn(async move {
         let mut relay_client = relay_client;
-        let result = super::relay_vision(&mut relay_client, &mut upstream, Some(&tracker)).await;
+        let result = super::relay_vision(
+            &mut relay_client,
+            &mut upstream,
+            Some(&tracker),
+            &super::HalfOpen::default(),
+        )
+        .await;
         let counted = clash_state::snapshot()
             .0
             .into_iter()

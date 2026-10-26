@@ -618,7 +618,12 @@ pub async fn pump_conn_tracked<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any,
 {
-    let relay = pump_conn_tracked_inner(client, conn, prefix, tracker);
+    let half = HalfOpen::default();
+    let relay = end_half_open(
+        pump_conn_tracked_inner(client, conn, prefix, tracker, &half),
+        &half,
+        half_close_idle(),
+    );
     if let Some(tracker) = tracker {
         let signal = tracker.close_signal();
         tokio::select! {
@@ -636,6 +641,7 @@ async fn pump_conn_tracked_inner<S>(
     conn: Conn,
     prefix: &[u8],
     tracker: Option<&clash_state::ConnHandle>,
+    half: &HalfOpen,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any,
@@ -650,7 +656,8 @@ where
             if let Some(client_tcp) = client_raw_tcp(&client) {
                 let up = &*upstream as &dyn std::any::Any;
                 if let Some(upstream_tcp) = up.downcast_ref::<TcpStream>() {
-                    return relay::relay(client_tcp, upstream_tcp, prefix, tracker, false).await;
+                    return relay::relay(client_tcp, upstream_tcp, prefix, tracker, false, half)
+                        .await;
                 }
                 // a plain vless client: the kernel moves the bytes once the
                 // relay has eaten the two-byte answer head
@@ -658,7 +665,8 @@ where
                     .downcast_ref::<crate::outbound::secure::VlessStream>()
                     .and_then(|v| v.raw_pending())
                 {
-                    return relay::relay(client_tcp, upstream_tcp, prefix, tracker, true).await;
+                    return relay::relay(client_tcp, upstream_tcp, prefix, tracker, true, half)
+                        .await;
                 }
             }
             // Vision on TLS over TCP: userspace until its download is Direct
@@ -671,7 +679,7 @@ where
                         tracker.add_upload(prefix.len() as u64);
                     }
                 }
-                return relay::relay_vision(&mut client, &mut upstream, tracker)
+                return relay::relay_vision(&mut client, &mut upstream, tracker, half)
                     .await
                     .map(|_| ());
             }
@@ -684,10 +692,10 @@ where
             }
             match tracker {
                 Some(tracker) => {
-                    relay_tracked(&mut client, &mut upstream, tracker).await?;
+                    relay_tracked(&mut client, &mut upstream, tracker, half).await?;
                 }
                 None => {
-                    copy_bidirectional_pooled(&mut client, &mut upstream).await?;
+                    copy_bidirectional_pooled(&mut client, &mut upstream, half).await?;
                 }
             }
             Ok(())
@@ -710,6 +718,7 @@ where
                 loop {
                     let n = client_read.read(&mut up_buf).await?;
                     if n == 0 {
+                        half.finish();
                         return Ok(());
                     }
                     writer.write_chunk(&up_buf[..n]).await?;
@@ -721,7 +730,10 @@ where
             let down = async {
                 loop {
                     match reader.read(&mut down_buf).await {
-                        Ok(0) => return Ok(()),
+                        Ok(0) => {
+                            half.finish();
+                            return Ok(());
+                        }
                         Ok(n) => {
                             client_write.write_all(&down_buf[..n]).await?;
                             if let Some(tracker) = tracker {
@@ -729,6 +741,7 @@ where
                             }
                         }
                         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
+                            half.finish();
                             return Ok(());
                         }
                         Err(err) => return Err(err),
@@ -1104,6 +1117,165 @@ mod relay_buffer_tests {
     }
 }
 
+/// Set by the first direction of a relay that finishes; see [`end_half_open`].
+#[derive(Default)]
+pub(crate) struct HalfOpen(std::sync::atomic::AtomicBool);
+
+impl HalfOpen {
+    pub(crate) fn finish(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn finished(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// How long a relay with one direction over may go without activity on the
+/// other before it ends. Neither side can do anything about a peer that keeps
+/// its half open and silent: the session, its sockets and buffers would live
+/// until that peer gives up. Xray ends the same case with its `uplinkOnly` and
+/// `downlinkOnly` timers (1 s by default); this is ten times that, so a slow
+/// answer to a half-closed request still comes through.
+/// `XRUST_HALF_CLOSE_IDLE_MS` overrides it.
+const HALF_CLOSE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn half_close_idle() -> std::time::Duration {
+    static IDLE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *IDLE.get_or_init(|| {
+        if let Some(val) = crate::env_var("HALF_CLOSE_IDLE_MS")
+            && let Ok(ms) = val.parse::<u64>()
+            && ms > 0
+        {
+            return std::time::Duration::from_millis(ms);
+        }
+        HALF_CLOSE_IDLE
+    })
+}
+
+/// Run `relay` until it ends, or, once `half` says a direction is over, until
+/// the relay has not been woken for [`HALF_CLOSE_IDLE`]. Every wake restarts
+/// the limit: the relay is only ever woken by its sockets, so a direction
+/// that keeps moving is never cut. Until a direction is over there is no
+/// timer at all. The end is quiet (`Ok`), like the end of the relay.
+async fn end_half_open<F>(relay: F, half: &HalfOpen, idle: std::time::Duration) -> io::Result<()>
+where
+    F: std::future::Future<Output = io::Result<()>>,
+{
+    let mut relay = std::pin::pin!(relay);
+    let mut timer: Option<Pin<Box<tokio::time::Sleep>>> = None;
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(result) = relay.as_mut().poll(cx) {
+            return Poll::Ready(result);
+        }
+        if !half.finished() {
+            return Poll::Pending;
+        }
+        let now = tokio::time::Instant::now();
+        match &mut timer {
+            Some(t) if t.deadline() <= now => return Poll::Ready(Ok(())),
+            Some(t) => t.as_mut().reset(now + idle),
+            None => timer = Some(Box::pin(tokio::time::sleep_until(now + idle))),
+        }
+        if let Some(t) = &mut timer {
+            let _ = t.as_mut().poll(cx);
+        }
+        Poll::Pending
+    })
+    .await
+}
+
+#[cfg(test)]
+mod half_open_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::duplex;
+    use tokio::time::{Instant, timeout};
+
+    const IDLE: Duration = Duration::from_millis(150);
+
+    /// A relay of `app` <-> `server` through two duplex pairs, ended by the
+    /// half-open limit; returns when it ends.
+    fn relay(
+        relay_client: tokio::io::DuplexStream,
+        relay_up: tokio::io::DuplexStream,
+    ) -> tokio::task::JoinHandle<io::Result<()>> {
+        tokio::spawn(async move {
+            let (mut a, mut b) = (relay_client, relay_up);
+            let half = HalfOpen::default();
+            end_half_open(
+                async {
+                    copy_bidirectional_pooled(&mut a, &mut b, &half)
+                        .await
+                        .map(|_| ())
+                },
+                &half,
+                IDLE,
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn a_silent_half_open_relay_ends() {
+        let (mut app, relay_client) = duplex(4096);
+        let (relay_up, mut server) = duplex(4096);
+        let task = relay(relay_client, relay_up);
+        app.write_all(b"request").await.unwrap();
+        app.shutdown().await.unwrap();
+        let mut got = [0u8; 7];
+        server.read_exact(&mut got).await.unwrap();
+        let started = Instant::now();
+        let ended = timeout(IDLE * 10, task).await.expect("relay must end");
+        ended.unwrap().unwrap();
+        assert!(started.elapsed() >= IDLE, "ended before the limit");
+        // the client side sees the end of the stream
+        let mut rest = Vec::new();
+        app.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_keeps_moving_after_half_close_arrives_whole() {
+        let (mut app, relay_client) = duplex(4096);
+        let (relay_up, mut server) = duplex(4096);
+        let task = relay(relay_client, relay_up);
+        app.shutdown().await.unwrap();
+        let reader = tokio::spawn(async move {
+            let mut got = Vec::new();
+            app.read_to_end(&mut got).await.unwrap();
+            got
+        });
+        // eight pieces, each well inside the limit, the whole well past it
+        for i in 0..8u8 {
+            tokio::time::sleep(IDLE / 3).await;
+            server.write_all(&[i; 100]).await.unwrap();
+        }
+        server.shutdown().await.unwrap();
+        drop(server);
+        task.await.unwrap().unwrap();
+        let got = reader.await.unwrap();
+        let want: Vec<u8> = (0..8u8).flat_map(|i| [i; 100]).collect();
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    async fn a_silent_relay_with_both_halves_open_is_not_cut() {
+        let (mut app, relay_client) = duplex(4096);
+        let (relay_up, mut server) = duplex(4096);
+        let task = relay(relay_client, relay_up);
+        tokio::time::sleep(IDLE * 3).await;
+        assert!(!task.is_finished(), "no direction ended, no limit applies");
+        app.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"ping");
+        drop(app);
+        drop(server);
+        task.await.unwrap().unwrap();
+    }
+}
+
 enum TransferState {
     Running(PooledBuffer),
     ShuttingDown(u64),
@@ -1138,7 +1310,11 @@ where
     }
 }
 
-async fn copy_bidirectional_pooled<A, B>(a: &mut A, b: &mut B) -> io::Result<(u64, u64)>
+async fn copy_bidirectional_pooled<A, B>(
+    a: &mut A,
+    b: &mut B,
+    half: &HalfOpen,
+) -> io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -1148,6 +1324,9 @@ where
     std::future::poll_fn(|cx| {
         let res_a = transfer_one_direction(cx, &mut a_to_b, a, b)?;
         let res_b = transfer_one_direction(cx, &mut b_to_a, b, a)?;
+        if res_a.is_ready() || res_b.is_ready() {
+            half.finish();
+        }
         let amt_a = ready!(res_a);
         let amt_b = ready!(res_b);
         Poll::Ready(Ok((amt_a, amt_b)))
@@ -1163,6 +1342,7 @@ async fn relay_tracked<S, U>(
     client: &mut S,
     upstream: &mut U,
     tracker: &clash_state::ConnHandle,
+    half: &HalfOpen,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1178,6 +1358,7 @@ where
         result = copy_bidirectional_pooled(
             &mut counted,
             upstream,
+            half,
         ) => result.map(|_| ()),
         _ = signal.wait() => Err(closed_by_api()),
     }
