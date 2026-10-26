@@ -83,21 +83,29 @@ smoltcp = { version = "0.14", default-features = false }
 x25519-dalek = { version = "2", default-features = false, features = ["static_secrets"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 
+# Size first, with the cryptography kept fast. "s" makes the binary ~28 %
+# smaller, and on a Cortex-A53 router (MT6000, VLESS + REALITY, AES-GCM) it
+# was also faster: 588 -> 662 Mbit/s at 57.6 % -> 42.9 % of one core. The hot
+# AEAD paths live in core-crypto, which stays at 3; anything generic from
+# RustCrypto is compiled for size wherever it is instantiated, so per-packet
+# and per-record crypto must go through core-crypto (fastgcm, fastchacha).
+# Measured on x86_64 against opt-level = 3: TLS, REALITY, ws, httpupgrade,
+# grpc, h2, h2mux and xhttp within a few percent; hysteria2 a few percent more
+# CPU; TLS ChaCha20 and WireGuard on par once routed through core-crypto.
 [profile.release]
-opt-level = 3
+opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
 overflow-checks = false
 
-# With opt-level = 3 above these overrides change nothing. They are kept for a
-# size-first profile, but they are not enough for one: with opt-level = "s"
-# (plus core-crypto = 3) the binary loses ~28 %, yet the generic RustCrypto
-# AEADs are instantiated and LTO-optimized outside these crates and run ~3x
-# slower, and TLS ChaCha20-Poly1305 end to end loses ~22 % on x86_64. ChaCha on
-# aarch64 goes through the same RustCrypto path, so do not switch to "s"
-# without a Cortex-A53 measurement.
+[profile.release.package.core-crypto]
+opt-level = 3
+
+# Kept from the opt-level = 3 profile. Under fat LTO they do not keep generic
+# code fast in the crates that instantiate it (see above), but they cost
+# nothing.
 [profile.release.package.aes]
 opt-level = 3
 [profile.release.package.aes-gcm]
