@@ -36,6 +36,7 @@ sec1 = { version = "0.7.3", default-features = false, features = ["pkcs8", "pem"
 sha2 = { version = "0.10.7", default-features = false }
 signature = { version = "2.1.0", default-features = false }
 x25519-dalek = { version = "2", default-features = false }
+zeroize = { version = "1.7", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

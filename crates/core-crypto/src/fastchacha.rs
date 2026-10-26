@@ -31,6 +31,7 @@ use chacha20::{
     ChaCha20 as ChaCha20Core,
     cipher::{KeyIvInit, StreamCipher},
 };
+use zeroize::Zeroize;
 
 /// Below this the eight-block setup costs more than it saves.
 #[cfg(target_arch = "x86_64")]
@@ -118,6 +119,21 @@ impl ChaChaPoly {
         cipher.apply_keystream(buf);
         true
     }
+}
+
+impl Drop for ChaChaPoly {
+    fn drop(&mut self) {
+        self.key.zeroize();
+        #[cfg(target_arch = "x86_64")]
+        self.words.zeroize();
+    }
+}
+
+/// XOR the ChaCha20 keystream (RFC 8439: 96-bit nonce, block counter from 0)
+/// into `data`. Encrypting and decrypting are the same call.
+pub fn chacha20_xor(key: &[u8; 32], nonce: &[u8; 12], data: &mut [u8]) {
+    let mut cipher = ChaCha20Core::new(key.into(), nonce.into());
+    cipher.apply_keystream(data);
 }
 
 pub(crate) mod poly {
@@ -725,6 +741,24 @@ mod tests {
 
                 assert!(fast.open(&nonce, &aad, &mut a, &tag_a), "open, len {len}");
                 assert_eq!(a, plain, "plaintext, len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn keystream_xor_agrees_with_chacha20_crate() {
+        for (k, n) in [(0u8, 0u8), (3, 7), (0xa5, 0x5a)] {
+            let key: [u8; 32] = pattern(32, k).try_into().unwrap();
+            let nonce: [u8; 12] = pattern(12, n).try_into().unwrap();
+            for len in [0usize, 1, 12, 16, 63, 64, 65, 148, 1500] {
+                let plain = pattern(len, len as u8 ^ k);
+                let mut a = plain.clone();
+                chacha20_xor(&key, &nonce, &mut a);
+                let mut b = plain.clone();
+                ChaCha20Core::new((&key).into(), (&nonce).into()).apply_keystream(&mut b);
+                assert_eq!(a, b, "len {len} key {k} nonce {n}");
+                chacha20_xor(&key, &nonce, &mut a);
+                assert_eq!(a, plain, "round trip, len {len}");
             }
         }
     }

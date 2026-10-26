@@ -404,6 +404,7 @@ dependencies = [
  "sha2",
  "signature",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
