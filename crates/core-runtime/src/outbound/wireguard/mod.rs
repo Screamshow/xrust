@@ -1483,10 +1483,11 @@ impl Stack {
         // one as before and leave in batches, one syscall per batch rather
         // than per datagram. The datagrams and their order are unchanged.
         let mut outbox = std::mem::take(&mut self.outbox);
-        // one wait budget for the whole flush: the stack task also reads the
-        // sockets and runs the timers, so a full send buffer must not hold it
-        // for longer than this however many batches there are
-        let deadline = tokio::time::Instant::now() + SEND_WAIT;
+        // one wait budget for the whole flush, counted from the first time
+        // the send buffer is full: the stack task also reads the sockets and
+        // runs the timers, so it must not wait longer than this however many
+        // batches there are, and sealing time does not eat into the budget
+        let mut deadline = None;
         while let Some(pkt) = self.device.tx.pop_front() {
             let pkt = match ip_dst(&pkt).and_then(|dst| self.lpm(dst)) {
                 Some(pi) => self.xmit_to_peer_into(pi, pkt, Some(&mut outbox)),
@@ -1498,10 +1499,10 @@ impl Stack {
                 self.device.free.get_mut().push(pkt);
             }
             if outbox.len() >= SEND_BATCH {
-                self.send_outbox(&mut outbox, deadline).await;
+                self.send_outbox(&mut outbox, &mut deadline).await;
             }
         }
-        self.send_outbox(&mut outbox, deadline).await;
+        self.send_outbox(&mut outbox, &mut deadline).await;
         self.outbox = outbox;
     }
 
@@ -1509,7 +1510,7 @@ impl Stack {
     async fn send_outbox(
         &mut self,
         outbox: &mut Vec<(SocketAddr, Vec<u8>)>,
-        deadline: tokio::time::Instant,
+        deadline: &mut Option<tokio::time::Instant>,
     ) {
         let mut start = 0;
         while start < outbox.len() {
@@ -1943,14 +1944,15 @@ const SEND_BATCH: usize = 64;
 const SEND_WAIT: Duration = Duration::from_millis(50);
 
 /// Send `items` in order. When the socket's send buffer is full the rest
-/// waits for it to drain, as a blocking write in the reference waits; once
-/// `deadline` passes the rest is dropped. Any other error skips just that
-/// datagram.
+/// waits for it to drain, as a blocking write in the reference waits. The
+/// wait budget starts at the first full buffer of the flush (`deadline` is
+/// shared by its batches); once it passes the rest is dropped. Any other
+/// error skips just that datagram.
 async fn send_datagrams(
     sock: &UdpSocket,
     items: &[(SocketAddr, Vec<u8>)],
     tag: &str,
-    deadline: tokio::time::Instant,
+    deadline: &mut Option<tokio::time::Instant>,
 ) {
     let mut sent = 0;
     while sent < items.len() {
@@ -1959,7 +1961,11 @@ async fn send_datagrams(
             Ok(n) => sent += n.max(1),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if !matches!(
-                    tokio::time::timeout_at(deadline, sock.writable()).await,
+                    tokio::time::timeout_at(
+                        *deadline.get_or_insert_with(|| tokio::time::Instant::now() + SEND_WAIT),
+                        sock.writable()
+                    )
+                    .await,
                     Ok(Ok(()))
                 ) {
                     return;
@@ -2537,8 +2543,7 @@ mod batch_send_tests {
             .collect();
         // a fresh socket learns it is writable from the reactor first
         tx.writable().await.unwrap();
-        let deadline = tokio::time::Instant::now() + SEND_WAIT;
-        send_datagrams(&tx, &items, "test", deadline).await;
+        send_datagrams(&tx, &items, "test", &mut None).await;
         let mut buf = vec![0u8; 2048];
         for (i, (_, want)) in items.iter().enumerate() {
             let (n, from) =
