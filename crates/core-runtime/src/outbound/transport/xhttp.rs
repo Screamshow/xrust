@@ -1439,8 +1439,12 @@ impl PostWriter {
 }
 
 struct SplitConn {
-    pending: BytesMut,
-    dl: mpsc::Receiver<io::Result<Vec<u8>>>,
+    /// The rest of the last download chunk.
+    pending: Bytes,
+    /// A download error met by a read that already returned data; the next
+    /// read reports it.
+    dl_error: Option<io::Error>,
+    dl: mpsc::Receiver<io::Result<Bytes>>,
     dl_task: tokio::task::JoinHandle<()>,
     ack_task: Option<tokio::task::JoinHandle<()>>,
     up: Up,
@@ -1508,7 +1512,8 @@ impl SplitConn {
         let session_id = new_session_id(&cfg.meta);
         let (_, dl) = mpsc::channel(4);
         Self {
-            pending: BytesMut::new(),
+            pending: Bytes::new(),
+            dl_error: None,
             dl,
             dl_task: tokio::spawn(async {}),
             ack_task: None,
@@ -1538,7 +1543,7 @@ impl SplitConn {
     /// Read GET headers concurrently with upload; a server may await the
     /// first VLESS payload before answering the download request.
     fn spawn_download_stream(&mut self, mut io: AnyStream) {
-        let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
         self.dl = rx;
         self.dl_task = tokio::spawn(async move {
             let (head, pending) = match h1io::read_head(&mut io).await {
@@ -1562,7 +1567,7 @@ impl SplitConn {
 
     /// Feed the download channel from an HTTP/2 GET stream without blocking initial dial.
     fn spawn_h2_download_stream(&mut self, response: h2::client::ResponseFuture) {
-        let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
         self.dl = rx;
         self.dl_task = tokio::spawn(async move {
             let resp = match response.await {
@@ -1591,7 +1596,7 @@ impl SplitConn {
                     Ok(bytes) => {
                         let len = bytes.len();
                         let _ = body.flow_control().release_capacity(len);
-                        if !bytes.is_empty() && tx.send(Ok(bytes.to_vec())).await.is_err() {
+                        if !bytes.is_empty() && tx.send(Ok(bytes)).await.is_err() {
                             return;
                         }
                     }
@@ -1615,7 +1620,7 @@ impl SplitConn {
         task: JoinHandle<io::Result<h1io::Body>>,
         failure: Failure,
     ) {
-        let (tx, rx) = mpsc::channel::<io::Result<Vec<u8>>>(4);
+        let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
         self.dl = rx;
         self.dl_task = tokio::spawn(async move {
             match task.await {
@@ -1696,18 +1701,21 @@ impl SplitConn {
 }
 
 /// Read a response body into the download channel. Channel close is EOF.
-async fn pump(mut body: h1io::Body, tx: mpsc::Sender<io::Result<Vec<u8>>>) {
-    let mut buf = vec![0u8; 16 * 1024];
+async fn pump(mut body: h1io::Body, tx: mpsc::Sender<io::Result<Bytes>>) {
+    const READ: usize = 16 * 1024;
+    let mut buf = BytesMut::new();
     loop {
-        let n = match body.read(&mut buf).await {
+        buf.reserve(READ);
+        let mut room = bytes::BufMut::limit(&mut buf, READ);
+        match body.read_buf(&mut room).await {
             Ok(0) => break,
-            Ok(n) => n,
+            Ok(_) => {}
             Err(e) => {
                 let _ = tx.send(Err(e)).await;
                 return;
             }
-        };
-        if tx.send(Ok(buf[..n].to_vec())).await.is_err() {
+        }
+        if tx.send(Ok(buf.split().freeze())).await.is_err() {
             return;
         }
     }
@@ -1720,22 +1728,39 @@ impl AsyncRead for XhttpConn {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let split = &mut *self.split;
+        if let Some(e) = split.dl_error.take() {
+            return Poll::Ready(Err(e));
+        }
+        // Fill the buffer from the chunks already queued; whatever ends the
+        // download after some data waits for the next read.
+        let mut filled = false;
         loop {
             if !split.pending.is_empty() {
                 let n = out.remaining().min(split.pending.len());
                 out.put_slice(&split.pending[..n]);
-                let _ = split.pending.split_to(n);
-                return Poll::Ready(Ok(()));
+                bytes::Buf::advance(&mut split.pending, n);
+                filled = true;
+                if out.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
             }
             match split.dl.poll_recv(cx) {
                 Poll::Ready(Some(Ok(chunk))) => {
                     if let Some(idle) = &mut split.half_closed {
                         idle.last_rx = tokio::time::Instant::now();
                     }
-                    split.pending.extend_from_slice(&chunk)
+                    split.pending = chunk;
                 }
-                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
-                Poll::Ready(None) => return Poll::Ready(Ok(())), // EOF
+                Poll::Ready(Some(Err(e))) => {
+                    if filled {
+                        split.dl_error = Some(e);
+                        return Poll::Ready(Ok(()));
+                    }
+                    return Poll::Ready(Err(e));
+                }
+                // EOF; a closed channel stays closed for the next read
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending if filled => return Poll::Ready(Ok(())),
                 Poll::Pending => {
                     let Some(idle) = &mut split.half_closed else {
                         if !split
@@ -3537,5 +3562,105 @@ mod tests {
             .expect("reset");
         drop(conn);
         server.abort();
+    }
+
+    /// A conn whose download chunks are fed by the test.
+    fn conn_with_download() -> (XhttpConn, mpsc::Sender<io::Result<Bytes>>) {
+        let mut split = SplitConn::new(&cfg(json!({"mode": "packet-up", "path": "/xhttp"})));
+        let (tx, rx) = mpsc::channel(4);
+        split.dl = rx;
+        (
+            XhttpConn {
+                split: Box::new(split),
+            },
+            tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn download_read_takes_every_queued_chunk() {
+        use tokio::io::AsyncReadExt;
+        let (mut conn, tx) = conn_with_download();
+        for chunk in [&b"abc"[..], b"defg", b"hi"] {
+            tx.send(Ok(Bytes::from_static(chunk))).await.unwrap();
+        }
+        let mut buf = [0u8; 64];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abcdefghi");
+        tx.send(Ok(Bytes::from_static(b"tail"))).await.unwrap();
+        drop(tx);
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"tail");
+        assert_eq!(conn.read(&mut buf).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn download_read_into_a_small_buffer_keeps_every_byte() {
+        use tokio::io::AsyncReadExt;
+        let (mut conn, tx) = conn_with_download();
+        for chunk in [&b"abc"[..], b"defg", b"hi"] {
+            tx.send(Ok(Bytes::from_static(chunk))).await.unwrap();
+        }
+        drop(tx);
+        let mut buf = [0u8; 2];
+        let mut reads = Vec::new();
+        loop {
+            let n = conn.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            reads.push(buf[..n].to_vec());
+        }
+        assert_eq!(reads.concat(), b"abcdefghi");
+        assert!(reads.iter().all(|r| r.len() == 2 || r == b"i"));
+    }
+
+    #[tokio::test]
+    async fn download_eof_after_queued_chunks_comes_after_the_data() {
+        use tokio::io::AsyncReadExt;
+        let (mut conn, tx) = conn_with_download();
+        tx.send(Ok(Bytes::from_static(b"one"))).await.unwrap();
+        tx.send(Ok(Bytes::from_static(b"two"))).await.unwrap();
+        drop(tx);
+        let mut buf = [0u8; 64];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"onetwo");
+        assert_eq!(conn.read(&mut buf).await.unwrap(), 0);
+        assert_eq!(conn.read(&mut buf).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn download_error_after_data_is_reported_by_the_next_read() {
+        use tokio::io::AsyncReadExt;
+        let (mut conn, tx) = conn_with_download();
+        tx.send(Ok(Bytes::from_static(b"data"))).await.unwrap();
+        tx.send(Err(io::Error::other("broken download")))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut buf = [0u8; 64];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"data");
+        let e = conn.read(&mut buf).await.unwrap_err();
+        assert_eq!(e.to_string(), "broken download");
+        assert_eq!(conn.read(&mut buf).await.unwrap(), 0);
+    }
+
+    /// Data left in a chunk by a full buffer is served before a queued error.
+    #[tokio::test]
+    async fn download_error_waits_for_the_rest_of_a_chunk() {
+        use tokio::io::AsyncReadExt;
+        let (mut conn, tx) = conn_with_download();
+        tx.send(Ok(Bytes::from_static(b"abcdef"))).await.unwrap();
+        tx.send(Err(io::Error::other("broken download")))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 4];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abcd");
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ef");
+        let e = conn.read(&mut buf).await.unwrap_err();
+        assert_eq!(e.to_string(), "broken download");
     }
 }
