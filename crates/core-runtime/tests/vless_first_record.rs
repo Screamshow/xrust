@@ -754,6 +754,48 @@ async fn interop_with_xray_as_the_server() {
         }
     }
 
+    // packet-up with the Xray 26 extras a provider's nodes carry: the
+    // session in a header, uploads as GET with the data in headers, padding
+    // in obfs mode, sized and paced uploads
+    for (label, xray_extra, ours) in [
+        (
+            "session in a header",
+            json!({"sessionIDPlacement": "header"}),
+            json!({"session_placement": "header"}),
+        ),
+        (
+            "GET uploads",
+            json!({"uplinkHTTPMethod": "GET"}),
+            json!({"uplink_http_method": "GET"}),
+        ),
+        (
+            "all extras",
+            json!({"uplinkHTTPMethod": "GET", "sessionIDPlacement": "header",
+                "xPaddingObfsMode": true, "scMaxEachPostBytes": 32768,
+                "scMinPostsIntervalMs": 30}),
+            json!({"uplink_http_method": "GET", "session_placement": "header",
+                "x_padding_obfs_mode": true, "sc_max_each_post_bytes": "32768",
+                "sc_min_posts_interval_ms": "30"}),
+        ),
+    ] {
+        let mut settings = json!({"path": "/xh", "mode": "packet-up"});
+        let mut transport = json!({"type": "xhttp", "path": "/xh", "mode": "packet-up"});
+        for (k, v) in xray_extra.as_object().unwrap() {
+            settings[k] = v.clone();
+        }
+        for (k, v) in ours.as_object().unwrap() {
+            transport[k] = v.clone();
+        }
+        cases.push((
+            format!("xhttp packet-up+tls, {label}"),
+            "",
+            json!({"network": "xhttp", "security": "tls", "tlsSettings": xray_tls(),
+                "xhttpSettings": settings}),
+            chrome.clone(),
+            Some(transport),
+        ));
+    }
+
     for (label, flow, mut stream, client_tls, transport) in cases {
         let port = free_port();
         let decoy = free_port();

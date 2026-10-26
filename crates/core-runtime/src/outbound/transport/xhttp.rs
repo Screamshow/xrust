@@ -1995,7 +1995,12 @@ impl XhttpConfig {
         seq: Option<&str>,
         has_body: bool,
     ) -> io::Result<http::Request<()>> {
-        let mut path = self.path.clone();
+        // Xray's normalized path ends with a slash, and the session and seq
+        // are appended to it (`appendToPath`): `/xh/SID/7`, or `/xh/` and
+        // `/xh/7` when the session rides in a header, query or cookie. The
+        // server only routes requests under `/xh/`, so a bare `/xh` with the
+        // session placed elsewhere was refused.
+        let mut path = self.base_path();
         let mut query: Vec<(String, String)> = Vec::new();
         let mut extra_headers: Vec<(String, String)> = Vec::new();
 
@@ -2015,10 +2020,6 @@ impl XhttpConfig {
                     extra_headers.push(("cookie".to_string(), format!("{}={}", m.session_key, sid)))
                 }
             }
-        } else if !path.ends_with('/') {
-            // stream-one: the reference client and Xray server expect the path to end
-            // with a trailing slash when matching the route.
-            path.push('/');
         }
         if let Some(seq) = seq {
             match m.seq_placement {
@@ -2100,6 +2101,15 @@ impl XhttpConfig {
         builder
             .body(())
             .map_err(|e| io::Error::other(format!("xhttp: build request: {e}")))
+    }
+
+    /// The configured path with its trailing slash, Xray's normalized path.
+    fn base_path(&self) -> String {
+        if self.path.ends_with('/') {
+            self.path.clone()
+        } else {
+            format!("{}/", self.path)
+        }
     }
 
     fn gen_padding(&self) -> String {
@@ -2636,6 +2646,29 @@ mod tests {
             req.headers().get("content-type").unwrap(),
             "application/grpc"
         );
+    }
+
+    /// Xray appends the session and seq to its normalized path, which ends
+    /// with a slash: with the session in a header, the download GET goes to
+    /// `/xh/` and an upload to `/xh/<seq>`, which is what its server routes.
+    #[test]
+    fn paths_follow_xrays_append_to_path() {
+        let path = |c: &XhttpConfig, session: Option<&str>, seq: Option<&str>| {
+            c.build_request("https", "srv:443", "POST", session, seq, false)
+                .unwrap()
+                .uri()
+                .path()
+                .to_string()
+        };
+        let plain = cfg(json!({"path": "/xh"}));
+        assert_eq!(path(&plain, Some("SID"), None), "/xh/SID");
+        assert_eq!(path(&plain, Some("SID"), Some("7")), "/xh/SID/7");
+        assert_eq!(path(&plain, None, None), "/xh/");
+        let header = cfg(json!({"path": "/xh", "session_placement": "header"}));
+        assert_eq!(path(&header, Some("SID"), None), "/xh/");
+        assert_eq!(path(&header, Some("SID"), Some("7")), "/xh/7");
+        let slash = cfg(json!({"path": "/xh/"}));
+        assert_eq!(path(&slash, Some("SID"), Some("7")), "/xh/SID/7");
     }
 
     #[test]
