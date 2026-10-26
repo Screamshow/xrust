@@ -805,6 +805,21 @@ mod ni {
         }
     }
 
+    /// Eight counter blocks `ctr..ctr+8` of `base`, already whitened with the
+    /// first round key: what [`keystream`] starts from.
+    #[inline]
+    #[target_feature(enable = "aes,pclmulqdq,sse2,sse4.1,ssse3")]
+    unsafe fn counters8(rk: &[__m128i; 16], base: __m128i, ctr: u32) -> [__m128i; 8] {
+        unsafe {
+            let mut b = [zero(); 8];
+            for (i, blk) in b.iter_mut().enumerate() {
+                let c = ctr.wrapping_add(i as u32).swap_bytes() as i32;
+                *blk = _mm_xor_si128(_mm_insert_epi32::<3>(base, c), rk[0]);
+            }
+            b
+        }
+    }
+
     /// Keystream for the 1..=8 blocks of a tail, as cheap as the count allows.
     #[inline]
     #[target_feature(enable = "aes,pclmulqdq,sse2,sse4.1,ssse3")]
@@ -963,18 +978,48 @@ mod ni {
                 let ptr = buf.as_mut_ptr();
                 let mut ctr = 2u32;
                 let mut off = 0;
+                // The ciphertext of one batch is hashed while the next batch
+                // goes through the AES rounds: the two use different execution
+                // units, and done one after the other each waits for the other.
+                let mut pending: Option<[__m128i; 8]> = None;
                 while len - off >= 128 {
-                    let ks = keystream::<8, NR>(&self.rk, base, ctr);
+                    let mut b = counters8(&self.rk, base, ctr);
                     ctr = ctr.wrapping_add(8);
+                    let mut acc = (zero(), zero(), zero());
+                    for r in 1..NR {
+                        for blk in b.iter_mut() {
+                            *blk = _mm_aesenc_si128(*blk, self.rk[r]);
+                        }
+                        if let Some(prev) = &pending
+                            && r <= 8
+                        {
+                            let j = r - 1;
+                            let v = if j == 0 {
+                                _mm_xor_si128(prev[0], x)
+                            } else {
+                                prev[j]
+                            };
+                            mul_acc(v, self.h[7 - j], &mut acc);
+                        }
+                    }
+                    for blk in b.iter_mut() {
+                        *blk = _mm_aesenclast_si128(*blk, self.rk[NR]);
+                    }
+                    if pending.is_some() {
+                        x = reduce(acc);
+                    }
                     let mut c = [zero(); 8];
                     for i in 0..8 {
                         let p = ptr.add(off + 16 * i);
-                        let v = _mm_xor_si128(load(p), ks[i]);
+                        let v = _mm_xor_si128(load(p), b[i]);
                         store(p, v);
                         c[i] = bswap(v);
                     }
-                    x = self.ghash(x, &c);
+                    pending = Some(c);
                     off += 128;
+                }
+                if let Some(prev) = &pending {
+                    x = self.ghash(x, prev);
                 }
                 if off < len {
                     let n = (len - off).div_ceil(16);
@@ -1011,18 +1056,48 @@ mod ni {
                 let ptr = buf.as_mut_ptr();
                 let mut ctr = 2u32;
                 let mut off = 0;
+                // as in `seal_n`: the previous batch is hashed during this
+                // batch's AES rounds, which leaves the GHASH chain a whole
+                // batch of slack
+                let mut pending: Option<[__m128i; 8]> = None;
                 while len - off >= 128 {
-                    let ks = keystream::<8, NR>(&self.rk, base, ctr);
+                    let mut b = counters8(&self.rk, base, ctr);
                     ctr = ctr.wrapping_add(8);
+                    let mut acc = (zero(), zero(), zero());
+                    for r in 1..NR {
+                        for blk in b.iter_mut() {
+                            *blk = _mm_aesenc_si128(*blk, self.rk[r]);
+                        }
+                        if let Some(prev) = &pending
+                            && r <= 8
+                        {
+                            let j = r - 1;
+                            let v = if j == 0 {
+                                _mm_xor_si128(prev[0], x)
+                            } else {
+                                prev[j]
+                            };
+                            mul_acc(v, self.h[7 - j], &mut acc);
+                        }
+                    }
+                    for blk in b.iter_mut() {
+                        *blk = _mm_aesenclast_si128(*blk, self.rk[NR]);
+                    }
+                    if pending.is_some() {
+                        x = reduce(acc);
+                    }
                     let mut c = [zero(); 8];
                     for i in 0..8 {
                         let p = ptr.add(off + 16 * i);
                         let v = load(p);
                         c[i] = bswap(v);
-                        store(p, _mm_xor_si128(v, ks[i]));
+                        store(p, _mm_xor_si128(v, b[i]));
                     }
-                    x = self.ghash(x, &c);
+                    pending = Some(c);
                     off += 128;
+                }
+                if let Some(prev) = &pending {
+                    x = self.ghash(x, prev);
                 }
                 if off < len {
                     // The tag covers the ciphertext, so hash before decrypting.
@@ -1113,6 +1188,38 @@ mod tests {
                 assert_eq!(buf, want_ct, "ciphertext, key {key_len} len {len}");
                 assert_eq!(tag, want_tag, "tag, key {key_len} len {len}");
 
+                assert!(gcm.open(&nonce, &aad, &mut buf, &tag), "open len {len}");
+                assert_eq!(buf, pt, "plaintext, key {key_len} len {len}");
+            }
+        }
+    }
+
+    /// The SIMD loops hash one 128-byte batch while the next one is
+    /// encrypted, so every batch count and tail length goes past the oracle.
+    #[test]
+    fn matches_rustcrypto_across_batch_boundaries() {
+        let mut seed = 23;
+        for key_len in [16usize, 32] {
+            let key = fill(&mut seed, key_len);
+            let gcm = Gcm::new(&key);
+            for round in 0..300usize {
+                let len = match round % 3 {
+                    0 => (fill(&mut seed, 2)[0] as usize) * 128,
+                    1 => (fill(&mut seed, 2)[0] as usize) * 128 + 1 + round % 127,
+                    _ => {
+                        let r = fill(&mut seed, 3);
+                        (usize::from(r[0]) << 8 | usize::from(r[1])) + usize::from(r[2]) * 4
+                    }
+                };
+                let aad_len = round % 70;
+                let nonce: [u8; 12] = fill(&mut seed, 12).try_into().unwrap();
+                let aad = fill(&mut seed, aad_len);
+                let pt = fill(&mut seed, len);
+                let (want_ct, want_tag) = reference(&key, &nonce, &aad, &pt);
+                let mut buf = pt.clone();
+                let tag = gcm.seal(&nonce, &aad, &mut buf);
+                assert_eq!(buf, want_ct, "ciphertext, key {key_len} len {len}");
+                assert_eq!(tag, want_tag, "tag, key {key_len} len {len}");
                 assert!(gcm.open(&nonce, &aad, &mut buf, &tag), "open len {len}");
                 assert_eq!(buf, pt, "plaintext, key {key_len} len {len}");
             }
