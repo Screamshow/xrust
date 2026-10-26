@@ -191,6 +191,9 @@ impl Vless {
         // TLS stream the bytes on the wire are identical either way -- only the POST
         // framing changes -- and the server parses the head out of the byte stream
         // rather than deciding where the request ends from the first packet.
+        if self.vision {
+            crate::inbound::disable_tls_read_batching(&mut stream);
+        }
         if !header[consumed..].is_empty() {
             stream.write_all(&header[consumed..]).await?;
             stream.flush().await?;

@@ -162,6 +162,18 @@ pub(crate) fn enable_vision_direct_read(stream: &mut AnyStream) -> bool {
     false
 }
 
+/// Vision decides between outer TLS records whether the next bytes are still
+/// TLS, so a read must stop after each record. Called before the first read.
+pub(crate) fn disable_tls_read_batching(stream: &mut AnyStream) {
+    let stream = (**stream).as_any_mut();
+    if let Some(alpn) = stream.downcast_mut::<AlpnStream>() {
+        return disable_tls_read_batching(&mut alpn.inner);
+    }
+    if let Some(tls) = stream.downcast_mut::<crate::tls_utls::FingerprintStream<TcpStream>>() {
+        tls.disable_read_batching();
+    }
+}
+
 /// Only the TCP fingerprint TLS wrapper exposes a compatible raw transport.
 pub(crate) fn supports_vision_direct(stream: &mut AnyStream) -> bool {
     let stream = (**stream).as_any_mut();

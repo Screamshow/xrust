@@ -50,6 +50,13 @@ pub struct FingerprintStream<S> {
     eof: bool,
     direct_read: bool,
     direct_write: bool,
+    /// Hand over every record already buffered in one read, not only the
+    /// first. Off under Vision: there the peer can stop outer TLS after any
+    /// record, and the bytes behind it must not be opened as one.
+    batch_reads: bool,
+    /// a record error met after plaintext was already handed over in the same
+    /// call, kept for the next read
+    read_error: Option<io::Error>,
 }
 
 impl<S> FingerprintStream<S> {
@@ -69,7 +76,15 @@ impl<S> FingerprintStream<S> {
             eof: false,
             direct_read: false,
             direct_write: false,
+            batch_reads: true,
+            read_error: None,
         }
+    }
+
+    /// Return from a read after one record, as Vision needs: it decides
+    /// between records whether the next bytes are still TLS.
+    pub(crate) fn disable_read_batching(&mut self) {
+        self.batch_reads = false;
     }
 
     pub fn get_ref(&self) -> &S {
@@ -85,6 +100,7 @@ impl<S> FingerprintStream<S> {
     }
 
     pub(crate) fn enable_direct_read(&mut self) {
+        self.batch_reads = false;
         self.direct_read = true;
         self.release_direct_read_buffer();
     }
@@ -119,6 +135,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let me = self.get_mut();
+        // whether this call already put plaintext into `buf`: then it returns
+        // before the socket is asked again, and an error waits for the next call
+        let mut produced = false;
+        if let Some(e) = me.read_error.take() {
+            return Poll::Ready(Err(e));
+        }
         loop {
             // plaintext the reader's buffer could not take whole
             if me.plain_at < me.plain_end {
@@ -133,6 +155,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
                     me.plain_end = 0;
                     me.record_end = 0;
                     me.release_direct_read_buffer();
+                    // A socket read holds several records. Handing over one per
+                    // call made the relay write each 16 KiB record on its own.
+                    if me.batch_reads && buf.remaining() > 0 {
+                        produced = true;
+                        continue;
+                    }
                 }
                 return Poll::Ready(Ok(()));
             }
@@ -174,7 +202,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
                     me.rpos += record_end;
                     continue;
                 }
+                Ok(None) if produced => return Poll::Ready(Ok(())),
                 Ok(None) => {}
+                // the plaintext already handed over goes out first, and the
+                // error with the next call
+                Err(e) if produced => {
+                    me.read_error = Some(e);
+                    return Poll::Ready(Ok(()));
+                }
                 Err(e) => return Poll::Ready(Err(e)),
             }
             // Read straight into the buffer's spare room: a zeroed stack array per
@@ -444,5 +479,139 @@ mod memory_tests {
         assert_eq!(rpos, 0);
         release_drained_raw(&mut raw, &mut rpos);
         assert_eq!(raw.capacity(), 0);
+    }
+}
+
+#[cfg(test)]
+mod read_batching_tests {
+    use super::*;
+    use core_tls::client::{Config, Handshake};
+    use core_tls::rustls::{RootCertStore, ServerConfig};
+    use core_tls::verify::WebpkiVerifier;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    const RECORD: usize = core_tls::record::MAX_FRAGMENT;
+
+    /// Our client over a duplex to a rustls server. The server writes three
+    /// full records, then `tail` straight onto the transport, and holds the
+    /// connection open until the returned sender fires.
+    async fn three_records_then(
+        tail: &'static [u8],
+    ) -> (
+        FingerprintStream<DuplexStream>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        core_tls::install_default_provider();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
+        let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.crt")).unwrap(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.key")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(certs[0].clone()).unwrap();
+        let verifier = WebpkiVerifier::new(Arc::new(roots)).unwrap();
+        let template = core_tls::fingerprints::by_name("chrome").unwrap();
+        let (mut client, peer) = tokio::io::duplex(4 * CHUNK);
+        let (ready_send, ready_recv) = tokio::sync::oneshot::channel();
+        let (done_send, done_recv) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+                .accept(peer)
+                .await
+                .unwrap();
+            let mut hello = [0; 2];
+            tls.read_exact(&mut hello).await.unwrap();
+            tls.write_all(&vec![0x5a; 3 * RECORD]).await.unwrap();
+            tls.flush().await.unwrap();
+            let (mut raw, _) = tls.into_inner();
+            raw.write_all(tail).await.unwrap();
+            ready_send.send(()).unwrap();
+            let _ = done_recv.await;
+        });
+        let mut handshake = Handshake::new(Config {
+            template: &template,
+            server_name: "localhost",
+            alpn: &[],
+            verifier: &verifier,
+            reality: None,
+            fragment: false,
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        handshake.run(&mut client).await.unwrap();
+        let connection = Connection::new(&mut handshake).unwrap();
+        let mut stream = FingerprintStream::new(client, connection);
+        stream.write_all(b"hi").await.unwrap();
+        (stream, ready_recv, done_send)
+    }
+
+    /// Everything the server sent is buffered before the first read, so one
+    /// read hands over all three records instead of the first one only.
+    #[tokio::test]
+    async fn one_read_hands_over_every_buffered_record() {
+        let (mut stream, ready, _done) = three_records_then(b"").await;
+        ready.await.unwrap();
+        let mut buf = vec![0; 8 * RECORD];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(n, 3 * RECORD);
+        assert!(buf[..n].iter().all(|b| *b == 0x5a));
+    }
+
+    /// Vision decides after each record whether the next bytes are still
+    /// TLS, so with batching off a read stops at the record boundary.
+    #[tokio::test]
+    async fn without_batching_a_read_stops_after_one_record() {
+        let (mut stream, ready, _done) = three_records_then(b"").await;
+        stream.disable_read_batching();
+        ready.await.unwrap();
+        let mut buf = vec![0; 8 * RECORD];
+        for _ in 0..3 {
+            assert_eq!(stream.read(&mut buf).await.unwrap(), RECORD);
+        }
+    }
+
+    /// A broken record behind good ones: the plaintext before it is handed
+    /// over first, and the error comes with the next read.
+    #[tokio::test]
+    async fn a_bad_record_after_good_ones_fails_the_next_read() {
+        const BAD: &[u8] = &[
+            0x17, 0x03, 0x03, 0x00, 0x20, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+            17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+        ];
+        let (mut stream, ready, _done) = three_records_then(BAD).await;
+        ready.await.unwrap();
+        let mut buf = vec![0; 8 * RECORD];
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 3 * RECORD);
+        let err = stream.read(&mut buf).await.expect_err("the bad record");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+    }
+
+    /// A small reader still gets whole records in order, split at its size.
+    #[tokio::test]
+    async fn a_small_reader_gets_every_byte() {
+        let (mut stream, ready, _done) = three_records_then(b"").await;
+        ready.await.unwrap();
+        let mut total = 0;
+        let mut buf = vec![0; 10_000];
+        while total < 3 * RECORD {
+            let n = stream.read(&mut buf).await.unwrap();
+            assert!(n > 0 && n <= buf.len());
+            assert!(buf[..n].iter().all(|b| *b == 0x5a));
+            total += n;
+        }
+        assert_eq!(total, 3 * RECORD);
     }
 }
