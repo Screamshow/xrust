@@ -1485,6 +1485,10 @@ impl Stack {
         // one as before and leave in batches, one syscall per batch rather
         // than per datagram. The datagrams and their order are unchanged.
         let mut outbox = std::mem::take(&mut self.outbox);
+        // one wait budget for the whole flush: the stack task also reads the
+        // sockets and runs the timers, so a full send buffer must not hold it
+        // for longer than this however many batches there are
+        let deadline = tokio::time::Instant::now() + SEND_WAIT;
         while let Some(pkt) = self.device.tx.pop_front() {
             let pkt = match ip_dst(&pkt).and_then(|dst| self.lpm(dst)) {
                 Some(pi) => self.xmit_to_peer_into(pi, pkt, Some(&mut outbox)),
@@ -1496,15 +1500,19 @@ impl Stack {
                 self.device.free.get_mut().push(pkt);
             }
             if outbox.len() >= SEND_BATCH {
-                self.send_outbox(&mut outbox).await;
+                self.send_outbox(&mut outbox, deadline).await;
             }
         }
-        self.send_outbox(&mut outbox).await;
+        self.send_outbox(&mut outbox, deadline).await;
         self.outbox = outbox;
     }
 
     /// Send and empty `outbox`, in order, one socket family run at a time.
-    async fn send_outbox(&mut self, outbox: &mut Vec<(SocketAddr, Vec<u8>)>) {
+    async fn send_outbox(
+        &mut self,
+        outbox: &mut Vec<(SocketAddr, Vec<u8>)>,
+        deadline: tokio::time::Instant,
+    ) {
         let mut start = 0;
         while start < outbox.len() {
             let v6 = outbox[start].0.is_ipv6();
@@ -1518,7 +1526,9 @@ impl Stack {
                 Some(&*self.sock)
             };
             match sock {
-                Some(sock) => send_datagrams(sock, &outbox[start..end], &self.cfg.tag).await,
+                Some(sock) => {
+                    send_datagrams(sock, &outbox[start..end], &self.cfg.tag, deadline).await
+                }
                 None => logging::debug(format_args!(
                     "wireguard[{}]: no ipv6 socket for {}",
                     self.cfg.tag, outbox[start].0
@@ -1930,15 +1940,20 @@ async fn run(
 /// Largest number of datagrams handed to the kernel in one call.
 const SEND_BATCH: usize = 64;
 
-/// How long a full socket send buffer may hold up the rest of a batch before
-/// it is dropped.
+/// How long a full socket send buffer may hold up the rest of one device
+/// flush before it is dropped.
 const SEND_WAIT: Duration = Duration::from_millis(50);
 
 /// Send `items` in order. When the socket's send buffer is full the rest
-/// waits for it to drain, as a blocking write in the reference waits; only
-/// if it stays full for [`SEND_WAIT`] is the rest dropped. Any other error
-/// skips just that datagram.
-async fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str) {
+/// waits for it to drain, as a blocking write in the reference waits; once
+/// `deadline` passes the rest is dropped. Any other error skips just that
+/// datagram.
+async fn send_datagrams(
+    sock: &UdpSocket,
+    items: &[(SocketAddr, Vec<u8>)],
+    tag: &str,
+    deadline: tokio::time::Instant,
+) {
     let mut sent = 0;
     while sent < items.len() {
         let chunk = &items[sent..items.len().min(sent + SEND_BATCH)];
@@ -1946,7 +1961,7 @@ async fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: 
             Ok(n) => sent += n.max(1),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 if !matches!(
-                    tokio::time::timeout(SEND_WAIT, sock.writable()).await,
+                    tokio::time::timeout_at(deadline, sock.writable()).await,
                     Ok(Ok(()))
                 ) {
                     return;
@@ -1985,7 +2000,9 @@ fn send_some(sock: &UdpSocket, chunk: &[(SocketAddr, Vec<u8>)]) -> io::Result<us
     for (i, hdr) in hdrs.iter_mut().enumerate() {
         hdr.msg_hdr.msg_name = addrs[i].as_ptr() as *mut libc::c_void;
         hdr.msg_hdr.msg_namelen = addrs[i].len();
-        hdr.msg_hdr.msg_iov = &mut iovs[i];
+        // a raw pointer per element: indexing would reborrow the whole slice
+        // and invalidate the pointers already taken
+        hdr.msg_hdr.msg_iov = unsafe { iovs.as_mut_ptr().add(i) };
         hdr.msg_hdr.msg_iovlen = 1;
     }
     let fd = sock.as_raw_fd();
@@ -2522,7 +2539,8 @@ mod batch_send_tests {
             .collect();
         // a fresh socket learns it is writable from the reactor first
         tx.writable().await.unwrap();
-        send_datagrams(&tx, &items, "test").await;
+        let deadline = tokio::time::Instant::now() + SEND_WAIT;
+        send_datagrams(&tx, &items, "test", deadline).await;
         let mut buf = vec![0u8; 2048];
         for (i, (_, want)) in items.iter().enumerate() {
             let (n, from) =
