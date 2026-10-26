@@ -60,6 +60,51 @@ pub(crate) fn size_network_udp_buffers(sock: socket2::SockRef<'_>) {
     }
 }
 
+/// Size of the client's first-flight datagrams in the quic-go based
+/// reference clients (hysteria2, sing-box, Xray: Chrome's 1250 bytes).
+/// quinn otherwise uses 1200.
+pub(crate) const QUIC_GO_INITIAL_MTU: u16 = 1250;
+/// Length of the Destination Connection ID in a quic-go client's first
+/// Initial (quinn otherwise picks 20 bytes).
+const QUIC_GO_INITIAL_DCID_LEN: usize = 8;
+
+/// Zero-length Source Connection IDs, as the reference clients use. Safe
+/// here because every hysteria2 connection has its own endpoint and socket:
+/// quinn then routes incoming packets by the remote address, which the hop
+/// relay keeps fixed while the server port changes.
+struct ZeroLengthCid;
+
+impl quinn::ConnectionIdGenerator for ZeroLengthCid {
+    fn generate_cid(&mut self) -> quinn::ConnectionId {
+        quinn::ConnectionId::new(&[])
+    }
+
+    fn cid_len(&self) -> usize {
+        0
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        None
+    }
+}
+
+/// Shape a one-connection client endpoint's handshake like quic-go's: an
+/// 8-byte random Initial DCID, zero-length SCIDs, and no address
+/// validation token carried over from an earlier connection (quic-go sets
+/// no token store).
+pub(crate) fn quic_go_client_shape(
+    endpoint: &mut quinn::EndpointConfig,
+    client: &mut quinn::ClientConfig,
+) {
+    endpoint.cid_generator(|| Box::new(ZeroLengthCid));
+    client.initial_dst_cid_provider(Arc::new(|| {
+        let mut cid = [0u8; QUIC_GO_INITIAL_DCID_LEN];
+        let _ = random_bytes(&mut cid);
+        quinn::ConnectionId::new(&cid)
+    }));
+    client.token_store(Arc::new(quinn::NoneTokenStore));
+}
+
 /// Pool bounds for the per-outbound QUIC connection pool: one shared QUIC
 /// connection serializes every stream through a single quinn driver task and
 /// one UDP socket, which loses to the reference at 8 streams.
@@ -202,9 +247,7 @@ impl QuicTunnelOptions {
         if let Some(v) = uni_streams {
             transport.max_concurrent_uni_streams(VarInt::from_u64(v).unwrap_or(VarInt::MAX));
         }
-        if let Some(size) = self.initial_packet_size {
-            transport.initial_mtu(size);
-        }
+        transport.initial_mtu(self.initial_packet_size.unwrap_or(QUIC_GO_INITIAL_MTU));
         if self.disable_path_mtu_discovery {
             transport.mtu_discovery_config(None);
         }

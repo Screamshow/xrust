@@ -17,8 +17,8 @@ use crate::outbound::quic::{
     CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN,
     PoolLease, QuicStream, QuicTunnelDefaults, QuicTunnelOptions, SalamanderRelay, VarintReader,
     bind_udp, bind_udp_loopback, dest_string, io_from_datagram, io_from_quinn,
-    pick_port_from_ranges, put_varint, random_padding, read_varint, resolve_host, spawn_hop_relay,
-    udp_loopback_pair,
+    pick_port_from_ranges, put_varint, quic_go_client_shape, random_padding, read_varint,
+    resolve_host, spawn_hop_relay, udp_loopback_pair,
 };
 use crate::outbound::urltest::parse_duration;
 use crate::tls_client::TlsOptions;
@@ -239,9 +239,13 @@ impl Hysteria2 {
         } else {
             bind_udp(addr)?
         };
-        let (ep_config, transport) =
+        let (mut ep_config, transport) =
             self.quic
                 .build_configs(CongestionKind::Bbr, None, self.want_udp);
+        let quic_tls = self.tls.quic_config(&[b"h3"])?;
+        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
+        client_config.transport_config(Arc::new(transport));
+        quic_go_client_shape(&mut ep_config, &mut client_config);
         let mut endpoint = quinn::Endpoint::new(
             ep_config,
             None,
@@ -249,9 +253,6 @@ impl Hysteria2 {
             quinn::default_runtime()
                 .ok_or_else(|| io::Error::other("hysteria2: no quinn runtime"))?,
         )?;
-        let quic_tls = self.tls.quic_config(&[b"h3"])?;
-        let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
-        client_config.transport_config(Arc::new(transport));
         endpoint.set_default_client_config(client_config);
 
         let relay = if need_relay {
@@ -789,6 +790,48 @@ mod tests {
                 Some(b"obfs-test".as_slice())
             );
         }
+    }
+
+    /// The first Initial is shaped like a quic-go client's: a 1250-byte
+    /// datagram, an 8-byte DCID, a zero-length SCID and no token; the rest
+    /// of the first flight keeps the same zero-length SCID.
+    #[tokio::test]
+    async fn first_initial_has_quic_go_shape() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let cfg = serde_json::json!({
+            "server": "127.0.0.1", "server_port": server.local_addr().unwrap().port(),
+            "password": "test", "tls": {"enabled": true, "insecure": true}
+        });
+        let outbound = Arc::new(Hysteria2::build(cfg.as_object().unwrap(), "test").unwrap());
+        let dial = tokio::spawn({
+            let outbound = Arc::clone(&outbound);
+            async move {
+                let _ = outbound.dial().await;
+            }
+        });
+        let mut dcids = Vec::new();
+        let mut buf = [0u8; 2048];
+        for i in 0..2 {
+            let n = tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buf))
+                .await
+                .expect("Initial datagram")
+                .unwrap();
+            let dg = &buf[..n];
+            assert_eq!(dg[0] & 0xf0, 0xc0, "long header Initial");
+            assert_eq!(&dg[1..5], &[0, 0, 0, 1], "QUIC v1");
+            let dcid_len = dg[5] as usize;
+            assert_eq!(dcid_len, 8, "DCID length");
+            dcids.push(dg[6..6 + dcid_len].to_vec());
+            assert_eq!(dg[6 + dcid_len], 0, "zero-length SCID");
+            assert_eq!(dg[7 + dcid_len], 0, "no token");
+            if i == 0 {
+                assert_eq!(n, 1250, "first Initial datagram size");
+            } else {
+                assert!(n >= 1200, "padded Initial datagram, got {n}");
+            }
+        }
+        assert_eq!(dcids[0], dcids[1], "one connection");
+        dial.abort();
     }
 
     #[test]
