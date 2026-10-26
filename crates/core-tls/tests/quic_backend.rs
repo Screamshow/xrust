@@ -313,3 +313,146 @@ fn in_memory_client_server_handshake() {
     assert!(!server.is_handshaking(), "server handshake complete");
     assert!(!client.is_handshaking(), "client handshake complete");
 }
+
+/// Extensions of a ClientHello (`type == 1`) or ServerHello (`type == 2`)
+/// handshake message as `(type, body)` pairs.
+fn hello_extensions(msg: &[u8]) -> Vec<(u16, &[u8])> {
+    let typ = msg[0];
+    let mut p = 4 + 2 + 32; // header, legacy_version, random
+    p += 1 + msg[p] as usize; // session id
+    if typ == 1 {
+        p += 2 + u16::from_be_bytes([msg[p], msg[p + 1]]) as usize; // suites
+        p += 1 + msg[p] as usize; // compression methods
+    } else {
+        p += 2 + 1; // suite, compression method
+    }
+    let end = p + 2 + u16::from_be_bytes([msg[p], msg[p + 1]]) as usize;
+    p += 2;
+    let mut out = Vec::new();
+    while p < end {
+        let typ = u16::from_be_bytes([msg[p], msg[p + 1]]);
+        let len = u16::from_be_bytes([msg[p + 2], msg[p + 3]]) as usize;
+        out.push((typ, &msg[p + 4..p + 4 + len]));
+        p += 4 + len;
+    }
+    out
+}
+
+fn extension<'a>(exts: &[(u16, &'a [u8])], typ: u16) -> &'a [u8] {
+    exts.iter()
+        .find(|(t, _)| *t == typ)
+        .map(|(_, body)| *body)
+        .unwrap_or_else(|| panic!("extension {typ:#06x} present"))
+}
+
+/// `key_share` entries of a ClientHello as `(group, share length)`.
+fn client_key_shares(body: &[u8]) -> Vec<(u16, usize)> {
+    let mut shares = Vec::new();
+    let mut p = 2;
+    while p < body.len() {
+        let group = u16::from_be_bytes([body[p], body[p + 1]]);
+        let len = u16::from_be_bytes([body[p + 2], body[p + 3]]) as usize;
+        shares.push((group, len));
+        p += 4 + len;
+    }
+    shares
+}
+
+/// TLS 1.3 HelloRetryRequest marker (RFC 8446 §4.1.3).
+const HRR_RANDOM: [u8; 8] = [0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11];
+
+/// Run a QUIC handshake with `server_crypto`; return the ClientHello and the
+/// server's first handshake message.
+fn quic_handshake(server_crypto: Arc<QuicServerConfig>) -> (Vec<u8>, Vec<u8>) {
+    let client_crypto = Arc::new(QuicClientConfig::new(Arc::new(AcceptAny)));
+    let params = default_params();
+    let mut client = client_crypto
+        .start_session(0x0000_0001, "localhost", &params)
+        .expect("client session");
+    let mut server = server_crypto.start_session(0x0000_0001, &params);
+
+    let flight1 = drain_write(client.as_mut());
+    feed_levels(server.as_mut(), &flight1);
+    let flight2 = drain_write(server.as_mut());
+    feed_levels(client.as_mut(), &flight2);
+    let flight3 = drain_write(client.as_mut());
+    feed_levels(server.as_mut(), &flight3);
+    let _ = drain_write(server.as_mut());
+    assert!(!server.is_handshaking(), "server handshake complete");
+    assert!(!client.is_handshaking(), "client handshake complete");
+    (flight1.concat(), flight2[0].clone())
+}
+
+/// The QUIC hello offers X25519MLKEM768 first with its 1216-byte share,
+/// then the X25519 component share, like Go's crypto/tls; a rustls server
+/// with the same provider picks the hybrid group.
+#[test]
+fn quic_hello_offers_hybrid_mlkem_then_x25519() {
+    let groups: Vec<_> = configured_provider()
+        .kx_groups
+        .iter()
+        .map(|g| u16::from(g.name()))
+        .collect();
+    assert_eq!(groups, [0x11ec, 0x001d, 0x0017, 0x0018]);
+
+    let (certs, key) = load_certs();
+    let server_crypto = Arc::new(QuicServerConfig::new(certs, key).expect("server config"));
+    let (hello, server_hello) = quic_handshake(server_crypto);
+
+    let exts = hello_extensions(&hello);
+    let supported = extension(&exts, 0x000a);
+    let offered: Vec<u16> = supported[2..]
+        .chunks(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(offered, [0x11ec, 0x001d, 0x0017, 0x0018]);
+    assert_eq!(
+        client_key_shares(extension(&exts, 0x0033)),
+        [(0x11ec, 1184 + 32), (0x001d, 32)]
+    );
+    assert!(
+        exts.iter().all(|(t, _)| *t != 0x0029 && *t != 0x002a),
+        "no pre_shared_key / early_data in a fresh hello"
+    );
+
+    assert_eq!(server_hello[0], 2, "ServerHello");
+    assert_ne!(&server_hello[6..14], &HRR_RANDOM, "no HelloRetryRequest");
+    let share = extension(&hello_extensions(&server_hello), 0x0033);
+    assert_eq!(u16::from_be_bytes([share[0], share[1]]), 0x11ec);
+    assert_eq!(
+        u16::from_be_bytes([share[2], share[3]]) as usize,
+        1088 + 32,
+        "ML-KEM ciphertext then X25519 share"
+    );
+}
+
+/// A server without ML-KEM selects the X25519 component share directly:
+/// no HelloRetryRequest, and the handshake completes on X25519.
+#[test]
+fn quic_hello_falls_back_to_x25519_component_without_retry() {
+    let base = core_crypto::provider();
+    let provider = rustls::crypto::CryptoProvider {
+        kx_groups: base
+            .kx_groups
+            .iter()
+            .copied()
+            .filter(|g| g.name() == rustls::NamedGroup::X25519)
+            .collect(),
+        ..base
+    };
+    let (certs, key) = load_certs();
+    let server = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("server cert");
+    let server_crypto = Arc::new(QuicServerConfig::try_from(server).expect("quic server"));
+    let (_, server_hello) = quic_handshake(server_crypto);
+
+    assert_eq!(server_hello[0], 2, "ServerHello");
+    assert_ne!(&server_hello[6..14], &HRR_RANDOM, "no HelloRetryRequest");
+    let share = extension(&hello_extensions(&server_hello), 0x0033);
+    assert_eq!(u16::from_be_bytes([share[0], share[1]]), 0x001d);
+    assert_eq!(u16::from_be_bytes([share[2], share[3]]), 32);
+}

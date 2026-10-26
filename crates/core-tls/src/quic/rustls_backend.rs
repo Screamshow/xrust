@@ -589,9 +589,10 @@ pub fn initial_suite_from_provider(
         })
 }
 
-/// The pure-Rust provider (`core-crypto`) with QUIC-capable suites.
+/// The pure-Rust provider (`core-crypto`) with QUIC-capable suites and the
+/// QUIC key exchange groups (X25519MLKEM768 first, like quic-go clients).
 pub fn configured_provider() -> Arc<rustls::crypto::CryptoProvider> {
-    Arc::new(core_crypto::provider())
+    Arc::new(core_crypto::quic_provider())
 }
 
 fn to_vec(params: &TransportParameters) -> Vec<u8> {

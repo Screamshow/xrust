@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use crypto::{SharedSecret, SupportedKxGroup};
 use ml_kem::EncodedSizeUser;
-use ml_kem::kem::Decapsulate;
+use ml_kem::kem::{Decapsulate, Encapsulate, EncapsulationKey};
 use paste::paste;
 use rustls::crypto;
 
@@ -150,6 +150,51 @@ impl crypto::SupportedKxGroup for X25519MLKEM768 {
         }))
     }
 
+    /// Server side: encapsulate to the client's ML-KEM key and run X25519
+    /// against its classical half. The default `start` + `complete` would
+    /// decapsulate instead, which only the key's owner can do.
+    fn start_and_complete(
+        &self,
+        peer: &[u8],
+    ) -> Result<crypto::CompletedKeyExchange, rustls::Error> {
+        if peer.len() != MLKEM768_EK_LEN + X25519_LEN {
+            return Err(invalid_key_share());
+        }
+        let ek_bytes: [u8; MLKEM768_EK_LEN] = peer[..MLKEM768_EK_LEN]
+            .try_into()
+            .map_err(|_| invalid_key_share())?;
+        let ek_raw: ml_kem::Encoded<EncapsulationKey<ml_kem::MlKem768Params>> = ek_bytes.into();
+        let ek = EncapsulationKey::<ml_kem::MlKem768Params>::from_bytes(&ek_raw);
+        // FIPS 203 §7.2 modulus check: every coefficient must already be
+        // reduced, so decoding and re-encoding gives the same bytes.
+        if ek.as_bytes() != ek_raw {
+            return Err(invalid_key_share());
+        }
+        let (ct, pq_secret) = ek
+            .encapsulate(&mut rand_core::OsRng)
+            .map_err(|()| invalid_key_share())?;
+        let x_peer: [u8; X25519_LEN] = peer[MLKEM768_EK_LEN..]
+            .try_into()
+            .map_err(|_| invalid_key_share())?;
+        let x_priv = x25519_dalek::EphemeralSecret::random_from_rng(rand_core::OsRng);
+        let x_pub = x25519_dalek::PublicKey::from(&x_priv);
+        let x_secret = x_priv.diffie_hellman(&x_peer.into());
+        if !x_secret.was_contributory() {
+            return Err(invalid_key_share());
+        }
+        let mut pub_key = Vec::with_capacity(MLKEM768_CT_LEN + X25519_LEN);
+        pub_key.extend_from_slice(ct.as_slice());
+        pub_key.extend_from_slice(x_pub.as_bytes());
+        let mut secret = Vec::with_capacity(64);
+        secret.extend_from_slice(pq_secret.as_slice());
+        secret.extend_from_slice(x_secret.as_ref());
+        Ok(crypto::CompletedKeyExchange {
+            group: rustls::NamedGroup::X25519MLKEM768,
+            pub_key,
+            secret: secret.into(),
+        })
+    }
+
     fn usable_for_version(&self, version: rustls::ProtocolVersion) -> bool {
         version == rustls::ProtocolVersion::TLSv1_3
     }
@@ -218,10 +263,17 @@ impl crypto::ActiveKeyExchange for X25519MLKEM768KeyExchange {
 
 pub const ALL_KX_GROUPS: &[&dyn SupportedKxGroup] = &[&X25519, &SecP256R1, &SecP384R1];
 
+/// Groups for QUIC handshakes (hysteria2, DoQ/DoH3): what Go's crypto/tls
+/// offers, which every quic-go based reference client uses. The hybrid group
+/// comes first, so the hello carries its 1216-byte share followed by the
+/// X25519 component share; a server without ML-KEM picks the X25519 share
+/// without a HelloRetryRequest.
+pub const QUIC_KX_GROUPS: &[&dyn SupportedKxGroup] =
+    &[&X25519MLKEM768, &X25519, &SecP256R1, &SecP384R1];
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ml_kem::kem::{Encapsulate, EncapsulationKey};
     use ml_kem::{Encoded, MlKem768Params};
 
     #[test]
@@ -262,6 +314,32 @@ mod tests {
         // Malformed peer shares are rejected, not panics.
         let kx2 = group.start().expect("start");
         assert!(kx2.complete(&server_share[..10]).is_err());
+    }
+
+    /// Both halves through rustls's API: the server encapsulates with
+    /// `start_and_complete`, the client decapsulates; both get one secret.
+    #[test]
+    fn x25519mlkem768_server_side_agrees_with_client() {
+        let group = X25519MLKEM768;
+        let client = group.start().expect("start");
+        let client_share = client.pub_key().to_vec();
+        let server = group.start_and_complete(&client_share).expect("server");
+        assert_eq!(server.group, rustls::NamedGroup::X25519MLKEM768);
+        assert_eq!(server.pub_key.len(), MLKEM768_CT_LEN + X25519_LEN);
+        let client_secret = client.complete(&server.pub_key).expect("client");
+        assert_eq!(client_secret.secret_bytes(), server.secret.secret_bytes());
+        assert_eq!(client_secret.secret_bytes().len(), 64);
+
+        // Wrong length, an unreduced ML-KEM coefficient, and a
+        // non-contributory X25519 half are refused.
+        assert!(group.start_and_complete(&client_share[..100]).is_err());
+        let mut unreduced = client_share.clone();
+        unreduced[0] = 0xff;
+        unreduced[1] |= 0x0f; // first 12-bit coefficient = 0xfff >= q
+        assert!(group.start_and_complete(&unreduced).is_err());
+        let mut zero_x = client_share;
+        zero_x[MLKEM768_EK_LEN..].fill(0);
+        assert!(group.start_and_complete(&zero_x).is_err());
     }
 
     #[test]

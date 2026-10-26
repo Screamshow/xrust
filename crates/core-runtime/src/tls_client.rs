@@ -596,8 +596,8 @@ impl TlsOptions {
         Ok(config)
     }
 
-    /// QUIC client config for quinn (hysteria2 / tuic): TLS 1.3 only, early
-    /// data on, ALPN from `tls.alpn` or `default_alpn`.
+    /// QUIC client config for quinn (hysteria2, DoQ/DoH3): TLS 1.3 only, no
+    /// session resumption, ALPN from `tls.alpn` or `default_alpn`.
     pub fn quic_config(
         &self,
         default_alpn: &[&[u8]],
@@ -610,7 +610,7 @@ impl TlsOptions {
                 .filter_map(|s| core_crypto::resolve_cipher_suite(s))
                 .collect();
             if !suites.is_empty() {
-                Arc::new(core_crypto::provider_with_suites(suites))
+                Arc::new(core_crypto::quic_provider_with_suites(suites))
             } else {
                 core_tls::quic::configured_provider()
             }
@@ -635,7 +635,11 @@ impl TlsOptions {
         } else {
             config.alpn_protocols = default_alpn.iter().map(|a| a.to_vec()).collect();
         }
-        config.enable_early_data = true;
+        // quic-go based clients (hysteria2, sing-box, Xray) set no session
+        // cache: every hello is a full handshake with both key shares. A
+        // rustls ticket would add pre_shared_key/early_data, and its key
+        // exchange hint would shrink key_share to the group used last time.
+        config.resumption = rustls::client::Resumption::disabled();
         core_tls::quic::QuicClientConfig::try_from_rustls(Arc::new(config))
             .map_err(|e| io::Error::other(format!("QUIC initial suite: {e}")))
     }

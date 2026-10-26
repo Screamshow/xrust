@@ -181,6 +181,20 @@ pub fn provider_with_suites(cipher_suites: Vec<SupportedCipherSuite>) -> CryptoP
     }
 }
 
+/// [`provider`] with the QUIC key exchange groups: X25519MLKEM768 first,
+/// then X25519, P-256 and P-384, as Go's crypto/tls offers them.
+pub fn quic_provider() -> CryptoProvider {
+    quic_provider_with_suites(ALL_CIPHER_SUITES.to_vec())
+}
+
+/// [`provider_with_suites`] with the QUIC key exchange groups.
+pub fn quic_provider_with_suites(cipher_suites: Vec<SupportedCipherSuite>) -> CryptoProvider {
+    CryptoProvider {
+        kx_groups: kx::QUIC_KX_GROUPS.to_vec(),
+        ..provider_with_suites(cipher_suites)
+    }
+}
+
 pub fn resolve_cipher_suite(name: &str) -> Option<SupportedCipherSuite> {
     match name {
         "TLS_AES_128_GCM_SHA256" => Some(TLS13_AES_128_GCM_SHA256),
