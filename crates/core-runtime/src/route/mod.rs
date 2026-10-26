@@ -37,7 +37,7 @@ use crate::outbound::direct::Direct;
 use crate::outbound::hysteria2::Hysteria2;
 use crate::outbound::masque::Masque;
 use crate::outbound::proxy::{HttpOut, Selector};
-use crate::outbound::secure::Vless;
+use crate::outbound::secure::{Trojan, Vless};
 use crate::outbound::tailscale::Tailscale;
 use crate::outbound::urltest::Urltest;
 use crate::outbound::wireguard::WireGuard;
@@ -239,6 +239,7 @@ pub enum Outbound {
     Block(Block),
     Http(HttpOut),
     Vless(Vless),
+    Trojan(Trojan),
     Hysteria2(Hysteria2),
     Masque(Masque),
     WireGuard(WireGuard),
@@ -261,6 +262,7 @@ impl Outbound {
                 .map(|s| Conn::Plain(Box::new(s))),
             Outbound::Http(http) => http.connect(target).await.map(Conn::Plain),
             Outbound::Vless(vless) => vless.connect(target).await.map(Conn::Plain),
+            Outbound::Trojan(trojan) => trojan.connect(target).await.map(Conn::Plain),
             Outbound::Hysteria2(hy2) => hy2.connect(target).await.map(Conn::Plain),
             Outbound::Masque(masque) => masque.connect(target).await.map(Conn::Plain),
             Outbound::WireGuard(wg) => wg.connect(target).await.map(Conn::Plain),
@@ -282,6 +284,7 @@ impl Outbound {
             Outbound::Hysteria2(hy2) => hy2.connect_udp(target).await,
             Outbound::Masque(masque) => masque.connect_udp(target).await,
             Outbound::Vless(vless) => vless.connect_udp(target).await,
+            Outbound::Trojan(trojan) => trojan.connect_udp(target).await,
             Outbound::WireGuard(wg) => wg.connect_udp(target).await,
             Outbound::Block(_) => Err(io::Error::new(
                 io::ErrorKind::ConnectionRefused,
@@ -312,6 +315,7 @@ impl Outbound {
         match self {
             Outbound::Direct(d) => apply(&mut d.dial),
             Outbound::Vless(v) => apply(&mut v.dial),
+            Outbound::Trojan(t) => apply(&mut t.dial),
             Outbound::Http(h) => apply(&mut h.dial),
             _ => {}
         }
@@ -330,6 +334,7 @@ impl Outbound {
             "block" => Ok(Outbound::Block(Block)),
             "http" => Ok(Outbound::Http(HttpOut::build(obj, at)?)),
             "vless" => Ok(Outbound::Vless(Vless::build(obj, at)?)),
+            "trojan" => Ok(Outbound::Trojan(Trojan::build(obj, at)?)),
             "hysteria2" => Ok(Outbound::Hysteria2(Hysteria2::build(obj, at)?)),
             "masque" => Ok(Outbound::Masque(Masque::build(obj, at)?)),
             "urltest" => Ok(Outbound::Urltest(Urltest::build(obj, at)?)),

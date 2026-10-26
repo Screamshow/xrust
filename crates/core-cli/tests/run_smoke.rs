@@ -190,10 +190,12 @@ fn version_as_sing_box_is_the_block_forkop_parses() {
         format!("sing-box version 1.14.2-rust-x.{version}"),
         "{said}"
     );
+    // Forkop X turns features on by these tokens: the order is kept and new
+    // ones go at the end
     assert!(
-        lines
-            .iter()
-            .any(|l| l.starts_with("Features:") && l.contains("transport.xhttp")),
+        lines.contains(
+            &"Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,outbound.trojan"
+        ),
         "{said}"
     );
     assert!(lines.iter().any(|l| l.starts_with("Tags:")), "{said}");

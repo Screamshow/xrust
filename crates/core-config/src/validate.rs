@@ -4297,7 +4297,6 @@ pub fn validate(root: &Value) -> Result<(), String> {
                         ty,
                         "naive"
                             | "vmess"
-                            | "trojan"
                             | "shadowsocks"
                             | "tuic"
                             | "anytls"
@@ -4306,7 +4305,9 @@ pub fn validate(root: &Value) -> Result<(), String> {
                             | "fptn"
                             | "openvpn"
                             | "openvpn-client"
-                    ) || (section == "outbounds" && ty == "socks");
+                    ) || (section == "outbounds" && ty == "socks")
+                        // the trojan client is in; a trojan server is not
+                        || (section != "outbounds" && ty == "trojan");
                     if removed {
                         return Err(format!(
                             "{section}[{i}]: protocol {ty:?} is excluded from Rust X"
@@ -6123,6 +6124,26 @@ fn validate_vless_encryption(i: usize, obj: &Map<String, Value>) -> Result<(), S
     ))
 }
 
+/// What the trojan client builds with: TLS on, and no `multiplex`. The
+/// reference would dial a plain trojan or mux its streams; ours would refuse to
+/// connect or ignore the option, so both are refused at check time instead.
+fn validate_trojan_client(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
+    if obj
+        .get("multiplex")
+        .and_then(|m| m.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Err(format!(
+            "outbounds[{i}].multiplex: multiplex is not supported on the trojan outbound"
+        ));
+    }
+    if !tls_enabled(obj.get("tls")) {
+        return Err(format!("outbounds[{i}]: trojan requires TLS"));
+    }
+    Ok(())
+}
+
 fn validate_anytls_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     // reference stage-2 prune runs deep: empty containers behave as absent.
@@ -7607,6 +7628,9 @@ fn validate_outbound(
             validate_plain_out_decode(i, ty, tag, obj)?;
             if ty == "vless" {
                 validate_vless_encryption(i, obj)?;
+            }
+            if ty == "trojan" {
+                validate_trojan_client(i, obj)?;
             }
         }
         "direct" => validate_direct_out_decode(i, tag, obj)?,

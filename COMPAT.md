@@ -8,9 +8,10 @@
 > schema policy, not of the implementation. Fixing it properly means walking
 > every field of every option against the code, which is its own piece of work.
 
-> Naive, VMess, Trojan, Shadowsocks, TUIC, AnyTLS, Snell, ShadowTLS, FPTN,
-> outbound SOCKS and OpenVPN were removed from the core; `check` rejects them
-> (see `docs/RUST-X.md`). Rows that describe them are historical.
+> Naive, VMess, Shadowsocks, TUIC, AnyTLS, Snell, ShadowTLS, FPTN, outbound
+> SOCKS, OpenVPN and the Trojan inbound were removed from the core; `check`
+> rejects them (see `docs/RUST-X.md`). Rows that describe them are historical.
+> The Trojan outbound is supported.
 
 Goal: **full schema compatibility** with sing-box (Leadaxe/sing-box-lx feature set).
 Policy: the reference `check` decodes strictly — unknown fields anywhere are
@@ -67,7 +68,8 @@ Status legend: `planned` · `partial` · `done` · `divergent` (documented diffe
 |---|---|---|
 | `direct`, `selector`, `urltest`, `block`, `dns` | planned | urltest `mode: round_robin` (lx) |
 | `socks`, `http`, `shadowsocks` | planned | |
-| `vmess`, `vless`, `trojan` | planned | |
+| `vless` | planned | |
+| `trojan` | runtime interop green (TCP and UDP vs ref sing-box over TLS, uTLS, REALITY, ws, gRPC, HTTPUpgrade) | TLS required, no `multiplex`; `tests/trojan.rs` |
 | `hysteria2`, `tuic` | runtime interop green (quinn dial vs ref sing-box over SOCKS5 TCP; hy2 ALPN `h3`, tuic ALPN empty + EKM auth; check-parity full field allowlists) | ring-free QUIC crypto (`core-crypto` + `core-tls::quic`); outbound dial in `core-runtime/outbound/{quic,hysteria2,tuic}.rs`; `hy2_interop` SING_BOX_REF-gated |
 | `wireguard` (+ AWG 2/3 fields) | planned | lx/extended schema at endpoint root |
 | `xhttp` transport | planned | lx `with_xhttp` |

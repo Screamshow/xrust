@@ -1,0 +1,164 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "udp",
+        "tag": "u",
+        "server": "1.1.1.1"
+      }
+    ],
+    "final": "u"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "trojan",
+      "tag": "trojan-tls",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "hunter2",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "alpn": [
+          "h2",
+          "http/1.1"
+        ]
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-utls",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "hunter2",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "insecure": true,
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-reality",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "hunter2",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0",
+          "short_id": "0123abcd"
+        }
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-ws",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "hunter2",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/ws",
+        "headers": {
+          "Host": "example.com"
+        }
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-grpc",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "hunter2",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        }
+      },
+      "transport": {
+        "type": "grpc",
+        "service_name": "svc"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-httpupgrade",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "hunter2",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com"
+      },
+      "transport": {
+        "type": "httpupgrade",
+        "path": "/up",
+        "host": "example.com"
+      }
+    },
+    {
+      "type": "trojan",
+      "tag": "trojan-h2",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "hunter2",
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com"
+      },
+      "transport": {
+        "type": "http",
+        "path": "/h2",
+        "host": [
+          "example.com"
+        ]
+      }
+    },
+    {
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": [
+        "trojan-tls",
+        "trojan-reality",
+        "trojan-ws"
+      ]
+    }
+  ],
+  "route": {
+    "final": "auto",
+    "default_domain_resolver": "u"
+  }
+}

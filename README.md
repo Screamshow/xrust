@@ -4,6 +4,10 @@
 пакетной (`--no-default-features --features rust-x`). Числа и возможности в
 унаследованной документации ниже относятся к upstream, если не указано иначе.
 
+Исходящие протоколы профиля: VLESS (с Vision), Trojan (только клиент),
+Hysteria2, WireGuard/AmneziaWG, MASQUE, Tailscale и HTTP; транспорты и
+TLS/uTLS/REALITY общие для VLESS и Trojan.
+
 Поддерживаемые платформы: **OpenWrt x86_64 и aarch64_cortex-a53**.
 CI выполняет Linux-тесты и статические musl-сборки этих двух архитектур.
 Другие ОС и архитектуры не входят в поддержку нашего форка.

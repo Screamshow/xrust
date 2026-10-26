@@ -1483,6 +1483,7 @@ fn clash_type_name(outbound: &Outbound) -> &'static str {
         Outbound::Block(_) => "Reject",
         Outbound::Http(_) => "HTTP",
         Outbound::Vless(_) => "VLESS",
+        Outbound::Trojan(_) => "Trojan",
         Outbound::Hysteria2(_) => "Hysteria2",
         Outbound::Masque(_) => "MASQUE",
         Outbound::WireGuard(_) => "WireGuard",
