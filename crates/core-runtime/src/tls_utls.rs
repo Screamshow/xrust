@@ -204,6 +204,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
                 }
                 Ok(None) if produced => return Poll::Ready(Ok(())),
                 Ok(None) => {}
+                // close_notify is the end of the stream, as rustls and Go's
+                // crypto/tls report it, not a failure; later reads see
+                // `is_closed` and return end of stream too
+                Err(_) if me.connection.is_closed() => return Poll::Ready(Ok(())),
                 // the plaintext already handed over goes out first, and the
                 // error with the next call
                 Err(e) if produced => {
@@ -613,5 +617,74 @@ mod read_batching_tests {
             total += n;
         }
         assert_eq!(total, 3 * RECORD);
+    }
+}
+
+#[cfg(test)]
+mod close_notify_tests {
+    use super::*;
+    use core_tls::client::{Config, Handshake};
+    use core_tls::rustls::{RootCertStore, ServerConfig};
+    use core_tls::verify::WebpkiVerifier;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that answers and closes properly (close_notify, then the
+    /// socket) ends our read stream cleanly instead of failing it.
+    #[tokio::test]
+    async fn close_notify_is_a_clean_end_of_stream() {
+        core_tls::install_default_provider();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
+        let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.crt")).unwrap(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.key")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(certs[0].clone()).unwrap();
+        let verifier = WebpkiVerifier::new(Arc::new(roots)).unwrap();
+        let template = core_tls::fingerprints::by_name("chrome").unwrap();
+        let (mut client, peer) = tokio::io::duplex(4 * CHUNK);
+        tokio::spawn(async move {
+            let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+                .accept(peer)
+                .await
+                .unwrap();
+            let mut hello = [0; 2];
+            tls.read_exact(&mut hello).await.unwrap();
+            tls.write_all(b"answer").await.unwrap();
+            // close_notify, then the transport closes
+            tls.shutdown().await.unwrap();
+        });
+        let mut handshake = Handshake::new(Config {
+            template: &template,
+            server_name: "localhost",
+            alpn: &[],
+            verifier: &verifier,
+            reality: None,
+            fragment: false,
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        handshake.run(&mut client).await.unwrap();
+        let connection = Connection::new(&mut handshake).unwrap();
+        let mut stream = FingerprintStream::new(client, connection);
+        stream.write_all(b"hi").await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"answer");
+        // and it stays ended
+        let mut more = [0u8; 8];
+        assert_eq!(stream.read(&mut more).await.unwrap(), 0);
     }
 }
