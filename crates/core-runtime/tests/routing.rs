@@ -410,6 +410,7 @@ fn client_hello(sni: &str) -> Vec<u8> {
         cipher_suites: vec![0x00, 0x2f],
         compression: vec![0x00],
         extensions: vec![core_tls::hello::Ext::Sni],
+        shuffle_extensions: false,
     };
     core_tls::hello::build(&template, &[0x11; 32], &[], sni, &[], None).expect("client hello")
 }

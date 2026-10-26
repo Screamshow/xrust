@@ -25,6 +25,9 @@ TLS session resumption are not implemented.
 Like uTLS (and Sing-Box X 1.0.3/1.0.4 and Xray 26.10.21 on the wire), every
 hello draws five GREASE values -- cipher, group (supported_groups and the
 key_share entry alike), the two extension ids (never equal) and version --
-independently of one another.
+independently of one another. The Chrome table shuffles its extensions per
+hello with uTLS's `ShuffleChromeTLSExtensions` procedure, GREASE fixed, and
+lists them in uTLS's HelloChrome_133 order because that procedure's outcome
+depends on the starting order. Firefox and Safari keep a fixed order.
 
 Regenerate tables with `python3 tools/fingerprint_tables.py`, then `cargo fmt`.

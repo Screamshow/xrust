@@ -1,5 +1,6 @@
 //! Every vendored fingerprint rebuilds its own capture byte-for-byte, apart
-//! from GREASE values and the GREASE ECH body, which is checked by structure.
+//! from GREASE values and the GREASE ECH body, which is checked by structure,
+//! and, for the Chrome tables that shuffle per hello, the extension order.
 //!
 //! The captures are what the reference sent as a uTLS client
 //! (tests/spikes/clienthello/captures, taken on sing-box-lx 1.14.2-lx.3). A
@@ -81,7 +82,7 @@ fn every_table_rebuilds_its_capture() {
             _ => None,
         });
         assert!(
-            same_except_grease(&rebuilt, &data, ech),
+            same_except_grease(&rebuilt, &data, ech, template.shuffle_extensions),
             "{name}: the rebuilt hello differs from the capture outside GREASE"
         );
     }
@@ -237,10 +238,38 @@ fn mask_body(id: u16, body: &[u8]) -> Vec<u8> {
 /// The two hellos agree once GREASE is set aside. GREASE ECH is drawn per
 /// hello, so both sides only have to be a well-formed outer ECH the profile's
 /// parameters allow.
-fn same_except_grease(rebuilt: &[u8], capture: &[u8], ech: Option<EchGrease>) -> bool {
-    let (Ok(left), Ok(right)) = (parse_record(rebuilt), parse_record(capture)) else {
+fn same_except_grease(
+    rebuilt: &[u8],
+    capture: &[u8],
+    ech: Option<EchGrease>,
+    shuffled: bool,
+) -> bool {
+    let (Ok(mut left), Ok(mut right)) = (parse_record(rebuilt), parse_record(capture)) else {
         return false;
     };
+    if shuffled {
+        // the order is drawn per hello: compare the extensions as a set, with
+        // the GREASE ones, which never move, compared in place
+        for hello in [&mut left, &mut right] {
+            let key = |e: &core_tls::hello::Ext| match e {
+                core_tls::hello::Ext::Static(id, _) if is_grease(*id) => None,
+                core_tls::hello::Ext::Static(id, _) => Some(*id),
+                core_tls::hello::Ext::Sni => Some(0x0000),
+                core_tls::hello::Ext::Alpn => Some(0x0010),
+                core_tls::hello::Ext::KeyShare(_) => Some(0x0033),
+                core_tls::hello::Ext::EchGrease(_) => Some(0xfe0d),
+            };
+            let exts = &mut hello.template.extensions;
+            let movable: Vec<usize> = (0..exts.len())
+                .filter(|&i| key(&exts[i]).is_some())
+                .collect();
+            let mut sorted: Vec<_> = movable.iter().map(|&i| exts[i].clone()).collect();
+            sorted.sort_by_key(|e| key(e));
+            for (slot, ext) in movable.into_iter().zip(sorted) {
+                exts[slot] = ext;
+            }
+        }
+    }
     let mask = |data: &[u8]| -> Vec<u16> {
         data.chunks(2)
             .filter(|c| c.len() == 2)

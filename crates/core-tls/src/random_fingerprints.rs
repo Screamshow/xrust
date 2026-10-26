@@ -69,6 +69,8 @@ fn generate(rng: &mut impl RngCore) -> Template {
         !matches!(ext, Ext::Static(0x0005 | 0x0012 | 0x001b | 0x0023, _)) || rng.next_u32() & 1 == 0
     });
     shuffle(&mut profile.extensions, rng);
+    // the order drawn here is the process's; it is not redrawn per hello
+    profile.shuffle_extensions = false;
     profile
 }
 

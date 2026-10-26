@@ -97,6 +97,9 @@ pub struct Template {
     pub cipher_suites: Vec<u8>,
     pub compression: Vec<u8>,
     pub extensions: Vec<Ext>,
+    /// Shuffle the extensions per hello, as uTLS's Chrome 106+ presets do
+    /// (`ShuffleChromeTLSExtensions`); GREASE stays where the table puts it.
+    pub shuffle_extensions: bool,
 }
 
 #[derive(Debug)]
@@ -179,6 +182,7 @@ pub fn parse_record(data: &[u8]) -> io::Result<ParsedHello> {
             cipher_suites,
             compression,
             extensions,
+            shuffle_extensions: false,
         },
         random,
         session_id,
@@ -222,8 +226,9 @@ fn extract_x25519(body: &[u8]) -> io::Result<Option<[u8; 32]>> {
 }
 
 /// One ClientHello record from a template. Per hello, like uTLS: the GREASE
-/// values (`Grease`), the GREASE ECH body and -- through the caller -- random,
-/// session id and key shares.
+/// values (`Grease`), the GREASE ECH body, the extension order for the
+/// templates that shuffle, and -- through the caller -- random, session id and
+/// key shares.
 pub fn build(
     template: &Template,
     random: &[u8; 32],
@@ -247,9 +252,13 @@ pub fn build(
     hs.push(template.compression.len() as u8);
     hs.extend_from_slice(&template.compression);
 
+    let mut order: Vec<&Ext> = template.extensions.iter().collect();
+    if template.shuffle_extensions {
+        shuffle_chrome_extensions(&mut order)?;
+    }
     let mut exts = Vec::new();
     let mut grease_exts = 0;
-    for e in &template.extensions {
+    for e in order {
         let (id, body): (u16, Vec<u8>) = match e {
             // the first GREASE extension takes ext1, the second ext2
             Ext::Static(id, body) if keyshare::is_grease(*id) => {
@@ -381,6 +390,24 @@ impl Grease {
         }
         Ok(out)
     }
+}
+
+/// uTLS `ShuffleChromeTLSExtensions` (u_parrots.go:2940-2975): Go's
+/// `rand.Shuffle` -- for i from the end down to 1, swap i with a uniform
+/// j in 0..=i -- with every swap that touches a GREASE, padding or
+/// pre_shared_key extension skipped. Skipping swaps is not a uniform
+/// permutation of the rest, so the procedure is copied rather than replaced
+/// by a fair shuffle: the order distribution is what an observer compares.
+fn shuffle_chrome_extensions(exts: &mut [&Ext]) -> io::Result<()> {
+    let fixed = |e: &Ext| matches!(e, Ext::Static(id, _) if keyshare::is_grease(*id) || *id == 0x0015 || *id == 0x0029);
+    for i in (1..exts.len()).rev() {
+        let j = pick(i + 1)?;
+        if fixed(exts[i]) || fixed(exts[j]) {
+            continue;
+        }
+        exts.swap(i, j);
+    }
+    Ok(())
 }
 
 fn build_sni(name: &str) -> io::Result<Vec<u8>> {

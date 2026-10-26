@@ -1,7 +1,7 @@
 //! What changes from one ClientHello to the next, and what has to agree inside
 //! one. The references (uTLS presets, as Sing-Box X and Xray send them) draw
 //! per handshake: five GREASE values (cipher, group, two extension ids,
-//! version) and the GREASE ECH body.
+//! version), the GREASE ECH body and, for Chrome, the extension order.
 //! Everything else is constant, so it must be constant here too.
 
 use std::collections::HashSet;
@@ -169,5 +169,35 @@ fn safari_keeps_its_order_and_grease_positions() {
     assert_eq!(first.order.last(), Some(&0x0a0a));
     for _ in 0..64 {
         assert_eq!(hello("safari", false).order, first.order);
+    }
+}
+
+/// Chrome shuffles every extension but GREASE per hello, like uTLS's
+/// `ShuffleChromeTLSExtensions`: the order varies, the set does not, and the
+/// two GREASE extensions stay first and last.
+#[test]
+fn chrome_shuffles_its_extensions_per_hello() {
+    let mut orders = HashSet::new();
+    let mut first_slot = HashSet::new();
+    let reference: HashSet<u16> = hello("chrome", true).order.into_iter().collect();
+    for _ in 0..ROUNDS {
+        let s = hello("chrome", false);
+        assert_eq!(s.order.first(), Some(&0x0a0a));
+        assert_eq!(s.order.last(), Some(&0x0a0a));
+        assert_eq!(s.order.iter().copied().collect::<HashSet<_>>(), reference);
+        first_slot.insert(s.order[1]);
+        orders.insert(s.order);
+    }
+    assert!(orders.len() > ROUNDS * 9 / 10, "{} orders", orders.len());
+    // every movable extension reaches the first movable slot
+    assert_eq!(first_slot.len(), reference.len() - 1);
+}
+
+/// The process-stable `randomized` profile keeps the order it drew.
+#[test]
+fn randomized_keeps_its_drawn_order() {
+    let first = hello("randomized", true);
+    for _ in 0..32 {
+        assert_eq!(hello("randomized", false).order, first.order);
     }
 }

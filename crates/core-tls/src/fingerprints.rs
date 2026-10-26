@@ -99,6 +99,7 @@ pub fn r360() -> Template {
                 ],
             ),
         ],
+        shuffle_extensions: false,
     }
 }
 
@@ -128,6 +129,7 @@ pub fn android() -> Template {
                 ],
             ),
         ],
+        shuffle_extensions: false,
     }
 }
 
@@ -145,8 +147,19 @@ pub fn chrome() -> Template {
         compression: vec![0x00],
         extensions: vec![
             Ext::Static(0xdada, vec![]),
-            Ext::Static(0x001b, vec![0x02, 0x00, 0x02]),
+            Ext::Sni,
+            Ext::Static(0x0017, vec![]),
             Ext::Static(0xff01, vec![0x00]),
+            Ext::Static(
+                0x000a,
+                vec![
+                    0x00, 0x0a, 0x8a, 0x8a, 0x11, 0xec, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18,
+                ],
+            ),
+            Ext::Static(0x000b, vec![0x01, 0x00]),
+            Ext::Static(0x0023, vec![]),
+            Ext::Alpn,
+            Ext::Static(0x0005, vec![0x01, 0x00, 0x00, 0x00, 0x00]),
             Ext::Static(
                 0x000d,
                 vec![
@@ -154,17 +167,7 @@ pub fn chrome() -> Template {
                     0x01, 0x08, 0x06, 0x06, 0x01,
                 ],
             ),
-            Ext::Static(0x0005, vec![0x01, 0x00, 0x00, 0x00, 0x00]),
-            Ext::Static(0x002b, vec![0x06, 0x0a, 0x0a, 0x03, 0x04, 0x03, 0x03]),
-            Ext::EchGrease(EchGrease::CHROME),
             Ext::Static(0x0012, vec![]),
-            Ext::Sni,
-            Ext::Static(
-                0x000a,
-                vec![
-                    0x00, 0x0a, 0x8a, 0x8a, 0x11, 0xec, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18,
-                ],
-            ),
             Ext::KeyShare(vec![
                 0x04, 0xed, 0x8a, 0x8a, 0x00, 0x01, 0x00, 0x11, 0xec, 0x04, 0xc0, 0x44, 0x5a, 0x66,
                 0x2d, 0x69, 0x53, 0xc8, 0xfb, 0xc9, 0x54, 0x5a, 0xc2, 0x06, 0x34, 0x25, 0x10, 0xf6,
@@ -258,14 +261,14 @@ pub fn chrome() -> Template {
                 0xda, 0xea, 0x4d, 0xe4, 0xd7, 0xf8, 0xcd, 0xe1, 0xee, 0x29, 0xf2, 0xd3, 0x1c, 0x80,
                 0x58, 0x39, 0x02,
             ]),
-            Ext::Static(0x0023, vec![]),
-            Ext::Static(0x000b, vec![0x01, 0x00]),
-            Ext::Static(0x44cd, vec![0x00, 0x03, 0x02, 0x68, 0x32]),
             Ext::Static(0x002d, vec![0x01, 0x01]),
-            Ext::Alpn,
-            Ext::Static(0x0017, vec![]),
+            Ext::Static(0x002b, vec![0x06, 0x0a, 0x0a, 0x03, 0x04, 0x03, 0x03]),
+            Ext::Static(0x001b, vec![0x02, 0x00, 0x02]),
+            Ext::Static(0x44cd, vec![0x00, 0x03, 0x02, 0x68, 0x32]),
+            Ext::EchGrease(EchGrease::CHROME),
             Ext::Static(0xcaca, vec![0x00]),
         ],
+        shuffle_extensions: true,
     }
 }
 
@@ -404,6 +407,7 @@ pub fn chrome_padding_psk_shuffle() -> Template {
             ),
             Ext::Static(0x2a2a, vec![0x00]),
         ],
+        shuffle_extensions: true,
     }
 }
 
@@ -542,6 +546,7 @@ pub fn chrome_pq() -> Template {
             ),
             Ext::Static(0xfafa, vec![0x00]),
         ],
+        shuffle_extensions: true,
     }
 }
 
@@ -680,6 +685,7 @@ pub fn chrome_pq_psk() -> Template {
             Ext::Static(0x001b, vec![0x02, 0x00, 0x02]),
             Ext::Static(0x3a3a, vec![0x00]),
         ],
+        shuffle_extensions: true,
     }
 }
 
@@ -818,6 +824,7 @@ pub fn chrome_psk() -> Template {
             Ext::EchGrease(EchGrease::CHROME),
             Ext::Static(0x1a1a, vec![0x00]),
         ],
+        shuffle_extensions: false,
     }
 }
 
@@ -956,6 +963,7 @@ pub fn chrome_psk_shuffle() -> Template {
             ]),
             Ext::Static(0x6a6a, vec![0x00]),
         ],
+        shuffle_extensions: true,
     }
 }
 
@@ -1029,6 +1037,7 @@ pub fn edge() -> Template {
                 ],
             ),
         ],
+        shuffle_extensions: false,
     }
 }
 
@@ -1172,6 +1181,7 @@ pub fn firefox() -> Template {
             Ext::Static(0x001b, vec![0x06, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03]),
             Ext::EchGrease(EchGrease::FIREFOX),
         ],
+        shuffle_extensions: false,
     }
 }
 
@@ -1245,6 +1255,7 @@ pub fn ios() -> Template {
                 ],
             ),
         ],
+        shuffle_extensions: false,
     }
 }
 
@@ -1319,6 +1330,7 @@ pub fn qq() -> Template {
                 ],
             ),
         ],
+        shuffle_extensions: false,
     }
 }
 
@@ -1455,5 +1467,6 @@ pub fn safari() -> Template {
             Ext::Static(0x001b, vec![0x02, 0x00, 0x01]),
             Ext::Static(0x4a4a, vec![0x00]),
         ],
+        shuffle_extensions: false,
     }
 }

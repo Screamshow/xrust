@@ -154,8 +154,9 @@ fn ungrease(id: u16, body: &[u8]) -> (u16, Vec<u8>) {
     (id, body)
 }
 
-/// Everything but GREASE values and the ECH body equals the template. SNI,
-/// ALPN, key share and ECH are compared by id only.
+/// Everything but GREASE values, the ECH body and -- for a template that
+/// shuffles -- the extension order equals the template. SNI, ALPN, key share
+/// and ECH are compared by id only.
 fn check_against_template(name: &str, template: &Template, exts: &[(u16, Vec<u8>)]) {
     let want: Vec<(u16, Option<Vec<u8>>)> = template
         .extensions
@@ -171,7 +172,7 @@ fn check_against_template(name: &str, template: &Template, exts: &[(u16, Vec<u8>
             Ext::KeyShare(_) => (0x0033, None),
         })
         .collect();
-    let got: Vec<(u16, Option<Vec<u8>>)> = exts
+    let mut got: Vec<(u16, Option<Vec<u8>>)> = exts
         .iter()
         .map(|(id, body)| match *id {
             ECH | 0x0000 | 0x0010 | 0x0033 => (*id, None),
@@ -181,7 +182,17 @@ fn check_against_template(name: &str, template: &Template, exts: &[(u16, Vec<u8>
             }
         })
         .collect();
+    let mut want = want;
     assert_eq!(want.len(), got.len(), "{name}: extension count");
+    if template.shuffle_extensions {
+        for (i, (a, b)) in want.iter().zip(&got).enumerate() {
+            if a.0 == 0x0a0a || b.0 == 0x0a0a {
+                assert_eq!(a, b, "{name}: GREASE extension #{i} moved");
+            }
+        }
+        want.sort();
+        got.sort();
+    }
     assert_eq!(want, got, "{name}: extensions");
 }
 

@@ -101,9 +101,39 @@ def ech_grease(name, body):
     return "        Ext::EchGrease(EchGrease::%s)," % profile
 
 
+# uTLS presets built with ShuffleChromeTLSExtensions (u_parrots.go): the
+# builder reshuffles their extensions per hello; chrome_psk (Chrome 100 PSK)
+# keeps a fixed order.
+SHUFFLED = {"chrome", "chrome_psk_shuffle", "chrome_padding_psk_shuffle", "chrome_pq", "chrome_pq_psk"}
+
+
+# The order a shuffled preset lists its extensions in before the shuffle. The
+# shuffle skips swaps that touch GREASE, so its outcome is not uniform and
+# depends on this order: the table keeps uTLS's, not the captured permutation.
+# HelloChrome_133 (= HelloChrome_Auto), u_parrots.go:917-964.
+SPEC_ORDER = {
+    "chrome": [0x0000, 0x0017, 0xFF01, 0x000A, 0x000B, 0x0023, 0x0010, 0x0005, 0x000D,
+               0x0012, 0x0033, 0x002D, 0x002B, 0x001B, 0x44CD, 0xFE0D],
+}
+
+
+def spec_order(name, extensions):
+    order = SPEC_ORDER.get(name)
+    if order is None:
+        return extensions
+    movable = [e for e in extensions if not is_grease(e[0])]
+    if sorted(e[0] for e in movable) != sorted(order):
+        raise SystemExit("%s: captured extensions do not match the uTLS spec" % name)
+    movable.sort(key=lambda e: order.index(e[0]))
+    out = []
+    for ext in extensions:
+        out.append(ext if is_grease(ext[0]) else movable.pop(0))
+    return out
+
+
 def emit(name, parsed):
     ext_lines = []
-    for ext_id, body in parsed["extensions"]:
+    for ext_id, body in spec_order(name, parsed["extensions"]):
         if ext_id == 0xFE0D:
             ext_lines.append(ech_grease(name, body))
             continue
@@ -140,6 +170,7 @@ pub fn %s() -> Template {
         extensions: vec![
 %s
         ],
+        shuffle_extensions: %s,
     }
 }
 """ % (
@@ -154,6 +185,7 @@ pub fn %s() -> Template {
         ", ".join("0x%02x" % byte for byte in ciphers),
         ", ".join("0x%02x" % b for b in parsed["compression"]),
         "\n".join(ext_lines),
+        "true" if name in SHUFFLED else "false",
     )
 
 
