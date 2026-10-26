@@ -7,8 +7,9 @@
 use blake2::digest::typenum::U16;
 use blake2::digest::{KeyInit, Mac};
 use blake2::{Blake2s256, Blake2sMac, Digest};
-use chacha20poly1305::aead::{Aead, AeadInPlace, Payload};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, Tag, XChaCha20Poly1305, XNonce};
+use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, XChaCha20Poly1305, XNonce};
+use core_crypto::fastchacha::ChaChaPoly;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 const CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
@@ -363,8 +364,8 @@ pub fn process_response(
     Ok(Session {
         local_index: hs.sender_index,
         remote_index,
-        send_cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key)),
-        recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&recv_key)),
+        send_cipher: ChaChaPoly::new(&send_key),
+        recv_cipher: ChaChaPoly::new(&recv_key),
         send_counter: 0,
         recv_max: 0,
         recv_any: false,
@@ -516,8 +517,8 @@ pub fn build_response(
     let session = Session {
         local_index: r_sender_index,
         remote_index: init_res.sender_index,
-        send_cipher: ChaCha20Poly1305::new(Key::from_slice(&recv_key_initiator)),
-        recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&send_key_initiator)),
+        send_cipher: ChaChaPoly::new(&recv_key_initiator),
+        recv_cipher: ChaChaPoly::new(&send_key_initiator),
         send_counter: 0,
         recv_max: 0,
         recv_any: false,
@@ -535,8 +536,8 @@ const RECV_WINDOW: u64 = 2048;
 pub struct Session {
     pub local_index: u32,
     pub remote_index: u32,
-    send_cipher: ChaCha20Poly1305,
-    recv_cipher: ChaCha20Poly1305,
+    send_cipher: ChaChaPoly,
+    recv_cipher: ChaChaPoly,
     send_counter: u64,
     /// Highest accepted receive counter; bit `i` = counter `recv_max - i`.
     recv_max: u64,
@@ -577,12 +578,7 @@ impl Session {
         nonce[4..].copy_from_slice(&counter.to_le_bytes());
         let tag = self
             .send_cipher
-            .encrypt_in_place_detached(
-                Nonce::from_slice(&nonce),
-                &[],
-                &mut msg[TRANSPORT_HEADER_LEN..],
-            )
-            .ok()?;
+            .seal(&nonce, &[], &mut msg[TRANSPORT_HEADER_LEN..]);
         msg.extend_from_slice(&tag);
         Some(msg)
     }
@@ -596,7 +592,8 @@ impl Session {
 
     /// Same as [`Self::open`], but decrypts into a caller-provided scratch
     /// buffer so a hot path can recycle instead of allocating per packet.
-    /// On success `out` holds the plaintext; on failure it is untouched.
+    /// On success `out` holds the plaintext; on failure its contents are
+    /// unspecified (zeroed after a bad tag).
     pub fn open_into(&mut self, msg: &[u8], out: &mut Vec<u8>) -> bool {
         if msg.len() < TRANSPORT_HEADER_LEN + 16 {
             return false;
@@ -619,16 +616,15 @@ impl Session {
         }
         let body = &msg[TRANSPORT_HEADER_LEN..];
         let (ciphertext, tag) = body.split_at(body.len() - 16);
+        let tag: &[u8; 16] = tag.try_into().expect("16-byte tag");
         // The one copy that is not going away: the plaintext must outlive
         // the recv buffer, and the AEAD opens in place.
         out.clear();
         out.extend_from_slice(ciphertext);
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&counter.to_le_bytes());
-        let authenticated = self
-            .recv_cipher
-            .decrypt_in_place_detached(Nonce::from_slice(&nonce), &[], out, Tag::from_slice(tag))
-            .is_ok();
+        let authenticated = self.recv_cipher.open(&nonce, &[], out, tag);
+        // The replay window only moves for authenticated packets.
         authenticated && self.accept_counter(counter)
     }
 
@@ -802,8 +798,8 @@ mod tests {
         let mut a = Session {
             local_index: 1,
             remote_index: 2,
-            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&[1u8; 32])),
-            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&[2u8; 32])),
+            send_cipher: ChaChaPoly::new(&[1u8; 32]),
+            recv_cipher: ChaChaPoly::new(&[2u8; 32]),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -813,8 +809,8 @@ mod tests {
         let mut b = Session {
             local_index: 2,
             remote_index: 1,
-            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&[2u8; 32])),
-            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&[1u8; 32])),
+            send_cipher: ChaChaPoly::new(&[2u8; 32]),
+            recv_cipher: ChaChaPoly::new(&[1u8; 32]),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -837,13 +833,118 @@ mod tests {
         assert!(b.open(&other).is_none());
     }
 
+    fn test_session(local: u32, remote: u32, send: [u8; 32], recv: [u8; 32]) -> Session {
+        Session {
+            local_index: local,
+            remote_index: remote,
+            send_cipher: ChaChaPoly::new(&send),
+            recv_cipher: ChaChaPoly::new(&recv),
+            send_counter: 0,
+            recv_max: 0,
+            recv_any: false,
+            recv_bitmap: [0; 32],
+            awg_transport: HDR_TRANSPORT,
+        }
+    }
+
+    fn counter_nonce(counter: u64) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&counter.to_le_bytes());
+        nonce
+    }
+
+    /// Transport messages match a plain RustCrypto ChaCha20-Poly1305
+    /// construction byte for byte, in both directions.
+    #[test]
+    fn transport_matches_reference_aead() {
+        use chacha20poly1305::aead::AeadInPlace;
+
+        let send_key = [0x5au8; 32];
+        let recv_key = [0xa7u8; 32];
+        let reference_tx = ChaCha20Poly1305::new(Key::from_slice(&send_key));
+        let reference_rx = ChaCha20Poly1305::new(Key::from_slice(&recv_key));
+        let mut s = test_session(7, 9, send_key, recv_key);
+
+        for (counter, len) in [0usize, 1, 15, 16, 17, 255, 256, 257, 1420, 1500]
+            .into_iter()
+            .enumerate()
+        {
+            let counter = counter as u64;
+            let pkt: Vec<u8> = (0..len).map(|i| (i * 7 + len) as u8).collect();
+
+            // Ours -> reference.
+            let msg = s.seal(&pkt).expect("seal");
+            let padded = len + (16 - len % 16) % 16;
+            let mut want = Vec::new();
+            want.extend_from_slice(&u32::from(MSG_TRANSPORT).to_le_bytes());
+            want.extend_from_slice(&9u32.to_le_bytes());
+            want.extend_from_slice(&counter.to_le_bytes());
+            want.extend_from_slice(&pkt);
+            want.resize(TRANSPORT_HEADER_LEN + padded, 0);
+            let tag = reference_tx
+                .encrypt_in_place_detached(
+                    Nonce::from_slice(&counter_nonce(counter)),
+                    &[],
+                    &mut want[TRANSPORT_HEADER_LEN..],
+                )
+                .expect("reference seal");
+            want.extend_from_slice(&tag);
+            assert_eq!(msg, want, "sealed bytes, len {len}");
+
+            // Reference -> ours.
+            let mut body = pkt.clone();
+            body.resize(padded, 0);
+            let tag = reference_rx
+                .encrypt_in_place_detached(
+                    Nonce::from_slice(&counter_nonce(counter)),
+                    &[],
+                    &mut body,
+                )
+                .expect("reference seal");
+            let mut msg = Vec::new();
+            msg.extend_from_slice(&u32::from(MSG_TRANSPORT).to_le_bytes());
+            msg.extend_from_slice(&7u32.to_le_bytes());
+            msg.extend_from_slice(&counter.to_le_bytes());
+            msg.extend_from_slice(&body);
+            msg.extend_from_slice(&tag);
+            let out = s.open(&msg).expect("open reference message");
+            assert_eq!(&out[..len], &pkt[..], "opened bytes, len {len}");
+            assert!(out[len..].iter().all(|b| *b == 0));
+        }
+    }
+
+    /// A bad tag is refused and leaves the replay window alone, so the
+    /// genuine packet with the same counter still gets in.
+    #[test]
+    fn bad_tag_does_not_move_replay_window() {
+        let mut a = test_session(1, 2, [1u8; 32], [2u8; 32]);
+        let mut b = test_session(2, 1, [2u8; 32], [1u8; 32]);
+        for len in [0usize, 64, 300, 1400] {
+            let pkt = vec![0x42u8; len];
+            let msg = a.seal(&pkt).expect("seal");
+
+            let mut bad_tag = msg.clone();
+            let last = bad_tag.len() - 1;
+            bad_tag[last] ^= 1;
+            assert!(b.open(&bad_tag).is_none(), "bad tag, len {len}");
+
+            let mut bad_body = msg.clone();
+            bad_body[TRANSPORT_HEADER_LEN] ^= 0x80;
+            assert!(b.open(&bad_body).is_none(), "bad body, len {len}");
+
+            let out = b.open(&msg).expect("genuine packet after forgeries");
+            assert_eq!(&out[..len], &pkt[..]);
+            assert!(b.open(&msg).is_none(), "replay, len {len}");
+        }
+    }
+
     #[test]
     fn recv_window_out_of_order() {
         let mut s = Session {
             local_index: 1,
             remote_index: 2,
-            send_cipher: ChaCha20Poly1305::new(Key::from_slice(&[0u8; 32])),
-            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(&[0u8; 32])),
+            send_cipher: ChaChaPoly::new(&[0u8; 32]),
+            recv_cipher: ChaChaPoly::new(&[0u8; 32]),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,

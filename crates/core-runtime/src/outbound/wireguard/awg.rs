@@ -12,8 +12,6 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use chacha20::ChaCha20;
-use chacha20::cipher::{KeyIvInit, StreamCipher};
 use serde_json::{Map, Value};
 
 use super::noise::HeaderRange;
@@ -576,8 +574,7 @@ pub fn mask_header(key: &[u8; 32], nonce12: &[u8], data: &mut [u8]) -> bool {
         return false;
     }
     let nonce: [u8; HEADER_NONCE_LEN] = nonce12.try_into().expect("len checked");
-    let mut cipher = ChaCha20::new(key.into(), &nonce.into());
-    cipher.apply_keystream(data);
+    core_crypto::fastchacha::chacha20_xor(key, &nonce, data);
     true
 }
 
@@ -975,6 +972,33 @@ mod tests {
         assert_eq!(data, orig);
         let mut tiny = [0u8; 11];
         assert!(!mask_header(&key, &nonce, &mut tiny));
+    }
+
+    #[test]
+    fn mask_matches_chacha20_keystream() {
+        use chacha20::ChaCha20;
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
+
+        let key: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(13) ^ 0x5c);
+        let nonce: [u8; 12] = std::array::from_fn(|i| 0xf0 ^ i as u8);
+        for len in [12usize, 16, 64, 65, 148, 1500] {
+            let orig: Vec<u8> = (0..len).map(|i| (i * 3) as u8).collect();
+            let mut want = orig.clone();
+            ChaCha20::new((&key).into(), (&nonce).into()).apply_keystream(&mut want);
+            let mut got = orig.clone();
+            assert!(mask_header(&key, &nonce, &mut got));
+            assert_eq!(got, want, "len {len}");
+        }
+        // Fixed vector: 16-byte transport header, all-zero key and nonce.
+        let mut header = [0u8; 16];
+        assert!(mask_header(&[0u8; 32], &[0u8; 12], &mut header));
+        assert_eq!(
+            header,
+            [
+                0x76, 0xb8, 0xe0, 0xad, 0xa0, 0xf1, 0x3d, 0x90, 0x40, 0x5d, 0x6a, 0xe5, 0x53, 0x86,
+                0xbd, 0x28
+            ]
+        );
     }
 
     #[test]
