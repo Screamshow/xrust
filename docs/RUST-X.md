@@ -24,7 +24,8 @@ Profile tests: `cargo test -p core-config --test rust_x_profile`.
 
 The removed protocols used to sit behind an optional `legacy-protocols` Cargo
 feature; that feature and the modules only it compiled were deleted, and can
-be recovered from git history if needed. Keep fork-specific fixes in focused
+be recovered from git history if needed: the last tree with them is the
+parent of commit `af793ad`. Keep fork-specific fixes in focused
 commits and port upstream changes without replacing our DNS, routing,
 monitoring or OpenWrt behavior; upstream protocols outside this profile are
 not imported.
