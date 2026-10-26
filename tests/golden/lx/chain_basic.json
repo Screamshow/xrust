@@ -6,9 +6,10 @@
   "outbounds": [
     { "type": "direct", "tag": "direct" },
     {
-      "type": "shadowsocks", "tag": "node-in",
-      "server": "in.example.com", "server_port": 8388,
-      "method": "2022-blake3-aes-128-gcm", "password": "8JCsPssfgS8tiRwiMlhARg=="
+      "type": "vless", "tag": "node-in",
+      "server": "in.example.com", "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+      "tls": { "enabled": true, "server_name": "in.example.com" }
     },
     {
       "type": "vless", "tag": "node-mid-a",
@@ -25,8 +26,9 @@
     },
     { "type": "selector", "tag": "selector-mid", "outbounds": ["node-mid-a", "node-mid-b", "direct"], "interrupt_exist_connections": true },
     {
-      "type": "trojan", "tag": "node-exit",
-      "server": "exit.example.com", "server_port": 443, "password": "secret",
+      "type": "vless", "tag": "node-exit",
+      "server": "exit.example.com", "server_port": 443,
+      "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
       "tls": { "enabled": true, "server_name": "exit.example.com" }
     },
     {

@@ -131,7 +131,6 @@ async fn http_outbound_via_second_box() {
     assert_tunnel(stream).await;
 }
 
-#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn selector_defaults_to_first_member() {
     let echo = spawn_echo().await;
@@ -151,7 +150,7 @@ async fn selector_defaults_to_first_member() {
         ],
         "outbounds": [
             {"type": "direct", "tag": "direct"},
-            {"type": "socks", "tag": "via-b", "server": "127.0.0.1", "server_port": downstream.port()},
+            {"type": "http", "tag": "via-b", "server": "127.0.0.1", "server_port": downstream.port()},
             {"type": "selector", "tag": "sel", "outbounds": ["via-b", "direct"]}
         ],
         "route": {"final": "sel"}
@@ -163,7 +162,6 @@ async fn selector_defaults_to_first_member() {
     assert_tunnel(stream).await;
 }
 
-#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn selector_default_field_selects_direct() {
     let echo = spawn_echo().await;
@@ -174,7 +172,7 @@ async fn selector_default_field_selects_direct() {
         ],
         "outbounds": [
             {"type": "direct", "tag": "direct"},
-            {"type": "socks", "tag": "via-b", "server": "127.0.0.1", "server_port": 1},
+            {"type": "http", "tag": "via-b", "server": "127.0.0.1", "server_port": 1},
             {"type": "selector", "tag": "sel", "outbounds": ["via-b", "direct"], "default": "direct"}
         ],
         "route": {"final": "sel"}
@@ -218,7 +216,6 @@ async fn socks_outbound_auth_handshake() {
     assert_tunnel(stream).await;
 }
 
-#[cfg(feature = "legacy-protocols")]
 async fn spawn_http204() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 204");
     let addr = listener.local_addr().expect("204 addr");
@@ -239,7 +236,6 @@ async fn spawn_http204() -> SocketAddr {
     addr
 }
 
-#[cfg(feature = "legacy-protocols")]
 async fn try_relay(inbound: SocketAddr, echo: SocketAddr) -> bool {
     let Ok(mut stream) = TcpStream::connect(inbound).await else {
         return false;
@@ -268,7 +264,6 @@ async fn try_relay(inbound: SocketAddr, echo: SocketAddr) -> bool {
     stream.read_exact(&mut bnd).await.is_ok()
 }
 
-#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn urltest_selects_working_member() {
     use std::time::Duration;
@@ -291,8 +286,8 @@ async fn urltest_selects_working_member() {
         ],
         "outbounds": [
             {"type": "direct", "tag": "direct"},
-            {"type": "socks", "tag": "dead", "server": "127.0.0.1", "server_port": 1},
-            {"type": "socks", "tag": "live", "server": "127.0.0.1", "server_port": downstream.port()},
+            {"type": "http", "tag": "dead", "server": "127.0.0.1", "server_port": 1},
+            {"type": "http", "tag": "live", "server": "127.0.0.1", "server_port": downstream.port()},
             {"type": "urltest", "tag": "auto", "outbounds": ["dead", "live"],
              "url": format!("http://127.0.0.1:{}/generate_204", probe_target.port()),
              "interval": "1h", "tolerance": 50}
