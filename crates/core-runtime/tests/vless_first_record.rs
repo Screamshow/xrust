@@ -189,7 +189,8 @@ fn vision_frame(data: &[u8]) -> (u8, &[u8], usize) {
 }
 
 /// Client first, REALITY with Vision: the head, the UUID and the Vision frame
-/// of the payload are one record, the frame long-padded as Xray pads a TLS
+/// of the payload are one write (one record, or two once the padding takes it
+/// past Go's first-record size), the frame long-padded as Xray pads a TLS
 /// hello (content and padding together 900 to 1399 bytes).
 #[tokio::test]
 async fn reality_vision_sends_head_and_first_frame_in_one_record() {
@@ -209,9 +210,18 @@ async fn reality_vision_sends_head_and_first_frame_in_one_record() {
     stream.write_all(b"second").await.unwrap();
     stream.flush().await.unwrap();
     drop(stream);
-    let records = server.await.unwrap();
-    assert_eq!(records.len(), 2, "two writes, two records");
-    let first = &records[0].1;
+    let records: Vec<Vec<u8>> = server.await.unwrap().into_iter().map(|r| r.1).collect();
+    // The first write leaves as the connection's first record; like Go's
+    // (and so Xray's) TLS that record holds at most 1186 bytes of plaintext,
+    // and a padded first write longer than that goes on in a second one.
+    let mut first = records[0].clone();
+    let mut next = 1;
+    if first.len() == 1186 {
+        first.extend_from_slice(&records[1]);
+        next = 2;
+    }
+    assert!(records[0].len() <= 1186, "{}", records[0].len());
+    assert_eq!(records.len(), next + 1, "the first write, then the second");
     let head = expected_head(true, "example.com", 443);
     assert_eq!(&first[..head.len()], &head[..], "the request head");
     assert_eq!(&first[head.len()..head.len() + 16], &UUID, "then the UUID");
@@ -222,7 +232,7 @@ async fn reality_vision_sends_head_and_first_frame_in_one_record() {
         (900..1400).contains(&(content.len() + padding)),
         "{padding}"
     );
-    let (command, content, _) = vision_frame(&records[1].1);
+    let (command, content, _) = vision_frame(&records[next]);
     assert_eq!((command, content), (0x00, &b"second"[..]), "no UUID again");
 }
 
@@ -753,7 +763,6 @@ async fn interop_with_xray_as_the_server() {
             ));
         }
     }
-
     // packet-up with the Xray 26 extras a provider's nodes carry: the
     // session in a header, uploads as GET with the data in headers, padding
     // in obfs mode, sized and paced uploads

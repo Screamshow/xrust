@@ -67,14 +67,23 @@ pub struct FingerprintStream<S: AsyncWrite + Unpin> {
     read_error: Option<io::Error>,
     /// our close_notify went out (or is on its way in `wbuf`)
     close_notify_sent: bool,
+    /// Go's `bytesSent` and `packetsSent`, for its record sizes at the start
+    /// of a connection (see `record_limit`)
+    bytes_sent: u64,
+    packets_sent: u64,
 }
+
+/// Go's `tcpMSSEstimate`: records at the start of a connection grow by this
+/// much, less the header, the AEAD tag and the content type byte.
+const BOOST_STEP: usize = 1208 - 5 - 16 - 1;
+/// Go's `recordSizeBoostThreshold`: after this many bytes, full records.
+const BOOST_UNTIL: u64 = 128 * 1024;
 
 impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
     /// Wrap a transport whose handshake is already finished.
     pub fn new(inner: S, connection: Connection) -> Self {
         FingerprintStream {
             inner,
-            connection,
             raw: Vec::new(),
             rpos: 0,
             plain_at: 0,
@@ -90,7 +99,30 @@ impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
             batch_reads: true,
             read_error: None,
             close_notify_sent: false,
+            bytes_sent: connection.handshake_bytes(),
+            packets_sent: 0,
+            connection,
         }
+    }
+
+    /// The most plaintext the next record may carry. Go's `crypto/tls` (and
+    /// uTLS, which Xray's client runs) starts a connection with records the
+    /// size of one TCP segment and lets them grow by a segment each, until
+    /// 128 KiB have gone out (`maxPayloadSizeForWrite`): a record of 1186
+    /// bytes of plaintext, then up to 2372, 3558 and so on to 16384. A bulk
+    /// transfer, or a first write bigger than a segment -- the Vision head
+    /// with a client hello -- is cut that way at the start, and the same here.
+    fn record_limit(&mut self) -> usize {
+        let max = core_tls::record::MAX_FRAGMENT;
+        if self.bytes_sent >= BOOST_UNTIL {
+            return max;
+        }
+        let packet = self.packets_sent;
+        self.packets_sent += 1;
+        if packet > 1000 {
+            return max;
+        }
+        (BOOST_STEP * (packet as usize + 1)).min(max)
     }
 
     /// Whether closing our side should say close_notify first. Go's
@@ -127,6 +159,7 @@ impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
                 self.wbuf.clear();
                 self.connection
                     .write_record_parts_into(parts, &mut self.wbuf)?;
+                self.bytes_sent += self.wbuf.len() as u64;
                 self.out = Some(0);
                 self.pending_plaintext = parts.iter().map(|p| p.len()).sum();
                 continue;
@@ -379,7 +412,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
         // rather than with each call. A caller with more than a record's worth
         // writes it in pieces: `write_record` refuses more, and the number handed
         // back has to be what really left.
-        let take = buf.len().min(core_tls::record::MAX_FRAGMENT);
+        let room = if me.out.is_none() {
+            me.record_limit()
+        } else {
+            core_tls::record::MAX_FRAGMENT
+        };
+        let take = buf.len().min(room);
         me.poll_seal(cx, &[&buf[..take]])
     }
 
@@ -406,7 +444,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
         const MOST: usize = 16;
         let mut parts: [&[u8]; MOST] = [&[]; MOST];
         let mut count = 0;
-        let mut room = core_tls::record::MAX_FRAGMENT;
+        let mut room = if me.out.is_none() {
+            me.record_limit()
+        } else {
+            core_tls::record::MAX_FRAGMENT
+        };
         for buf in bufs {
             if count == MOST || room == 0 {
                 break;
@@ -831,6 +873,8 @@ mod read_batching_tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut stream = connected(|mut tls| async move {
             tls.write_all(b"go").await.unwrap();
+            let mut warm = vec![0u8; BOOST_UNTIL as usize];
+            tls.read_exact(&mut warm).await.unwrap();
             let mut got = vec![0u8; 9 + 16375 + 100];
             tls.read_exact(&mut got).await.unwrap();
             let _ = tx.send(got);
@@ -839,6 +883,11 @@ mod read_batching_tests {
         let mut go = [0u8; 2];
         stream.read_exact(&mut go).await.unwrap();
         assert!(stream.is_write_vectored());
+        // past the small records a connection starts with
+        stream
+            .write_all(&vec![0u8; BOOST_UNTIL as usize])
+            .await
+            .unwrap();
         let header = [1u8; 9];
         let payload = vec![2u8; 16375];
         let tail = vec![3u8; 100];
@@ -861,6 +910,37 @@ mod read_batching_tests {
         want.extend_from_slice(&payload);
         want.extend_from_slice(&tail);
         assert_eq!(got, want);
+    }
+
+    /// The records a connection starts with grow like Go's: 1186 bytes of
+    /// plaintext, then 2372, 3558 and on by 1186 to 16384, until 128 KiB went
+    /// out, and full records from there (`maxPayloadSizeForWrite`).
+    #[tokio::test]
+    async fn records_grow_like_gos_at_the_start() {
+        let mut stream = connected(|mut tls| async move {
+            let mut sink = vec![0u8; 1 << 16];
+            while tls.read(&mut sink).await.map(|n| n > 0).unwrap_or(false) {}
+        })
+        .await;
+        let mut sizes = Vec::new();
+        let chunk = vec![7u8; 1 << 16];
+        let mut sent = 0usize;
+        while sent < 300 * 1024 {
+            let n = stream.write(&chunk).await.unwrap();
+            sizes.push(n);
+            sent += n;
+        }
+        let step = 1208 - 5 - 16 - 1;
+        let start: Vec<usize> = (1..=13).map(|k| (step * k).min(16384)).collect();
+        assert_eq!(&sizes[..13], &start[..], "{sizes:?}");
+        // the handshake counts too, so the boost ends a little before
+        // 128 KiB of payload; from then on, full records
+        let boosted: usize = sizes.iter().take_while(|n| **n < 16384).sum();
+        assert!(
+            sizes[sizes.len() - 5..].iter().all(|n| *n == 16384),
+            "{sizes:?}"
+        );
+        assert!(boosted < 128 * 1024, "{boosted}");
     }
 
     /// A write after shutdown is refused and puts nothing on the wire; the

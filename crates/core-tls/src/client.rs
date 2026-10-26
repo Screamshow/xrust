@@ -85,6 +85,9 @@ pub struct Config<'a> {
 /// One handshake. [`Handshake::run`] is the whole thing over a blocking stream.
 pub struct Handshake<'a> {
     config: Config<'a>,
+    /// bytes of records this side has written, as Go's `Conn.bytesSent`
+    /// counts them from the hello on
+    sent: u64,
     shares: Shares,
     /// the suite ids the fingerprint offers, so we can tell whether the server
     /// answered our hello or one of its own; GREASE is drawn per hello and is
@@ -136,6 +139,7 @@ impl<'a> Handshake<'a> {
                 .collect()
         };
         Ok(Handshake {
+            sent: 0,
             shares: Shares::for_body(&key_share)?,
             offered,
             session_id: vec![0u8; 32],
@@ -261,12 +265,14 @@ impl<'a> Handshake<'a> {
                 &handshake[split_pos..],
                 record::VERSION_1_2,
             )?;
+            self.sent += (rec1.len() + rec2.len()) as u64;
             stream.write_all(&rec1).await?;
             stream.flush().await?;
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
             stream.write_all(&rec2).await?;
             stream.flush().await
         } else {
+            self.sent += record.len() as u64;
             stream.write_all(&record).await?;
             stream.flush().await
         }
@@ -498,6 +504,7 @@ impl<'a> Handshake<'a> {
             .as_mut()
             .ok_or_else(|| bad("no handshake keys, so nothing to seal with"))?;
         let sealed = sealer.seal(ContentType::Handshake, &message)?;
+        self.sent += (ccs.len() + sealed.len()) as u64;
         stream.write_all(&ccs).await?;
         stream.write_all(&sealed).await?;
         stream.flush().await?;
@@ -526,6 +533,8 @@ pub struct Connection {
     sealer: Sealer,
     opener: Opener,
     closed: bool,
+    /// what the handshake wrote, see [`Connection::handshake_bytes`]
+    handshake_bytes: u64,
 }
 
 impl Connection {
@@ -558,7 +567,14 @@ impl Connection {
                 KeySchedule::traffic_keys(&server_secret, hash, key_len),
             ),
             closed: false,
+            handshake_bytes: handshake.sent,
         })
+    }
+
+    /// The bytes of the records the handshake wrote: where Go's record-size
+    /// boost (`maxPayloadSizeForWrite`) starts counting.
+    pub fn handshake_bytes(&self) -> u64 {
+        self.handshake_bytes
     }
 
     /// Wrap `data` into one record appended to `out`, ready for the transport
@@ -714,6 +730,7 @@ mod tests {
             sealer: Sealer::new(suite, keys()),
             opener: Opener::new(suite, keys()),
             closed: false,
+            handshake_bytes: 0,
         };
         (conn, Sealer::new(suite, keys()))
     }
