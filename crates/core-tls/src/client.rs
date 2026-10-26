@@ -617,7 +617,9 @@ impl Connection {
             ContentType::Alert => {
                 // close_notify is the end of the data, not a failure
                 let data = raw[5..5 + plain].to_vec();
-                if data.len() >= 2 && data[1] == 0 {
+                // only a record that is exactly one close_notify; a record
+                // holding several alerts is malformed (RFC 8446 5.1)
+                if data.len() == 2 && data[1] == 0 {
                     self.closed = true;
                 }
                 Err(alert(&data))
@@ -682,6 +684,40 @@ mod tests {
     use super::*;
     use crate::fingerprints;
     use crate::verify::AcceptsAnything;
+
+    /// A connection and the peer's sealer, on keys we made up.
+    fn pair() -> (Connection, Sealer) {
+        let suite = CipherSuite::TLS13_AES_128_GCM_SHA256;
+        let keys = || KeySchedule::traffic_keys(b"a traffic secret we made up", Hash::Sha256, 16);
+        let conn = Connection {
+            sealer: Sealer::new(suite, keys()),
+            opener: Opener::new(suite, keys()),
+            closed: false,
+        };
+        (conn, Sealer::new(suite, keys()))
+    }
+
+    /// Only an alert record that is exactly close_notify ends the stream;
+    /// a fatal alert, or close_notify followed by another alert in the same
+    /// record, is an error and leaves the connection open.
+    #[test]
+    fn only_a_lone_close_notify_closes() {
+        for (payload, closes) in [
+            (&[1u8, 0][..], true),
+            (&[2, 0][..], true),
+            (&[2, 40][..], false),
+            (&[1, 0, 2, 40][..], false),
+            (&[0][..], false),
+        ] {
+            let (mut conn, mut peer) = pair();
+            let mut record = peer.seal(ContentType::Alert, payload).unwrap();
+            assert!(
+                conn.read_record_in_place(&mut record).is_err(),
+                "{payload:?}"
+            );
+            assert_eq!(conn.is_closed(), closes, "{payload:?}");
+        }
+    }
 
     /// The list we check the server's suite against has to be the one that
     /// went out on the wire: pairing the template bytes with mismatched
