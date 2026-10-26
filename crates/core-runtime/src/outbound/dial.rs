@@ -41,11 +41,15 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `sing/common/network.DefaultFallbackDelay`: how long the first address gets
 /// before the other family starts.
 const DEFAULT_FALLBACK_DELAY: Duration = Duration::from_millis(300);
-/// `C.TCPKeepAliveInitial` and `C.TCPKeepAliveInterval`.
+/// `C.TCPKeepAliveInitial` and `C.TCPKeepAliveInterval` (sing-box 1.14).
 #[cfg_attr(not(unix), allow(dead_code))]
-const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(15);
+const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(300);
 #[cfg_attr(not(unix), allow(dead_code))]
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(75);
+/// Go's `net.KeepAliveConfig` sends 9 probes when `Count` is left at zero,
+/// which the reference dialer does.
+#[cfg(unix)]
+const KEEP_ALIVE_COUNT: libc::c_int = 9;
 /// The queue length the reference asks TCP_FASTOPEN for.
 #[cfg(unix)]
 const FAST_OPEN_QUEUE: libc::c_int = 256;
@@ -216,9 +220,14 @@ impl DialOptions {
         if self.disable_tcp_keep_alive {
             return None;
         }
+        // zero means the default there, as it does in the reference
         Some((
-            self.tcp_keep_alive.unwrap_or(KEEP_ALIVE_IDLE),
-            self.tcp_keep_alive_interval.unwrap_or(KEEP_ALIVE_INTERVAL),
+            self.tcp_keep_alive
+                .filter(|d| !d.is_zero())
+                .unwrap_or(KEEP_ALIVE_IDLE),
+            self.tcp_keep_alive_interval
+                .filter(|d| !d.is_zero())
+                .unwrap_or(KEEP_ALIVE_INTERVAL),
         ))
     }
 
@@ -305,29 +314,7 @@ impl DialOptions {
             )?;
         }
         if !udp {
-            match self.keep_alive() {
-                None => set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 0)?,
-                Some((idle, interval)) => {
-                    set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
-                    #[cfg(any(target_os = "macos", target_os = "ios"))]
-                    const TCP_KEEPIDLE_OPT: libc::c_int = libc::TCP_KEEPALIVE;
-                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
-                    const TCP_KEEPIDLE_OPT: libc::c_int = libc::TCP_KEEPIDLE;
-
-                    set_int(
-                        fd,
-                        libc::IPPROTO_TCP,
-                        TCP_KEEPIDLE_OPT,
-                        idle.as_secs() as libc::c_int,
-                    )?;
-                    set_int(
-                        fd,
-                        libc::IPPROTO_TCP,
-                        libc::TCP_KEEPINTVL,
-                        interval.as_secs() as libc::c_int,
-                    )?;
-                }
-            }
+            self.apply_keep_alive(fd)?;
             if self.tcp_fast_open {
                 set_int(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, FAST_OPEN_QUEUE)?;
             }
@@ -360,6 +347,31 @@ impl DialOptions {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl DialOptions {
+    /// Keep-alive as the reference dialer sets it: on with its idle time,
+    /// interval and probe count, or explicitly off.
+    fn apply_keep_alive(&self, fd: RawFd) -> io::Result<()> {
+        let Some((idle, interval)) = self.keep_alive() else {
+            return set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 0);
+        };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        const TCP_KEEPIDLE_OPT: libc::c_int = libc::TCP_KEEPALIVE;
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        const TCP_KEEPIDLE_OPT: libc::c_int = libc::TCP_KEEPIDLE;
+        // whole seconds, rounded up as Go does: a sub-second value is 1 s
+        let secs = |d: Duration| {
+            d.as_secs()
+                .saturating_add(u64::from(d.subsec_nanos() > 0))
+                .min(libc::c_int::MAX as u64) as libc::c_int
+        };
+        set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1)?;
+        set_int(fd, libc::IPPROTO_TCP, TCP_KEEPIDLE_OPT, secs(idle))?;
+        set_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, secs(interval))?;
+        set_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, KEEP_ALIVE_COUNT)
     }
 }
 
@@ -535,10 +547,22 @@ pub async fn connect_tcp(host: &str, port: u16, options: &DialOptions) -> io::Re
 /// set on the socket, and the socket-options path when there is.
 async fn connect_one(addr: SocketAddr, options: &DialOptions) -> io::Result<TcpStream> {
     let stream = if options.is_empty() {
-        match tokio::time::timeout(options.connect_timeout(), TcpStream::connect(addr)).await {
-            Ok(result) => result?,
-            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout")),
+        let stream =
+            match tokio::time::timeout(options.connect_timeout(), TcpStream::connect(addr)).await {
+                Ok(result) => result?,
+                Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timeout")),
+            };
+        // the reference turns keep-alive on for every dial, options or not
+        // (Go sets it after the connect too); a failure here leaves a
+        // working connection, so it is not one to give up the dial for
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if let Err(err) = options.apply_keep_alive(stream.as_raw_fd()) {
+                crate::logging::debug(format_args!("tcp keep-alive: {err}"));
+            }
         }
+        stream
     } else {
         dial_tcp(addr, options).await?
     };
@@ -1334,6 +1358,81 @@ mod tests {
         }
     }
 
+    /// A dialed socket carries the reference's keep-alive whether or not
+    /// any dial option sends it down the socket-options path: 300 s idle,
+    /// 75 s interval, 9 probes; `disable_tcp_keep_alive` turns it off, and
+    /// zero durations fall back to the defaults.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dialed_sockets_carry_the_reference_keep_alive() {
+        use std::os::fd::AsRawFd;
+        let get = |stream: &TcpStream, level: libc::c_int, name: libc::c_int| {
+            let mut value: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: a live socket and an int-sized out buffer
+            let rc = unsafe {
+                libc::getsockopt(
+                    stream.as_raw_fd(),
+                    level,
+                    name,
+                    std::ptr::addr_of_mut!(value).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt");
+            value
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let cases = [
+            (DialOptions::default(), Some((300, 75))),
+            (
+                // an unrelated option takes the socket-options path
+                DialOptions {
+                    reuse_addr: true,
+                    ..Default::default()
+                },
+                Some((300, 75)),
+            ),
+            (
+                DialOptions {
+                    tcp_keep_alive: Some(Duration::ZERO),
+                    tcp_keep_alive_interval: Some(Duration::from_millis(1500)),
+                    ..Default::default()
+                },
+                Some((300, 2)),
+            ),
+            (
+                DialOptions {
+                    disable_tcp_keep_alive: true,
+                    ..Default::default()
+                },
+                None,
+            ),
+        ];
+        for (options, want) in cases {
+            let stream = connect_tcp_addr(addr, &options).await.expect("dial");
+            match want {
+                Some((idle, interval)) => {
+                    assert_eq!(get(&stream, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+                    assert_eq!(get(&stream, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), idle);
+                    assert_eq!(
+                        get(&stream, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
+                        interval
+                    );
+                    assert_eq!(get(&stream, libc::IPPROTO_TCP, libc::TCP_KEEPCNT), 9);
+                }
+                None => assert_eq!(get(&stream, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 0),
+            }
+        }
+    }
+
     #[test]
     fn keep_alive_defaults_to_the_reference_pair_and_off_means_off() {
         let default = DialOptions::default();
@@ -1436,6 +1535,7 @@ mod tests {
         assert_eq!(get_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
         assert_eq!(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 42);
         assert_eq!(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 11);
+        assert_eq!(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT), 9);
         unsafe { libc::close(fd) };
 
         // and the fragment default the reference asks for
