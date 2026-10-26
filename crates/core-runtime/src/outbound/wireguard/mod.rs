@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -166,6 +166,7 @@ enum Cmd {
         id: u32,
         dst: SocketAddr,
         to_caller: mpsc::Sender<Vec<u8>>,
+        stalled: Arc<AtomicBool>,
         resp: oneshot::Sender<Result<(), String>>,
     },
     TcpData {
@@ -193,6 +194,8 @@ enum Cmd {
 struct WgShared {
     cmd_tx: mpsc::Sender<Cmd>,
     next_id: AtomicU32,
+    /// wakes the stack task when a stalled connection's caller made room
+    wake: Arc<tokio::sync::Notify>,
 }
 
 /// WireGuard endpoint outbound (see module docs).
@@ -429,13 +432,15 @@ impl WireGuard {
             ));
         }
         let (tx, rx) = mpsc::channel(CMD_QUEUE);
+        let wake = Arc::new(tokio::sync::Notify::new());
         let shared = Arc::new(WgShared {
             cmd_tx: tx,
             next_id: AtomicU32::new(1),
+            wake: Arc::clone(&wake),
         });
         let cfg = Arc::new(self.cfg.clone());
         tokio::spawn(async move {
-            if let Err(e) = run(cfg, Arc::new(sock), sock_v6, rx).await {
+            if let Err(e) = run(cfg, Arc::new(sock), sock_v6, rx, wake).await {
                 logging::error(format_args!("wireguard stack exited: {e}"));
             }
         });
@@ -458,6 +463,7 @@ impl WireGuard {
         let (caller_read, caller_write) = tokio::io::split(local);
         let (to_caller_tx, to_caller_rx) = mpsc::channel(REPLY_QUEUE);
         let (resp_tx, resp_rx) = oneshot::channel();
+        let stalled = Arc::new(AtomicBool::new(false));
 
         shared
             .cmd_tx
@@ -465,6 +471,7 @@ impl WireGuard {
                 id,
                 dst,
                 to_caller: to_caller_tx,
+                stalled: Arc::clone(&stalled),
                 resp: resp_tx,
             })
             .await
@@ -509,10 +516,18 @@ impl WireGuard {
         });
 
         // stack → caller: pump replies with per-connection backpressure.
+        let wake = Arc::clone(&shared.wake);
         tokio::spawn(async move {
             let mut write = caller_write;
             let mut replies = to_caller_rx;
             while let Some(bytes) = replies.recv().await {
+                // A slot is free again. If the stack had to hold data back
+                // for want of one, its receive window is shut and only it can
+                // reopen it: wake it now rather than at the peer's next
+                // zero-window probe, which backs off to tens of seconds.
+                if stalled.swap(false, Ordering::SeqCst) {
+                    wake.notify_one();
+                }
                 if write.write_all(&bytes).await.is_err() {
                     break;
                 }
@@ -598,6 +613,9 @@ struct TcpConn {
     #[allow(dead_code)]
     dst: SocketAddr,
     to_caller: mpsc::Sender<Vec<u8>>,
+    /// set when data is held back because `to_caller` is full; the caller's
+    /// pump clears it and wakes the stack once it has made room
+    stalled: Arc<AtomicBool>,
     resp: Option<oneshot::Sender<Result<(), String>>>,
     from_caller: VecDeque<(Vec<u8>, oneshot::Sender<()>)>,
     stash: Option<Vec<u8>>,
@@ -1074,6 +1092,7 @@ impl Stack {
                 id,
                 dst,
                 to_caller,
+                stalled,
                 resp,
             } => {
                 let Some(pi) = self.lpm(dst.ip()) else {
@@ -1105,6 +1124,7 @@ impl Stack {
                         handle,
                         dst,
                         to_caller,
+                        stalled,
                         resp: Some(resp),
                         from_caller: VecDeque::new(),
                         stash: None,
@@ -1565,6 +1585,10 @@ impl Stack {
                             Ok(n) => match conn.to_caller.try_send(rbuf[..n].to_vec()) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(v)) => {
+                                    // Flag first, then the retry below: either
+                                    // the retry finds room, or the pump sees
+                                    // the flag after it makes room and wakes us.
+                                    conn.stalled.store(true, Ordering::SeqCst);
                                     conn.stash = Some(v);
                                     break;
                                 }
@@ -1595,7 +1619,10 @@ impl Stack {
             if let Some(stash) = conn.stash.take() {
                 match conn.to_caller.try_send(stash) {
                     Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(v)) => conn.stash = Some(v),
+                    Err(mpsc::error::TrySendError::Full(v)) => {
+                        conn.stalled.store(true, Ordering::SeqCst);
+                        conn.stash = Some(v);
+                    }
                     Err(mpsc::error::TrySendError::Closed(_)) => caller_gone = true,
                 }
             }
@@ -1823,6 +1850,7 @@ async fn run(
     sock: Arc<UdpSocket>,
     sock_v6: Option<Arc<UdpSocket>>,
     mut rx: mpsc::Receiver<Cmd>,
+    wake: Arc<tokio::sync::Notify>,
 ) -> io::Result<()> {
     let mtu = cfg.mtu;
     let mut device = WgDevice::new(mtu);
@@ -1903,6 +1931,9 @@ async fn run(
         let sock = Arc::clone(&stack.sock);
         let s6_opt = stack.sock_v6.as_ref().map(Arc::clone);
         tokio::select! {
+            // a stalled connection's caller made room: move the held-back
+            // data and let the stack reopen the receive window
+            _ = wake.notified() => {}
             cmd = rx.recv() => match cmd {
                 Some(cmd) => stack.process_cmd(cmd),
                 None => return Ok(()),
