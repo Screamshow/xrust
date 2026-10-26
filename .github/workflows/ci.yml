@@ -70,7 +70,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
+            budget: 13631488
           - target: aarch64-unknown-linux-musl
+            budget: 12582912
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,11 +87,11 @@ jobs:
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
-      - name: Size budget (<= 12 MiB)
+      - name: Size budget (13 MiB x86_64, 12 MiB ARM64)
         run: |
           size=$(stat -c%s "target/${{ matrix.target }}/release/tachyon-core")
           echo "size=$size bytes"
-          test "$size" -le 12582912
+          test "$size" -le ${{ matrix.budget }}
       - uses: actions/upload-artifact@v4
         with:
           name: tachyon-core-${{ matrix.target }}

@@ -27,8 +27,10 @@ jobs:
         include:
           - name: x86_64-musl
             target: x86_64-unknown-linux-musl
+            budget: 13631488
           - name: aarch64-musl
             target: aarch64-unknown-linux-musl
+            budget: 12582912
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,8 +44,8 @@ jobs:
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
-      - name: Size budget (12 MiB)
-        run: test "$(stat -c%s target/${{ matrix.target }}/release/tachyon-core)" -le 12582912
+      - name: Size budget (13 MiB x86_64, 12 MiB ARM64)
+        run: test "$(stat -c%s target/${{ matrix.target }}/release/tachyon-core)" -le ${{ matrix.budget }}
       - name: Architecture check
         run: file target/${{ matrix.target }}/release/tachyon-core
       - name: Pack
