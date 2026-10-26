@@ -61,6 +61,15 @@ use ::aead::{Aead, KeyInit};
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+/// The process tuning knob `XRUST_<name>`, or the pre-rename `TACHYON_<name>`
+/// when the new one is unset, so existing router setups keep working.
+#[cfg(feature = "std")]
+pub fn env_var(name: &str) -> Option<alloc::string::String> {
+    std::env::var(alloc::format!("XRUST_{name}"))
+        .or_else(|_| std::env::var(alloc::format!("TACHYON_{name}")))
+        .ok()
+}
+
 /// The key length the TLS 1.3 record AEAD of `suite` needs, or `None` for a
 /// suite that is not ours to run.
 ///

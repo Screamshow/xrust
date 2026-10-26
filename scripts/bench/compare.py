@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Results table from a proto.py run: tachyon-core against sing-box core.
+"""Results table from a proto.py run: xrust against sing-box core.
 
 One row per protocol. Each throughput cell carries the percentage one side is
 faster by, memory is the peak RSS of the proxy processes, `conns` is how many
@@ -74,7 +74,7 @@ def main():
 
     lines = []
     lines.append(
-        f"tachyon-core vs sing-box (`{d.get('ref', 'sing-box')}`), "
+        f"xrust vs sing-box (`{d.get('ref', 'sing-box')}`), "
         f"{d.get('runs', '?')} runs x {d.get('seconds', '?')}s, "
         f"p50 rounds {d.get('rounds', '?')}; host: {d.get('cpu', '?')} "
         f"({d.get('cores', '?')} cores), client cpus {d.get('client_cpus', '?')}, "
@@ -82,7 +82,7 @@ def main():
     )
     lines.append("")
     lines.append(
-        "Cells: `tachyon / sing-box`. Faster column: `+` = tachyon-core is faster, "
+        "Cells: `xrust / sing-box`. Faster column: `+` = xrust is faster, "
         "`-` = sing-box is. RSS is peak VmHWM of the proxy side(s) named in the "
         "header, in MiB. Connect is median time to a first echoed byte."
     )
@@ -91,12 +91,12 @@ def main():
     for part, title, note in (
         (
             "A",
-            "Part A: both sides are the core under test (tachyon client+server vs sing-box client+server)",
+            "Part A: both sides are the core under test (xrust client+server vs sing-box client+server)",
             "",
         ),
         (
             "B",
-            "Part B: one sing-box server for everyone, the tachyon client against the sing-box client",
+            "Part B: one sing-box server for everyone, the xrust client against the sing-box client",
             "",
         ),
     ):

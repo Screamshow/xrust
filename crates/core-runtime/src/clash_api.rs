@@ -20,7 +20,7 @@
 //! and cache.db persistence (the delay history is in-memory only).
 //!
 //! Known deviations (deliberate): HTTP keep-alive loop without `Date`
-//! headers; version string reports `tachyon-core`.
+//! headers; version string reports `Xrust`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -395,13 +395,13 @@ async fn serve(listener: TcpListener, api: Arc<ClashApi>, router: Arc<Router>) {
 /// too keeps idle connections from piling up; HTTP clients reopen a closed
 /// idle connection on their own. Responses, WebSocket streams and delay
 /// probes are not covered by it.
-/// `TACHYON_CLASH_API_HEADER_TIMEOUT_MS` overrides it.
+/// `XRUST_CLASH_API_HEADER_TIMEOUT_MS` overrides it.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn header_timeout() -> Duration {
     static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *TIMEOUT.get_or_init(|| {
-        if let Ok(val) = std::env::var("TACHYON_CLASH_API_HEADER_TIMEOUT_MS")
+        if let Some(val) = crate::env_var("CLASH_API_HEADER_TIMEOUT_MS")
             && let Ok(ms) = val.parse::<u64>()
             && ms > 0
         {
@@ -730,7 +730,7 @@ fn classify_proxies(path: &str, external_ui: bool) -> (Route, &'static [&'static
 }
 
 /// `/group/{name}/delay`: urltest groups live on their own mount in the
-/// reference, and tachyon's UI probes them here rather than under `/proxies`.
+/// reference, and the router UI probes them here rather than under `/proxies`.
 fn classify_group(rest: &str) -> (Route, &'static [&'static str]) {
     let rest = rest.strip_suffix('/').unwrap_or(rest);
     match rest.rsplit_once('/') {

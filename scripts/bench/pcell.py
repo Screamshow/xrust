@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One proto.py cell under `perf record`: where does the client spend its time.
 
-    pcell.py --case vmess-ws-tls --impl tachyon --tachyon /bench/tachyon-core \
+    pcell.py --case vmess-ws-tls --impl tachyon --xrust /bench/xrust \
              --ref /bench/sing-box-lx --streams 1 --out /bench/perf-vmess-ws
 
 The cell is run exactly the way proto.py runs it (same configs, same pinning, same
@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--case", required=True)
     ap.add_argument("--impl", default="tachyon", help="which client is profiled: tachyon | ref")
     ap.add_argument("--server", default="", help="tachyon | ref; default follows the part")
-    ap.add_argument("--tachyon", required=True)
+    ap.add_argument("--xrust", "--tachyon", dest="tachyon", required=True)
     ap.add_argument("--ref", required=True)
     ap.add_argument("--streams", type=int, default=1)
     ap.add_argument("--seconds", type=int, default=4)

@@ -266,7 +266,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tachyon-zip-{name}"));
+        let dir = std::env::temp_dir().join(format!("xrust-zip-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }

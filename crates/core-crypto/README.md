@@ -1,7 +1,7 @@
-> **Vendored `rustls-rustcrypto` fork for tachyon-core.** Copy of
+> **Vendored `rustls-rustcrypto` fork for Xrust.** Copy of
 > [`oxitls-rustcrypto-provider`](https://crates.io/crates/oxitls-rustcrypto-provider)
 > 0.3.0 (itself a fork of `rustls-rustcrypto`), renamed to `core-crypto` and a
-> workspace member of tachyon-core. Two reasons it exists:
+> workspace member of Xrust. Two reasons it exists:
 >
 > 1. **RUSTSEC-2026-0104** — CRL-parsing panic in `rustls-webpki` 0.102.x;
 >    the fork drops `rustls-webpki` and routes `alg_id` through

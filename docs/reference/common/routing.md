@@ -42,7 +42,7 @@ DNS, BitTorrent, SSH и RDP, не теряя первых байтов.
 
 ```json
 { "type": "inline", "tag": "local", "rules": [] }
-{ "type": "local",  "tag": "file",  "path": "/etc/tachyon/rules.srs" }
+{ "type": "local",  "tag": "file",  "path": "/etc/xrust/rules.srs" }
 { "type": "remote", "tag": "net",  "url": "https://...", "update_interval": "24h", "download_detour": "proxy" }
 ```
 

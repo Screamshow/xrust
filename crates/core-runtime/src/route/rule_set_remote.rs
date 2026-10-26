@@ -102,7 +102,7 @@ const RECOVERY_LADDER: [Duration; 4] = [
 ];
 
 /// Opt-in: keep the engine running with an empty rule-set instead of aborting
-/// the start, and fetch it in the background. `TACHYON_RULESET_SOFT_START=1`.
+/// the start, and fetch it in the background. `XRUST_RULESET_SOFT_START=1`.
 ///
 /// Off by default, because the reference aborts with `initial rule-set:
 /// <tag>` and an empty set means the rules pointing at it match nothing. A
@@ -110,8 +110,8 @@ const RECOVERY_LADDER: [Duration; 4] = [
 /// start there costs DNS as well as the proxy.
 pub fn soft_start_enabled() -> bool {
     matches!(
-        std::env::var("TACHYON_RULESET_SOFT_START").as_deref(),
-        Ok("1") | Ok("true")
+        crate::env_var("RULESET_SOFT_START").as_deref(),
+        Some("1") | Some("true")
     )
 }
 
@@ -622,7 +622,7 @@ impl RemoteRegistry {
     }
 
     /// Fetch every remote set once; a failure aborts the start unless
-    /// `TACHYON_RULESET_SOFT_START` asks for the set to be filled later.
+    /// `XRUST_RULESET_SOFT_START` asks for the set to be filled later.
     pub async fn start_all(
         &self,
         router: &Arc<Router>,
@@ -1184,7 +1184,7 @@ mod tests {
     async fn initial_path_is_used_before_the_first_fetch() {
         let router = router().await;
         let payload = srs_with("local.example");
-        let path = std::env::temp_dir().join("tachyon-remote-rule-set-test.srs");
+        let path = std::env::temp_dir().join("xrust-remote-rule-set-test.srs");
         std::fs::write(&path, &payload).expect("write");
         let path = path.to_string_lossy().to_string();
         // a URL that would fail: the initial path must be enough
@@ -1196,7 +1196,7 @@ mod tests {
             set.set.index().has_suffix("local.example"),
             "the initial path compiled its suffix"
         );
-        let _ = std::fs::remove_file(std::env::temp_dir().join("tachyon-remote-rule-set-test.srs"));
+        let _ = std::fs::remove_file(std::env::temp_dir().join("xrust-remote-rule-set-test.srs"));
     }
 
     #[tokio::test]

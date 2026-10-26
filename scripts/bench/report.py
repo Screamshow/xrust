@@ -3,7 +3,7 @@ freshest measurement any run produced, so a narrow `-Only` rerun replaces only
 its own rows and the rest of the page stays on the last full pass.
 
 The table is a classic comparison grid: one row per protocol, every metric a
-group of three columns -- tachyon-core, sing-box and how many percent we are
+group of three columns -- xrust, sing-box and how many percent we are
 better -- with the percentage cell tinted green or red and a verdict pill
 closing the row. The protocol name column and the header rows are sticky, so
 the wide grid stays readable while it scrolls sideways and down in its own
@@ -32,7 +32,7 @@ MAX_COST = 1.10
 LOSS, WIN, TIE = "loss", "win", "tie"
 VERDICT_RU = {WIN: "победа", LOSS: "провал", TIE: "паритет"}
 
-OUR_NAME = "tachyon-core"
+OUR_NAME = "xrust"
 REF_NAME = "sing-box"
 
 HOST_RU = {"desktop": "десктоп", "router": "роутер"}
@@ -241,7 +241,7 @@ def thead_html(groups):
         f'<th class="grp" colspan="3">{html.escape(t)}</th>' for t, *_ in groups
     )
     subs = "".join(
-        "<th>tachyon-core</th><th>sing-box</th><th>%</th>"
+        "<th>xrust</th><th>sing-box</th><th>%</th>"
         for _ in groups
     )
     return (
@@ -324,7 +324,7 @@ def tables_html(cells, strict, bulk_gib):
     seen.sort()
 
     titles = {
-        "A": "Обе стороны под тестом: tachyon-core ↔ tachyon-core против sing-box ↔ sing-box",
+        "A": "Обе стороны под тестом: xrust ↔ xrust против sing-box ↔ sing-box",
         "B": "Клиент против клиента: сервер sing-box с обеих сторон",
     }
     out, totals = [], {LOSS: 0, WIN: 0, TIE: 0}
@@ -560,7 +560,7 @@ def toolbar():
 def footer_js():
     return """
 <script>
- const KEY = "tachyon-report-v1";
+ const KEY = "xrust-report-v1";
  let state = { losses: false, host: "", q: "" };
  try { state = Object.assign(state, JSON.parse(localStorage.getItem(KEY) || "{}")); }
  catch (e) {}
@@ -631,7 +631,7 @@ def meta_line(run, strict, extra=""):
             f"CPU, задержка и память не выше {int(MAX_COST * 100)}%, "
             f"подключение — не выше 1.5x эталона + 2 мс."
         )
-        + " Колонка «%»: плюс — tachyon-core лучше на столько процентов."
+        + " Колонка «%»: плюс — xrust лучше на столько процентов."
         + (f" {extra}" if extra else "")
         + "</p>"
     )

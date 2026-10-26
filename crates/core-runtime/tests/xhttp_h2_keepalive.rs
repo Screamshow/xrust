@@ -169,7 +169,7 @@ async fn stand(mode: &str, xmux: Value) -> Stand {
         // closed packet-up sessions end quickly, so idle means idle
         // SAFETY: set once, before any box of this binary is started
         unsafe {
-            std::env::set_var("TACHYON_XHTTP_HALF_CLOSE_IDLE_MS", "500");
+            std::env::set_var("XRUST_XHTTP_HALF_CLOSE_IDLE_MS", "500");
         }
     });
     let server_in = json!({

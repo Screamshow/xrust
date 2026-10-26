@@ -52,9 +52,11 @@ mod rule_set;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// Compatibility contract: Tachyon parses `sing-box version X` (generator.uc).
+/// Compatibility contract: Forkop X parses `sing-box version X` (generator.uc)
+/// and recognises this core by the `-rust-x.` suffix (older builds reported
+/// `-tachyon.`, which Forkop X still accepts).
 /// When invoked through the `sing-box` name we print upstream-shaped output;
-/// under our own name we print tachyon-core output.
+/// under our own name we print xrust output.
 fn bin_invoked_as_sing_box() -> bool {
     std::env::args()
         .next()
@@ -68,12 +70,9 @@ fn bin_invoked_as_sing_box() -> bool {
 
 fn version_line() -> String {
     if bin_invoked_as_sing_box() {
-        format!(
-            "sing-box version v{}-tachyon.0\n",
-            env!("CARGO_PKG_VERSION")
-        )
+        format!("sing-box version v{}-rust-x.0\n", env!("CARGO_PKG_VERSION"))
     } else {
-        format!("tachyon-core {}\n", env!("CARGO_PKG_VERSION"))
+        format!("xrust {}\n", env!("CARGO_PKG_VERSION"))
     }
 }
 
@@ -214,9 +213,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // for machinery nothing can use — the steal queues, the cross-worker
     // handoffs — while every task switch could have been a plain loop over the
     // ready queue, so that case takes the current-thread runtime instead.
-    // TACHYON_WORKERS overrides the guess (benchmarks, cpu-restricted cgroups).
-    let workers = std::env::var("TACHYON_WORKERS")
-        .ok()
+    // XRUST_WORKERS overrides the guess (benchmarks, cpu-restricted cgroups).
+    let workers = core_runtime::env_var("WORKERS")
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
@@ -563,7 +561,7 @@ unsafe fn raise_rlimit_nofile() {
 mod nofile_tests;
 
 fn usage() -> String {
-    "usage: tachyon-core [options] <command> [command-options]\n\
+    "usage: xrust [options] <command> [command-options]\n\
      \n\
      global options:\n\
        -c, --config <path>               configuration file path\n\
@@ -609,7 +607,7 @@ fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
 
     // The reference accepts global options (-c, -C, -D, --disable-color) before or after the command.
-    // On OpenWrt, Tachyon/Podkop calls `sing-box -c <path> check`, or `sing-box -D <dir> -c <path> run`.
+    // On OpenWrt, Forkop X/Podkop calls `sing-box -c <path> check`, or `sing-box -D <dir> -c <path> run`.
     let mut working_dir: Option<PathBuf> = None;
     let mut config_from_flags: Option<PathBuf> = None;
     let mut command: Option<String> = None;
@@ -790,9 +788,9 @@ mod tests {
     #[test]
     fn test_format_and_merge_cli() {
         let temp_dir = std::env::temp_dir();
-        let path1 = temp_dir.join(format!("tachyon_test_cfg1_{}.json", std::process::id()));
-        let path2 = temp_dir.join(format!("tachyon_test_cfg2_{}.json", std::process::id()));
-        let path_out = temp_dir.join(format!("tachyon_test_cfg_out_{}.json", std::process::id()));
+        let path1 = temp_dir.join(format!("xrust_test_cfg1_{}.json", std::process::id()));
+        let path2 = temp_dir.join(format!("xrust_test_cfg2_{}.json", std::process::id()));
+        let path_out = temp_dir.join(format!("xrust_test_cfg_out_{}.json", std::process::id()));
 
         std::fs::write(&path1, r#"{"log":{"level":"debug"}}"#).unwrap();
         std::fs::write(&path2, r#"{"inbounds":[{"tag":"in","type":"mixed"}]}"#).unwrap();

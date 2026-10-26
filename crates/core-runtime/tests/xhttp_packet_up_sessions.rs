@@ -35,7 +35,7 @@ async fn test_guard() -> tokio::sync::MutexGuard<'static, ()> {
         // SAFETY: set once, before any box of this binary is started; every
         // test takes this guard first.
         unsafe {
-            std::env::set_var("TACHYON_XHTTP_HALF_CLOSE_IDLE_MS", IDLE_MS.to_string());
+            std::env::set_var("XRUST_XHTTP_HALF_CLOSE_IDLE_MS", IDLE_MS.to_string());
         }
     });
     LOCK.lock().await

@@ -45,13 +45,13 @@ jobs:
       - name: Build
         run: cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
       - name: Size budget (13 MiB x86_64, 12 MiB ARM64)
-        run: test "$(stat -c%s target/${{ matrix.target }}/release/tachyon-core)" -le ${{ matrix.budget }}
+        run: test "$(stat -c%s target/${{ matrix.target }}/release/xrust)" -le ${{ matrix.budget }}
       - name: Architecture check
-        run: file target/${{ matrix.target }}/release/tachyon-core
+        run: file target/${{ matrix.target }}/release/xrust
       - name: Pack
         run: |
           name="rust-x-${{ matrix.name }}"
-          cp "target/${{ matrix.target }}/release/tachyon-core" "$name"
+          cp "target/${{ matrix.target }}/release/xrust" "$name"
           tar -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4

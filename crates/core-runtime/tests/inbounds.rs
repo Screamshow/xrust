@@ -497,7 +497,7 @@ async fn tun_inbound_linux_open_interface() {
             {
                 "type": "tun",
                 "tag": "tun-in",
-                "interface_name": "tachyon-tst0",
+                "interface_name": "xrust-tst0",
                 "inet4_address": "172.19.100.1/30",
                 "mtu": 1500,
                 "auto_route": false

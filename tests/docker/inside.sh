@@ -4,7 +4,7 @@ set -euo pipefail
 
 cd /src
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/cache/target}"
-export TACHYON_CORE_BIN="$CARGO_TARGET_DIR/debug/tachyon-core"
+export XRUST_BIN="$CARGO_TARGET_DIR/debug/xrust"
 export SING_BOX_REF="${SING_BOX_REF:-/usr/local/bin/sing-box-ref}"
 # The target dir is a persistent volume, so cargo keeps every artifact of every
 # past commit: a few dozen runs and it reaches tens of GB. Incremental data is
@@ -46,10 +46,10 @@ fi
 
 echo "== musl static build + size budget (<= 12 MiB)"
 cargo build --workspace --release --target x86_64-unknown-linux-musl
-size=$(stat -c%s "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/tachyon-core")
+size=$(stat -c%s "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/xrust")
 echo "size=$size bytes"
 test "$size" -le 12582912
-file "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/tachyon-core"
+file "$CARGO_TARGET_DIR/x86_64-unknown-linux-musl/release/xrust"
 
 echo "== differential vs $SING_BOX_REF (STRICT=1)"
 STRICT=1 bash tests/differential/run.sh

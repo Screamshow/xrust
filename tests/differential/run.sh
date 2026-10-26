@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Differential harness: tachyon-core vs reference sing-box-lx on the golden corpus.
+# Differential harness: xrust vs reference sing-box-lx on the golden corpus.
 #
-# usage: SING_BOX_REF=/path/to/sing-box [-c /path/to/tachyon-core] [STRICT=1] run.sh
+# usage: SING_BOX_REF=/path/to/sing-box [XRUST_BIN=/path/to/xrust] [STRICT=1] run.sh
 #
 #   valid dirs (lx, tachyon): both binaries must exit 0.
-#   invalid dir: reference must exit non-zero; tachyon-core must exit non-zero
+#   invalid dir: reference must exit non-zero; xrust must exit non-zero
 #   too (semantic validation, F1) — enforced only when STRICT=1, otherwise a
 #   known gap is reported without failing the run.
 set -uo pipefail
@@ -12,17 +12,17 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CORPUS="$ROOT/tests/golden"
 REF="${SING_BOX_REF:?set SING_BOX_REF to the reference sing-box binary}"
-CORE="${TACHYON_CORE_BIN:-}"
+CORE="${XRUST_BIN:-${TACHYON_CORE_BIN:-}}"
 if [[ -z "$CORE" ]]; then
   for candidate in \
-    "$ROOT/target/debug/tachyon-core" \
-    "$ROOT/target/debug/tachyon-core.exe" \
-    "$ROOT/target/release/tachyon-core" \
-    "$ROOT/target/release/tachyon-core.exe"; do
+    "$ROOT/target/debug/xrust" \
+    "$ROOT/target/debug/xrust.exe" \
+    "$ROOT/target/release/xrust" \
+    "$ROOT/target/release/xrust.exe"; do
     if [[ -x "$candidate" || -f "$candidate" ]]; then CORE="$candidate"; break; fi
   done
 fi
-[[ -n "$CORE" && -f "$CORE" ]] || { echo "tachyon-core binary not found (build it or set TACHYON_CORE_BIN)" >&2; exit 2; }
+[[ -n "$CORE" && -f "$CORE" ]] || { echo "xrust binary not found (build it or set XRUST_BIN)" >&2; exit 2; }
 [[ -f "$REF" ]] || { echo "reference binary not found: $REF" >&2; exit 2; }
 
 STRICT="${STRICT:-0}"

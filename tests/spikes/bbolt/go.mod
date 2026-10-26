@@ -1,4 +1,4 @@
-module tachyon.bbolt.spike
+module xrust.bbolt.spike
 
 go 1.25.4
 

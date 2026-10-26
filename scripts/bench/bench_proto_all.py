@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Multi-proxy protocol benchmark: compares tachyon-core vs sing-box vs Xray vs Mihomo
+"""Multi-proxy protocol benchmark: compares xrust vs sing-box vs Xray vs Mihomo
 across all supported protocols against an identical reference server.
 
 Every case runs:
@@ -787,7 +787,7 @@ def launch_server(ref_bin, case, server_cpus, server_workers=None, xray_bin=None
     env = os.environ.copy()
     if server_workers:
         env["GOMAXPROCS"] = str(server_workers)
-        env["TACHYON_WORKERS"] = str(server_workers)
+        env["XRUST_WORKERS"] = str(server_workers)
     pre = (lambda: os.sched_setaffinity(0, server_cpus)) if hasattr(os, "sched_setaffinity") else None
     proc = subprocess.Popen([ref_bin, "run", "-c", cfg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, preexec_fn=pre)
     
@@ -805,7 +805,7 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
     d = tempfile.mkdtemp(prefix=f"proto_cli_{core_name}_")
     env = os.environ.copy()
     if workers:
-        env["TACHYON_WORKERS"] = str(workers)
+        env["XRUST_WORKERS"] = str(workers)
         env["GOMAXPROCS"] = str(workers)
     pre = (lambda: os.sched_setaffinity(0, client_cpus)) if hasattr(os, "sched_setaffinity") else None
 
@@ -882,9 +882,9 @@ def launch_client(core_name, bin_path, case, client_cpus, workers=None):
 # ---------------------------------------------------------------- table output
 def print_comparison_table(results):
     print("\n" + "=" * 135)
-    print("  ALL-PROTOCOL MULTI-PROXY BENCHMARK (Tachyon vs Sing-box vs Xray vs Mihomo)")
+    print("  ALL-PROTOCOL MULTI-PROXY BENCHMARK (Xrust vs Sing-box vs Xray vs Mihomo)")
     print("=" * 135)
-    header = f"{'Protocol':<28} | {'Tachyon 1s/8s':<19} | {'Sing-box 1s/8s':<19} | {'Xray 1s/8s':<19} | {'Mihomo 1s/8s':<19} | {'Winner':<18}"
+    header = f"{'Protocol':<28} | {'Xrust 1s/8s':<19} | {'Sing-box 1s/8s':<19} | {'Xray 1s/8s':<19} | {'Mihomo 1s/8s':<19} | {'Winner':<18}"
     print(header)
     print("-" * 135)
 
@@ -922,13 +922,13 @@ def print_comparison_table(results):
             if best_ref > 0:
                 ratio = t_speed / best_ref
                 if ratio >= 1.05:
-                    winner = f"TACHYON ({ratio:.1f}x)"
+                    winner = f"XRUST ({ratio:.1f}x)"
                 elif ratio <= 0.95:
                     winner = f"{best_name.upper()} ({1/ratio:.1f}x)"
                 else:
                     winner = "TIE"
             else:
-                winner = "TACHYON (ONLY)"
+                winner = "XRUST (ONLY)"
 
         print(f"{pname:<28} | {t_cell:<19} | {s_cell:<19} | {x_cell:<19} | {m_cell:<19} | {winner:<18}")
 
@@ -1034,7 +1034,7 @@ def generate_html_report(results, profile, out_path):
             if best_ref > 0:
                 ratio = t_speed / best_ref
                 if ratio >= 1.05:
-                    win_badge = f"<span class='vpill win'>TACHYON +{int((ratio-1)*100)}%</span>"
+                    win_badge = f"<span class='vpill win'>XRUST +{int((ratio-1)*100)}%</span>"
                     t_wins += 1
                     row_status = "win"
                 elif ratio <= 0.95:
@@ -1046,7 +1046,7 @@ def generate_html_report(results, profile, out_path):
                     ties += 1
                     row_status = "tie"
             else:
-                win_badge = "<span class='vpill win'>TACHYON ONLY</span>"
+                win_badge = "<span class='vpill win'>XRUST ONLY</span>"
                 t_wins += 1
                 row_status = "win"
 
@@ -1076,7 +1076,7 @@ def generate_html_report(results, profile, out_path):
 
     if profile in ("router2", "router-2core"):
         env_tag = "ROUTER 2-CORE (Dual-Core)"
-        env_pill_worker = "2 worker потока (GOMAXPROCS=2, TACHYON_WORKERS=2)"
+        env_pill_worker = "2 worker потока (GOMAXPROCS=2, XRUST_WORKERS=2)"
         env_pill_cli = "Client CPU: Cores 0,1 (2 ядра)"
         env_pill_srv = "Server CPU: 4 ядра (VPS upstream model)"
     elif profile == "router":
@@ -1115,7 +1115,7 @@ def generate_html_report(results, profile, out_path):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Мульти-протокольная матрица: tachyon vs sing-box vs Xray vs Mihomo vs steer ({env_tag})</title>
+<title>Мульти-протокольная матрица: xrust vs sing-box vs Xray vs Mihomo vs steer ({env_tag})</title>
 <style>
  :root {{
   --bg: #0b0c10; --card: #13141c; --head: #1a1b24; --grp: #20222e;
@@ -1306,7 +1306,7 @@ def generate_html_report(results, profile, out_path):
       </div>
     </div>
     <div class="summary-line">
-      <span class="sum-win"><b>{t_wins}</b> победы tachyon</span>
+      <span class="sum-win"><b>{t_wins}</b> победы xrust</span>
       <span class="sum-dot">&bull;</span>
       <span class="sum-tie"><b>{ties}</b> паритета</span>
       <span class="sum-dot">&bull;</span>
@@ -1336,7 +1336,7 @@ def generate_html_report(results, profile, out_path):
       <thead>
         <tr>
           <th class="th-name">Протокол</th>
-          <th class="th-core th-t">tachyon-core (Rust) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
+          <th class="th-core th-t">xrust (Rust) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
           <th class="th-core">sing-box (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
           <th class="th-core">Xray-core (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
           <th class="th-core">Mihomo (Go) <span class="th-hint">1s/8s &bull; p50 &bull; RSS &bull; CPU</span></th>
@@ -1393,7 +1393,7 @@ def generate_html_report(results, profile, out_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tachyon", default="/bench/tachyon-core")
+    ap.add_argument("--xrust", "--tachyon", dest="tachyon", default="/bench/xrust")
     ap.add_argument("--sing-box", default="/bench/sing-box-lx")
     ap.add_argument("--xray", default="/bench/xray-linux")
     ap.add_argument("--mihomo", default="/bench/mihomo-linux")

@@ -116,7 +116,7 @@ fn can_run_tproxy_test() -> bool {
         return true;
     }
     assert!(
-        std::env::var_os("TACHYON_REQUIRE_NET_ADMIN").is_none(),
+        std::env::var_os("XRUST_REQUIRE_NET_ADMIN").is_none(),
         "privileged TProxy regression gate requires CAP_NET_ADMIN or CAP_NET_RAW"
     );
     eprintln!("SKIP transparent UDP: requires CAP_NET_ADMIN or CAP_NET_RAW");

@@ -835,7 +835,7 @@ mod tests {
             "missing openvpn static key"
         );
         // raw 256 bytes from a file path
-        let temp = std::env::temp_dir().join(format!("tachyon-ovpn-key-{}", std::process::id()));
+        let temp = std::env::temp_dir().join(format!("xrust-ovpn-key-{}", std::process::id()));
         std::fs::write(&temp, &material).unwrap();
         let from_path = load_static_key_material(None, Some(temp.to_str().unwrap())).unwrap();
         std::fs::remove_file(&temp).ok();

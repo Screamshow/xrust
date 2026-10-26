@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Protocol-by-protocol comparison: tachyon-core vs reference sing-box (Linux, stdlib only).
+"""Protocol-by-protocol comparison: xrust vs reference sing-box (Linux, stdlib only).
 
 Every case is a chain  load -> [client proxy] ==protocol==> [server proxy] -> sink
 built from the same sing-box JSON for every implementation, so a number is a
 property of the implementation and not of the config.
 
   Part A  protocols that both implementations can serve (server inbound exists
-          in tachyon-core): the full 2x2 grid, client x server.
+          in xrust): the full 2x2 grid, client x server.
             diagonal cells   tachyon->tachyon vs ref->ref   speed, CPU, latency
             crossed cells    tachyon->ref and ref->tachyon  interop (works or not)
-  Part B  transports/protocols where tachyon-core has no server (ws, grpc,
+  Part B  transports/protocols where xrust has no server (ws, grpc,
           reality, hysteria2, tuic, ...): the reference serves, and the two
           clients are compared against that same server.
 
@@ -17,7 +17,7 @@ Each cell runs in a forked child under a hard timeout, so a hung protocol is a
 row that says FAIL, not a hung benchmark. The client proxy is pinned to
 CLIENT_CPUS, the server proxy to SERVER_CPUS, load and sink to the rest.
 
-    proto.py --tachyon /bench/tachyon-core --ref /bench/sing-box-lx --out proto.json
+    proto.py --xrust /bench/xrust --ref /bench/sing-box-lx --out proto.json
 """
 import argparse
 import base64
@@ -645,7 +645,7 @@ def report(results, ref_name):
     interop_bad = []
     for part, title in (
         ("A", "Part A: both sides implemented (client x server grid)"),
-        ("B", "Part B: reference server, tachyon-core vs reference client"),
+        ("B", "Part B: reference server, xrust vs reference client"),
     ):
         lines += [f"\n### {title}\n"]
         if part == "A":
@@ -753,7 +753,7 @@ def live_refresh(out, results, run_meta, ref_name, done, total, current=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tachyon", required=True)
+    ap.add_argument("--xrust", "--tachyon", dest="tachyon", required=True)
     ap.add_argument("--ref", required=True)
     ap.add_argument("--ref-name", default="sing-box-lx")
     ap.add_argument("--client-cpus", default="0-1")

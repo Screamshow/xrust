@@ -1152,7 +1152,7 @@ mod tests {
         use std::io::Write as _;
         use std::os::unix::net::UnixListener;
 
-        let dir = std::env::temp_dir().join(format!("tachyon-dial-protect-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("xrust-dial-protect-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("tmpdir");
         let path = dir.join("protect.sock");
         let _ = std::fs::remove_file(&path);
@@ -1414,7 +1414,7 @@ mod tests {
             Ok(()) => true,
             Err(error)
                 if error.kind() == io::ErrorKind::PermissionDenied
-                    && std::env::var("TACHYON_TEST_REQUIRE_SO_MARK").as_deref() != Ok("1") =>
+                    && std::env::var("XRUST_TEST_REQUIRE_SO_MARK").as_deref() != Ok("1") =>
             {
                 // Unprivileged CI still checks the other options; a separate
                 // mandatory privileged pass verifies SO_MARK itself.

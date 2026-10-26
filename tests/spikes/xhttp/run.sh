@@ -14,7 +14,7 @@
 set -uo pipefail
 
 OUT="${1:?usage: run.sh <outdir>}"
-OUR="${OUR_BIN:?OUR_BIN=<our tachyon-core binary>}"
+OUR="${OUR_BIN:?OUR_BIN=<our xrust binary>}"
 XRAY="${XRAY_BIN:-xray}"
 SERVER_PORT="${SERVER_PORT:-19902}"
 ECHO_PORT="${ECHO_PORT:-19901}"

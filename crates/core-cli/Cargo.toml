@@ -1,6 +1,6 @@
 [package]
 name = "core-cli"
-description = "tachyon-core: sing-box-compatible proxy core optimized for routers"
+description = "Xrust: sing-box-compatible proxy core optimized for routers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "tachyon-core"
+name = "xrust"
 path = "src/main.rs"
 
 [features]

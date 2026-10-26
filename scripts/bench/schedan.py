@@ -10,7 +10,7 @@ payload prev_pid = the same thread in the other space. Everything else --
 sched_stat_runtime totals, sleep gaps, wakeup pairs -- is keyed through that
 map, so the output speaks in the ids the rest of the bench uses.
 
-Without target_pid the target threads are picked by comm (tachyon-core /
+Without target_pid the target threads are picked by comm (xrust /
 tokio-rt-worker); with it, /proc/<pid>/task is consulted while it is alive.
 """
 import collections
@@ -24,7 +24,7 @@ SW = re.compile(r"prev_comm=(\S+) prev_pid=(\d+) .*?prev_state=(\S+)\s*==> "
                 r"next_comm=(\S+) next_pid=(\d+)")
 WK = re.compile(r"comm=(\S+) pid=(\d+) prio=\d+")
 RT = re.compile(r"pid=(\d+) runtime=(\d+)")
-OURS = {"tachyon-core", "tokio-rt-worker"}
+OURS = {"xrust", "tachyon-core", "tokio-rt-worker"}
 
 
 def main():

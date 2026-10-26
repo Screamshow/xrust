@@ -6,7 +6,7 @@
 //! 3. `GET /api/v1/fptn`: WebSocket handshake upgrade.
 //! 4. WebSocket data plane: sends `MSG_IP_ASSIGNMENT`, processes `MSG_BATCH_IP_PACKET`
 //!    carrying client IP datagrams, answers ICMP echo requests, and forwards UDP/TCP
-//!    into the Tachyon Router data plane.
+//!    into the Xrust router data plane.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};

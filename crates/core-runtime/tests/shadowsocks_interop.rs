@@ -88,9 +88,7 @@ async fn wait_listening(port: u16) -> bool {
 }
 
 async fn socks_roundtrip(proxy: SocketAddr, echo: SocketAddr, method: &str) {
-    let mut stream = TcpStream::connect(proxy)
-        .await
-        .expect("connect to tachyon-core");
+    let mut stream = TcpStream::connect(proxy).await.expect("connect to xrust");
     stream
         .write_all(&[0x05, 0x01, 0x00])
         .await
@@ -149,7 +147,7 @@ async fn assert_method(ref_bin: &str, method: &str, password: &str) {
         "route": {"final": "ss-up"}
     }))
     .await
-    .expect("start tachyon-core");
+    .expect("start xrust");
     let proxy = instance.inbound_addrs()[0].1;
 
     let result = tokio::time::timeout(

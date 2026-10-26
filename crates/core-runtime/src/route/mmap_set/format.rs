@@ -1,4 +1,4 @@
-//! Binary format definitions for Tachyon Memory-Mapped Rule-Sets (TSRS)
+//! Binary format definitions for Xrust Memory-Mapped Rule-Sets (TSRS)
 //! and incremental Delta updates (TDLT).
 
 pub const TSRS_MAGIC: &[u8; 4] = b"TSRS";

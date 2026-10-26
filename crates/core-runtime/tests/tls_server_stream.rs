@@ -28,7 +28,7 @@ fn server_tls() -> ServerTls {
             "enabled": true,
             "certificate": CERT.lines().collect::<Vec<&str>>(),
             "key": KEY.lines().collect::<Vec<&str>>(),
-            "alpn": ["tachyon"],
+            "alpn": ["xrust"],
         }),
         "test",
     )
@@ -54,7 +54,7 @@ fn client_config() -> ClientConfig {
             store
         })
         .with_no_client_auth();
-    config.alpn_protocols = vec![b"tachyon".to_vec()];
+    config.alpn_protocols = vec![b"xrust".to_vec()];
     config
 }
 
@@ -162,7 +162,7 @@ async fn a_megabyte_survives_both_ways() {
 #[tokio::test]
 async fn the_negotiated_protocol_is_the_one_the_client_offered() {
     let mut config = client_config();
-    config.alpn_protocols = vec![b"nope".to_vec(), b"tachyon".to_vec()];
+    config.alpn_protocols = vec![b"nope".to_vec(), b"xrust".to_vec()];
     let (theirs, ours) = loopback().await;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let name = PkiServerName::try_from("localhost").expect("server name");
@@ -177,7 +177,7 @@ async fn the_negotiated_protocol_is_the_one_the_client_offered() {
     let negotiated = client.get_ref().1.alpn_protocol();
     assert_eq!(
         negotiated,
-        Some(b"tachyon".as_slice()),
+        Some(b"xrust".as_slice()),
         "alpn came back as {negotiated:?}"
     );
 }
@@ -215,7 +215,7 @@ async fn inbound_server_enforces_cipher_suites() {
             "enabled": true,
             "certificate": CERT.lines().collect::<Vec<&str>>(),
             "key": KEY.lines().collect::<Vec<&str>>(),
-            "alpn": ["tachyon"],
+            "alpn": ["xrust"],
             "cipher_suites": ["TLS_CHACHA20_POLY1305_SHA256"],
         }),
         "test",

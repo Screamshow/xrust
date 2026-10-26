@@ -3,7 +3,7 @@
 #
 #   powershell -File scripts\bench\proto.ps1                 # everything (~7 min)
 #   powershell -File scripts\bench\proto.ps1 -Only vmess     # cases whose name contains "vmess"
-#   powershell -File scripts\bench\proto.ps1 -SkipBuild      # use target\bench\tachyon-core as is
+#   powershell -File scripts\bench\proto.ps1 -SkipBuild      # use target\bench\xrust as is
 #
 # Debug loop (a few minutes instead of ten):
 #
@@ -21,7 +21,7 @@
 # -Quick turns it off unless -BulkGib is given explicitly; a slow host (the
 # router) wants -BulkGib 1 to keep cells inside the 240 s guard.
 #
-# Needs target\bench\sing-box-lx (the reference) next to the tachyon binary.
+# Needs target\bench\sing-box-lx (the reference) next to the xrust binary.
 param(
     [string]$Only = "",
     [switch]$SkipBuild,
@@ -51,7 +51,7 @@ if (-not $SkipBuild) {
     $env:RUSTFLAGS = "-C linker=rust-lld -C link-self-contained=yes"
     cargo build -p core-cli --release --target x86_64-unknown-linux-musl
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
-    Copy-Item target\x86_64-unknown-linux-musl\release\tachyon-core "$bench\tachyon-core" -Force
+    Copy-Item target\x86_64-unknown-linux-musl\release\xrust "$bench\xrust" -Force
 }
 Copy-Item scripts\bench\bench.py, scripts\bench\proto.py, scripts\bench\report.py $bench -Force
 
@@ -59,11 +59,11 @@ $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $name = "proto-$stamp"
 $filter = if ($Only) { "--only $Only" } else { "" }
 $cross = if ($NoCross) { "--no-cross" } else { "" }
-$cmd = "chmod +x /bench/tachyon-core /bench/sing-box*; python3 /bench/proto.py --tachyon /bench/tachyon-core --ref /bench/sing-box-lx --runs $Runs --seconds $Seconds --rounds $Rounds --part $Part --bulk-gib $($BulkGib.ToString([cultureinfo]::InvariantCulture)) $filter $cross --out /bench/$name.json 2>&1"
+$cmd = "chmod +x /bench/xrust /bench/sing-box*; python3 /bench/proto.py --xrust /bench/xrust --ref /bench/sing-box-lx --runs $Runs --seconds $Seconds --rounds $Rounds --part $Part --bulk-gib $($BulkGib.ToString([cultureinfo]::InvariantCulture)) $filter $cross --out /bench/$name.json 2>&1"
 
-$size = [math]::Round((Get-Item "$bench\tachyon-core").Length / 1MB, 2)
+$size = [math]::Round((Get-Item "$bench\xrust").Length / 1MB, 2)
 $mode = if ($Quick) { "quick debug mode" } elseif ($NoCross) { "no interop cells" } else { "full grid" }
-Write-Host "tachyon-core: $size MiB, running the matrix ($mode)..."
+Write-Host "xrust: $size MiB, running the matrix ($mode)..."
 docker run --rm -e PROTO_LOG -e PROTO_WORK --ulimit nofile=1048576:1048576 -v "${bench}:/bench" python:3 sh -c $cmd | Out-Null
 
 $report = "$bench\$name.md"

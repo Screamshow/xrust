@@ -33,7 +33,7 @@
 set -uo pipefail
 
 OUT="${1:?usage: run.sh <outdir>}"
-OUR="${OUR_BIN:-/cache/target/debug/tachyon-core}"
+OUR="${OUR_BIN:-/cache/target/debug/xrust}"
 REF="${SING_BOX_REF:-sing-box-ref}"
 ECHO_PORT="${ECHO_PORT:-19001}"
 VLESS_PORT="${VLESS_PORT:-19002}"

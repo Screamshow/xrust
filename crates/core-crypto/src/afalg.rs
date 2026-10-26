@@ -28,7 +28,7 @@
 //! without `AF_ALG` (Docker's default seccomp profile blocks the socket
 //! call), a software-only driver, or an ARM CE driver that loses to our own
 //! SIMD all simply get `0` — off for the whole process — and the proxy never
-//! notices. `TACHYON_AF_ALG=off` forces that by hand.
+//! notices. `XRUST_AF_ALG=off` forces that by hand.
 
 // The kernel and libc spell `msg_controllen` / `msg_iovlen` differently per
 // target (usize, u32, i32 across glibc/musl), so every write adapts with
@@ -494,15 +494,12 @@ fn recv_exact(fd: RawFd, msg: &mut libc::msghdr, expect: usize) -> io::Result<()
 /// race the software path at the record sizes the proxy actually seals.
 /// Runs once, before the first `Gcm::new` returns.
 fn calibrate() -> usize {
-    if matches!(
-        std::env::var("TACHYON_AF_ALG").as_deref(),
-        Ok("0") | Ok("off")
-    ) {
+    if matches!(crate::env_var("AF_ALG").as_deref(), Some("0") | Some("off")) {
         return 0;
     }
     if matches!(
-        std::env::var("TACHYON_AF_ALG").as_deref(),
-        Ok("1") | Ok("on") | Ok("force")
+        crate::env_var("AF_ALG").as_deref(),
+        Some("1") | Some("on") | Some("force")
     ) {
         // Testing valve: route every non-empty payload through the kernel
         // even when the software cipher would have won the race, so the

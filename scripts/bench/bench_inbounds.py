@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive benchmark for all tachyon-core server inbounds vs sing-box.
+"""Comprehensive benchmark for all xrust server inbounds vs sing-box.
 
 Tests:
   - Classic: mixed (socks5), mixed (http)
@@ -307,7 +307,7 @@ def probe(port, deadline_s=12):
 
 def measure_cell(server_bin, client_bin, case, ports, cpus, runs=1, seconds=1, rounds=300):
     proxy_port, server_port = ports
-    work = tempfile.mkdtemp(prefix="tachyon_inb_")
+    work = tempfile.mkdtemp(prefix="xrust_inb_")
     bench.PROXY_PORT = proxy_port
 
     server_inbound = dict(case["server"], tag="in", listen="127.0.0.1", listen_port=server_port)
@@ -496,7 +496,7 @@ def generate_html_report(results, run_meta, out_path):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Бенчмарк всех серверных инбаундов: tachyon-core vs sing-box</title>
+<title>Бенчмарк всех серверных инбаундов: xrust vs sing-box</title>
 <style>
  :root {{
   --bg: #090a0f; --card: #12141c; --card-hover: #171924; --header: #1a1c28;
@@ -669,7 +669,7 @@ def generate_html_report(results, run_meta, out_path):
    <div class="hero-title">
      <h1>Сводный бенчмарк серверных инбаундов</h1>
      <div class="hero-sub">
-       <span>Сравнение производительности датаплейна: <b>tachyon-core</b> vs <b>sing-box-lx</b></span>
+       <span>Сравнение производительности датаплейна: <b>xrust</b> vs <b>sing-box-lx</b></span>
        <span class="badge-pill">STATIC MUSL &le; 12 MiB</span>
        <span class="badge-pill">PURE-RUST CRYPTO</span>
      </div>
@@ -725,7 +725,7 @@ def generate_html_report(results, run_meta, out_path):
         <tr>
           <th>Протокол / Инбаунд</th>
           <th>Шифрование / Auth</th>
-          <th class="th-tachyon">Tachyon Скорость</th>
+          <th class="th-tachyon">Xrust Скорость</th>
           <th>Sing-box Скорость</th>
           <th style="text-align:center;">Прирост</th>
           <th>RTT p50</th>
@@ -742,7 +742,7 @@ def generate_html_report(results, run_meta, out_path):
 
   <!-- Architecture Highlights -->
   <div class="arch-box">
-    <h3>Ключевые инженерные преимущества датаплейна tachyon-core</h3>
+    <h3>Ключевые инженерные преимущества датаплейна xrust</h3>
     <div class="arch-grid">
       <div class="arch-item">
         <div class="arch-item-title">100% Pure-Rust криптография</div>
@@ -760,7 +760,7 @@ def generate_html_report(results, run_meta, out_path):
   </div>
 
   <div class="footer">
-    <div>Ядро: tachyon-core (Rust 2024 musl) &bull; Среда: {run_meta.get('cpu', 'CPU')} ({run_meta.get('cores', 'N')} cores) &bull; Версия sing-box-lx: {run_meta.get('ref', 'v1.14.2-lx.12')}</div>
+    <div>Ядро: xrust (Rust 2024 musl) &bull; Среда: {run_meta.get('cpu', 'CPU')} ({run_meta.get('cores', 'N')} cores) &bull; Версия sing-box-lx: {run_meta.get('ref', 'v1.14.2-lx.12')}</div>
     <div>Отчёт сформирован автоматически</div>
   </div>
 
@@ -820,7 +820,7 @@ def run_tls_dest(certs, cpus):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tachyon", default="target/bench/tachyon-core")
+    ap.add_argument("--xrust", "--tachyon", dest="tachyon", default="target/bench/xrust")
     ap.add_argument("--ref", default="target/bench/sing-box-lx")
     ap.add_argument("--client-cpus", default="0-1")
     ap.add_argument("--server-cpus", default="2-3")
@@ -833,7 +833,7 @@ def main():
     tachyon_bin = os.path.abspath(args.tachyon)
     ref_bin = os.path.abspath(args.ref)
 
-    work = tempfile.mkdtemp(prefix="tachyon_cert_")
+    work = tempfile.mkdtemp(prefix="xrust_cert_")
     # Generate certs via openssl or fallback
     cert_path = os.path.join(work, "localhost.crt")
     key_path = os.path.join(work, "localhost.key")
@@ -892,7 +892,7 @@ def main():
         name = case["name"]
         print(f"Benchmarking inbound: {name:<24s} ...", end=" ", flush=True)
 
-        # 1. Tachyon server inbound
+        # 1. Xrust server inbound
         t_res = measure_cell(tachyon_bin, tachyon_bin, case, ports, cpus,
                              runs=1, seconds=args.seconds, rounds=args.rounds)
 

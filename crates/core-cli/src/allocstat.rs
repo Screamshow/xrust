@@ -1,5 +1,5 @@
 //! Feature `allocstat`: a counting allocator wrapped around mimalloc, dumping
-//! one line per second to `/tmp/tachyon-allocstat.txt` while `TACHYON_ALLOCSTAT`
+//! one line per second to `/tmp/xrust-allocstat.txt` while `XRUST_ALLOCSTAT`
 //! is set. The bench needs to know where the heap actually sits -- live bytes
 //! and objects by size class, plus allocation churn -- which no amount of
 //! reading `/proc` says, because mimalloc keeps the whole heap in one mapping.
@@ -115,7 +115,7 @@ fn label(b: usize) -> String {
 }
 
 pub(crate) fn start() {
-    if std::env::var_os("TACHYON_ALLOCSTAT").is_none() {
+    if core_runtime::env_var("ALLOCSTAT").is_none() {
         return;
     }
     std::thread::spawn(|| {
@@ -166,6 +166,6 @@ fn writeln_dump(line: String) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/tachyon-allocstat.txt")?;
+        .open("/tmp/xrust-allocstat.txt")?;
     writeln!(f, "{line}")
 }

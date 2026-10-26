@@ -742,7 +742,7 @@ async fn external_ui_is_downloaded_and_mounted_under_ui() {
     ]);
     let origin = serve_once(bundle).await;
 
-    let dir = std::env::temp_dir().join(format!("tachyon-ui-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("xrust-ui-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
     let config = serde_json::json!({

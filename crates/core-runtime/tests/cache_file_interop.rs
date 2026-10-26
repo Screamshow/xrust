@@ -36,7 +36,7 @@ fn reference_cache_db_loads_and_our_write_passes_the_reference_reader() {
     };
     assert!(written.status.success(), "go write-cache failed");
 
-    let go_path = std::env::temp_dir().join(format!("tachyon-go-cache-{}.db", std::process::id()));
+    let go_path = std::env::temp_dir().join(format!("xrust-go-cache-{}.db", std::process::id()));
     let Some(result) = go("write-cache", &go_path) else {
         return;
     };

@@ -263,7 +263,7 @@ async fn interop_wireguard() {
         "route": {"final": "wg"}
     }))
     .await
-    .expect("start tachyon-core");
+    .expect("start xrust");
     let proxy = instance.inbound_addrs()[0].1;
     eprintln!("wireguard: box up, proxy {proxy}");
 

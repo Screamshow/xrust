@@ -41,7 +41,7 @@ fn config(port: u16) -> serde_json::Value {
 }
 
 fn write_config(name: &str, value: &serde_json::Value) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("tachyon-core-smoke-{name}.json"));
+    let path = std::env::temp_dir().join(format!("xrust-smoke-{name}.json"));
     std::fs::write(&path, serde_json::to_vec_pretty(value).expect("json")).expect("write config");
     path
 }
@@ -49,7 +49,7 @@ fn write_config(name: &str, value: &serde_json::Value) -> std::path::PathBuf {
 /// The daemon, with its output discarded: this test is about the socket it opens,
 /// not about what it says.
 fn spawn(config: &std::path::Path) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+    Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("run")
         .arg("-c")
         .arg(config)
@@ -57,7 +57,7 @@ fn spawn(config: &std::path::Path) -> std::process::Child {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn tachyon-core run")
+        .expect("spawn xrust run")
 }
 
 /// Wait for the port to answer, and say what happened instead if it never does.
@@ -66,7 +66,7 @@ fn wait_for_listener(port: u16, child: &mut std::process::Child) -> SocketAddr {
     let deadline = Instant::now() + STARTUP;
     while Instant::now() < deadline {
         if let Ok(Some(status)) = child.try_wait() {
-            panic!("tachyon-core run exited before it listened: {status}");
+            panic!("xrust run exited before it listened: {status}");
         }
         if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
             return addr;
@@ -74,7 +74,7 @@ fn wait_for_listener(port: u16, child: &mut std::process::Child) -> SocketAddr {
         std::thread::sleep(Duration::from_millis(50));
     }
     let _ = child.kill();
-    panic!("tachyon-core run did not listen on {addr} within {STARTUP:?}");
+    panic!("xrust run did not listen on {addr} within {STARTUP:?}");
 }
 
 /// The whole point: `run` takes the same configuration the library does, comes
@@ -113,7 +113,7 @@ fn run_starts_and_serves() {
 fn check_accepts_what_run_takes() {
     let port = free_port();
     let path = write_config("check", &config(port));
-    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("check")
         .arg("-c")
         .arg(&path)
@@ -131,15 +131,15 @@ fn check_accepts_what_run_takes() {
 /// and not a panic.
 #[test]
 fn run_refuses_a_config_it_cannot_read() {
-    let missing = std::env::temp_dir().join("tachyon-core-smoke-absent.json");
+    let missing = std::env::temp_dir().join("xrust-smoke-absent.json");
     let _ = std::fs::remove_file(&missing);
-    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("run")
         .arg("-c")
         .arg(&missing)
         .stdin(Stdio::null())
         .output()
-        .expect("run tachyon-core");
+        .expect("run xrust");
     assert!(
         !output.status.success(),
         "run accepted a config that is not there"
@@ -148,11 +148,11 @@ fn run_refuses_a_config_it_cannot_read() {
     assert!(!said.trim().is_empty(), "the refusal said nothing");
 }
 
-/// The version string is what the Tachyon package reads to decide what it has
+/// The version string is what Forkop X reads to decide what it has
 /// installed, so its shape is part of the interface.
 #[test]
-fn version_is_the_shape_tachyon_parses() {
-    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+fn version_is_the_shape_forkop_parses() {
+    let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("version")
         .output()
         .expect("run version");
@@ -171,8 +171,8 @@ fn openwrt_cli_invocations() {
     let path = write_config("openwrt-check", &config(port));
     let temp_dir = std::env::temp_dir();
 
-    // 1. Tachyon watchdog style: sing-box -c <path> check
-    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+    // 1. Router watchdog style: sing-box -c <path> check
+    let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("-c")
         .arg(&path)
         .arg("check")
@@ -181,7 +181,7 @@ fn openwrt_cli_invocations() {
     assert!(output.status.success(), "leading -c check failed");
 
     // 2. OpenWrt procd style: sing-box -D <dir> -c <path> check
-    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("-D")
         .arg(&temp_dir)
         .arg("-c")
@@ -192,7 +192,7 @@ fn openwrt_cli_invocations() {
     assert!(output.status.success(), "-D check failed");
 
     // 3. Trailing options with --disable-color
-    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("check")
         .arg("-c")
         .arg(&path)
@@ -204,7 +204,7 @@ fn openwrt_cli_invocations() {
     assert!(output.status.success(), "trailing flags check failed");
 
     // 4. Short -v version
-    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("-v")
         .output()
         .expect("run -v");
@@ -212,7 +212,7 @@ fn openwrt_cli_invocations() {
     assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
 
     // 5. Config directory (-C / --config-directory) and multi-config merging
-    let conf_dir = std::env::temp_dir().join(format!("tachyon-conf-d-{}", free_port()));
+    let conf_dir = std::env::temp_dir().join(format!("xrust-conf-d-{}", free_port()));
     let _ = std::fs::create_dir_all(&conf_dir);
     let part1 = conf_dir.join("00-log.json");
     let part2 = conf_dir.join("10-inbound.json");
@@ -232,7 +232,7 @@ fn openwrt_cli_invocations() {
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("check")
         .arg("-C")
         .arg(&conf_dir)
@@ -244,7 +244,7 @@ fn openwrt_cli_invocations() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_tachyon-core"))
+    let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
         .arg("check")
         .arg("-c")
         .arg(&part1)

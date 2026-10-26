@@ -863,7 +863,7 @@ fn router_main_dns_section_builds() {
         2,
     )
     .expect("compile rule-set");
-    let dir = std::env::temp_dir().join("tachyon-dns-rule-set-test");
+    let dir = std::env::temp_dir().join("xrust-dns-rule-set-test");
     std::fs::create_dir_all(&dir).expect("create rule-set dir");
     let path = dir.join("ruleset.srs");
     std::fs::write(&path, &compiled).expect("write rule-set");

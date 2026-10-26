@@ -15,7 +15,7 @@ fn options(path: &std::path::Path) -> CacheFileOptions {
 
 fn temp_path(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir();
-    dir.join(format!("tachyon-cache-{tag}-{}.db", std::process::id()))
+    dir.join(format!("xrust-cache-{tag}-{}.db", std::process::id()))
 }
 
 #[test]
@@ -256,7 +256,7 @@ fn an_explicit_flush_still_works_and_resets_the_counters() {
 /// A store pointed at an unwritable path must not take the data path with it.
 #[test]
 fn an_unwritable_store_is_survivable() {
-    let dir = std::env::temp_dir().join(format!("tachyon-cache-ro-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("xrust-cache-ro-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
     let path = dir.join("sub").join("deeper").join("cache.db");

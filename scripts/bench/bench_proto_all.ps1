@@ -1,4 +1,4 @@
-# Runs bench_proto_all.py in Docker: Tachyon vs Sing-box vs Xray vs Mihomo across 39 protocols
+# Runs bench_proto_all.py in Docker: Xrust vs Sing-box vs Xray vs Mihomo across 39 protocols
 #
 #   .\scripts\bench\bench_proto_all.ps1                         # router profile (1 worker, core 1)
 #   .\scripts\bench\bench_proto_all.ps1 -Profile desktop        # desktop profile (multi-core)
@@ -54,7 +54,7 @@ $argStr = $extraArgs -join " "
 Write-Host "Launching All-Protocol Multi-Proxy Benchmark ($Profile profile) ..."
 docker run --rm --ulimit nofile=1048576:1048576 `
     -v "${work}:/bench" python:3 `
-    sh -c "chmod +x /bench/tachyon-core /bench/sing-box* /bench/xray-linux /bench/mihomo-linux && python3 /bench/bench_proto_all.py $argStr"
+    sh -c "chmod +x /bench/xrust /bench/sing-box* /bench/xray-linux /bench/mihomo-linux && python3 /bench/bench_proto_all.py $argStr"
 
 Write-Host "`nReport saved to: $work\proto-all-$Profile.html"
 Write-Host "JSON saved to:   $work\proto-all-$Profile.json"

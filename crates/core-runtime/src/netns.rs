@@ -306,7 +306,7 @@ mod tests {
         let list: serde_json::Value = serde_json::from_str(
             r#"[
                 {"type": "default", "tag": "vpn", "path": "/proc/self/ns/net"},
-                {"type": "unshare", "tag": "fresh", "pid_file": "/tmp/tachyon-netns.pid"}
+                {"type": "unshare", "tag": "fresh", "pid_file": "/tmp/xrust-netns.pid"}
             ]"#,
         )
         .expect("json");

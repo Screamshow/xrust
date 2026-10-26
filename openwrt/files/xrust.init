@@ -5,18 +5,18 @@ START=95
 STOP=10
 USE_PROCD=1
 
-NAME="tachyon-core"
-PROG="/usr/bin/tachyon-core"
+NAME="xrust"
+PROG="/usr/bin/xrust"
 [ -x "$PROG" ] || PROG="/usr/bin/sing-box"
 
-DEFAULT_CONF="/etc/tachyon-core/config.json"
+DEFAULT_CONF="/etc/xrust/config.json"
 FALLBACK_CONF="/etc/sing-box/config.json"
 RUN_CONF="/tmp/sing-box/config.json"
 
 get_config_path() {
 	if [ -f /sbin/uci ]; then
 		local uci_conf
-		uci_conf="$(uci -q get tachyon-core.main.config_file)"
+		uci_conf="$(uci -q get xrust.main.config_file)"
 		if [ -n "$uci_conf" ] && [ -e "$uci_conf" ]; then
 			echo "$uci_conf"
 			return
@@ -68,8 +68,8 @@ start_service() {
 	procd_set_param limits nofile="65535 65535"
 
 	# Soft start allows daemon to bind and serve local DNS even if WAN is not up yet
-	procd_set_param env TACHYON_RULESET_SOFT_START=1
-	procd_set_param env TACHYON_WORKERS="$cpus"
+	procd_set_param env XRUST_RULESET_SOFT_START=1
+	procd_set_param env XRUST_WORKERS="$cpus"
 
 	# Shield the proxy daemon from aggressive OOM killer sweeps on low-RAM devices
 	procd_set_param oom_score_adj -500
@@ -93,7 +93,7 @@ version() {
 }
 
 service_triggers() {
-	procd_add_reload_trigger "tachyon-core"
+	procd_add_reload_trigger "xrust"
 }
 
 EXTRA_COMMANDS="check version"

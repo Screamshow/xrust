@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 const CERT_PEM: &str = include_str!("../../../tests/golden/certs/localhost.crt");
 const KEY_PEM: &str = include_str!("../../../tests/golden/certs/localhost.key");
 const ANSWER: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
-const PROBE: &str = "x-tachyon-probe";
+const PROBE: &str = "x-xrust-probe";
 
 /// What the h3 responder saw: `<probe>|<content-type>` of the POST.
 type Seen = Arc<std::sync::Mutex<Option<String>>>;

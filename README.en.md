@@ -15,7 +15,7 @@ the inherited documentation below describes upstream capabilities and measuremen
 
 <div align="center">
 
-![Tachyon Core Banner](assets/readme/hero.svg)
+![Xrust Banner](assets/readme/hero.svg)
 
 [![Stars](https://img.shields.io/github/stars/Dushnilin/tachyon-core?style=for-the-badge&color=00F0FF)](https://github.com/Dushnilin/tachyon-core/stargazers)
 [![Rust](https://img.shields.io/badge/Rust-1.89+_(2024)-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
@@ -36,7 +36,7 @@ the inherited documentation below describes upstream capabilities and measuremen
 
 ## ⚡ Overview
 
-**tachyon-core** is a proxy core for routers and embedded systems, written from scratch in pure **Rust**. It takes the **same JSON config** and the **same CLI** as sing-box, but without the Go runtime: the same `/etc/sing-box/config.json`, the same `check -c` / `version` / `run`, and the same binary, which reports a compatible version string when installed under the name `sing-box`.
+**Xrust** is a proxy core for routers and embedded systems, written from scratch in pure **Rust**. It takes the **same JSON config** and the **same CLI** as sing-box, but without the Go runtime: the same `/etc/sing-box/config.json`, the same `check -c` / `version` / `run`, and the same binary, which reports a compatible version string when installed under the name `sing-box`.
 
 The full [sing-box-lx](https://github.com/Leadaxe/sing-box-lx) feature set is supported: XHTTP, AmneziaWG 2.0/3.x, MASQUE/WARP, uTLS, REALITY, ShadowTLS, DNS groups, post-quantum encryption, native Tailscale, and zero-copy mmap rule-sets.
 
@@ -44,7 +44,7 @@ All numbers come from real static musl builds measured against reference Go core
 
 **Averages across all target architectures:**
 
-| | tachyon-core | Go cores (sing-box-lx / Xray / Mihomo) | Advantage |
+| | Xrust | Go cores (sing-box-lx / Xray / Mihomo) | Advantage |
 |---|:---:|:---:|:---:|
 | **Binary size** | **10.0–12.8 MiB** (4.7–5.3 MB in archive) | ~70 MiB | **~6.5× smaller** |
 | **Idle RAM** | **4.2 MiB** | ~41 MiB | **~10× less** |
@@ -63,7 +63,7 @@ All numbers come from real static musl builds measured against reference Go core
 
 ## ⚔️ Why Rust and Not Go
 
-| | sing-box / sing-box-lx / Xray (Go) | tachyon-core (Rust) |
+| | sing-box / sing-box-lx / Xray (Go) | Xrust (Rust) |
 |---|---|---|
 | **Garbage collector** | Continuous heap scans plus Stop-The-World phases: CPU spikes and **2–15 ms pauses** on weak router CPUs. Audible as micro-stutter in VoIP and ping spikes in games | No collector at all. RAII reclaims memory deterministically, the instant a socket goes out of scope. **0.00 ms pauses**, flat latency graph |
 | **Scheduler and pools** | Internal thread pools, goroutine stacks, `mheap` reservations: ~41 MiB when fully idle, past 100 MiB at 10k connections, then OOM-Killer | Nothing is pre-reserved. 4.2 MiB idle, ~10 MiB peak |
@@ -78,7 +78,7 @@ All numbers come from real static musl builds measured against reference Go core
 
 <div align="center">
 
-![Tachyon Speed Pipeline](assets/readme/tachyon_speed.svg)
+![Speed Pipeline](assets/readme/tachyon_speed.svg)
 
 </div>
 
@@ -129,7 +129,7 @@ All numbers come from real static musl builds measured against reference Go core
 
 <div align="center">
 
-![Tachyon Core Architecture](assets/readme/architecture.svg)
+![Xrust Architecture](assets/readme/architecture.svg)
 
 </div>
 
@@ -159,15 +159,15 @@ Full field reference — **[docs/reference/](docs/reference/README.md)**: every 
 
 <div align="center">
 
-![Tachyon Core CLI Showcase](assets/readme/cli_showcase.svg)
+![Xrust CLI Showcase](assets/readme/cli_showcase.svg)
 
 </div>
 
 ```bash
-tachyon-core check -c /etc/sing-box/config.json                    # config validation (247/0 across the corpus)
-tachyon-core version                                              # upstream-compatible version string
-tachyon-core run -c /etc/sing-box/config.json                     # run
-tachyon-core rule-set compile rules.json -o rules.srs            # SRS v5, both directions
+xrust check -c /etc/sing-box/config.json                          # config validation (247/0 across the corpus)
+xrust version                                                     # upstream-compatible version string
+xrust run -c /etc/sing-box/config.json                            # run
+xrust rule-set compile rules.json -o rules.srs                    # SRS v5, both directions
 ```
 
 | Command | Purpose | Status |
@@ -244,8 +244,8 @@ Features are split into phases with automatic differential testing against the r
 
 ## 📜 License
 
-**[GPL-3.0-only](LICENSE)**, inherited from sing-box and sing-box-lx. `tachyon-core` is an independent Tachyon community project, not affiliated with SagerNet or Leadaxe. Copyrights on the protocols and sing-box specifications belong to their respective authors.
+**[GPL-3.0-only](LICENSE)**, inherited from sing-box and sing-box-lx. `xrust` is an independent community project, not affiliated with SagerNet or Leadaxe. Copyrights on the protocols and sing-box specifications belong to their respective authors.
 
 <p align="center">
-  <img src="assets/readme/footer_tachyon.svg" width="100%" alt="Tachyon Community Footer" />
+  <img src="assets/readme/footer_tachyon.svg" width="100%" alt="Footer" />
 </p>

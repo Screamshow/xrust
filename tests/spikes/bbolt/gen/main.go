@@ -143,7 +143,7 @@ func main() {
 	fmt.Println("OK")
 }
 
-// verifyCache checks a tachyon-core cache.db the way the reference reads it.
+// verifyCache checks an Xrust cache.db the way the reference reads it.
 func verifyCache(path string) error {
 	db, err := bolt.Open(path, 0o600, &bolt.Options{ReadOnly: true})
 	if err != nil {

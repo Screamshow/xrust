@@ -770,7 +770,7 @@ fn closed_by_api() -> io::Error {
 fn relay_buf() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        if let Ok(val) = std::env::var("TACHYON_RELAY_BUF")
+        if let Some(val) = crate::env_var("RELAY_BUF")
             && let Ok(n) = val.parse::<usize>()
             && n > 0
         {

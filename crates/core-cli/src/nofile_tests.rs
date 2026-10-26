@@ -3,7 +3,7 @@ use std::process::Command;
 
 #[test]
 fn inherited_limits() {
-    const CHILD_CASE: &str = "TACHYON_NOFILE_TEST_CASE";
+    const CHILD_CASE: &str = "XRUST_NOFILE_TEST_CASE";
     let mut inherited = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

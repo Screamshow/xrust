@@ -197,7 +197,7 @@ def spawn(binary, cfg, cpus, workers, directory, name):
     path = Path(directory) / (name + '.json')
     path.write_text(json.dumps(cfg))
     log = open(Path(directory) / (name + '.log'), 'w')
-    env = dict(os.environ, TACHYON_WORKERS=str(workers), GOMAXPROCS=str(workers))
+    env = dict(os.environ, XRUST_WORKERS=str(workers), GOMAXPROCS=str(workers))
     try:
         return subprocess.Popen([binary, 'run', '-c', str(path)], stdout=log, stderr=log,
                                 env=env, preexec_fn=lambda: os.sched_setaffinity(0, cpus))

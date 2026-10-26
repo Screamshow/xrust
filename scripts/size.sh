@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/size.sh — verifies binary size budget for tachyon-core (<= 12 MiB).
+# scripts/size.sh — verifies binary size budget for xrust (<= 12 MiB).
 set -euo pipefail
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
@@ -7,13 +7,13 @@ TARGET_TRIPLE="${TARGET_TRIPLE:-x86_64-unknown-linux-musl}"
 
 FULL_LIMIT=12582912    # 12 MiB
 
-echo "=== Building tachyon-core (release) ==="
+echo "=== Building xrust (release) ==="
 cargo build --workspace --no-default-features --features rust-x --release --target "$TARGET_TRIPLE"
-FULL_BIN="$TARGET_DIR/$TARGET_TRIPLE/release/tachyon-core"
+FULL_BIN="$TARGET_DIR/$TARGET_TRIPLE/release/xrust"
 
 if [[ ! -f "$FULL_BIN" ]]; then
     # fallback to root target if not in subfolder
-    FULL_BIN="$TARGET_DIR/release/tachyon-core"
+    FULL_BIN="$TARGET_DIR/release/xrust"
 fi
 
 FULL_SIZE=$(stat -c%s "$FULL_BIN" 2>/dev/null || stat -f%z "$FULL_BIN" 2>/dev/null || wc -c < "$FULL_BIN")
@@ -21,7 +21,7 @@ FULL_MIB=$(awk "BEGIN {printf \"%.2f\", $FULL_SIZE / 1048576}")
 
 echo ""
 echo "================================================================="
-echo "                TACHYON-CORE BINARY SIZE REPORT                 "
+echo "                    XRUST BINARY SIZE REPORT                 "
 echo "================================================================="
 printf "| %-12s | %-12s | %-10s | %-10s | %-8s |\n" "Build" "Bytes" "Size (MiB)" "Budget" "Status"
 echo "|--------------|--------------|------------|------------|----------|"

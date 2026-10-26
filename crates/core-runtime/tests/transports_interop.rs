@@ -154,7 +154,7 @@ async fn assert_transport(ref_bin: &str, label: &str, make: impl Fn(u16) -> (Val
         "route": {"final": "up"}
     }))
     .await
-    .expect("start tachyon-core");
+    .expect("start xrust");
     let proxy = instance.inbound_addrs()[0].1;
 
     let result =

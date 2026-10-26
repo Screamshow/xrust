@@ -1,6 +1,6 @@
 [package]
 name = "core-runtime"
-description = "tachyon-core data plane runtime"
+description = "Xrust data plane runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

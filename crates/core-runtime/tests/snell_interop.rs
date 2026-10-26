@@ -275,7 +275,7 @@ async fn assert_snell(
         "route": {"final": "up"}
     }))
     .await
-    .expect("start tachyon-core");
+    .expect("start xrust");
     let proxy = instance.inbound_addrs()[0].1;
 
     for round in 0..rounds {

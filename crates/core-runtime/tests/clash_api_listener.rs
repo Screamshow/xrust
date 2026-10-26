@@ -20,7 +20,7 @@ async fn guard() -> MutexGuard<'static, ()> {
         // test takes this guard first.
         unsafe {
             std::env::set_var(
-                "TACHYON_CLASH_API_HEADER_TIMEOUT_MS",
+                "XRUST_CLASH_API_HEADER_TIMEOUT_MS",
                 HEADER_TIMEOUT_MS.to_string(),
             );
         }

@@ -1,7 +1,7 @@
 //! Golden corpus contract:
 //! every config under `../tests/golden/{lx,tachyon,ext}` must pass
 //! `core_config::check_str` (schema + semantic validation), and every config
-//! under `../tests/golden/invalid` must fail it. `ext/` holds tachyon-core
+//! under `../tests/golden/invalid` must fail it. `ext/` holds Xrust
 //! extensions (e.g. `fptn` token outbounds) that the reference sing-box
 //! rejects as unknown types, so the differential harness skips that dir.
 

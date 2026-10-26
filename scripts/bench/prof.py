@@ -11,7 +11,7 @@ sink on one core, server on the other):
   are counts only.
 
 Usage: python3 prof.py [--case ss-aes-128-gcm] [--streams 8] [--seconds 12]
-                       [--tachyon PATH] [--ref PATH]
+                       [--xrust PATH] [--ref PATH]
 """
 
 import argparse
@@ -317,7 +317,7 @@ def main():
     ap.add_argument("--case", default="ss-aes-128-gcm")
     ap.add_argument("--streams", type=int, default=8)
     ap.add_argument("--seconds", type=float, default=12)
-    ap.add_argument("--tachyon", default="/tmp/bench/tachyon-core")
+    ap.add_argument("--xrust", "--tachyon", dest="tachyon", default="/tmp/bench/xrust")
     ap.add_argument("--ref", default="/usr/bin/sing-box")
     ap.add_argument("--only", choices=("tachyon", "ref"))
     ap.add_argument("--skip-strace", action="store_true")

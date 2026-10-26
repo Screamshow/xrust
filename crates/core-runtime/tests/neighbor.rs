@@ -18,7 +18,7 @@ const LEASES: &str = "\
 
 /// A lease file of our own, so the test never reads the host's real one.
 fn lease_file(name: &str) -> String {
-    let path = std::env::temp_dir().join(format!("tachyon-neighbor-{name}.leases"));
+    let path = std::env::temp_dir().join(format!("xrust-neighbor-{name}.leases"));
     std::fs::write(&path, LEASES).expect("write leases");
     path.to_string_lossy().into_owned()
 }

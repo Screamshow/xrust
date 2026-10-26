@@ -35,7 +35,7 @@ jobs:
       # covers what the unprivileged `cargo test` above can only skip.
       - name: Exit gate (privileged)
         run: |
-          sudo -E env "PATH=$PATH" TACHYON_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --features legacy-protocols --lib outbound::dial::tests::the_options_reach_the_socket -- --exact
+          sudo -E env "PATH=$PATH" XRUST_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --features legacy-protocols --lib outbound::dial::tests::the_options_reach_the_socket -- --exact
           sudo -E env "PATH=$PATH" cargo test -p core-runtime --features legacy-protocols --test exit_gate -- --nocapture
           sudo -E env "PATH=$PATH" cargo test -p core-runtime --features legacy-protocols --test inbounds -- --nocapture
 
@@ -46,7 +46,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       # run.sh refuses to start without a binary, so this build is not optional.
-      - name: Build tachyon-core
+      - name: Build xrust
         run: cargo build --workspace --features legacy-protocols
       - name: Fetch reference sing-box-lx
         run: |
@@ -89,10 +89,10 @@ jobs:
         run: cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
       - name: Size budget (13 MiB x86_64, 12 MiB ARM64)
         run: |
-          size=$(stat -c%s "target/${{ matrix.target }}/release/tachyon-core")
+          size=$(stat -c%s "target/${{ matrix.target }}/release/xrust")
           echo "size=$size bytes"
           test "$size" -le ${{ matrix.budget }}
       - uses: actions/upload-artifact@v4
         with:
-          name: tachyon-core-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/tachyon-core
+          name: xrust-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/xrust

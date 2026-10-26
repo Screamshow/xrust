@@ -106,7 +106,7 @@ fn writes_db_go_can_verify() {
         ],
     };
 
-    let out = std::env::temp_dir().join(format!("tachyon-bbolt-rust-{}.db", std::process::id()));
+    let out = std::env::temp_dir().join(format!("xrust-bbolt-rust-{}.db", std::process::id()));
     core_experimental::bbolt::write(&out, &root).expect("write db");
 
     let db = core_experimental::bbolt::Db::open(&out).expect("re-open own db");

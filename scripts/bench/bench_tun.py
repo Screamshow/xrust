@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark for tachyon-core TUN inbound (Phase F6).
+"""Benchmark for xrust TUN inbound (Phase F6).
 
 Measures:
   - TCP Throughput (1-stream & 8-stream, Gbit/s)
@@ -148,14 +148,14 @@ def measure_throughput(target_ip, target_port, concurrency=1, duration_secs=3):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Tachyon TUN Inbound Benchmark")
-    parser.add_argument("--bin", default="target/x86_64-unknown-linux-musl/release/tachyon-core", help="Path to tachyon-core binary")
+    parser = argparse.ArgumentParser(description="Xrust TUN Inbound Benchmark")
+    parser.add_argument("--bin", default="target/x86_64-unknown-linux-musl/release/xrust", help="Path to xrust binary")
     parser.add_argument("--duration", type=int, default=3, help="Duration per throughput test in seconds")
     parser.add_argument("--out", default="target/bench/tun_result.json", help="Path to JSON output")
     args = parser.parse_args()
 
     print("=" * 70)
-    print("🚀 TACHYON-CORE TUN INBOUND SPEED BENCHMARK (Phase F6)")
+    print("🚀 XRUST TUN INBOUND SPEED BENCHMARK (Phase F6)")
     print("=" * 70)
 
     # 1. Start sink server in background
@@ -181,8 +181,8 @@ def main():
         except Exception:
             pass
 
-    # 3. Start tachyon-core with TUN inbound
-    print("[2/3] Starting tachyon-core with smoltcp TUN inbound...")
+    # 3. Start xrust with TUN inbound
+    print("[2/3] Starting xrust with smoltcp TUN inbound...")
     cfg = {
         "log": {"level": "warn"},
         "inbounds": [
@@ -254,7 +254,7 @@ def main():
             json.dump(result, f, indent=2)
 
         print("\n" + "=" * 70)
-        print("📊 РЕЗУЛЬТАТЫ БЕНЧМАРКА TUN ИНБАУНДА (tachyon-core vs Direct)")
+        print("📊 РЕЗУЛЬТАТЫ БЕНЧМАРКА TUN ИНБАУНДА (xrust vs Direct)")
         print("=" * 70)
         print(f"{'Метрика':<30} | {'Direct (Hardware)':<20} | {'TUN (smoltcp Rust)':<20}")
         print("-" * 75)

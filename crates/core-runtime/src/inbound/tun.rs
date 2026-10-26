@@ -684,7 +684,7 @@ impl PhyTxToken for TunTxToken<'_> {
     }
 }
 
-/// An active transparent TCP session bridged between `smoltcp` and Tachyon router.
+/// An active transparent TCP session bridged between `smoltcp` and the Xrust router.
 #[allow(dead_code)]
 struct TunTcpSession {
     handle: SocketHandle,

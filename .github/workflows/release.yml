@@ -88,7 +88,7 @@ jobs:
       - name: Size budget
         shell: bash
         run: |
-          bin="target/${{ matrix.target }}/release/tachyon-core"
+          bin="target/${{ matrix.target }}/release/xrust"
           size=$(wc -c < "$bin" | tr -d ' ')
           budget="${{ matrix.budget || env.SIZE_BUDGET }}"
           echo "${{ matrix.name }}: $size bytes, budget $budget"
@@ -98,14 +98,14 @@ jobs:
         if: ${{ runner.os != 'Windows' }}
         shell: bash
         run: |
-          file "target/${{ matrix.target }}/release/tachyon-core"
+          file "target/${{ matrix.target }}/release/xrust"
 
       - name: Pack (Unix)
         shell: bash
         run: |
           ver="${{ inputs.tag || github.ref_name }}"
           name="rust-x-${{ matrix.name }}-${ver#rust-x-}"
-          bin="target/${{ matrix.target }}/release/tachyon-core"
+          bin="target/${{ matrix.target }}/release/xrust"
           cp "$bin" "./${name}"
 
           tar -czf "${name}.tar.gz" "./${name}"

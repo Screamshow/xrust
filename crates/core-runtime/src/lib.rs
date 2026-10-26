@@ -22,6 +22,8 @@ pub mod ws;
 #[cfg(feature = "clash-api")]
 mod zip;
 
+pub use core_crypto::env_var;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

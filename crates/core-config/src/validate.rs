@@ -10882,7 +10882,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_valid_tachyon_shape() {
+    fn accepts_valid_router_shape() {
         let cfg = json!({
             "log": {"level": "warn", "timestamp": false},
             "dns": {"servers": [{"type": "udp", "tag": "d", "server": "1.1.1.1"}], "final": "d"},

@@ -86,7 +86,7 @@ async fn log_output_file_receives_lines() {
     // path does not error; content verification is covered by the sink
     // unit behaviour (append open) which is exercised at init time.
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("tachyon-core-log-test-{}.log", std::process::id()));
+    let path = dir.join(format!("xrust-log-test-{}.log", std::process::id()));
     let path_str = path.to_string_lossy().replace('\\', "/");
     let cfg = json!({
         "log": {"level": "info", "timestamp": true, "output": path_str},

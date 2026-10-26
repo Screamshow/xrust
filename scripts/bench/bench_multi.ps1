@@ -1,4 +1,4 @@
-# Runs bench_multi.py in a clean python:3 container: tachyon-core vs sing-box vs Xray vs Mihomo.
+# Runs bench_multi.py in a clean python:3 container: xrust vs sing-box vs Xray vs Mihomo.
 #
 #   .\scripts\bench\bench_multi.ps1                      # router profile (1 worker, core 1, ~20s)
 #   .\scripts\bench\bench_multi.ps1 -Profile desktop     # desktop profile (multi-core, ~20s)
@@ -83,7 +83,7 @@ $argStr = $extraArgs -join " "
 Write-Host "Launching multi-proxy benchmark ($Profile profile) ..."
 docker run --rm --ulimit nofile=1048576:1048576 --cap-add=NET_ADMIN `
     -v "${work}:/bench" python:3 `
-    sh -c "chmod +x /bench/tachyon-core /bench/sing-box* /bench/xray-linux /bench/mihomo-linux /bench/steer/usr/bin/* /bench/steer/usr/sbin/* 2>/dev/null; python3 /bench/bench_multi.py $argStr"
+    sh -c "chmod +x /bench/xrust /bench/sing-box* /bench/xray-linux /bench/mihomo-linux /bench/steer/usr/bin/* /bench/steer/usr/sbin/* 2>/dev/null; python3 /bench/bench_multi.py $argStr"
 
 Write-Host "`nReport saved to: $work\multi-$suffix.html"
 Write-Host "JSON saved to:   $work\multi-$suffix.json"

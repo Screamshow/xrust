@@ -132,7 +132,7 @@ mod tests {
     use super::*;
 
     fn socket_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("tachyon-protect-{name}"));
+        let dir = std::env::temp_dir().join(format!("xrust-protect-{name}"));
         std::fs::create_dir_all(&dir).expect("tmpdir");
         let path = dir.join("protect.sock");
         let _ = std::fs::remove_file(&path);
@@ -191,8 +191,7 @@ mod tests {
     /// And a path nobody is listening on is an error, not a panic.
     #[test]
     fn a_missing_helper_is_an_error() {
-        let err =
-            protect("/nonexistent/tachyon/protect.sock", 0).expect_err("nothing is listening");
+        let err = protect("/nonexistent/xrust/protect.sock", 0).expect_err("nothing is listening");
         assert!(err.to_string().contains("connect protect path"), "{err}");
     }
 }

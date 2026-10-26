@@ -42,13 +42,13 @@ pub(crate) type Dialer =
 /// socket live until the server gives up. Every download chunk restarts the
 /// limit, so a response that keeps moving is read to its end. Xray ends the
 /// same case with its `downlinkOnly` policy timer (5 s by default); this is
-/// twice that. `TACHYON_XHTTP_HALF_CLOSE_IDLE_MS` overrides it.
+/// twice that. `XRUST_XHTTP_HALF_CLOSE_IDLE_MS` overrides it.
 const HALF_CLOSE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
 
 fn half_close_idle() -> std::time::Duration {
     static IDLE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *IDLE.get_or_init(|| {
-        if let Ok(val) = std::env::var("TACHYON_XHTTP_HALF_CLOSE_IDLE_MS")
+        if let Some(val) = crate::env_var("XHTTP_HALF_CLOSE_IDLE_MS")
             && let Ok(ms) = val.parse::<u64>()
             && ms > 0
         {

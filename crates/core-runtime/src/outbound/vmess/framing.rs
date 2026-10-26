@@ -38,15 +38,14 @@ pub(crate) const WRITE_CHUNK: usize = 16 * 1024 - CIPHER_OVERHEAD - (MAX_PADDING
 /// in-flight are the same number now.
 pub(crate) const WRITE_BATCH: usize = 128 * 1024;
 
-/// [`WRITE_BATCH`], with `TACHYON_VMESS_BATCH` as a diagnostic override: the
+/// [`WRITE_BATCH`], with `XRUST_VMESS_BATCH` as a diagnostic override: the
 /// batch sets how many bytes one vmess frame -- and therefore one grpc message
 /// downstream -- carries, so shrinking it lets the bench reproduce the
 /// reference's message size against our own server.
 pub(crate) fn write_batch() -> usize {
     static SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *SIZE.get_or_init(|| {
-        std::env::var("TACHYON_VMESS_BATCH")
-            .ok()
+        crate::env_var("VMESS_BATCH")
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|v| *v >= 4096)
             .unwrap_or(WRITE_BATCH)

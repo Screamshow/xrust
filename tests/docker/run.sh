@@ -6,9 +6,9 @@ set -euo pipefail
 # Git-bash rewrites leading-slash args (/src -> C:/Program Files/Git/src)
 export MSYS_NO_PATHCONV=1
 
-# Windows-style path (G:/tachyon-core) so docker build/run can use it directly
+# Windows-style path (G:/xrust) so docker build/run can use it directly
 ROOT="$(cd "$(dirname "$0")/../.." && (pwd -W 2>/dev/null || pwd))"
-IMAGE="${IMAGE:-tachyon-core-test:latest}"
+IMAGE="${IMAGE:-xrust-test:latest}"
 
 docker build -q -t "$IMAGE" -f "$ROOT/tests/docker/Dockerfile" "$ROOT/tests/docker" >/dev/null
 
@@ -19,11 +19,11 @@ docker run --rm \
     --cap-add=NET_ADMIN \
     --cap-add=NET_RAW \
     -v "$HOST_DIR:/src" \
-    -v tachyon-core-cargo-registry:/usr/local/cargo/registry \
-    -v tachyon-core-cargo-git:/usr/local/cargo/git \
-    -v tachyon-core-target:/cache/target \
-    -v tachyon-core-gomod:/go/pkg/mod \
-    -v tachyon-core-gobuild:/root/.cache/go-build \
+    -v xrust-cargo-registry:/usr/local/cargo/registry \
+    -v xrust-cargo-git:/usr/local/cargo/git \
+    -v xrust-target:/cache/target \
+    -v xrust-gomod:/go/pkg/mod \
+    -v xrust-gobuild:/root/.cache/go-build \
     -w /src \
     -e CARGO_TARGET_DIR=/cache/target \
     -e GOMODCACHE=/go/pkg/mod \

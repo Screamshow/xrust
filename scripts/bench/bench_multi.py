@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fast, objective multi-core benchmark: tachyon-core vs sing-box vs Xray vs Mihomo.
+"""Fast, objective multi-core benchmark: xrust vs sing-box vs Xray vs Mihomo.
 
 Measures:
   1. Binary size (MiB on disk)
@@ -378,12 +378,12 @@ def setup_proxy(name, bin_path, proxy_cpus, workers=None):
     d = tempfile.mkdtemp(prefix=f"bench_{name}_")
     env = os.environ.copy()
     if workers:
-        env["TACHYON_WORKERS"] = str(workers)
+        env["XRUST_WORKERS"] = str(workers)
         env["GOMAXPROCS"] = str(workers)
 
     preexec = (lambda: os.sched_setaffinity(0, proxy_cpus)) if hasattr(os, "sched_setaffinity") else None
 
-    if name in ("tachyon", "tachyon-core", "sing-box"):
+    if name in ("tachyon", "xrust", "tachyon-core", "sing-box"):
         cfg_path = os.path.join(d, "config.json")
         cfg = {
             "log": {"level": "error"},
@@ -554,7 +554,7 @@ def bench_one(name, bin_path, proxy_cpus, args):
 
 def print_table(results, direct):
     print("\n" + "=" * 115)
-    print("  FAST & OBJECTIVE PROXY CORE BENCHMARK (Tachyon vs Sing-box vs Xray vs Mihomo vs Steer)")
+    print("  FAST & OBJECTIVE PROXY CORE BENCHMARK (Xrust vs Sing-box vs Xray vs Mihomo vs Steer)")
     print("=" * 115)
     header = f"{'Proxy':<14} | {'Size':<7} | {'Start':<8} | {'Idle RSS':<9} | {'p50 us':<7} | {'p99 us':<7} | {'1s Gbps':<8} | {'8s Gbps':<8} | {'CPU s/GiB':<10} | {'C1K RSS':<8} | {'Peak RSS':<8}"
     print(header)
@@ -610,7 +610,7 @@ def generate_html(data, out_path):
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Proxy Core Benchmark: Tachyon vs Sing-box vs Xray vs Mihomo vs Steer</title>
+<title>Proxy Core Benchmark: Xrust vs Sing-box vs Xray vs Mihomo vs Steer</title>
 <style>
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background: #0f1117; color: #e1e4e8; padding: 24px; }}
   h1 {{ font-size: 20px; margin-bottom: 4px; color: #58a6ff; }}
@@ -659,7 +659,7 @@ def generate_html(data, out_path):
 
 def main():
     ap = argparse.ArgumentParser(description="Multi-proxy fast benchmark runner")
-    ap.add_argument("--tachyon", default="/bench/tachyon-core")
+    ap.add_argument("--xrust", "--tachyon", dest="tachyon", default="/bench/xrust")
     ap.add_argument("--sing-box", default="/bench/sing-box-lx")
     ap.add_argument("--xray", default="/bench/xray-linux")
     ap.add_argument("--mihomo", default="/bench/mihomo-linux")

@@ -94,7 +94,7 @@ async fn a_hosts_server_answers_from_its_predefined_entries() {
 #[tokio::test]
 async fn a_hosts_server_reads_the_configured_files() {
     let _g = test_guard().await;
-    let path = std::env::temp_dir().join("tachyon-hosts-test");
+    let path = std::env::temp_dir().join("xrust-hosts-test");
     std::fs::write(
         &path,
         "# a comment\n10.9.8.7 first.test alias.test\n\nnot-an-ip second.test\n",

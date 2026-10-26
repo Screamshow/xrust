@@ -7,7 +7,7 @@ output="${output:-dist/rust-x-v$version}"
 mkdir -p "$output"
 archives=()
 for cpu in x86_64 aarch64; do
-    binary="target/$cpu-unknown-linux-musl/release/tachyon-core"
+    binary="target/$cpu-unknown-linux-musl/release/xrust"
     name="rust-x-$cpu-v$version"
     test -f "$binary"
     test "$(wc -c < "$binary")" -le 12582912

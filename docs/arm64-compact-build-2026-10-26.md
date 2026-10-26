@@ -55,7 +55,7 @@ cargo build --locked -p core-cli --no-default-features --features rust-x \
     --config 'profile.release.package.core-crypto.opt-level=3'
 ```
 
-Результат: `target/aarch64-unknown-linux-musl/release/tachyon-core`.
+Результат: `target/aarch64-unknown-linux-musl/release/xrust`.
 
 `core-crypto` на 3 — единственное отличие от «чистого» `"s"`. В этом крейте
 лежат `fastgcm` и `fastchacha`; по замерам x86_64 (BLD-06) именно он
@@ -142,7 +142,7 @@ cargo build --locked -p core-cli --no-default-features --features rust-x \
 OpenWrt SDK (`scripts/openwrt_apk_tool.sh`, SDK 25.12.3, apk-tools 3.0.5).
 
 ```sh
-install -m 755 target/aarch64-unknown-linux-musl/release/tachyon-core \
+install -m 755 target/aarch64-unknown-linux-musl/release/xrust \
     <binaries>/rust-x-aarch64-v0.0.27
 SOURCE_DATE_EPOCH=0 python3 scripts/package_openwrt.py \
     --binaries <binaries> --output <out> --apk-tool <путь к apk> \
