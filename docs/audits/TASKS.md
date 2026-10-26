@@ -2575,3 +2575,11 @@ cargo build --locked -p core-cli --no-default-features --features rust-x \
 - Переименование: workspace (legacy) и rust-x компилируются, run_smoke 5/5, core-crypto 30/30, anytls 7/7, xhttp и clash_api проходят, clippy чистый; три golden-теста core-cli в rust-x падали и раньше (входят в 138 известных).
 
 Ожидает проверки на OpenWrt: пакет собирается и ставится как раньше, Forkop X распознаёт ядро, `XRUST_WORKERS` работает.
+
+### Один формат версии — 2026-10-26
+
+Статус: исправлено, ожидает независимой проверки. xrust: `d0c32a0`; Forkop X: тесты, коммит «Test the single Rust core version format».
+
+Бинарник, запущенный как `sing-box`, печатал `v<версия>-rust-x.0` — второй формат, из которого Forkop X прочитал бы «sing-box 0.0» (и выключил бы возможности 1.14); правильный блок печатала только обёртка пакета. Теперь бинарник сам печатает тот же блок, что раньше обёртка: `sing-box version 1.14.2-rust-x.<версия>` (база конфигурации — одна константа), строки `Xrust:`, `Features:` (Forkop X читает поддержку XHTTP, `runtime.uc`) и `Tags:` (`ui.uc`). Обёртка `/usr/bin/sing-box` сведена к `exec` бинарника; состав пакета не менялся. В тестах Forkop X второй вид версии убран.
+
+Проверки разработки: run_smoke 6/6 (новый: вызов через ссылку `sing-box`, проверка блока); изменённые тесты Forkop X проходят (`sing_box_cache_identity` падает в том же месте и на неизменённом HEAD). Ожидает проверки на OpenWrt: `sing-box version` на роутере печатает прежний блок, Forkop X видит XHTTP и теги в интерфейсе.
