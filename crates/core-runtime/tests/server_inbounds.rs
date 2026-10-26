@@ -433,6 +433,7 @@ async fn a_vless_server_carries_a_udp_datagram() {
     assert_eq!(String::from_utf8_lossy(&got), "a datagram");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn a_trojan_server_carries_a_udp_datagram() {
     let _guard = test_guard().await;
@@ -454,6 +455,7 @@ async fn a_trojan_server_carries_a_udp_datagram() {
     assert_eq!(String::from_utf8_lossy(&got), "a datagram");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn a_vmess_server_carries_a_udp_datagram() {
     let _guard = test_guard().await;
@@ -612,6 +614,7 @@ async fn a_vless_inbound_refuses_an_empty_user_list() {
     assert!(chain.contains("must not be empty"), "{chain}");
 }
 
+#[cfg(feature = "legacy-protocols")]
 /// A trojan client speaking the raw protocol: `[56-byte SHA224 hex][CRLF]
 /// [command][atyp][addr][port][CRLF]`, the same bytes our outbound writes and
 /// the reference's server reads.
@@ -666,6 +669,7 @@ async fn trojan_request(
     Ok(answer)
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn trojan_server_carries_our_own_client_traffic() {
     let _guard = test_guard().await;
@@ -693,6 +697,7 @@ async fn trojan_server_carries_our_own_client_traffic() {
     drop(instance);
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn trojan_server_refuses_a_wrong_password() {
     let _guard = test_guard().await;
@@ -721,6 +726,7 @@ async fn trojan_server_refuses_a_wrong_password() {
     drop(instance);
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn trojan_server_refuses_two_users_with_one_password() {
     let _guard = test_guard().await;
@@ -744,6 +750,7 @@ async fn trojan_server_refuses_two_users_with_one_password() {
     assert!(chain.contains("password used by"), "{chain}");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn trojan_server_refuses_an_unknown_command() {
     let _guard = test_guard().await;
@@ -977,6 +984,7 @@ async fn through_our_own_client_rounds(
     Ok(())
 }
 
+#[cfg(feature = "legacy-protocols")]
 fn vmess_server(uuid: &str) -> Value {
     json!({
         "type": "vmess",
@@ -987,6 +995,7 @@ fn vmess_server(uuid: &str) -> Value {
     })
 }
 
+#[cfg(feature = "legacy-protocols")]
 fn vmess_client(uuid: &str) -> Value {
     json!({"type": "vmess", "tag": "out", "uuid": uuid})
 }
@@ -995,6 +1004,7 @@ fn io_shutdown(err: std::io::Error) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::ConnectionAborted, err.to_string())
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn vmess_server_carries_our_own_client_traffic() {
     let _guard = test_guard().await;
@@ -1009,6 +1019,7 @@ async fn vmess_server_carries_our_own_client_traffic() {
     assert_eq!(String::from_utf8_lossy(&got), "through-the-vmess-server");
 }
 
+#[cfg(feature = "legacy-protocols")]
 /// sing-box puts `zero` on a vmess outbound that sits on TLS: the body is the
 /// bare stream, no frames. The server used to read it as chunks and wait for the
 /// rest of a frame that was never coming.
@@ -1024,6 +1035,7 @@ async fn vmess_server_carries_a_zero_security_body() {
     assert_eq!(String::from_utf8_lossy(&got), "bare body");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn vmess_server_refuses_an_unknown_uuid() {
     let _guard = test_guard().await;
@@ -1044,6 +1056,7 @@ async fn vmess_server_refuses_an_unknown_uuid() {
     );
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn a_vmess_inbound_needs_users() {
     let _guard = test_guard().await;
@@ -1085,6 +1098,7 @@ fn vless_client(uuid: &str, flow: &str) -> Value {
     outbound
 }
 
+#[cfg(feature = "legacy-protocols")]
 fn ss_server(method: &str, password: &str) -> Value {
     json!({
         "type": "shadowsocks",
@@ -1096,10 +1110,12 @@ fn ss_server(method: &str, password: &str) -> Value {
     })
 }
 
+#[cfg(feature = "legacy-protocols")]
 fn ss_client(method: &str, password: &str) -> Value {
     json!({"type": "shadowsocks", "tag": "out", "method": method, "password": password})
 }
 
+#[cfg(feature = "legacy-protocols")]
 /// Both AEAD families, each measured against our own client: the 2022 one with
 /// its sealed head and the legacy one with a bare address in the first chunk.
 /// The 2022 methods take a pre-shared key, so their password is base64.
@@ -1130,6 +1146,7 @@ async fn shadowsocks_server_carries_our_own_client_traffic() {
     }
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn shadowsocks_server_refuses_a_wrong_password() {
     let _guard = test_guard().await;
@@ -1149,6 +1166,7 @@ async fn shadowsocks_server_refuses_a_wrong_password() {
     }
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn a_shadowsocks_2022_server_wants_a_key_of_its_own_length() {
     let _guard = test_guard().await;
@@ -1163,6 +1181,7 @@ async fn a_shadowsocks_2022_server_wants_a_key_of_its_own_length() {
     assert!(chain.contains("must be 16 bytes"), "{chain}");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn a_shadowsocks_inbound_refuses_the_multi_user_shape() {
     let _guard = test_guard().await;
@@ -1516,6 +1535,7 @@ async fn vless_server_over_xhttp_tls_auto_multi_write() {
     .expect("tls auto multi write round trip");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn trojan_server_over_tls_carries_domain_and_ipv6_targets() {
     use core_runtime::inbound::Target;
@@ -1544,6 +1564,7 @@ async fn trojan_server_over_tls_carries_domain_and_ipv6_targets() {
     }
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn trojan_server_over_tls_carries_our_own_client_traffic() {
     let _guard = test_guard().await;
@@ -1564,6 +1585,7 @@ async fn trojan_server_over_tls_carries_our_own_client_traffic() {
     assert_eq!(String::from_utf8_lossy(&got), "through-tls");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn vmess_server_over_tls_carries_our_own_client_traffic() {
     let _guard = test_guard().await;
@@ -1578,6 +1600,7 @@ async fn vmess_server_over_tls_carries_our_own_client_traffic() {
     assert_eq!(String::from_utf8_lossy(&got), "through-tls");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn shadowsocks_server_over_tls_carries_our_own_client_traffic() {
     let _guard = test_guard().await;

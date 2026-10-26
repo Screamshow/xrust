@@ -469,12 +469,14 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn check_accepts_token_config() {
         let raw = serde_json::to_string(&fptn_config(&token_brotli(two_servers()))).unwrap();
         crate::check_str(&raw).unwrap();
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn check_rejects_token_form_errors() {
         let raw = serde_json::to_string(&json!({
@@ -513,6 +515,7 @@ mod tests {
         assert!(err.contains("fptn token: invalid base64"), "{err}");
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn check_rejects_token_content_errors() {
         let raw = serde_json::to_string(&json!({
@@ -534,6 +537,7 @@ mod tests {
         assert!(err.contains("duplicate server name"), "{err}");
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn check_rejects_mixed_forms_and_duplicate_tags() {
         let raw = serde_json::to_string(&json!({
@@ -560,6 +564,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn check_accepts_two_groups_and_member_reference() {
         let raw = serde_json::to_string(&json!({
@@ -574,6 +579,7 @@ mod tests {
         crate::check_str(&raw).unwrap();
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn check_rejects_handwritten_member_shape() {
         let raw = serde_json::to_string(&json!({

@@ -3,7 +3,9 @@
 //! self-interop loop over each outbound protocol.
 
 use std::net::SocketAddr;
+#[cfg(feature = "legacy-protocols")]
 use std::sync::Arc;
+#[cfg(feature = "legacy-protocols")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
@@ -90,6 +92,7 @@ fn upbox(upstream: SocketAddr, outbound_type: &str) -> Value {
     })
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn socks_outbound_via_second_box() {
     let echo = spawn_echo().await;
@@ -128,6 +131,7 @@ async fn http_outbound_via_second_box() {
     assert_tunnel(stream).await;
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn selector_defaults_to_first_member() {
     let echo = spawn_echo().await;
@@ -159,6 +163,7 @@ async fn selector_defaults_to_first_member() {
     assert_tunnel(stream).await;
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn selector_default_field_selects_direct() {
     let echo = spawn_echo().await;
@@ -181,6 +186,7 @@ async fn selector_default_field_selects_direct() {
     assert_tunnel(stream).await;
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn socks_outbound_auth_handshake() {
     let echo = spawn_echo().await;
@@ -212,6 +218,7 @@ async fn socks_outbound_auth_handshake() {
     assert_tunnel(stream).await;
 }
 
+#[cfg(feature = "legacy-protocols")]
 async fn spawn_http204() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 204");
     let addr = listener.local_addr().expect("204 addr");
@@ -232,6 +239,7 @@ async fn spawn_http204() -> SocketAddr {
     addr
 }
 
+#[cfg(feature = "legacy-protocols")]
 async fn try_relay(inbound: SocketAddr, echo: SocketAddr) -> bool {
     let Ok(mut stream) = TcpStream::connect(inbound).await else {
         return false;
@@ -260,6 +268,7 @@ async fn try_relay(inbound: SocketAddr, echo: SocketAddr) -> bool {
     stream.read_exact(&mut bnd).await.is_ok()
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn urltest_selects_working_member() {
     use std::time::Duration;
@@ -305,6 +314,7 @@ async fn urltest_selects_working_member() {
     assert!(ok, "urltest never selected the live member");
 }
 
+#[cfg(feature = "legacy-protocols")]
 /// A SOCKS4 responder: enough of the protocol to prove our client speaks it.
 async fn spawn_socks4(upstream: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind socks4");
@@ -374,6 +384,7 @@ async fn spawn_socks4(upstream: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
     (addr, hits)
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn socks4_outbound_connects_through_a_v4_server() {
     let echo = spawn_echo().await;

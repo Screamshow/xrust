@@ -889,6 +889,7 @@ fn router_main_dns_section_builds() {
     assert!(!svc.fakeip_stores().is_empty(), "router config uses fakeip");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn tcp_transport_uses_the_detour_outbound() {
     // a TCP DNS responder behind the `direct` outbound: the detour plumbing is

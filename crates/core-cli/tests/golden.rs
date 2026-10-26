@@ -44,10 +44,12 @@ fn corpus_files(dir_name: &str) -> Vec<PathBuf> {
     files
 }
 
+#[cfg(feature = "legacy-protocols")]
 /// Corpus entries the current platform rejects by design: `routing_mark` and
 /// the other dialer gates exist on Linux only (common/dialer.New).
 const PLATFORM_SKIPPED: &[&str] = &["tachyon/f1-exit-gate.json"];
 
+#[cfg(feature = "legacy-protocols")]
 fn assert_accepts(dir_name: &str) {
     use_workspace_cwd();
     for file in corpus_files(dir_name) {
@@ -79,16 +81,19 @@ fn assert_rejects(dir_name: &str) {
     }
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[test]
 fn golden_lx_configs_pass_check() {
     assert_accepts("lx");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[test]
 fn golden_tachyon_configs_pass_check() {
     assert_accepts("tachyon");
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[test]
 fn golden_ext_configs_pass_check() {
     assert_accepts("ext");

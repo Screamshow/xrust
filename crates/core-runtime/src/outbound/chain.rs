@@ -192,6 +192,7 @@ mod tests {
         assert!(chain.resolve(&tags).is_err());
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn chain_golden_lx_loads_in_router() {
         let text = include_str!("../../../../tests/golden/lx/chain_basic.json");

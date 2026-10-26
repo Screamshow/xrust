@@ -167,6 +167,7 @@ async fn mixed_socks4_user_check() {
     i.shutdown();
 }
 
+#[cfg(feature = "legacy-protocols")]
 #[tokio::test]
 async fn socks_inbound_takes_socks4_and_5_refuses_http() {
     let _g = test_guard().await;

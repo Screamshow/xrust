@@ -10531,6 +10531,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn a_server_inbound_with_a_transport_is_refused_not_ignored() {
         // measured on the router: a vless+ws inbound started, bound its port,
@@ -10881,6 +10882,7 @@ mod tests {
         assert!(err.contains("unknown inbound type: wireguard"));
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn accepts_valid_router_shape() {
         let cfg = json!({
@@ -11474,6 +11476,7 @@ mod tests {
         assert!(err.contains("realm.xyz"), "{err}");
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn tuic_out_unknown_field() {
         let err = validate(&json!({
@@ -11487,6 +11490,7 @@ mod tests {
         assert!(err.contains("auth_timeout"), "{err}");
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn tuic_out_bad_cc() {
         let err = validate(&json!({
@@ -11503,6 +11507,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn tuic_out_bad_relay() {
         let err = validate(&json!({
@@ -11516,6 +11521,7 @@ mod tests {
         assert!(err.contains("unknown udp_relay_mode"), "{err}");
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn tuic_out_ovs_conflict() {
         let err = validate(&json!({
@@ -11530,6 +11536,7 @@ mod tests {
         assert!(err.contains("udp_over_stream is conflict"), "{err}");
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn tuic_out_bad_heartbeat() {
         let err = validate(&json!({
@@ -11568,6 +11575,7 @@ mod tests {
         assert!(err.contains("missing certificate"), "{err}");
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn tuic_in_unknown_field() {
         let err = validate(&json!({
@@ -11617,6 +11625,7 @@ mod tests {
         assert!(validate_masquerade(&json!({"type": "string", "status_code": 302}), "at").is_ok());
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn valid_hy2_tuic_shapes() {
         let cfg = json!({
@@ -11966,6 +11975,7 @@ mod tests {
         assert!(err.contains("invalid vhttp: bad"), "{err}");
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn fptn_extra_fields_and_obfuscation_rules() {
         let server_form = |extra: Value| {
@@ -12784,6 +12794,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn empty_tag_falls_back_to_index() {
         let json = |raw: &str| lx_json(raw);
@@ -13000,6 +13011,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-protocols")]
     /// The same validation the QUIC server inbounds get has to run for the proxy
     /// ones too: a `tls` block on a vless inbound that `check` does not look at
     /// is a block the runtime may refuse with words the reference never says.
@@ -13050,6 +13062,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn tuic_inbound_uuid_is_an_init_check() {
         let json = |raw: &str| lx_json(raw);
@@ -13191,6 +13204,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "legacy-protocols")]
     #[test]
     fn inbound_containers_and_field_kinds() {
         let json = |raw: &str| lx_json(raw);
@@ -17248,6 +17262,7 @@ fn oc_base64_strict_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[cfg(feature = "legacy-protocols")]
 mod endpoint_probe_parity_tests {
     use super::validate;
     use serde_json::Value;
