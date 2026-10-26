@@ -47,7 +47,10 @@ pub struct FingerprintStream<S> {
     out: Option<usize>,
     /// Plaintext length of the sealed record, independent of later input growth.
     pending_plaintext: usize,
+    /// the peer's stream ended: a read hands back nothing more
     eof: bool,
+    /// our side was shut down; the peer may still be sending
+    write_closed: bool,
     direct_read: bool,
     direct_write: bool,
     /// Hand over every record already buffered in one read, not only the
@@ -74,6 +77,7 @@ impl<S> FingerprintStream<S> {
             out: None,
             pending_plaintext: 0,
             eof: false,
+            write_closed: false,
             direct_read: false,
             direct_write: false,
             batch_reads: true,
@@ -266,6 +270,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
+        if me.write_closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
         if me.direct_write {
             return Pin::new(&mut me.inner).poll_write(cx, buf);
         }
@@ -307,8 +314,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // Only our direction ends here. A client that half-closes its upload
+        // still expects the rest of the download.
         let me = self.get_mut();
-        me.eof = true;
+        me.write_closed = true;
         Pin::new(&mut me.inner).poll_shutdown(cx)
     }
 }
@@ -497,16 +506,15 @@ mod read_batching_tests {
 
     const RECORD: usize = core_tls::record::MAX_FRAGMENT;
 
-    /// Our client over a duplex to a rustls server. The server writes three
-    /// full records, then `tail` straight onto the transport, and holds the
-    /// connection open until the returned sender fires.
-    async fn three_records_then(
-        tail: &'static [u8],
-    ) -> (
-        FingerprintStream<DuplexStream>,
-        tokio::sync::oneshot::Receiver<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
+    type ServerStream = tokio_rustls::server::TlsStream<DuplexStream>;
+
+    /// Our client over a duplex to a rustls server that runs `serve` once
+    /// the handshake is done.
+    async fn connected<F, Fut>(serve: F) -> FingerprintStream<DuplexStream>
+    where
+        F: FnOnce(ServerStream) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         core_tls::install_default_provider();
         let dir =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
@@ -529,21 +537,12 @@ mod read_batching_tests {
         let verifier = WebpkiVerifier::new(Arc::new(roots)).unwrap();
         let template = core_tls::fingerprints::by_name("chrome").unwrap();
         let (mut client, peer) = tokio::io::duplex(4 * CHUNK);
-        let (ready_send, ready_recv) = tokio::sync::oneshot::channel();
-        let (done_send, done_recv) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
-            let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+            let tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
                 .accept(peer)
                 .await
                 .unwrap();
-            let mut hello = [0; 2];
-            tls.read_exact(&mut hello).await.unwrap();
-            tls.write_all(&vec![0x5a; 3 * RECORD]).await.unwrap();
-            tls.flush().await.unwrap();
-            let (mut raw, _) = tls.into_inner();
-            raw.write_all(tail).await.unwrap();
-            ready_send.send(()).unwrap();
-            let _ = done_recv.await;
+            serve(tls).await;
         });
         let mut handshake = Handshake::new(Config {
             template: &template,
@@ -557,9 +556,86 @@ mod read_batching_tests {
         .unwrap();
         handshake.run(&mut client).await.unwrap();
         let connection = Connection::new(&mut handshake).unwrap();
-        let mut stream = FingerprintStream::new(client, connection);
+        FingerprintStream::new(client, connection)
+    }
+
+    /// The server writes three full records, then `tail` straight onto the
+    /// transport, and holds the connection open until the returned sender
+    /// fires.
+    async fn three_records_then(
+        tail: &'static [u8],
+    ) -> (
+        FingerprintStream<DuplexStream>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (ready_send, ready_recv) = tokio::sync::oneshot::channel();
+        let (done_send, done_recv) = tokio::sync::oneshot::channel::<()>();
+        let mut stream = connected(move |mut tls| async move {
+            let mut hello = [0; 2];
+            tls.read_exact(&mut hello).await.unwrap();
+            tls.write_all(&vec![0x5a; 3 * RECORD]).await.unwrap();
+            tls.flush().await.unwrap();
+            let (mut raw, _) = tls.into_inner();
+            raw.write_all(tail).await.unwrap();
+            ready_send.send(()).unwrap();
+            let _ = done_recv.await;
+        })
+        .await;
         stream.write_all(b"hi").await.unwrap();
         (stream, ready_recv, done_send)
+    }
+
+    /// The server reads the request up to the client's EOF, then answers
+    /// with three full records and closes.
+    async fn answer_after_eof() -> FingerprintStream<DuplexStream> {
+        connected(|mut tls| async move {
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 64];
+                match tls.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    // a TCP EOF without close_notify, which is what we send
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            assert_eq!(request, b"GET");
+            tls.write_all(&vec![0x5a; 3 * RECORD]).await.unwrap();
+            tls.shutdown().await.unwrap();
+        })
+        .await
+    }
+
+    /// Shutting down the upload must not end the download: the answer the
+    /// server sends after seeing our EOF still arrives in full.
+    #[tokio::test]
+    async fn shutdown_ends_only_the_write_side() {
+        let mut stream = answer_after_eof().await;
+        stream.write_all(b"GET").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response.len(), 3 * RECORD);
+        assert!(response.iter().all(|b| *b == 0x5a));
+    }
+
+    /// A write after shutdown is refused and puts nothing on the wire; the
+    /// download still runs to its end.
+    #[tokio::test]
+    async fn a_write_after_shutdown_is_refused() {
+        let mut stream = answer_after_eof().await;
+        stream.write_all(b"GET").await.unwrap();
+        stream.shutdown().await.unwrap();
+        let err = stream
+            .write(b"late")
+            .await
+            .expect_err("write after shutdown");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{err}");
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response.len(), 3 * RECORD);
     }
 
     /// Everything the server sent is buffered before the first read, so one
