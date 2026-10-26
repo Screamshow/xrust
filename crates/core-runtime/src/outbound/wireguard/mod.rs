@@ -808,6 +808,8 @@ struct Stack {
     udp: HashMap<u16, UdpSess>,
     next_port: u16,
     scratch: Vec<u8>,
+    /// Transport datagrams sealed during one device flush, sent together.
+    outbox: Vec<(SocketAddr, Vec<u8>)>,
 }
 
 impl Stack {
@@ -962,10 +964,24 @@ impl Stack {
     /// handshake completes. Returns the packet back when it was sent and the
     /// caller may recycle it.
     fn xmit_to_peer(&mut self, pi: usize, pkt: Vec<u8>) -> Option<Vec<u8>> {
+        self.xmit_to_peer_into(pi, pkt, None)
+    }
+
+    /// [`Self::xmit_to_peer`], but a sealed datagram goes into `outbox`
+    /// (when given and the peer has an address) instead of out at once.
+    fn xmit_to_peer_into(
+        &mut self,
+        pi: usize,
+        pkt: Vec<u8>,
+        outbox: Option<&mut Vec<(SocketAddr, Vec<u8>)>>,
+    ) -> Option<Vec<u8>> {
         let sealed = self.seal_transport(pi, &pkt);
         match sealed {
             Some(msg) => {
-                self.send_raw(pi, &msg);
+                match (outbox, self.peers[pi].resolved) {
+                    (Some(outbox), Some(addr)) => outbox.push((addr, msg)),
+                    _ => self.send_raw(pi, &msg),
+                }
                 self.peers[pi].last_sent = Some(Instant::now());
                 Some(pkt)
             }
@@ -1465,9 +1481,13 @@ impl Stack {
     }
 
     async fn flush_device_tx(&mut self) {
+        // A poll hands over a run of packets at once: they are sealed one by
+        // one as before and leave in batches, one syscall per batch rather
+        // than per datagram. The datagrams and their order are unchanged.
+        let mut outbox = std::mem::take(&mut self.outbox);
         while let Some(pkt) = self.device.tx.pop_front() {
             let pkt = match ip_dst(&pkt).and_then(|dst| self.lpm(dst)) {
-                Some(pi) => self.xmit_to_peer(pi, pkt),
+                Some(pi) => self.xmit_to_peer_into(pi, pkt, Some(&mut outbox)),
                 None => Some(pkt),
             };
             if let Some(pkt) = pkt
@@ -1475,7 +1495,38 @@ impl Stack {
             {
                 self.device.free.get_mut().push(pkt);
             }
+            if outbox.len() >= SEND_BATCH {
+                self.send_outbox(&mut outbox).await;
+            }
         }
+        self.send_outbox(&mut outbox).await;
+        self.outbox = outbox;
+    }
+
+    /// Send and empty `outbox`, in order, one socket family run at a time.
+    async fn send_outbox(&mut self, outbox: &mut Vec<(SocketAddr, Vec<u8>)>) {
+        let mut start = 0;
+        while start < outbox.len() {
+            let v6 = outbox[start].0.is_ipv6();
+            let end = outbox[start..]
+                .iter()
+                .position(|(addr, _)| addr.is_ipv6() != v6)
+                .map_or(outbox.len(), |n| start + n);
+            let sock = if v6 {
+                self.sock_v6.as_deref()
+            } else {
+                Some(&*self.sock)
+            };
+            match sock {
+                Some(sock) => send_datagrams(sock, &outbox[start..end], &self.cfg.tag).await,
+                None => logging::debug(format_args!(
+                    "wireguard[{}]: no ipv6 socket for {}",
+                    self.cfg.tag, outbox[start].0
+                )),
+            }
+            start = end;
+        }
+        outbox.clear();
     }
 
     fn maintain_tcp(&mut self) {
@@ -1809,6 +1860,7 @@ async fn run(
         udp: HashMap::new(),
         next_port: EPHEMERAL_BASE,
         scratch: vec![0u8; SCRATCH_BUF],
+        outbox: Vec::new(),
     };
     // Peer configs live in cfg (Arc) — materialize runtime state.
     let peer_cfgs = stack.cfg.peers.clone();
@@ -1873,6 +1925,85 @@ async fn run(
             _ = tokio::time::sleep_until(deadline) => {}
         }
     }
+}
+
+/// Largest number of datagrams handed to the kernel in one call.
+const SEND_BATCH: usize = 64;
+
+/// How long a full socket send buffer may hold up the rest of a batch before
+/// it is dropped.
+const SEND_WAIT: Duration = Duration::from_millis(50);
+
+/// Send `items` in order. When the socket's send buffer is full the rest
+/// waits for it to drain, as a blocking write in the reference waits; only
+/// if it stays full for [`SEND_WAIT`] is the rest dropped. Any other error
+/// skips just that datagram.
+async fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str) {
+    let mut sent = 0;
+    while sent < items.len() {
+        let chunk = &items[sent..items.len().min(sent + SEND_BATCH)];
+        match send_some(sock, chunk) {
+            Ok(n) => sent += n.max(1),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if !matches!(
+                    tokio::time::timeout(SEND_WAIT, sock.writable()).await,
+                    Ok(Ok(()))
+                ) {
+                    return;
+                }
+            }
+            Err(e) => {
+                logging::debug(format_args!("wireguard[{tag}]: udp send: {e}"));
+                sent += 1;
+            }
+        }
+    }
+}
+
+/// One `sendmmsg(2)`: how many of `chunk` (1..=SEND_BATCH) the kernel took.
+#[cfg(target_os = "linux")]
+fn send_some(sock: &UdpSocket, chunk: &[(SocketAddr, Vec<u8>)]) -> io::Result<usize> {
+    use std::os::fd::AsRawFd;
+    if chunk.len() == 1 {
+        return sock.try_send_to(&chunk[0].1, chunk[0].0).map(|_| 1);
+    }
+    let addrs: Vec<socket2::SockAddr> = chunk
+        .iter()
+        .map(|(addr, _)| socket2::SockAddr::from(*addr))
+        .collect();
+    let mut iovs: Vec<libc::iovec> = chunk
+        .iter()
+        .map(|(_, data)| libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: data.len(),
+        })
+        .collect();
+    // SAFETY: an all-zero mmsghdr is a valid empty header
+    let mut hdrs: Vec<libc::mmsghdr> = (0..chunk.len())
+        .map(|_| unsafe { std::mem::zeroed() })
+        .collect();
+    for (i, hdr) in hdrs.iter_mut().enumerate() {
+        hdr.msg_hdr.msg_name = addrs[i].as_ptr() as *mut libc::c_void;
+        hdr.msg_hdr.msg_namelen = addrs[i].len();
+        hdr.msg_hdr.msg_iov = &mut iovs[i];
+        hdr.msg_hdr.msg_iovlen = 1;
+    }
+    let fd = sock.as_raw_fd();
+    sock.try_io(tokio::io::Interest::WRITABLE, || {
+        // SAFETY: every header points at a live address and iovec above,
+        // and the kernel only reads them
+        let rc = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), hdrs.len() as _, 0 as _) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(rc as usize)
+        }
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn send_some(sock: &UdpSocket, chunk: &[(SocketAddr, Vec<u8>)]) -> io::Result<usize> {
+    sock.try_send_to(&chunk[0].1, chunk[0].0).map(|_| 1)
 }
 
 async fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {
@@ -2367,5 +2498,53 @@ mod tests {
             .send_to(&sealed, server_addr)
             .await
             .expect("send transport");
+    }
+}
+
+#[cfg(test)]
+mod batch_send_tests {
+    use super::*;
+
+    /// A run of datagrams longer than one batch goes out through the
+    /// batched path and arrives whole, once each and in order.
+    #[tokio::test]
+    async fn batched_datagrams_arrive_whole_and_in_order() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = rx.local_addr().unwrap();
+        let items: Vec<(SocketAddr, Vec<u8>)> = (0..150u32)
+            .map(|i| {
+                // small enough that 150 of them fit the receiver's default
+                // socket buffer, which is all a loopback test can count on
+                let len = 32 + (i as usize * 37) % 160;
+                (to, (0..len).map(|b| (b as u32 ^ i) as u8).collect())
+            })
+            .collect();
+        // a fresh socket learns it is writable from the reactor first
+        tx.writable().await.unwrap();
+        send_datagrams(&tx, &items, "test").await;
+        let mut buf = vec![0u8; 2048];
+        for (i, (_, want)) in items.iter().enumerate() {
+            let (n, from) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv_from(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("datagram {i} missing"))
+                    .unwrap();
+            assert_eq!(from, tx.local_addr().unwrap());
+            assert_eq!(&buf[..n], &want[..], "datagram {i}");
+        }
+    }
+
+    /// One datagram takes the plain path and counts as one.
+    #[tokio::test]
+    async fn a_single_datagram_is_sent_once() {
+        let rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to = rx.local_addr().unwrap();
+        tx.writable().await.unwrap();
+        assert_eq!(send_some(&tx, &[(to, vec![7; 100])]).unwrap(), 1);
+        let mut buf = [0u8; 256];
+        let (n, _) = rx.recv_from(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], &[7; 100][..]);
     }
 }
