@@ -20,6 +20,40 @@ use core_tls::client::{Connection, Record};
 /// that is not pathological.
 const CHUNK: usize = 64 * 1024;
 
+/// Buffers of connections that are waiting for their socket. A connection
+/// hands its buffers back when a read goes Pending with nothing left in them
+/// and takes one again on its next read or write: a busy connection gets the
+/// same memory back without a new allocation, and an idle one holds none.
+/// Each pool keeps at most `POOL_KEEP` buffers.
+struct Pool(std::sync::Mutex<Vec<Vec<u8>>>);
+
+const POOL_KEEP: usize = 8;
+/// read buffers, `CHUNK` each
+static READ_POOL: Pool = Pool(std::sync::Mutex::new(Vec::new()));
+/// sealed-record buffers, one record each
+static WRITE_POOL: Pool = Pool(std::sync::Mutex::new(Vec::new()));
+
+impl Pool {
+    fn take(&self) -> Vec<u8> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .unwrap_or_default()
+    }
+
+    fn give(&self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 {
+            return;
+        }
+        buf.clear();
+        let mut pool = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() < POOL_KEEP {
+            pool.push(buf);
+        }
+    }
+}
+
 /// TLS over `S`, established by us rather than by a library.
 pub struct FingerprintStream<S> {
     inner: S,
@@ -126,6 +160,22 @@ impl<S> FingerprintStream<S> {
             && self.rpos == self.raw.len()
             && self.read_error.is_none();
         (self.direct_read && drained).then_some(&self.inner)
+    }
+
+    /// While the socket has nothing to read, hand back whatever buffer holds
+    /// nothing: no record partly read, no plaintext not yet handed over, no
+    /// sealed record partly written.
+    fn park_buffers(&mut self) {
+        let drained = self.rpos == self.raw.len()
+            && self.plain_at == self.plain_end
+            && self.read_error.is_none();
+        if drained {
+            READ_POOL.give(std::mem::take(&mut self.raw));
+            self.rpos = 0;
+        }
+        if self.out.is_none() {
+            WRITE_POOL.give(std::mem::take(&mut self.wbuf));
+        }
     }
 
     fn release_direct_read_buffer(&mut self) {
@@ -241,6 +291,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
                     me.raw.truncate(left);
                     me.rpos = 0;
                 }
+                if me.raw.capacity() == 0 {
+                    me.raw = READ_POOL.take();
+                }
                 if me.raw.len() == me.raw.capacity() {
                     me.raw.reserve(CHUNK);
                 }
@@ -251,7 +304,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for FingerprintStream<S> {
                 match Pin::new(&mut me.inner).poll_read(cx, &mut read) {
                     Poll::Ready(Ok(())) => read.filled().len(),
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        me.park_buffers();
+                        return Poll::Pending;
+                    }
                 }
             };
             if got == 0 {
@@ -293,6 +349,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
         let take = buf.len().min(core_tls::record::MAX_FRAGMENT);
         loop {
             let Some(pos) = me.out else {
+                if me.wbuf.capacity() == 0 {
+                    me.wbuf = WRITE_POOL.take();
+                }
                 me.wbuf.clear();
                 if let Err(e) = me.connection.write_record_into(&buf[..take], &mut me.wbuf) {
                     return Poll::Ready(Err(e));
@@ -646,6 +705,61 @@ mod read_batching_tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         assert_eq!(response.len(), 3 * RECORD);
+    }
+
+    /// Poll one read with a waker that never fires: Pending when the socket
+    /// has nothing more for now.
+    fn read_now(stream: &mut FingerprintStream<DuplexStream>) -> Poll<usize> {
+        let mut buf = vec![0u8; 8 * RECORD];
+        let mut read = ReadBuf::new(&mut buf);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        match Pin::new(stream).poll_read(&mut cx, &mut read) {
+            Poll::Ready(r) => {
+                r.unwrap();
+                Poll::Ready(read.filled().len())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    /// Once everything received is handed over and the socket is quiet, the
+    /// connection holds no buffer; the next answer still arrives whole.
+    #[tokio::test]
+    async fn a_waiting_connection_holds_no_buffers() {
+        let (mut stream, ready, _done) = three_records_then(b"").await;
+        ready.await.unwrap();
+        let mut got = 0;
+        while got < 3 * RECORD {
+            match read_now(&mut stream) {
+                Poll::Ready(n) => got += n,
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        }
+        assert_eq!(got, 3 * RECORD);
+        assert!(read_now(&mut stream).is_pending());
+        assert_eq!(stream.raw.capacity(), 0, "read buffer kept while waiting");
+        assert_eq!(stream.wbuf.capacity(), 0, "write buffer kept while waiting");
+        // writing takes a buffer again and the bytes still go out
+        stream.write_all(b"more").await.unwrap();
+    }
+
+    /// A socket that stops in the middle of a record keeps the part already
+    /// read: the buffer holding it is not handed back.
+    #[tokio::test]
+    async fn a_partial_record_keeps_its_buffer() {
+        const PARTIAL: &[u8] = &[0x17, 0x03, 0x03, 0x00, 0x40, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let (mut stream, ready, _done) = three_records_then(PARTIAL).await;
+        ready.await.unwrap();
+        let mut got = 0;
+        while got < 3 * RECORD {
+            match read_now(&mut stream) {
+                Poll::Ready(n) => got += n,
+                Poll::Pending => tokio::task::yield_now().await,
+            }
+        }
+        assert!(read_now(&mut stream).is_pending());
+        assert!(stream.raw.capacity() > 0, "partial record dropped");
+        assert_eq!(&stream.raw[stream.rpos..], PARTIAL);
     }
 
     /// Everything the server sent is buffered before the first read, so one
