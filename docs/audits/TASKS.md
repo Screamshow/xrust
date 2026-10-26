@@ -2583,3 +2583,9 @@ cargo build --locked -p core-cli --no-default-features --features rust-x \
 Бинарник, запущенный как `sing-box`, печатал `v<версия>-rust-x.0` — второй формат, из которого Forkop X прочитал бы «sing-box 0.0» (и выключил бы возможности 1.14); правильный блок печатала только обёртка пакета. Теперь бинарник сам печатает тот же блок, что раньше обёртка: `sing-box version 1.14.2-rust-x.<версия>` (база конфигурации — одна константа), строки `Xrust:`, `Features:` (Forkop X читает поддержку XHTTP, `runtime.uc`) и `Tags:` (`ui.uc`). Обёртка `/usr/bin/sing-box` сведена к `exec` бинарника; состав пакета не менялся. В тестах Forkop X второй вид версии убран.
 
 Проверки разработки: run_smoke 6/6 (новый: вызов через ссылку `sing-box`, проверка блока); изменённые тесты Forkop X проходят (`sing_box_cache_identity` падает в том же месте и на неизменённом HEAD). Ожидает проверки на OpenWrt: `sing-box version` на роутере печатает прежний блок, Forkop X видит XHTTP и теги в интерфейсе.
+
+### Тесты legacy-протоколов только в legacy-сборке — 2026-10-26
+
+Коммит `bfef183`. Тесты протоколов, которых нет в сборке Rust X (проверки OpenVPN, TUIC, FPTN, Shadowsocks, Trojan, VMess, SOCKS-outbound, golden-наборы с ними, а также selector/urltest/detour, чей стенд построен на SOCKS-outbound), теперь собираются только с `legacy-protocols` вместе со вспомогательными функциями. Раньше они давали 138 постоянных падений в каждом прогоне Rust X и прятали настоящие. Legacy-сборка и CI запускают их как прежде.
+
+Проверки: Rust X (core-runtime, core-config, core-cli) — 1217 passed / 0 failed; legacy, затронутые наборы — 403 passed / 0 failed (все перенесённые тесты среди них, 165 проверок OpenVPN); clippy legacy с `-D warnings` (как CI) — чисто; новых предупреждений в Rust X нет. Ограничение: selector/urltest и detour DNS-резолвера в сборке Rust X теперь не проверяются (их стенд — SOCKS); при желании стенд можно перевести на VLESS.
