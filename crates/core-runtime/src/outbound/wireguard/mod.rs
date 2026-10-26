@@ -411,16 +411,10 @@ impl WireGuard {
                     ),
                 )
             })?;
-        let _ = socket2::SockRef::from(&sock)
-            .set_recv_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
-        let _ = socket2::SockRef::from(&sock)
-            .set_send_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
+        crate::outbound::quic::size_network_udp_buffers(socket2::SockRef::from(&sock));
         let sock_v6 = match UdpSocket::bind(("[::]", self.cfg.listen_port)).await {
             Ok(s) => {
-                let _ = socket2::SockRef::from(&s)
-                    .set_recv_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
-                let _ = socket2::SockRef::from(&s)
-                    .set_send_buffer_size(crate::outbound::quic::UDP_SOCKET_BUFFER);
+                crate::outbound::quic::size_network_udp_buffers(socket2::SockRef::from(&s));
                 Some(Arc::new(s))
             }
             Err(_) => None,

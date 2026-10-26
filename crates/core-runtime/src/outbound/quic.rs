@@ -33,6 +33,35 @@ const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW
 /// Prevents kernel-level packet drops during high-throughput bursts.
 pub(crate) const UDP_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 
+/// Give a socket that takes datagrams from the network [`UDP_SOCKET_BUFFER`]
+/// each way. A plain `SO_RCVBUF` is capped at `net.core.rmem_max`, 208 KiB on
+/// OpenWrt: a burst then overflows the queue (`RcvbufErrors`) and every tunnel
+/// TCP flow that lost a packet backs off for seconds. With CAP_NET_ADMIN the
+/// `*BUFFORCE` options go past the cap, which is what wireguard-go (7 MiB) and
+/// quic-go do; without it they fail and the plain size stays. The size is a
+/// limit on queued data, not memory taken up front.
+pub(crate) fn size_network_udp_buffers(sock: socket2::SockRef<'_>) {
+    let _ = sock.set_recv_buffer_size(UDP_SOCKET_BUFFER);
+    let _ = sock.set_send_buffer_size(UDP_SOCKET_BUFFER);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let size = UDP_SOCKET_BUFFER as libc::c_int;
+        for option in [libc::SO_RCVBUFFORCE, libc::SO_SNDBUFFORCE] {
+            // SAFETY: a valid socket and a c_int option value of the right size
+            unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
+    }
+}
+
 /// Pool bounds for the per-outbound QUIC connection pool: one shared QUIC
 /// connection serializes every stream through a single quinn driver task and
 /// one UDP socket, which loses to the reference at 8 streams.
@@ -999,9 +1028,7 @@ pub(crate) fn bind_udp(local: SocketAddr) -> io::Result<std::net::UdpSocket> {
     };
     let sock = std::net::UdpSocket::bind(bind)?;
     sock.set_nonblocking(true)?;
-    let sock_ref = socket2::SockRef::from(&sock);
-    let _ = sock_ref.set_recv_buffer_size(UDP_SOCKET_BUFFER);
-    let _ = sock_ref.set_send_buffer_size(UDP_SOCKET_BUFFER);
+    size_network_udp_buffers(socket2::SockRef::from(&sock));
     Ok(sock)
 }
 
@@ -1435,5 +1462,27 @@ mod tests {
             Some(&b"ab"[..])
         );
         assert!(d.items.is_empty());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod udp_buffer_tests {
+    use super::*;
+
+    /// Root (as on the router) gets the whole size past `rmem_max`; anyone
+    /// else keeps at least what a plain `SO_RCVBUF` gives.
+    #[test]
+    fn network_sockets_get_the_full_buffer_with_cap_net_admin() {
+        let plain = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = socket2::SockRef::from(&plain).set_recv_buffer_size(UDP_SOCKET_BUFFER);
+        let plain_size = socket2::SockRef::from(&plain).recv_buffer_size().unwrap();
+        let sock = bind_udp("127.0.0.1:1".parse().unwrap()).unwrap();
+        let got = socket2::SockRef::from(&sock);
+        assert!(got.recv_buffer_size().unwrap() >= plain_size);
+        // SAFETY: geteuid has no preconditions
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(got.recv_buffer_size().unwrap() >= UDP_SOCKET_BUFFER);
+            assert!(got.send_buffer_size().unwrap() >= UDP_SOCKET_BUFFER);
+        }
     }
 }
