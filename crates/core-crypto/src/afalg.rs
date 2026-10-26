@@ -78,6 +78,16 @@ pub fn threshold() -> usize {
     *THRESHOLD.get_or_init(calibrate)
 }
 
+/// Keep the kernel backend off for the rest of this process, if nothing has
+/// chosen it yet; `true` when it is off. A kernel-backed key holds two sockets
+/// for as long as it lives, which tests that count file descriptors would
+/// otherwise read as leaks.
+#[doc(hidden)]
+pub fn disable_for_process() -> bool {
+    let _ = THRESHOLD.set(0);
+    threshold() == 0
+}
+
 /// One keyed `gcm(aes)` parent socket plus the accepted child every
 /// operation runs on. The parent stays open because it owns the tfm the
 /// child borrowed (`af_alg_release_parent` is refcounted, but keeping both

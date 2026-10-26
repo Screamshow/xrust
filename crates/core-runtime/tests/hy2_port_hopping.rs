@@ -307,6 +307,7 @@ async fn long_stream(out: &Hysteria2, echo: SocketAddr, secs: f64) -> std::io::R
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_ports_without_server_port_transfers() {
+    no_kernel_crypto();
     let _g = SERIAL.lock().await;
     let server = spawn_server().await;
     let echo = spawn_tcp_echo().await;
@@ -325,6 +326,7 @@ async fn server_ports_without_server_port_transfers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tcp_stream_survives_hops() {
+    no_kernel_crypto();
     let _g = SERIAL.lock().await;
     let server = spawn_server().await;
     let echo = spawn_tcp_echo().await;
@@ -367,6 +369,7 @@ async fn tcp_stream_survives_hops() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hops_release_resources() {
+    no_kernel_crypto();
     let _g = SERIAL.lock().await;
     let server = spawn_server().await;
     let echo = spawn_tcp_echo().await;
@@ -420,6 +423,7 @@ async fn hops_release_resources() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hop_onto_closed_port_recovers() {
+    no_kernel_crypto();
     let _g = SERIAL.lock().await;
     let server = spawn_server().await;
     let echo = spawn_tcp_echo().await;
@@ -459,6 +463,7 @@ async fn hop_onto_closed_port_recovers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_port_unchanged() {
+    no_kernel_crypto();
     let _g = SERIAL.lock().await;
     let server = spawn_server().await;
     let echo = spawn_tcp_echo().await;
@@ -498,6 +503,7 @@ async fn single_port_unchanged() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn check_agrees_with_start() {
+    no_kernel_crypto();
     let _g = SERIAL.lock().await;
     let tls = json!({"enabled": true, "insecure": true, "server_name": "localhost"});
     let cases = [
@@ -543,4 +549,15 @@ async fn check_agrees_with_start() {
             instance.shutdown();
         }
     }
+}
+
+/// Kernel AES-GCM (`AF_ALG`) keeps two sockets per live key; the descriptor
+/// counts in this file are about our own sockets, so it stays off here. Every
+/// test calls this first, before any key exists.
+fn no_kernel_crypto() {
+    #[cfg(target_os = "linux")]
+    assert!(
+        core_crypto::afalg::disable_for_process(),
+        "kernel AES-GCM was chosen before the test could turn it off"
+    );
 }

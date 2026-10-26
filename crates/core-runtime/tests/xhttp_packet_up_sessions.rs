@@ -382,12 +382,14 @@ async fn closed_clients_leave_nothing_behind(mode: &str, http: Http, rounds: usi
 /// upstream must see every one of them end. (CN-02 / MEM-01.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_packet_up_sessions_leave_no_fds_or_upstreams_h1() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     closed_clients_leave_nothing_behind("packet-up", Http::H1, 40).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_packet_up_sessions_leave_no_fds_or_upstreams_h2() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     closed_clients_leave_nothing_behind("packet-up", Http::H2, 40).await;
 }
@@ -395,6 +397,7 @@ async fn closed_packet_up_sessions_leave_no_fds_or_upstreams_h2() {
 /// `auto` is packet-up here, and it is the default a subscription brings.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn closed_auto_sessions_leave_no_fds_or_upstreams() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     closed_clients_leave_nothing_behind("auto", Http::H1, 20).await;
 }
@@ -436,12 +439,14 @@ async fn half_close_then_read(http: Http) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn half_closed_packet_up_client_still_gets_the_whole_response_h1() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     half_close_then_read(Http::H1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn half_closed_packet_up_client_still_gets_the_whole_response_h2() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     half_close_then_read(Http::H2).await;
 }
@@ -487,12 +492,14 @@ async fn client_reset_frees_both_sides(http: Http) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_reset_frees_the_session_on_both_sides_h1() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     client_reset_frees_both_sides(Http::H1).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_reset_frees_the_session_on_both_sides_h2() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     client_reset_frees_both_sides(Http::H2).await;
 }
@@ -640,12 +647,14 @@ async fn server_fault_ends_the_session(fault: Fault) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_upload_ends_the_session() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     server_fault_ends_the_session(Fault::RefuseUploads).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_download_ends_the_session() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     server_fault_ends_the_session(Fault::DropDownload).await;
 }
@@ -654,6 +663,7 @@ async fn dropped_download_ends_the_session() {
 /// promptly and leaves nothing behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_session_ends_and_releases() {
+    no_kernel_crypto();
     let _guard = test_guard().await;
     let (echo, _live) = spawn_echo().await;
     let server = core_runtime::start(&json!({
@@ -704,4 +714,15 @@ async fn refused_session_ends_and_releases() {
     );
     drop(client);
     drop(server);
+}
+
+/// Kernel AES-GCM (`AF_ALG`) keeps two sockets per live key; the descriptor
+/// counts in this file are about our own sockets, so it stays off here. Every
+/// test calls this first, before any key exists.
+fn no_kernel_crypto() {
+    #[cfg(target_os = "linux")]
+    assert!(
+        core_crypto::afalg::disable_for_process(),
+        "kernel AES-GCM was chosen before the test could turn it off"
+    );
 }
