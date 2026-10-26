@@ -1483,11 +1483,6 @@ impl Stack {
         // one as before and leave in batches, one syscall per batch rather
         // than per datagram. The datagrams and their order are unchanged.
         let mut outbox = std::mem::take(&mut self.outbox);
-        // one wait budget for the whole flush, counted from the first time
-        // the send buffer is full: the stack task also reads the sockets and
-        // runs the timers, so it must not wait longer than this however many
-        // batches there are, and sealing time does not eat into the budget
-        let mut deadline = None;
         while let Some(pkt) = self.device.tx.pop_front() {
             let pkt = match ip_dst(&pkt).and_then(|dst| self.lpm(dst)) {
                 Some(pi) => self.xmit_to_peer_into(pi, pkt, Some(&mut outbox)),
@@ -1499,19 +1494,15 @@ impl Stack {
                 self.device.free.get_mut().push(pkt);
             }
             if outbox.len() >= SEND_BATCH {
-                self.send_outbox(&mut outbox, &mut deadline).await;
+                self.send_outbox(&mut outbox);
             }
         }
-        self.send_outbox(&mut outbox, &mut deadline).await;
+        self.send_outbox(&mut outbox);
         self.outbox = outbox;
     }
 
     /// Send and empty `outbox`, in order, one socket family run at a time.
-    async fn send_outbox(
-        &mut self,
-        outbox: &mut Vec<(SocketAddr, Vec<u8>)>,
-        deadline: &mut Option<tokio::time::Instant>,
-    ) {
+    fn send_outbox(&self, outbox: &mut Vec<(SocketAddr, Vec<u8>)>) {
         let mut start = 0;
         while start < outbox.len() {
             let v6 = outbox[start].0.is_ipv6();
@@ -1525,9 +1516,7 @@ impl Stack {
                 Some(&*self.sock)
             };
             match sock {
-                Some(sock) => {
-                    send_datagrams(sock, &outbox[start..end], &self.cfg.tag, deadline).await
-                }
+                Some(sock) => send_datagrams(sock, &outbox[start..end], &self.cfg.tag),
                 None => logging::debug(format_args!(
                     "wireguard[{}]: no ipv6 socket for {}",
                     self.cfg.tag, outbox[start].0
@@ -1939,38 +1928,18 @@ async fn run(
 /// Largest number of datagrams handed to the kernel in one call.
 const SEND_BATCH: usize = 64;
 
-/// How long a full socket send buffer may hold up the rest of one device
-/// flush before it is dropped.
-const SEND_WAIT: Duration = Duration::from_millis(50);
-
-/// Send `items` in order. When the socket's send buffer is full the rest
-/// waits for it to drain, as a blocking write in the reference waits. The
-/// wait budget starts at the first full buffer of the flush (`deadline` is
-/// shared by its batches); once it passes the rest is dropped. Any other
+/// Send `items` in order. A full socket send buffer drops the rest, as a
+/// single `try_send_to` per datagram dropped it before: the stack task must
+/// never wait here, because it is also the one reading the sockets, and a
+/// wait leaves incoming datagrams to overflow the receive buffer. Any other
 /// error skips just that datagram.
-async fn send_datagrams(
-    sock: &UdpSocket,
-    items: &[(SocketAddr, Vec<u8>)],
-    tag: &str,
-    deadline: &mut Option<tokio::time::Instant>,
-) {
+fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str) {
     let mut sent = 0;
     while sent < items.len() {
         let chunk = &items[sent..items.len().min(sent + SEND_BATCH)];
         match send_some(sock, chunk) {
             Ok(n) => sent += n.max(1),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                if !matches!(
-                    tokio::time::timeout_at(
-                        *deadline.get_or_insert_with(|| tokio::time::Instant::now() + SEND_WAIT),
-                        sock.writable()
-                    )
-                    .await,
-                    Ok(Ok(()))
-                ) {
-                    return;
-                }
-            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
             Err(e) => {
                 logging::debug(format_args!("wireguard[{tag}]: udp send: {e}"));
                 sent += 1;
@@ -2543,7 +2512,7 @@ mod batch_send_tests {
             .collect();
         // a fresh socket learns it is writable from the reactor first
         tx.writable().await.unwrap();
-        send_datagrams(&tx, &items, "test", &mut None).await;
+        send_datagrams(&tx, &items, "test");
         let mut buf = vec![0u8; 2048];
         for (i, (_, want)) in items.iter().enumerate() {
             let (n, from) =
