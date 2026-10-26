@@ -58,9 +58,13 @@ def main():
     p.add_argument('--version', required=True)
     p.add_argument('--revision', type=int, default=1)
     p.add_argument('--source-commit', required=True)
+    p.add_argument('--cpus', default='aarch64,x86_64',
+                   help='comma-separated subset of aarch64,x86_64 (default: both)')
     a = p.parse_args(); a.output.mkdir(parents=True, exist_ok=True)
     assets = []
+    requested = a.cpus.split(',')
     for cpu, arch, machine in [('aarch64', 'aarch64_cortex-a53', 183), ('x86_64', 'x86_64', 62)]:
+        if cpu not in requested: continue
         binary = (a.binaries / f'rust-x-{cpu}-v{a.version}').read_bytes()
         if binary[:5] != b'\x7fELF\x02' or int.from_bytes(binary[18:20], 'little') != machine:
             raise ValueError(f'Wrong ELF architecture: {cpu}')
