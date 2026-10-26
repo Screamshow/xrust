@@ -26,8 +26,10 @@ def validate(directory, version, signed=False):
         raise ValueError('Unexpected manifest version')
     assets = manifest['assets']
     expected = {(arch, fmt) for arch in ('x86_64', 'aarch64_cortex-a53') for fmt in ('apk', 'ipk')}
-    if len(assets) != 4 or {(a['architecture'], a['format']) for a in assets} != expected:
-        raise ValueError('Expected APK/IPK for both supported architectures')
+    beam = {(arch, fmt) for arch in ('aarch64_cortex-a73',) for fmt in ('apk', 'ipk')}
+    actual = {(a['architecture'], a['format']) for a in assets}
+    if actual not in (expected, expected | beam) or len(assets) != len(actual):
+        raise ValueError('Expected complete APK/IPK architecture pairs')
     for asset in assets:
         revision = 'r1' if asset['format'] == 'apk' else '1'
         name = f'rust-x_{version}-{revision}_{asset["architecture"]}.{asset["format"]}'
@@ -83,7 +85,8 @@ def main():
         run(*ssh, command)
         # Verification is performed on the signer against the existing trusted
         # public key before any release asset is replaced.
-        run(*ssh, f'cd {remote} && {APK} --keys-dir {remote} verify rust-x_{version}-r1_aarch64_cortex-a53.apk rust-x_{version}-r1_x86_64.apk && sha256sum -c OPENWRT-SHA256SUMS')
+        apk_names = ' '.join(shlex.quote(asset['file']) for asset in manifest['assets'] if asset['format'] == 'apk')
+        run(*ssh, f'cd {remote} && {APK} --keys-dir {remote} verify {apk_names} && sha256sum -c OPENWRT-SHA256SUMS')
         names = [a['file'] for a in manifest['assets']] + ['openwrt-manifest.json', 'forkop-apk.pem', 'OPENWRT-SHA256SUMS']
         for name in names:
             run(*scp, f'{HOST}:{remote}/{name}', str(args.output / name))
