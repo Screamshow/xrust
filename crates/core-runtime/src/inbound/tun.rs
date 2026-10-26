@@ -387,7 +387,7 @@ impl Tun {
             let mut device = TunDevice::new(self.mtu);
             let mut iconfig = IfaceConfig::new(HardwareAddress::Ip);
             let mut seed = [0u8; 8];
-            crate::outbound::shadowsocks::crypto::random_bytes(&mut seed)
+            crate::util::random_bytes(&mut seed)
                 .unwrap_or_else(|_| seed = [1, 2, 3, 4, 5, 6, 7, 8]);
             iconfig.random_seed = u64::from_le_bytes(seed);
             let mut iface = Interface::new(iconfig, &mut device, SmolInstant::now());

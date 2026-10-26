@@ -11,7 +11,6 @@ pub mod rule_set_remote;
 pub mod sniff;
 mod sniff_quic;
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
 use std::io;
@@ -845,11 +844,6 @@ impl RouterInner {
     }
 
     pub(crate) fn build(root: &Value) -> anyhow::Result<Self> {
-        let expanded = core_config::fptn::expand(root).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let root: Cow<'_, Value> = match expanded {
-            Some(value) => Cow::Owned(value),
-            None => Cow::Borrowed(root),
-        };
         let defaults = RouteDefaults::parse(root.get("route"))?;
         if let Some(tag) = &defaults.default_domain_resolver {
             crate::dns::set_default_domain_resolver(Some(tag.clone()));
@@ -930,7 +924,7 @@ impl RouterInner {
                     logging::warn(format_args!("route.{key} is not implemented yet (ignored)"));
                 }
             }
-            registry = build_rule_sets(map, &crate::http_client::Registry::from_config(&root)?)?;
+            registry = build_rule_sets(map, &crate::http_client::Registry::from_config(root)?)?;
             if let Some(list) = map.get("rules").and_then(Value::as_array) {
                 for (i, obj) in list.iter().enumerate() {
                     rules.push(Rule::build_with_rule_sets(
@@ -979,7 +973,7 @@ impl RouterInner {
             || rules.iter().any(Rule::needs_process);
         if defaults.find_neighbor
             || rules.iter().any(Rule::needs_neighbor)
-            || neighbor_domain_configured(&root)
+            || neighbor_domain_configured(root)
         {
             let resolver = neighbor::NeighborResolver::new(&lease_files);
             resolver.start();
@@ -988,10 +982,10 @@ impl RouterInner {
         let delay_history = (0..outbounds.len())
             .map(|_| std::sync::Mutex::new(None))
             .collect();
-        let mut setup_timeouts = outbound_setup_budgets(&root)?;
+        let mut setup_timeouts = outbound_setup_budgets(root)?;
         setup_timeouts.resize(outbounds.len(), OUTBOUND_SETUP_TIMEOUT);
         Ok(RouterInner {
-            probe_tls: crate::tls_client::probe_connector(&root)?,
+            probe_tls: crate::tls_client::probe_connector(root)?,
             outbounds,
             tags,
             default,

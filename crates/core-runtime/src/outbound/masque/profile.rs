@@ -9,7 +9,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::outbound::shadowsocks::crypto::decode_base64_std;
+use crate::util::decode_base64_std;
 
 use super::p256;
 

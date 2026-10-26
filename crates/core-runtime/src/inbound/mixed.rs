@@ -14,13 +14,11 @@ use crate::inbound::{
 use crate::logging;
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
-/// Which protocols a listener of this shape speaks. `mixed` answers both, the
-/// plain `socks` and `http` inbounds answer one and refuse the other, exactly as
-/// the reference's separate inbounds do.
+/// Which protocols a listener of this shape speaks. `mixed` (and `socks`, which
+/// is bound as one) answers both; the plain `http` inbound refuses SOCKS.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Flavor {
     Mixed,
-    Socks,
     Http,
 }
 
@@ -28,7 +26,6 @@ impl Flavor {
     fn name(self) -> &'static str {
         match self {
             Flavor::Mixed => "mixed",
-            Flavor::Socks => "socks",
             Flavor::Http => "http",
         }
     }
@@ -151,8 +148,7 @@ async fn handle_conn(
         0x05 if flavor != Flavor::Http => socks5(stream, peer, tag, users, router, udp).await,
         0x04 if flavor != Flavor::Http => socks4(stream, peer, tag, users, router).await,
         0x04 | 0x05 => Err(io::Error::other("socks request on an http inbound")),
-        byte if flavor != Flavor::Socks => http(stream, byte, peer, tag, users, router).await,
-        _ => Err(io::Error::other("not a socks request on a socks inbound")),
+        byte => http(stream, byte, peer, tag, users, router).await,
     }
 }
 
@@ -811,14 +807,6 @@ async fn dial_plain(
 ) -> io::Result<crate::inbound::AnyStream> {
     match router.connect_index(idx, dest).await {
         Ok(crate::inbound::Conn::Plain(s)) => Ok(s),
-        Ok(crate::inbound::Conn::Shadowsocks(..)) => {
-            stream
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-                .await?;
-            Err(io::Error::other(
-                "http forward over shadowsocks outbound not supported",
-            ))
-        }
         Err(err) => {
             logging::debug(format_args!("mixed[{tag}] {peer} dial {dest}: {err}"));
             let _ = stream
@@ -1101,7 +1089,7 @@ fn proxy_auth_ok(head_text: &str, users: &[(String, String)]) -> bool {
         else {
             return false;
         };
-        let Ok(raw) = crate::outbound::shadowsocks::crypto::decode_base64_std(b64.trim()) else {
+        let Ok(raw) = crate::util::decode_base64_std(b64.trim()) else {
             return false;
         };
         let Ok(decoded) = String::from_utf8(raw) else {

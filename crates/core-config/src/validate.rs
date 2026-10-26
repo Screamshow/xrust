@@ -379,19 +379,6 @@ fn dns_endpoint_tag_error(ty: &str, i: usize, tag: &str) -> Option<String> {
     Some(format!("initialize DNS server[{i}] {ty}[{tag}]: {message}"))
 }
 
-const SS_METHODS: &[&str] = &[
-    "2022-blake3-aes-128-gcm",
-    "2022-blake3-aes-256-gcm",
-    "2022-blake3-chacha20-poly1305",
-    "aes-128-gcm",
-    "aes-192-gcm",
-    "aes-256-gcm",
-    "chacha20-ietf-poly1305",
-    "xchacha20-ietf-poly1305",
-    "none",
-    "rc4-md5",
-];
-
 const UTLS_FINGERPRINTS: &[&str] = &[
     "chrome",
     "chrome_psk",
@@ -410,18 +397,11 @@ const UTLS_FINGERPRINTS: &[&str] = &[
     "random",
 ];
 
-const TLS_REQUIRED_OUTBOUNDS: &[&str] = &[
-    "hysteria2",
-    "tuic",
-    "anytls",
-    "hysteria",
-    "naive",
-    "shadowtls",
-];
+const TLS_REQUIRED_OUTBOUNDS: &[&str] = &["hysteria2", "hysteria"];
 
-const TLS_REQUIRED_INBOUNDS: &[&str] = &["hysteria2", "tuic", "hysteria"];
+const TLS_REQUIRED_INBOUNDS: &[&str] = &["hysteria2", "hysteria"];
 
-const SERVER_TLS_INBOUNDS: &[&str] = &["mixed", "http", "trojan", "vless", "vmess", "shadowsocks"];
+const SERVER_TLS_INBOUNDS: &[&str] = &["mixed", "http", "vless"];
 
 const TUN_LEGACY_FIELDS: &[&str] = &[
     "inet4_address",
@@ -447,17 +427,11 @@ const LEGACY_INBOUND_ERROR: &str = "legacy inbound fields are deprecated in sing
 /// reference `option.ServerOptions` embeddings: `{proto}OutboundOptions`
 /// carrying a plain-string `server` (snell/anytls/masque validate their own).
 const SERVER_OUT_BASES: &[(&str, &str)] = &[
-    ("socks", "SOCKSOutboundOptions"),
     ("http", "HTTPOutboundOptions"),
-    ("shadowsocks", "ShadowsocksOutboundOptions"),
-    ("shadowtls", "ShadowTLSOutboundOptions"),
-    ("vmess", "VMessOutboundOptions"),
     ("vless", "VLESSOutboundOptions"),
     ("trojan", "TrojanOutboundOptions"),
     ("hysteria", "HysteriaOutboundOptions"),
     ("hysteria2", "Hysteria2OutboundOptions"),
-    ("tuic", "TUICOutboundOptions"),
-    ("naive", "NaiveOutboundOptions"),
     ("ssh", "SSHOutboundOptions"),
 ];
 
@@ -734,18 +708,9 @@ const INBOUND_LISTEN_STRUCT: &[(&str, &str)] = &[
     ("tproxy", "TProxyInboundOptions"),
     ("redirect", "RedirectInboundOptions"),
     ("direct", "DirectInboundOptions"),
-    ("trojan", "TrojanInboundOptions"),
-    ("shadowsocks", "ShadowsocksInboundOptions"),
-    ("shadowtls", "ShadowTLSInboundOptions"),
-    ("vmess", "VMessInboundOptions"),
     ("vless", "VLESSInboundOptions"),
-    ("anytls", "AnyTLSInboundOptions"),
-    ("naive", "NaiveInboundOptions"),
     ("hysteria", "HysteriaInboundOptions"),
     ("hysteria2", "Hysteria2InboundOptions"),
-    ("tuic", "TUICInboundOptions"),
-    ("snell", "SnellInboundOptions"),
-    ("fptn", "FPTNInboundOptions"),
 ];
 
 /// Fields each simple inbound type declares beyond `ListenOptions` and the
@@ -766,49 +731,7 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
     ),
     ("redirect", &[]),
     ("direct", &["network", "override_address", "override_port"]),
-    (
-        "trojan",
-        &[
-            "users",
-            "fallback",
-            "fallback_for_alpn",
-            "multiplex",
-            "transport",
-            "tls",
-        ],
-    ),
-    (
-        "shadowsocks",
-        &[
-            "network",
-            "method",
-            "password",
-            "users",
-            "destinations",
-            "multiplex",
-            "managed",
-            "tls",
-        ],
-    ),
-    (
-        "shadowtls",
-        &[
-            "version",
-            "password",
-            "users",
-            "handshake",
-            "handshake_for_server_name",
-            "strict_mode",
-            "wildcard_sni",
-        ],
-    ),
-    ("vmess", &["users", "multiplex", "transport", "tls"]),
     ("vless", &["users", "multiplex", "transport", "tls"]),
-    ("anytls", &["users", "password", "padding_scheme", "tls"]),
-    (
-        "naive",
-        &["users", "network", "quic_congestion_control", "tls"],
-    ),
     (
         "hysteria",
         &[
@@ -877,18 +800,6 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
             "endpoint_independent_nat",
         ],
     ),
-    (
-        "fptn",
-        &[
-            "users",
-            "tls",
-            "dns",
-            "dns_ipv6",
-            "ipv4_pool",
-            "ipv6_pool",
-            "obfuscation",
-        ],
-    ),
 ];
 
 /// Inbound container fields: the Go field path the decoder reports and the type
@@ -903,20 +814,6 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         true,
     ),
     (
-        "trojan",
-        "tls",
-        "InboundTLSOptionsContainer.tls",
-        "option.InboundTLSOptions",
-        true,
-    ),
-    (
-        "vmess",
-        "tls",
-        "InboundTLSOptionsContainer.tls",
-        "option.InboundTLSOptions",
-        true,
-    ),
-    (
         "vless",
         "tls",
         "InboundTLSOptionsContainer.tls",
@@ -924,35 +821,7 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         true,
     ),
     (
-        "shadowsocks",
-        "tls",
-        "InboundTLSOptionsContainer.tls",
-        "option.InboundTLSOptions",
-        true,
-    ),
-    (
-        "anytls",
-        "tls",
-        "InboundTLSOptionsContainer.tls",
-        "option.InboundTLSOptions",
-        true,
-    ),
-    (
-        "naive",
-        "tls",
-        "InboundTLSOptionsContainer.tls",
-        "option.InboundTLSOptions",
-        true,
-    ),
-    (
         "http",
-        "tls",
-        "InboundTLSOptionsContainer.tls",
-        "option.InboundTLSOptions",
-        true,
-    ),
-    (
-        "tuic",
         "tls",
         "InboundTLSOptionsContainer.tls",
         "option.InboundTLSOptions",
@@ -973,20 +842,6 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         true,
     ),
     (
-        "shadowsocks",
-        "multiplex",
-        "multiplex",
-        "option.InboundMultiplexOptions",
-        true,
-    ),
-    (
-        "vmess",
-        "multiplex",
-        "multiplex",
-        "option.InboundMultiplexOptions",
-        true,
-    ),
-    (
         "vless",
         "multiplex",
         "multiplex",
@@ -994,28 +849,7 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         true,
     ),
     (
-        "trojan",
-        "multiplex",
-        "multiplex",
-        "option.InboundMultiplexOptions",
-        true,
-    ),
-    (
-        "vmess",
-        "transport",
-        "transport",
-        "option._V2RayTransportOptions",
-        true,
-    ),
-    (
         "vless",
-        "transport",
-        "transport",
-        "option._V2RayTransportOptions",
-        true,
-    ),
-    (
-        "trojan",
         "transport",
         "transport",
         "option._V2RayTransportOptions",
@@ -1024,18 +858,7 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
     ("mixed", "users", "users", "[]auth.User", false),
     ("http", "users", "users", "[]auth.User", false),
     ("socks", "users", "users", "[]auth.User", false),
-    ("naive", "users", "users", "[]auth.User", false),
-    (
-        "shadowsocks",
-        "users",
-        "users",
-        "[]option.ShadowsocksUser",
-        false,
-    ),
-    ("vmess", "users", "users", "[]option.VMessUser", false),
     ("vless", "users", "users", "[]option.VLESSUser", false),
-    ("trojan", "users", "users", "[]option.TrojanUser", false),
-    ("anytls", "users", "users", "[]option.AnyTLSUser", false),
     (
         "hysteria2",
         "users",
@@ -1059,27 +882,6 @@ const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
     ("direct", "network", "network_list"),
     ("direct", "override_address", "string"),
     ("direct", "override_port", "uint16"),
-    ("trojan", "fallback", "server_options"),
-    ("shadowsocks", "network", "network_list"),
-    ("shadowsocks", "method", "string"),
-    ("shadowsocks", "password", "string"),
-    ("shadowsocks", "destinations", "destination_list"),
-    ("shadowsocks", "managed", "bool"),
-    ("shadowtls", "version", "int"),
-    ("shadowtls", "password", "string"),
-    ("shadowtls", "handshake", "object"),
-    ("shadowtls", "handshake_for_server_name", "object"),
-    ("shadowtls", "strict_mode", "bool"),
-    ("shadowtls", "wildcard_sni", "int"),
-    ("anytls", "password", "string"),
-    ("anytls", "padding_scheme", "listable_string"),
-    ("trojan", "fallback_for_alpn", "fallback_map"),
-    ("tuic", "zero_rtt_handshake", "bool"),
-    ("tuic", "idle_timeout", "quic_duration"),
-    ("tuic", "keep_alive_period", "quic_duration"),
-    ("tuic", "disable_path_mtu_discovery", "quic_bool"),
-    ("naive", "network", "network_list"),
-    ("naive", "quic_congestion_control", "string"),
     ("hysteria", "up", "network_bytes"),
     ("hysteria", "down", "network_bytes"),
     ("hysteria", "up_mbps", "int"),
@@ -1207,21 +1009,6 @@ const TLS_IN_FIELDS: &[&str] = &[
     "reality",
 ];
 
-/// anytls outbound allowlist (reference option.AnyTLSOutboundOptions),
-/// excluding the dialer/TLS containers.
-const ANYTLS_OUT_FIELDS: &[&str] = &[
-    "type",
-    "tag",
-    "server",
-    "server_port",
-    "tls",
-    "password",
-    "idle_session_check_interval",
-    "idle_session_timeout",
-    "min_idle_session",
-    "client_metadata",
-];
-
 /// Go `tls.CipherSuites()` names accepted by the reference TLS client init.
 const TLS_CIPHER_SUITES: &[&str] = &[
     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
@@ -1244,16 +1031,6 @@ const TLS_VERSIONS: &[&str] = &["1.0", "1.1", "1.2", "1.3"];
 
 /// reference `option.CurvePreference` names (compared case-insensitively).
 const CURVE_PREFERENCES: &[&str] = &["p256", "p384", "p521", "x25519", "x25519mlkem768"];
-
-/// reference `tlsspoof.ParseMethod` accepted values.
-const SPOOF_METHODS: &[&str] = &[
-    "",
-    "wrong-sequence",
-    "wrong-checksum",
-    "wrong-ack",
-    "wrong-md5",
-    "wrong-timestamp",
-];
 
 /// Masque outbound allowlist (option.MASQUEOutboundOptions), excluding
 /// dialer/TLS containers.
@@ -1303,23 +1080,6 @@ const HY2_OUT_FIELDS: &[&str] = &[
     "tls",
 ];
 
-/// Tuic outbound allowlist (lx tuic.go).
-const TUIC_OUT_FIELDS: &[&str] = &[
-    "type",
-    "tag",
-    "server",
-    "server_port",
-    "uuid",
-    "password",
-    "congestion_control",
-    "udp_relay_mode",
-    "udp_over_stream",
-    "zero_rtt_handshake",
-    "heartbeat",
-    "network",
-    "tls",
-];
-
 /// Hy2 inbound allowlist (lx hy2_inbound.go).
 const HY2_IN_FIELDS: &[&str] = &[
     "type",
@@ -1336,60 +1096,7 @@ const HY2_IN_FIELDS: &[&str] = &[
     "tls",
 ];
 
-/// Tuic inbound allowlist (lx tuic inbound options).
-const TUIC_IN_FIELDS: &[&str] = &[
-    "type",
-    "tag",
-    "users",
-    "congestion_control",
-    "auth_timeout",
-    "zero_rtt_handshake",
-    "heartbeat",
-    "tls",
-];
-
-/// Snell outbound base allowlist (`option.AbstractSnellOutboundOptions` +
-/// `ServerOptions`; version-specific fields are added after the version switch).
-const SNELL_OUT_FIELDS: &[&str] = &[
-    "type",
-    "tag",
-    "version",
-    "psk",
-    "userkey",
-    "reuse",
-    "network",
-    "server",
-    "server_port",
-];
-
-/// Snell inbound base allowlist (`option.AbstractSnellInboundOptions`).
-const SNELL_IN_FIELDS: &[&str] = &["type", "tag", "version", "psk", "users"];
-
-// Plain outbound field sets (reference option/*.go: DialerOptions +
-// ServerOptions + OutboundTLSOptionsContainer are appended at decode time).
-const SOCKS_OUT_FIELDS: &[&str] = &["version", "username", "password", "network", "udp_over_tcp"];
 const HTTP_OUT_FIELDS: &[&str] = &["username", "password", "path", "headers"];
-const SS_OUT_FIELDS: &[&str] = &[
-    "method",
-    "password",
-    "plugin",
-    "plugin_opts",
-    "network",
-    "udp_over_tcp",
-    "multiplex",
-];
-const SHADOWTLS_OUT_FIELDS: &[&str] = &["version", "password"];
-const VMESS_OUT_FIELDS: &[&str] = &[
-    "uuid",
-    "security",
-    "alter_id",
-    "global_padding",
-    "authenticated_length",
-    "network",
-    "packet_encoding",
-    "multiplex",
-    "transport",
-];
 const VLESS_OUT_FIELDS: &[&str] = &[
     "uuid",
     "flow",
@@ -1414,17 +1121,6 @@ const HYSTERIA_OUT_FIELDS: &[&str] = &[
     "recv_window",
     "disable_mtu_discovery",
     "network",
-];
-const NAIVE_OUT_FIELDS: &[&str] = &[
-    "username",
-    "password",
-    "insecure_concurrency",
-    "extra_headers",
-    "stream_receive_window",
-    "udp_over_tcp",
-    "quic",
-    "quic_congestion_control",
-    "quic_session_receive_window",
 ];
 const SSH_OUT_FIELDS: &[&str] = &[
     "user",
@@ -1472,8 +1168,6 @@ const CHAIN_OUT_FIELDS: &[&str] = &[
 ];
 
 const BBR_PROFILES: &[&str] = &["standard", "conservative", "aggressive"];
-const TUIC_CC_ALGS: &[&str] = &["cubic", "new_reno", "bbr"];
-const TUIC_UDP_RELAY_MODES: &[&str] = &["native", "quic"];
 const OBFS_TYPES: &[&str] = &["salamander", "gecko"];
 const MASQ_URL_SCHEMES: &[&str] = &["file", "http", "https"];
 const MASQ_OBJ_TYPES: &[&str] = &["file", "proxy", "string"];
@@ -2189,50 +1883,6 @@ fn validate_users_hy2(value: &Value, at: &str) -> Result<(), String> {
             format!("{at}[{idx}]: json: cannot unmarshal value into Go value of type option.Hysteria2User")
         })?;
         reject_unknown_fields(u, &["name", "password"], &format!("{at}[{idx}"))?;
-    }
-    Ok(())
-}
-
-fn validate_users_tuic(value: &Value, at: &str) -> Result<(), String> {
-    if value.is_null() {
-        return Ok(());
-    }
-    let users = value.as_array().ok_or_else(|| {
-        format!(
-            "{at}: json: cannot unmarshal {} into Go struct field TUICInboundOptions.users of type []option.TUICUser",
-            json_kind(value)
-        )
-    })?;
-    for (idx, user) in users.iter().enumerate() {
-        let u = user.as_object().ok_or_else(|| {
-            format!(
-                "{at}[{idx}]: json: cannot unmarshal value into Go value of type option.TUICUser"
-            )
-        })?;
-        reject_unknown_fields(u, &["name", "uuid", "password"], &format!("{at}[{idx}]"))?;
-    }
-    Ok(())
-}
-
-/// reference `protocol/tuic.NewInbound`: the uuid list is walked after the
-/// server TLS config is built, so this is an init-chain check.
-fn check_users_tuic_uuid(value: &Value, init_at: &str) -> Result<(), String> {
-    let Some(users) = value.as_array() else {
-        return Ok(());
-    };
-    for (idx, user) in users.iter().enumerate() {
-        let Some(uuid) = user
-            .get("uuid")
-            .and_then(Value::as_str)
-            .filter(|uuid| !uuid.is_empty())
-        else {
-            return Err(format!("{init_at}: missing uuid for user {idx}"));
-        };
-        if !valid_uuid(uuid) {
-            return Err(format!(
-                "{init_at}: invalid uuid for user {idx}: uuid: incorrect UUID length"
-            ));
-        }
     }
     Ok(())
 }
@@ -2995,11 +2645,6 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
                 }
                 return Err(go_type_error(value, &field_at, go_struct, field, "string"));
             }
-            "listable_string" => {
-                // badoption.Listable[string] reports both shapes in one message
-                check_listable_string(value, &field_at)?;
-                continue;
-            }
             "network_list" => {
                 // option.NetworkList: a string or a list of them, and any other
                 // shape fails as the element type
@@ -3015,88 +2660,6 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
                 }
                 continue;
             }
-            "server_options" => {
-                if value.is_object() {
-                    continue;
-                }
-                return Err(go_type_error(
-                    value,
-                    &field_at,
-                    go_struct,
-                    field,
-                    "option.ServerOptions",
-                ));
-            }
-            "fallback_map" => {
-                if value.is_object() {
-                    continue;
-                }
-                return Err(go_type_error(
-                    value,
-                    &field_at,
-                    go_struct,
-                    field,
-                    "map[string]*option.ServerOptions",
-                ));
-            }
-            "quic_duration" => {
-                check_duration_field(
-                    value,
-                    &field_at,
-                    &format!("{go_struct}.QUICOptions.HTTP2Options"),
-                    field,
-                )?;
-                continue;
-            }
-            "quic_bool" => {
-                if is_pruned_bool(value) || matches!(value, Value::Bool(_)) {
-                    continue;
-                }
-                return Err(go_type_error(
-                    value,
-                    &field_at,
-                    &format!("{go_struct}.QUICOptions"),
-                    field,
-                    "bool",
-                ));
-            }
-            "object" => {
-                if value.is_object() {
-                    continue;
-                }
-                return Err(go_type_error(
-                    value,
-                    &field_at,
-                    go_struct,
-                    field,
-                    "map[string]interface {}",
-                ));
-            }
-            "destination_list" => match value {
-                Value::Null => {}
-                Value::Array(items) => {
-                    for (index, item) in items.iter().enumerate() {
-                        if !item.is_object() {
-                            return Err(go_type_error(
-                                item,
-                                &format!("{field_at}[{index}]"),
-                                go_struct,
-                                &format!("{field}[{index}]"),
-                                "option.ShadowsocksDestination",
-                            ));
-                        }
-                    }
-                }
-                other => {
-                    return Err(go_type_error(
-                        other,
-                        &field_at,
-                        go_struct,
-                        field,
-                        "[]option.ShadowsocksDestination",
-                    ));
-                }
-            },
             "int" => check_int_field(value, &field_at, go_struct, field)?,
             "uint16" => check_uint_field(value, &field_at, go_struct, field, 16)?,
             "uint32" => check_uint_field(value, &field_at, go_struct, field, 32)?,
@@ -3781,90 +3344,6 @@ fn validate_hy2_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), Str
     Ok(())
 }
 
-fn validate_tuic_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
-    let at = format!("outbounds[{i}]");
-    let mut allowed: Vec<&str> = TUIC_OUT_FIELDS.to_vec();
-    allowed.extend(DIALER_OUT_FIELDS);
-    allowed.extend(QUIC_OUT_FIELDS);
-    reject_unknown_fields(obj, &allowed, &at)?;
-
-    if let Some(v) = obj.get("heartbeat") {
-        check_duration_field(
-            v,
-            &format!("{at}.heartbeat"),
-            "TUICOutboundOptions",
-            "heartbeat",
-        )?;
-    }
-    if let Some(v) = obj.get("password") {
-        check_string_field(
-            v,
-            &format!("{at}.password"),
-            "TUICOutboundOptions",
-            "password",
-        )?;
-    }
-    if let Some(v) = obj.get("congestion_control") {
-        check_string_field(
-            v,
-            &format!("{at}.congestion_control"),
-            "TUICOutboundOptions",
-            "congestion_control",
-        )?;
-    }
-    if let Some(v) = obj.get("udp_relay_mode") {
-        check_string_field(
-            v,
-            &format!("{at}.udp_relay_mode"),
-            "TUICOutboundOptions",
-            "udp_relay_mode",
-        )?;
-    }
-    if let Some(v) = obj.get("network") {
-        check_network(v, &format!("{at}.network"), "TUICOutboundOptions")?;
-    }
-    if let Some(v) = obj.get("connect_timeout") {
-        check_duration_field(
-            v,
-            &format!("{at}.connect_timeout"),
-            "TUICOutboundOptions.DialerOptions.AbstractDialerOptions",
-            "connect_timeout",
-        )?;
-    }
-    if let Some(v) = obj.get("fallback_delay") {
-        check_duration_field(
-            v,
-            &format!("{at}.fallback_delay"),
-            "TUICOutboundOptions.DialerOptions.AbstractDialerOptions",
-            "fallback_delay",
-        )?;
-    }
-    if let Some(v) = obj.get("tcp_keep_alive") {
-        check_duration_field(
-            v,
-            &format!("{at}.tcp_keep_alive"),
-            "TUICOutboundOptions.DialerOptions.AbstractDialerOptions",
-            "tcp_keep_alive",
-        )?;
-    }
-    if let Some(v) = obj.get("tcp_keep_alive_interval") {
-        check_duration_field(
-            v,
-            &format!("{at}.tcp_keep_alive_interval"),
-            "TUICOutboundOptions.DialerOptions.AbstractDialerOptions",
-            "tcp_keep_alive_interval",
-        )?;
-    }
-    if let Some(v) = obj.get("domain_resolver") {
-        domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
-    }
-    if let Some(tls) = obj.get("tls") {
-        validate_tls_container(tls, &format!("{at}.tls"), false)?;
-        validate_utls_reality(tls, &format!("initialize outbound[{i}]"))?;
-    }
-    Ok(())
-}
-
 fn validate_masque_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     // reference stage-2 prune: the whole outbound map drops prunable values
@@ -4171,64 +3650,6 @@ fn validate_hy2_in_decode(i: usize, obj: &Map<String, Value>) -> Result<(), Stri
     Ok(())
 }
 
-fn validate_tuic_in_decode(
-    i: usize,
-    init_at: &str,
-    obj: &Map<String, Value>,
-) -> Result<(), String> {
-    let at = format!("inbounds[{i}]");
-    let mut allowed: Vec<&str> = TUIC_IN_FIELDS.to_vec();
-    allowed.extend(LISTEN_IN_FIELDS);
-    allowed.extend(QUIC_OUT_FIELDS);
-    allowed.extend(LEGACY_INBOUND_FIELDS);
-    reject_unknown_fields(obj, &allowed, &at)?;
-
-    if let Some(v) = obj.get("heartbeat") {
-        check_duration_field(
-            v,
-            &format!("{at}.heartbeat"),
-            "TUICInboundOptions",
-            "heartbeat",
-        )?;
-    }
-    if let Some(v) = obj.get("auth_timeout") {
-        check_duration_field(
-            v,
-            &format!("{at}.auth_timeout"),
-            "TUICInboundOptions",
-            "auth_timeout",
-        )?;
-    }
-    if let Some(v) = obj.get("congestion_control") {
-        check_string_field(
-            v,
-            &format!("{at}.congestion_control"),
-            "TUICInboundOptions",
-            "congestion_control",
-        )?;
-    }
-    if let Some(v) = obj.get("udp_timeout") {
-        check_udp_timeout(v, &format!("{at}.udp_timeout"))?;
-    }
-    if let Some(v) = obj.get("tcp_keep_alive") {
-        check_duration_field(
-            v,
-            &format!("{at}.tcp_keep_alive"),
-            "ListenOptions.AbstractListenOptions",
-            "tcp_keep_alive",
-        )?;
-    }
-    let _ = init_at;
-    if let Some(users) = obj.get("users") {
-        validate_users_tuic(users, &format!("{at}.users"))?;
-    }
-    if let Some(tls) = obj.get("tls") {
-        validate_tls_container(tls, &format!("{at}.tls"), true)?;
-    }
-    check_legacy_inbound(obj)?;
-    Ok(())
-}
-
 /// Validate a parsed configuration document against reference `check` rules.
 /// `network_namespaces`: a list of `{"type": "", "tag": "", "path": ""}` or
 /// `{"type": "unshare", "tag": "", "pid_file": ""}`, the reference's
@@ -4416,7 +3837,7 @@ pub fn validate(root: &Value) -> Result<(), String> {
             {
                 check_u16(port).map_err(|m| format!("outbounds[{i}].server_port: {m}"))?;
             }
-            validate_outbound(i, ty, &index_tag(tag, i), obj, &dns_tags)?;
+            validate_outbound(i, ty, &index_tag(tag, i), obj)?;
         }
     }
 
@@ -5262,175 +4683,6 @@ fn validate_dns(dns: &Value, tags: &mut HashSet<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// reference `option.SnellInboundOptions.UnmarshalJSON` (same three passes as
-/// the outbound, version enum 5/6, users decoded without strict unknown).
-fn validate_snell_in_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
-    let at = format!("inbounds[{i}]");
-    const ABSI: &str = "_SnellInboundOptions.AbstractSnellInboundOptions";
-    const LIS: &str = "_SnellInboundOptions.AbstractSnellInboundOptions.ListenOptions";
-
-    // pass 1: base + listen field types.
-    if let Some(v) = obj.get("version") {
-        snell_version_check(v, &format!("{at}.version"), "_SnellInboundOptions")?;
-    }
-    if let Some(v) = obj.get("psk") {
-        ep_str(v, &format!("{at}.psk"), ABSI, "psk")?;
-    }
-    if let Some(v) = obj.get("users") {
-        snell_users_decode(v, &format!("{at}.users"))?;
-    }
-    for f in ["bind_interface", "netns", "detour"] {
-        if let Some(v) = obj.get(f) {
-            ep_str(v, &format!("{at}.{f}"), LIS, f)?;
-        }
-    }
-    for f in [
-        "reuse_addr",
-        "disable_tcp_keep_alive",
-        "tcp_fast_open",
-        "tcp_multi_path",
-        "udp_fragment",
-        "proxy_protocol",
-        "proxy_protocol_accept_no_header",
-    ] {
-        if let Some(v) = obj.get(f) {
-            ep_bool(v, &format!("{at}.{f}"), LIS, f)?;
-        }
-    }
-    for f in ["tcp_keep_alive", "tcp_keep_alive_interval"] {
-        if let Some(v) = obj.get(f) {
-            check_duration_field(v, &format!("{at}.{f}"), LIS, f)?;
-        }
-    }
-    if let Some(v) = obj.get("udp_timeout") {
-        check_udp_timeout(v, &format!("{at}.udp_timeout"))?;
-    }
-    if let Some(v) = obj.get("routing_mark") {
-        check_routing_mark(v, &format!("{at}.routing_mark"))?;
-    }
-
-    // pass 2: version switch.
-    let version = snell_version(obj);
-    match version {
-        0 => return Err(format!("{at}: snell: missing version")),
-        5 | 6 => {}
-        v => return Err(format!("{at}: snell: unsupported version: {v}")),
-    }
-
-    // pass 3: version-specific fields, then unknown fields + legacy check.
-    let mut allowed: Vec<&str> = SNELL_IN_FIELDS.to_vec();
-    allowed.extend(LISTEN_IN_FIELDS);
-    allowed.extend(LEGACY_INBOUND_FIELDS);
-    if version == 5 {
-        if let Some(v) = obj.get("obfs_mode") {
-            ep_str(
-                v,
-                &format!("{at}.obfs_mode"),
-                "SnellObfsServerOptions",
-                "obfs_mode",
-            )?;
-        }
-        allowed.push("obfs_mode");
-    } else {
-        if let Some(v) = obj.get("mode") {
-            ep_str(v, &format!("{at}.mode"), "SnellV6Options", "mode")?;
-        }
-        allowed.push("mode");
-    }
-    reject_unknown_fields(obj, &allowed, &at)?;
-    check_legacy_inbound(obj)?;
-    Ok(())
-}
-
-/// users: elements decode leniently (no unknown rejection); null elements and
-/// prunable containers match the reference slice decode.
-fn snell_users_decode(value: &Value, at: &str) -> Result<(), String> {
-    const GO: &str = "_SnellInboundOptions.AbstractSnellInboundOptions";
-    match value {
-        Value::Null => Ok(()),
-        Value::Array(items) => {
-            for (idx, item) in items.iter().enumerate() {
-                match item {
-                    Value::Null => {}
-                    Value::Object(user) => {
-                        let uat = format!("{at}[{idx}]");
-                        if let Some(v) = user.get("userkey") {
-                            ep_str(
-                                v,
-                                &format!("{uat}.userkey"),
-                                "SnellUser.AbstractSnellInboundOptions.users",
-                                "userkey",
-                            )?;
-                        }
-                        if let Some(v) = user.get("name") {
-                            ep_str(
-                                v,
-                                &format!("{uat}.name"),
-                                "SnellUser.AbstractSnellInboundOptions.users",
-                                "name",
-                            )?;
-                        }
-                    }
-                    other => {
-                        return Err(format!(
-                            "{at}[{idx}]: json: cannot unmarshal {} into Go struct field {GO}.users of type option.SnellUser",
-                            json_kind(other)
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        other => Err(go_field_err(at, other, GO, "users", "[]option.SnellUser")),
-    }
-}
-
-/// reference inbound init: mode/obfs parse, psk checks (v6 enforces the
-/// 12..255-byte psk range), then per-user key rules.
-fn validate_snell_in_init(at: &str, obj: &Map<String, Value>) -> Result<(), String> {
-    let psk = obj.get("psk").and_then(Value::as_str).unwrap_or("");
-    if snell_version(obj) == 5 {
-        let raw = obj.get("obfs_mode").and_then(Value::as_str).unwrap_or("");
-        if !matches!(raw.to_lowercase().as_str(), "" | "none" | "http" | "tls") {
-            return Err(format!("{at}: snell: unknown obfs mode: {raw}"));
-        }
-        if psk.is_empty() {
-            return Err(format!("{at}: snell: missing pre-shared key"));
-        }
-    } else {
-        let raw = obj.get("mode").and_then(Value::as_str).unwrap_or("");
-        if !matches!(raw, "" | "default" | "unshaped" | "unsafe-raw") {
-            return Err(format!("{at}: snell: unknown v6 mode: {raw}"));
-        }
-        if psk.is_empty() {
-            return Err(format!("{at}: snell: missing pre-shared key"));
-        }
-        if !(12..=255).contains(&psk.len()) {
-            return Err(format!(
-                "{at}: snell: psk length must be between 12 and 255 bytes"
-            ));
-        }
-    }
-    if let Some(users) = obj.get("users").and_then(Value::as_array)
-        && !users.is_empty()
-    {
-        let mut seen: HashSet<&str> = HashSet::new();
-        for user in users {
-            let key = user.get("userkey").and_then(Value::as_str).unwrap_or("");
-            if key.is_empty() {
-                return Err(format!("{at}: snell: bad user key"));
-            }
-            if key.len() > 255 {
-                return Err(format!("{at}: snell: user key too long"));
-            }
-            if !seen.insert(key) {
-                return Err(format!("{at}: snell: duplicate user key"));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
     let at = format!("initialize inbound[{i}] {ty}[{tag}]");
     validate_listen_options(i, ty, obj)?;
@@ -5493,11 +4745,6 @@ fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> 
             ));
         }
         "hysteria2" => validate_hy2_in_decode(i, obj)?,
-        "tuic" => validate_tuic_in_decode(i, &at, obj)?,
-        "snell" => {
-            validate_snell_in_decode(i, obj)?;
-            validate_snell_in_init(&at, obj)?;
-        }
         _ => {
             check_legacy_inbound(obj)?;
         }
@@ -5509,136 +4756,85 @@ fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> 
         ));
     }
 
-    if ty == "shadowtls" {
-        let handshake_ok = obj
-            .get("handshake")
-            .and_then(Value::as_object)
-            .is_some_and(|hs| {
-                hs.get("server")
-                    .and_then(Value::as_str)
-                    .is_some_and(|s| !s.is_empty())
-                    && hs.get("server_port").is_some()
-            });
-        if !handshake_ok {
-            return Err(format!("{at}: missing default handshake information"));
-        }
-    }
-
-    if ty == "naive" && !tls_enabled(obj.get("tls")) {
-        return Err(format!("{at}: TLS is required for QUIC server"));
-    }
-
     if TLS_REQUIRED_INBOUNDS.contains(&ty) && !tls_enabled(obj.get("tls")) {
         return Err(format!("{at}: TLS required"));
     }
 
-    if ty == "hysteria2" || ty == "tuic" {
+    if ty == "hysteria2" {
         if tls_enabled(obj.get("tls")) {
             validate_server_tls(obj.get("tls").unwrap(), &at, &format!("inbounds[{i}].tls"))?;
         }
-        if ty == "tuic"
-            && let Some(users) = obj.get("users")
+        if let Some(obfs) = obj.get("obfs")
+            && obfs.is_object()
+            && obfs.as_object().is_some_and(|m| !m.is_empty())
         {
-            check_users_tuic_uuid(users, &at)?;
-        }
-        if ty == "hysteria2" {
-            if let Some(obfs) = obj.get("obfs")
-                && obfs.is_object()
-                && obfs.as_object().is_some_and(|m| !m.is_empty())
-            {
-                let has_user_pw = obj
-                    .get("users")
-                    .and_then(Value::as_array)
-                    .is_some_and(|users| {
-                        users.iter().any(|u| {
-                            u.get("password")
-                                .and_then(Value::as_str)
-                                .is_some_and(|p| !p.is_empty())
-                        })
-                    });
-                if !has_user_pw {
-                    return Err(format!("{at}: missing obfs password"));
-                }
-            }
-            if let Some(bbr) = obj.get("bbr_profile").and_then(Value::as_str)
-                && !bbr.is_empty()
-                && !BBR_PROFILES.contains(&bbr)
-            {
-                return Err(format!("{at}: unsupported BBR profile: {bbr}"));
-            }
-            if let Some(mq) = obj.get("masquerade")
-                && mq.is_string()
-            {
-                validate_masquerade(mq, "masquerade")?;
-            }
-            if let Some(realm) = obj.get("realm")
-                && realm_present(Some(realm))
-            {
-                let realm_obj = realm.as_object().unwrap();
-                let url = realm_obj
-                    .get("server_url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if url.is_empty() {
-                    return Err(format!(
-                        "{at}: create realm server: control server URL is required"
-                    ));
-                }
-                let host = url_host(url);
-                if host.is_empty() {
-                    return Err(format!(
-                        "{at}: create realm server: control server URL is required"
-                    ));
-                }
-                if realm_obj
-                    .get("realm_id")
-                    .and_then(Value::as_str)
-                    .is_none_or(|s| s.is_empty())
-                {
-                    return Err(format!("{at}: create realm server: realm ID is required"));
-                }
-                if let Some(iv) = realm_obj.get("ip_version").and_then(Value::as_i64)
-                    && iv != 0
-                    && iv != 4
-                    && iv != 6
-                {
-                    return Err(format!("{at}: invalid IP version: {iv}"));
-                }
-                if let Some(listen) = obj.get("listen").and_then(Value::as_str)
-                    && let Ok(ip) = IpAddr::from_str(listen)
-                    && realm_obj.get("ip_version").and_then(Value::as_i64) == Some(6)
-                    && ip.is_ipv4()
-                {
-                    return Err(format!(
-                        "{at}: realm.ip_version 6 conflicts with listen address {listen}"
-                    ));
-                }
+            let has_user_pw = obj
+                .get("users")
+                .and_then(Value::as_array)
+                .is_some_and(|users| {
+                    users.iter().any(|u| {
+                        u.get("password")
+                            .and_then(Value::as_str)
+                            .is_some_and(|p| !p.is_empty())
+                    })
+                });
+            if !has_user_pw {
+                return Err(format!("{at}: missing obfs password"));
             }
         }
-        if ty == "tuic" {
-            if let Some(cc) = obj.get("congestion_control").and_then(Value::as_str)
-                && !cc.is_empty()
-                && !TUIC_CC_ALGS.contains(&cc)
-            {
-                return Err(format!("{at}: unknown congestion control algorithm: {cc}"));
-            }
-            if let Some(users) = obj.get("users").and_then(Value::as_array) {
-                for (idx, user) in users.iter().enumerate() {
-                    let uuid = user.get("uuid").and_then(Value::as_str).unwrap_or("");
-                    if !valid_uuid(uuid) {
-                        return Err(format!(
-                            "{at}: invalid uuid for user {idx}: uuid: incorrect UUID length"
-                        ));
-                    }
-                }
-            }
+        if let Some(bbr) = obj.get("bbr_profile").and_then(Value::as_str)
+            && !bbr.is_empty()
+            && !BBR_PROFILES.contains(&bbr)
+        {
+            return Err(format!("{at}: unsupported BBR profile: {bbr}"));
         }
-    }
-
-    if ty == "shadowsocks" {
-        validate_ss_method(obj, &at, true)?;
-        if !ss_inbound_has_password(obj) {
-            return Err(format!("{at}: missing password"));
+        if let Some(mq) = obj.get("masquerade")
+            && mq.is_string()
+        {
+            validate_masquerade(mq, "masquerade")?;
+        }
+        if let Some(realm) = obj.get("realm")
+            && realm_present(Some(realm))
+        {
+            let realm_obj = realm.as_object().unwrap();
+            let url = realm_obj
+                .get("server_url")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if url.is_empty() {
+                return Err(format!(
+                    "{at}: create realm server: control server URL is required"
+                ));
+            }
+            let host = url_host(url);
+            if host.is_empty() {
+                return Err(format!(
+                    "{at}: create realm server: control server URL is required"
+                ));
+            }
+            if realm_obj
+                .get("realm_id")
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.is_empty())
+            {
+                return Err(format!("{at}: create realm server: realm ID is required"));
+            }
+            if let Some(iv) = realm_obj.get("ip_version").and_then(Value::as_i64)
+                && iv != 0
+                && iv != 4
+                && iv != 6
+            {
+                return Err(format!("{at}: invalid IP version: {iv}"));
+            }
+            if let Some(listen) = obj.get("listen").and_then(Value::as_str)
+                && let Ok(ip) = IpAddr::from_str(listen)
+                && realm_obj.get("ip_version").and_then(Value::as_i64) == Some(6)
+                && ip.is_ipv4()
+            {
+                return Err(format!(
+                    "{at}: realm.ip_version 6 conflicts with listen address {listen}"
+                ));
+            }
         }
     }
 
@@ -6144,417 +5340,6 @@ fn validate_trojan_client(i: usize, obj: &Map<String, Value>) -> Result<(), Stri
     Ok(())
 }
 
-fn validate_anytls_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
-    let at = format!("outbounds[{i}]");
-    // reference stage-2 prune runs deep: empty containers behave as absent.
-    let pruned =
-        deep_prune(&Value::Object(obj.clone())).unwrap_or_else(|| Value::Object(Map::new()));
-    let Some(pruned) = pruned.as_object() else {
-        return Ok(());
-    };
-    let obj = pruned;
-    const ABS: &str = "AnyTLSOutboundOptions.DialerOptions.AbstractDialerOptions";
-    check_dialer_platform_gates(obj, &format!("initialize outbound[{i}] anytls[{tag}]"))?;
-
-    // Field checks run before the unknown-field pass (fixed order matches the
-    // observed reference probes better than the BTreeMap alphabetical walk).
-    if let Some(v) = obj.get("detour") {
-        ep_str(
-            v,
-            &format!("{at}.detour"),
-            "AnyTLSOutboundOptions.DialerOptions",
-            "detour",
-        )?;
-    }
-    for f in [
-        "bind_interface",
-        "inet4_bind_address",
-        "inet6_bind_address",
-        "protect_path",
-        "netns",
-    ] {
-        if let Some(v) = obj.get(f) {
-            ep_str(v, &format!("{at}.{f}"), ABS, f)?;
-        }
-    }
-    for f in [
-        "bind_address_no_port",
-        "tcp_fast_open",
-        "tcp_multi_path",
-        "disable_tcp_keep_alive",
-        "udp_fragment",
-        "reuse_addr",
-    ] {
-        if let Some(v) = obj.get(f) {
-            ep_bool(v, &format!("{at}.{f}"), ABS, f)?;
-        }
-    }
-    for f in [
-        "connect_timeout",
-        "tcp_keep_alive",
-        "tcp_keep_alive_interval",
-        "fallback_delay",
-    ] {
-        if let Some(v) = obj.get(f) {
-            check_duration_field(v, &format!("{at}.{f}"), ABS, f)?;
-        }
-    }
-    if let Some(v) = obj.get("routing_mark") {
-        check_routing_mark(v, &format!("{at}.routing_mark"))?;
-    }
-    if let Some(v) = obj.get("domain_resolver") {
-        match v {
-            Value::Array(_) | Value::Number(_) | Value::Bool(_) => {
-                return Err(go_field_err(
-                    &format!("{at}.domain_resolver"),
-                    v,
-                    ABS,
-                    "domain_resolver",
-                    "option._DomainResolveOptions",
-                ));
-            }
-            _ => {
-                domain_resolver_server(v, &format!("{at}.domain_resolver"))?;
-            }
-        }
-    }
-    if let Some(v) = obj.get("network_strategy") {
-        match v {
-            Value::Null => {}
-            Value::String(s) if matches!(s.as_str(), "default" | "fallback" | "hybrid") => {}
-            Value::String(s) => {
-                return Err(format!(
-                    "{at}.network_strategy: unknown network strategy: {s}"
-                ));
-            }
-            other => {
-                return Err(go_field_err(
-                    &format!("{at}.network_strategy"),
-                    other,
-                    ABS,
-                    "network_strategy",
-                    "string",
-                ));
-            }
-        }
-    }
-    for f in ["network_type", "fallback_network_type"] {
-        if let Some(v) = obj.get(f) {
-            check_interface_types(v, &format!("{at}.{f}"))?;
-        }
-    }
-    if let Some(v) = obj.get("domain_strategy") {
-        match v {
-            Value::Null => {}
-            Value::String(s) if DOMAIN_STRATEGIES.contains(&s.as_str()) => {}
-            Value::String(s) => {
-                return Err(format!(
-                    "{at}.domain_strategy: unknown domain strategy: {s}"
-                ));
-            }
-            other => {
-                return Err(go_field_err(
-                    &format!("{at}.domain_strategy"),
-                    other,
-                    ABS,
-                    "domain_strategy",
-                    "string",
-                ));
-            }
-        }
-    }
-    if let Some(v) = obj.get("server") {
-        ep_str(
-            v,
-            &format!("{at}.server"),
-            "AnyTLSOutboundOptions.ServerOptions",
-            "server",
-        )?;
-    }
-    if let Some(v) = obj.get("tls") {
-        match v {
-            Value::Null => {}
-            Value::Object(_) => validate_tls_container(v, &format!("{at}.tls"), false)?,
-            other => {
-                return Err(go_field_err(
-                    &format!("{at}.tls"),
-                    other,
-                    "AnyTLSOutboundOptions.OutboundTLSOptionsContainer",
-                    "tls",
-                    "option.OutboundTLSOptions",
-                ));
-            }
-        }
-    }
-    if let Some(v) = obj.get("password") {
-        ep_str(
-            v,
-            &format!("{at}.password"),
-            "AnyTLSOutboundOptions",
-            "password",
-        )?;
-    }
-    for f in ["idle_session_check_interval", "idle_session_timeout"] {
-        if let Some(v) = obj.get(f) {
-            check_duration_field(v, &format!("{at}.{f}"), "AnyTLSOutboundOptions", f)?;
-        }
-    }
-    if let Some(v) = obj.get("min_idle_session") {
-        check_min_idle_session(v, &format!("{at}.min_idle_session"))?;
-    }
-    if let Some(v) = obj.get("client_metadata") {
-        ep_str(
-            v,
-            &format!("{at}.client_metadata"),
-            "AnyTLSOutboundOptions",
-            "client_metadata",
-        )?;
-    }
-
-    let mut allowed: Vec<&str> = ANYTLS_OUT_FIELDS.to_vec();
-    allowed.extend(DIALER_OUT_FIELDS);
-    reject_unknown_fields(obj, &allowed, &at)?;
-    Ok(())
-}
-
-/// `min_idle_session`: pointer-like int — null/empty containers ok; integral
-/// numbers in Go `int` range ok; everything else reports the float64 rendering
-/// of the literal (reference custom unmarshal decodes through float64).
-fn check_min_idle_session(value: &Value, at: &str) -> Result<(), String> {
-    const GS: &str = "AnyTLSOutboundOptions";
-    match value {
-        Value::Null => Ok(()),
-        Value::Number(n) => {
-            let ok = n.as_f64().is_some_and(|f| {
-                f.fract() == 0.0 && (-9223372036854775808.0..9223372036854775808.0).contains(&f)
-            });
-            if ok {
-                Ok(())
-            } else {
-                let literal = n
-                    .as_f64()
-                    .map_or_else(|| go_number_literal(value), |f| format!("{f}"));
-                Err(format!(
-                    "{at}: json: cannot unmarshal number {literal} into Go struct field {GS}.min_idle_session of type int"
-                ))
-            }
-        }
-        other => Err(go_field_err(at, other, GS, "min_idle_session", "int")),
-    }
-}
-
-/// reference `common/tls.NewClientWithOptions` for the anytls outbound:
-/// engine dispatch → reality/utls/std client construction checks.
-fn validate_tls_client_init(obj: &Map<String, Value>, at: &str) -> Result<(), String> {
-    let tls = obj.get("tls").and_then(Value::as_object);
-    let get = |k: &str| tls.and_then(|m| m.get(k));
-
-    let engine = get("engine").and_then(Value::as_str).unwrap_or("");
-    match engine {
-        "" | "go" => {}
-        "apple" => {
-            if !cfg!(target_os = "macos") {
-                return Err(format!(
-                    "{at}: Apple TLS engine is not available on non-Apple platforms"
-                ));
-            }
-        }
-        "windows" => {
-            if !cfg!(windows) {
-                return Err(format!(
-                    "{at}: Windows TLS engine is not available on non-Windows platforms"
-                ));
-            }
-        }
-        other => return Err(format!("{at}: unknown tls engine: {other}")),
-    }
-
-    let server = obj.get("server").and_then(Value::as_str).unwrap_or("");
-    let server_name = get("server_name").and_then(Value::as_str).unwrap_or("");
-    let sni = if server_name.is_empty() {
-        server
-    } else {
-        server_name
-    };
-    let insecure = get("insecure").and_then(Value::as_bool).unwrap_or(false);
-    let disable_sni = get("disable_sni").and_then(Value::as_bool).unwrap_or(false);
-    let spoof = get("spoof").and_then(Value::as_str).unwrap_or("");
-    let method = get("spoof_method").and_then(Value::as_str).unwrap_or("");
-    let reality_on = get("reality")
-        .and_then(Value::as_object)
-        .is_some_and(|m| m.get("enabled").and_then(Value::as_bool) == Some(true));
-    let utls_on = get("utls")
-        .and_then(Value::as_object)
-        .is_some_and(|m| m.get("enabled").and_then(Value::as_bool) == Some(true));
-
-    if reality_on {
-        if !utls_on {
-            return Err(format!("{at}: uTLS is required by reality client"));
-        }
-        if !spoof.is_empty() || !method.is_empty() {
-            return Err(format!("{at}: spoof is unsupported in reality"));
-        }
-    }
-
-    // shared checks (std/utls/reality clients share this order)
-    if sni.is_empty() && !insecure {
-        return Err(format!("{at}: missing server_name or insecure=true"));
-    }
-    if !insecure && disable_sni && reality_on {
-        return Err(format!("{at}: disable_sni is unsupported in reality"));
-    }
-
-    let cert_inline = tls_listable_join(get("certificate"));
-    let cert_path = get("certificate_path")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let sha_present = match get("certificate_public_key_sha256") {
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        _ => false,
-    };
-    if sha_present && (!cert_inline.is_empty() || !cert_path.is_empty()) {
-        return Err(format!(
-            "{at}: certificate_public_key_sha256 is conflict with certificate or certificate_path"
-        ));
-    }
-
-    for field in ["min_version", "max_version"] {
-        let v = get(field).and_then(Value::as_str).unwrap_or("");
-        if !v.is_empty() && !TLS_VERSIONS.contains(&v) {
-            return Err(format!("{at}: parse {field}: unknown tls version:{v}"));
-        }
-    }
-    if let Some(ciphers) = get("cipher_suites").and_then(Value::as_array) {
-        for c in ciphers {
-            let name = c.as_str().unwrap_or("");
-            if !TLS_CIPHER_SUITES.contains(&name) {
-                return Err(format!("{at}: unknown cipher_suite: {name}"));
-            }
-        }
-    }
-
-    let mut cert_content = cert_inline;
-    if cert_content.is_empty() && !cert_path.is_empty() {
-        cert_content = go_read_file(cert_path)
-            .map_err(|e| format!("{at}: read certificate: open {cert_path}: {e}"))?;
-    }
-    if !cert_content.is_empty() && !cert_content.contains("-----BEGIN CERTIFICATE-----") {
-        return Err(format!(
-            "{at}: failed to parse certificate:\n\n{cert_content}"
-        ));
-    }
-
-    let client_cert = tls_listable_join(get("client_certificate"));
-    let client_cert = if !client_cert.is_empty() {
-        client_cert
-    } else {
-        let p = get("client_certificate_path")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if p.is_empty() {
-            String::new()
-        } else {
-            go_read_file(p).map_err(|e| format!("{at}: read client certificate: open {p}: {e}"))?
-        }
-    };
-    let client_key = tls_listable_join(get("client_key"));
-    let client_key = if !client_key.is_empty() {
-        client_key
-    } else {
-        let p = get("client_key_path").and_then(Value::as_str).unwrap_or("");
-        if p.is_empty() {
-            String::new()
-        } else {
-            go_read_file(p).map_err(|e| format!("{at}: read client key: open {p}: {e}"))?
-        }
-    };
-    if !client_cert.is_empty() && !client_key.is_empty() {
-        // reference parses the x509 key pair here; parse failures are
-        // unprobed — accept and continue.
-    } else if !client_cert.is_empty() || !client_key.is_empty() {
-        return Err(format!(
-            "{at}: client certificate and client key must be provided together"
-        ));
-    }
-
-    // reference parseTLSSpoofOptions
-    if spoof.is_empty() {
-        if !method.is_empty() {
-            return Err(format!("{at}: spoof_method requires spoof"));
-        }
-    } else {
-        if !SPOOF_METHODS.contains(&method) {
-            return Err(format!("{at}: tls_spoof: unknown method: {method}"));
-        }
-        if disable_sni || sni.is_empty() || crate::netip_parse::parse_addr(sni).is_ok() {
-            return Err(format!("{at}: `spoof` requires TLS ClientHello with SNI"));
-        }
-        if spoof.eq_ignore_ascii_case(sni) {
-            return Err(format!("{at}: `spoof` must differ from `server_name`"));
-        }
-    }
-
-    if utls_on {
-        let fingerprint = get("utls")
-            .and_then(Value::as_object)
-            .and_then(|m| m.get("fingerprint"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if !fingerprint.is_empty() && !UTLS_FINGERPRINTS.contains(&fingerprint) {
-            return Err(format!("{at}: unknown uTLS fingerprint: {fingerprint}"));
-        }
-        let ech_on = get("ech")
-            .and_then(Value::as_object)
-            .is_some_and(|m| m.get("enabled").and_then(Value::as_bool) == Some(true));
-        if ech_on && reality_on {
-            return Err(format!("{at}: Reality is conflict with ECH"));
-        }
-    }
-
-    let kernel_tx = get("kernel_tx").and_then(Value::as_bool).unwrap_or(false);
-    let kernel_rx = get("kernel_rx").and_then(Value::as_bool).unwrap_or(false);
-    if (kernel_tx || kernel_rx) && !reality_on && !cfg!(target_os = "linux") {
-        return Err(format!("{at}: kTLS is only supported on Linux"));
-    }
-
-    if reality_on {
-        // reference newRealityClient: public_key → short_id → key_share → kTLS
-        let reality = get("reality").and_then(Value::as_object).unwrap();
-        let pk = reality
-            .get("public_key")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if let Some(idx) = go_b64_rawurl_error_index(pk) {
-            return Err(format!(
-                "{at}: decode public_key: illegal base64 data at input byte {idx}"
-            ));
-        }
-        if go_b64_rawurl_decoded_len(pk) != 32 {
-            return Err(format!("{at}: invalid public_key"));
-        }
-        let short_id = reality
-            .get("short_id")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        check_short_id(short_id).map_err(|m| format!("{at}: {m}"))?;
-        let key_share = reality
-            .get("key_share")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if !matches!(key_share, "" | "hybrid" | "classical") {
-            return Err(format!(
-                "{at}: unknown reality key_share: {key_share} (expected \"hybrid\" or \"classical\")"
-            ));
-        }
-        if (kernel_tx || kernel_rx) && !cfg!(target_os = "linux") {
-            return Err(format!("{at}: kTLS is only supported on Linux"));
-        }
-    }
-
-    Ok(())
-}
-
 /// Listable[string] → joined content (reference `strings.Join(list, "\n")`).
 fn tls_listable_join(value: Option<&Value>) -> String {
     match value {
@@ -6579,95 +5364,6 @@ fn go_read_file(path: &str) -> Result<String, String> {
                 "no such file or directory".to_string()
             }
         })
-}
-
-/// reference `option.SnellOutboundOptions.UnmarshalJSON`: base pass (types),
-/// version switch, then version-specific fields plus unknown fields via
-/// `badjson.UnmarshallExcluded`. Input is already stage-2 pruned by `validate`.
-fn validate_snell_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
-    let at = format!("outbounds[{i}]");
-    const ABSO: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions";
-    const SRV: &str = "_SnellOutboundOptions.AbstractSnellOutboundOptions.ServerOptions";
-
-    // pass 1: base + dialer field types.
-    if let Some(v) = obj.get("version") {
-        snell_version_check(v, &format!("{at}.version"), "_SnellOutboundOptions")?;
-    }
-    for f in ["psk", "userkey"] {
-        if let Some(v) = obj.get(f) {
-            ep_str(v, &format!("{at}.{f}"), ABSO, f)?;
-        }
-    }
-    if let Some(v) = obj.get("reuse") {
-        ep_bool(v, &format!("{at}.reuse"), ABSO, "reuse")?;
-    }
-    if let Some(v) = obj.get("network") {
-        snell_network(v, &format!("{at}.network"), ABSO)?;
-    }
-    if let Some(v) = obj.get("server") {
-        ep_str(v, &format!("{at}.server"), SRV, "server")?;
-    }
-    check_dialer_fields(
-        &at,
-        &format!("initialize outbound[{i}] snell[{tag}]"),
-        obj,
-        "_SnellOutboundOptions.AbstractSnellOutboundOptions",
-    )?;
-
-    // pass 2: version switch.
-    let version = snell_version(obj);
-    match version {
-        0 => return Err(format!("{at}: snell: missing version")),
-        4 | 6 => {}
-        v => return Err(format!("{at}: snell: unsupported version: {v}")),
-    }
-
-    // pass 3: version-specific fields, then unknown fields.
-    let mut allowed: Vec<&str> = SNELL_OUT_FIELDS.to_vec();
-    allowed.extend(DIALER_OUT_FIELDS);
-    if version == 4 {
-        for f in ["obfs_mode", "obfs_host"] {
-            if let Some(v) = obj.get(f) {
-                ep_str(v, &format!("{at}.{f}"), "SnellObfsClientOptions", f)?;
-            }
-        }
-        allowed.extend(["obfs_mode", "obfs_host"]);
-    } else {
-        if let Some(v) = obj.get("mode") {
-            ep_str(v, &format!("{at}.mode"), "SnellV6Options", "mode")?;
-        }
-        allowed.push("mode");
-    }
-    reject_unknown_fields(obj, &allowed, &at)?;
-    Ok(())
-}
-
-/// `version`: type errors report first (pass 1); the value itself is read back
-/// for the version switch. Integral floats (`4.0`) decode like Go's int.
-fn snell_version_check(value: &Value, at: &str, go_struct: &str) -> Result<(), String> {
-    match value {
-        Value::Null => Ok(()),
-        Value::Number(n)
-            if n.as_i64().is_some() || n.as_f64().is_some_and(|f| f.fract() == 0.0) =>
-        {
-            Ok(())
-        }
-        Value::Number(_) => Err(format!(
-            "{at}: json: cannot unmarshal number {} into Go struct field {go_struct}.version of type int",
-            go_number_literal(value)
-        )),
-        other => Err(go_field_err(at, other, go_struct, "version", "int")),
-    }
-}
-
-fn snell_version(obj: &Map<String, Value>) -> i64 {
-    match obj.get("version") {
-        Some(Value::Number(n)) => n
-            .as_i64()
-            .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
-            .unwrap_or(0),
-        _ => 0,
-    }
 }
 
 /// NetworkList: listable network enum; scalars otherwise follow the string
@@ -6862,49 +5558,6 @@ fn check_dialer_fields(
     Ok(())
 }
 
-/// `option.UDPOverTCPOptions`: bool or strict {enabled, version} object.
-fn check_udp_over_tcp(value: &Value, at: &str, outer: &str) -> Result<(), String> {
-    match value {
-        Value::Null | Value::Bool(_) => Ok(()),
-        Value::Object(map) => {
-            reject_unknown_fields(map, &["enabled", "version"], at)?;
-            if let Some(v) = map.get("enabled") {
-                ep_bool(v, &format!("{at}.enabled"), "_UDPOverTCPOptions", "enabled")?;
-            }
-            if let Some(v) = map.get("version")
-                && !matches!(v, Value::Number(_))
-            {
-                return Err(go_type_error(
-                    v,
-                    &format!("{at}.version"),
-                    "_UDPOverTCPOptions",
-                    "version",
-                    "uint8",
-                ));
-            }
-            if let Some(v) = map.get("version")
-                && v.as_u64().is_none_or(|number| number > u64::from(u8::MAX))
-            {
-                return Err(go_type_error(
-                    v,
-                    &format!("{at}.version"),
-                    "_UDPOverTCPOptions",
-                    "version",
-                    "uint8",
-                ));
-            }
-            Ok(())
-        }
-        other => Err(go_field_err(
-            at,
-            other,
-            outer,
-            "udp_over_tcp",
-            "option._UDPOverTCPOptions",
-        )),
-    }
-}
-
 /// `option.OutboundMultiplexOptions` (+ nested brutal).
 fn check_out_multiplex(value: &Value, at: &str, outer: &str) -> Result<(), String> {
     match value {
@@ -7021,22 +5674,10 @@ fn validate_plain_out_decode(
 ) -> Result<(), String> {
     let at = format!("outbounds[{i}]");
     let (protocol, go_base, has_tls, has_quic): (&[&str], &str, bool, bool) = match ty {
-        "socks" => (SOCKS_OUT_FIELDS, "SOCKSOutboundOptions", false, false),
         "http" => (HTTP_OUT_FIELDS, "HTTPOutboundOptions", true, false),
-        // `ShadowsocksOutboundOptions` embeds `OutboundTLSOptionsContainer`, so a
-        // shadowsocks server behind TLS is a shape the reference builds
-        "shadowsocks" => (SS_OUT_FIELDS, "ShadowsocksOutboundOptions", true, false),
-        "shadowtls" => (
-            SHADOWTLS_OUT_FIELDS,
-            "ShadowTLSOutboundOptions",
-            true,
-            false,
-        ),
-        "vmess" => (VMESS_OUT_FIELDS, "VMessOutboundOptions", true, false),
         "vless" => (VLESS_OUT_FIELDS, "VLESSOutboundOptions", true, false),
         "trojan" => (TROJAN_OUT_FIELDS, "TrojanOutboundOptions", true, false),
         "hysteria" => (HYSTERIA_OUT_FIELDS, "HysteriaOutboundOptions", true, true),
-        "naive" => (NAIVE_OUT_FIELDS, "NaiveOutboundOptions", true, false),
         "ssh" => (SSH_OUT_FIELDS, "SSHOutboundOptions", false, false),
         other => return Err(format!("{at}: unsupported plain outbound type: {other}")),
     };
@@ -7052,14 +5693,9 @@ fn validate_plain_out_decode(
     reject_unknown_fields(obj, &allowed, &at)?;
 
     let strings: &[&str] = match ty {
-        "socks" => &["version", "username", "password"],
         "http" => &["username", "password", "path"],
-        "shadowsocks" => &["method", "password", "plugin", "plugin_opts"],
-        "shadowtls" => &["password"],
-        "vmess" => &["uuid", "security", "packet_encoding"],
         "vless" => &["uuid", "flow", "encryption", "packet_encoding"],
         "trojan" => &["password"],
-        "naive" => &["username", "password", "quic_congestion_control"],
         "ssh" => &[
             "user",
             "password",
@@ -7076,29 +5712,15 @@ fn validate_plain_out_decode(
         }
     }
     for f in match ty {
-        "vmess" => &["alter_id"][..],
-        "naive" => &["insecure_concurrency"][..],
         "hysteria" => &["up_mbps", "down_mbps", "recv_window_conn", "recv_window"][..],
-        "shadowtls" => &["version"][..],
         _ => &[],
     } {
         if let Some(v) = obj.get(*f) {
             check_int_field(v, &format!("{at}.{f}"), go_base, f)?;
         }
     }
-    for f in match ty {
-        "vmess" => &["global_padding", "authenticated_length"][..],
-        "naive" => &["quic"][..],
-        _ => &[],
-    } {
-        if let Some(v) = obj.get(*f) {
-            ep_bool(v, &format!("{at}.{f}"), go_base, f)?;
-        }
-    }
-    if matches!(
-        ty,
-        "socks" | "shadowsocks" | "vmess" | "vless" | "trojan" | "hysteria"
-    ) && let Some(v) = obj.get("network")
+    if matches!(ty, "vless" | "trojan" | "hysteria")
+        && let Some(v) = obj.get("network")
     {
         snell_network(v, &format!("{at}.network"), go_base)?;
     }
@@ -7126,46 +5748,12 @@ fn validate_plain_out_decode(
     {
         check_duration_field(v, &format!("{at}.hop_interval"), go_base, "hop_interval")?;
     }
-    if ty == "naive" {
-        for f in ["stream_receive_window", "quic_session_receive_window"] {
-            if let Some(v) = obj.get(f) {
-                check_memory_bytes(v, &format!("{at}.{f}"), go_base, f)?;
-            }
-        }
-        if let Some(v) = obj.get("extra_headers") {
-            check_http_header(v, &format!("{at}.extra_headers"), go_base, "extra_headers")?;
-        }
-        // the reference switches on the congestion control whether or not
-        // `quic` is set, so an unknown name is a config error either way
-        if let Some(Value::String(cc)) = obj.get("quic_congestion_control")
-            && !matches!(cc.as_str(), "" | "bbr" | "bbr2" | "cubic" | "reno")
-        {
-            return Err(format!("{at}: unknown quic congestion control: {cc}"));
-        }
-        // a naive tunnel may not skip certificate checking
-        for (field, message) in [
-            ("insecure", "insecure is not supported on naive outbound"),
-            (
-                "disable_sni",
-                "disable_sni is not supported on naive outbound",
-            ),
-        ] {
-            if obj.get("tls").and_then(|tls| tls.get(field)) == Some(&Value::Bool(true)) {
-                return Err(format!("{at}: {message}"));
-            }
-        }
-    }
     if ty == "http"
         && let Some(v) = obj.get("headers")
     {
         check_http_header(v, &format!("{at}.headers"), go_base, "headers")?;
     }
-    if matches!(ty, "socks" | "shadowsocks" | "naive")
-        && let Some(v) = obj.get("udp_over_tcp")
-    {
-        check_udp_over_tcp(v, &format!("{at}.udp_over_tcp"), go_base)?;
-    }
-    if matches!(ty, "shadowsocks" | "vmess" | "vless" | "trojan")
+    if matches!(ty, "vless" | "trojan")
         && let Some(v) = obj.get("multiplex")
     {
         // the reference switches on the protocol name whatever `enabled` says
@@ -7298,150 +5886,6 @@ fn validate_tor_out_decode(i: usize, tag: &str, obj: &Map<String, Value>) -> Res
         obj,
         "TorOutboundOptions",
     )?;
-    Ok(())
-}
-
-/// Official `CensorshipStrategy::kSniRealityMode*` reality profiles as
-/// (`reality_<name>`, official enum name) pairs; the strategy numbers
-/// (20..=24, 60..=62, 80..=83, 100, 101) are accepted numerically.
-const FPTN_REALITY_PROFILES: &[(&str, &str)] = &[
-    ("reality_chrome145", "kSniRealityModeChrome145"),
-    ("reality_chrome146", "kSniRealityModeChrome146"),
-    ("reality_chrome147", "kSniRealityModeChrome147"),
-    ("reality_chrome148", "kSniRealityModeChrome148"),
-    ("reality_chrome149", "kSniRealityModeChrome149"),
-    ("reality_firefox149", "kSniRealityModeFirefox149"),
-    ("reality_firefox150", "kSniRealityModeFirefox150"),
-    ("reality_firefox151", "kSniRealityModeFirefox151"),
-    ("reality_yandex24", "kSniRealityModeYandex24"),
-    ("reality_yandex25", "kSniRealityModeYandex25"),
-    ("reality_yandex26_3", "kSniRealityModeYandex26_3"),
-    ("reality_yandex26_4", "kSniRealityModeYandex26_4"),
-    ("reality_safari26_4", "kSniRealityModeSafari26_4"),
-    ("reality_safari26_5", "kSniRealityModeSafari26_5"),
-];
-
-/// Censorship strategy knob shared by both fptn forms (token and server).
-fn check_fptn_obfuscation(obj: &Map<String, Value>, at: &str) -> Result<(), String> {
-    let Some(v) = obj.get("obfuscation").filter(|v| !v.is_null()) else {
-        return Ok(());
-    };
-    let raw = match v.as_str() {
-        Some(s) => s,
-        None => return Err(format!("{at}.obfuscation: must be a string")),
-    };
-    let reality = match raw {
-        "tls" | "tls_obfuscator" | "kTlsObfuscator" | "1" | "none" | "sni" | "kSni" | "0" => false,
-        "reality" => true,
-        "kSniRealityMode" | "2" => {
-            return Err(format!(
-                "{at}.obfuscation: reality mode 1 (kSniRealityMode) is deprecated in \
-                 the reference client; use \"reality\" (mode 2)"
-            ));
-        }
-        other => {
-            if FPTN_REALITY_PROFILES
-                .iter()
-                .any(|(alias, official)| *alias == other || *official == other)
-            {
-                true
-            } else if let Ok(n) = other.parse::<u16>() {
-                matches!(n, 20..=24 | 60..=62 | 80..=83 | 100 | 101)
-            } else {
-                return Err(format!(
-                    "{at}.obfuscation: invalid value (expected \"tls\", \"none\", \
-                     \"reality\" or a reality profile such as \"reality_chrome149\")"
-                ));
-            }
-        }
-    };
-    if reality && let Some(sv) = obj.get("sni").filter(|sv| !sv.is_null()) {
-        // The decoy ClientHello needs a capture-length SNI (4..=64, the
-        // template tables' entry range); an absent sni still resolves to a
-        // hostname server name at runtime and is checked there.
-        let sni = sv
-            .as_str()
-            .ok_or_else(|| format!("{at}.sni: must be a string"))?;
-        if !(4..=64).contains(&sni.len()) {
-            return Err(format!(
-                "{at}: reality obfuscation needs sni of 4..=64 bytes, got {}",
-                sni.len()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_fptn_out_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
-    let at = format!("outbounds[{i}]");
-    check_fptn_obfuscation(obj, &at)?;
-    if let Some(v) = obj.get("sni").filter(|v| !v.is_null())
-        && !v.is_string()
-    {
-        return Err(format!("{at}.sni: must be a string"));
-    }
-    if let Some(v) = obj.get("mtu").filter(|v| !v.is_null())
-        && !v.is_u64()
-    {
-        return Err(format!("{at}.mtu: must be an integer"));
-    }
-    if let Some(v) = obj.get("network_list") {
-        check_network_list(v, &format!("{at}.network_list"), "FPTNOutboundOptions")?;
-    }
-    if !obj.contains_key("server") {
-        let mut allowed: Vec<&str> = vec!["type", "tag", "token"];
-        allowed.extend_from_slice(DIALER_OUT_FIELDS);
-        // Set-once knobs copied to every expanded member by `fptn::expand`.
-        allowed.extend_from_slice(&["obfuscation", "sni", "mtu", "network_list"]);
-        reject_unknown_fields(obj, &allowed, &at)?;
-        match obj.get("token") {
-            Some(Value::String(s)) if !s.is_empty() => {}
-            Some(Value::String(_)) | None | Some(Value::Null) => {
-                return Err(format!("{at}: missing token"));
-            }
-            Some(_) => return Err(format!("{at}.token: must be a string")),
-        }
-        return Ok(());
-    }
-    let mut allowed: Vec<&str> = vec![
-        "type",
-        "tag",
-        "server",
-        "server_port",
-        "username",
-        "password",
-        "md5_fingerprint",
-        "sni",
-        "mtu",
-        "network_list",
-        "obfuscation",
-    ];
-    allowed.extend_from_slice(DIALER_OUT_FIELDS);
-    reject_unknown_fields(obj, &allowed, &at)?;
-    match obj.get("server") {
-        Some(Value::String(s)) if !s.is_empty() => {}
-        Some(Value::String(_)) | None | Some(Value::Null) => {
-            return Err(format!("{at}: missing server"));
-        }
-        Some(_) => return Err(format!("{at}.server: must be a string")),
-    }
-    if matches!(obj.get("server_port"), None | Some(Value::Null)) {
-        return Err(format!("{at}: missing server_port"));
-    }
-    for field in ["username", "password"] {
-        match obj.get(field) {
-            Some(Value::String(s)) if !s.is_empty() => {}
-            Some(Value::String(_)) | None | Some(Value::Null) => {
-                return Err(format!("{at}: missing {field}"));
-            }
-            Some(_) => return Err(format!("{at}.{field}: must be a string")),
-        }
-    }
-    if let Some(v) = obj.get("md5_fingerprint").filter(|v| !v.is_null())
-        && !v.is_string()
-    {
-        return Err(format!("{at}.md5_fingerprint: must be a string"));
-    }
     Ok(())
 }
 
@@ -7612,19 +6056,13 @@ fn validate_outbound(
     ty: &str,
     tag: &str,
     obj: &Map<String, Value>,
-    dns_tags: &HashSet<String>,
 ) -> Result<(), String> {
     let at = format!("initialize outbound[{i}] {ty}[{tag}]");
 
     match ty {
         "hysteria2" => validate_hy2_out_decode(i, obj)?,
-        "tuic" => validate_tuic_out_decode(i, obj)?,
         "masque" => validate_masque_out_decode(i, obj)?,
-        "anytls" => validate_anytls_out_decode(i, tag, obj)?,
-        "snell" => validate_snell_out_decode(i, tag, obj)?,
-        "fptn" => validate_fptn_out_decode(i, obj)?,
-        "socks" | "http" | "shadowsocks" | "shadowtls" | "vmess" | "vless" | "trojan"
-        | "hysteria" | "naive" | "ssh" => {
+        "http" | "vless" | "trojan" | "hysteria" | "ssh" => {
             validate_plain_out_decode(i, ty, tag, obj)?;
             if ty == "vless" {
                 validate_vless_encryption(i, obj)?;
@@ -7725,28 +6163,6 @@ fn validate_outbound(
     }
 
     match ty {
-        "socks" => {
-            if let Some(Value::String(s)) = obj.get("version")
-                && !matches!(s.as_str(), "" | "4" | "4a" | "5")
-            {
-                return Err(format!("{at}: unknown socks version: {s}"));
-            }
-        }
-        "vmess" => {
-            if let Some(Value::String(s)) = obj.get("security")
-                && !matches!(
-                    s.as_str(),
-                    "" | "auto" | "zero" | "none" | "aes-128-gcm" | "chacha20-poly1305"
-                )
-            {
-                return Err(format!("{at}: vmess: unsupported security type: {s}"));
-            }
-            if let Some(Value::String(s)) = obj.get("packet_encoding")
-                && !matches!(s.as_str(), "" | "packetaddr" | "xudp")
-            {
-                return Err(format!("{at}: unknown packet encoding: {s}"));
-            }
-        }
         "vless" => {
             if let Some(Value::String(s)) = obj.get("packet_encoding")
                 && !matches!(s.as_str(), "" | "packetaddr" | "xudp")
@@ -7907,84 +6323,6 @@ fn validate_outbound(
             {
                 // reference resolves at initialize: create realm http client: http_client not found
                 let _ = tag;
-            }
-        }
-        "tuic" => {
-            if tls_enabled(obj.get("tls"))
-                && !tls_insecure(obj.get("tls"))
-                && server_address(obj).is_empty()
-            {
-                return Err(format!("{at}: missing server_name or insecure=true"));
-            }
-            let uuid = obj.get("uuid").and_then(Value::as_str).unwrap_or("");
-            if !valid_uuid(uuid) {
-                return Err(format!("{at}: invalid uuid: uuid: incorrect UUID length"));
-            }
-            if obj.get("udp_over_stream").and_then(Value::as_bool) == Some(true)
-                && obj
-                    .get("udp_relay_mode")
-                    .and_then(Value::as_str)
-                    .is_some_and(|m| !m.is_empty())
-            {
-                return Err(format!(
-                    "{at}: udp_over_stream is conflict with udp_relay_mode"
-                ));
-            }
-            if let Some(mode) = obj.get("udp_relay_mode").and_then(Value::as_str)
-                && !mode.is_empty()
-                && !TUIC_UDP_RELAY_MODES.contains(&mode)
-            {
-                return Err(format!(
-                    "{at}: unknown udp_relay_mode: {mode} (expected native or quic)"
-                ));
-            }
-            if let Some(cc) = obj.get("congestion_control").and_then(Value::as_str)
-                && !cc.is_empty()
-                && !TUIC_CC_ALGS.contains(&cc)
-            {
-                return Err(format!("{at}: unknown congestion control algorithm: {cc}"));
-            }
-        }
-        "anytls" => {
-            // reference protocol/anytls NewOutbound: TLS required → tfo →
-            // NewClientWithOptions (TLS client checks) → dialer setup.
-            if obj.get("tcp_fast_open").and_then(Value::as_bool) == Some(true) {
-                return Err(format!(
-                    "{at}: tcp_fast_open is not supported with anytls outbound"
-                ));
-            }
-            validate_tls_client_init(obj, &at)?;
-            // reference dialer: a domain server resolves through the
-            // configured domain_resolver tag at initialize.
-            let server = obj.get("server").and_then(Value::as_str).unwrap_or("");
-            if !server.is_empty()
-                && crate::netip_parse::parse_addr(server).is_err()
-                && let Some(dr) = obj.get("domain_resolver")
-                && !prunes_value(dr)
-            {
-                let tag = domain_resolver_server(dr, &format!("outbounds[{i}].domain_resolver"))?;
-                if let Some(tag) = tag
-                    && !tag.is_empty()
-                    && !dns_tags.contains(&tag)
-                {
-                    return Err(format!("{at}: domain resolver not found: {tag}"));
-                }
-            }
-        }
-        "fptn" => {
-            let server = obj.get("server").and_then(Value::as_str).unwrap_or("");
-            if !server.is_empty()
-                && crate::netip_parse::parse_addr(server).is_err()
-                && let Some(dr) = obj.get("domain_resolver")
-                && !prunes_value(dr)
-            {
-                let tag = domain_resolver_server(dr, &format!("outbounds[{i}].domain_resolver"))?;
-                if let Some(tag) = tag
-                    && !tag.is_empty()
-                    && !dns_tags.contains(&tag)
-                {
-                    return Err(format!("{at}: domain resolver not found: {tag}"));
-                }
             }
         }
         _ => {}
@@ -8201,50 +6539,6 @@ fn validate_outbound(
                 return Err(format!(
                     "{at}: masque: mtu {mtu} too large for h2 (max 16000)"
                 ));
-            }
-        }
-        "shadowsocks" => {
-            validate_ss_method(obj, &at, false)?;
-            let password = obj.get("password").and_then(Value::as_str).unwrap_or("");
-            if password.is_empty() {
-                return Err(format!("{at}: missing password"));
-            }
-            if let Some(required_len) =
-                ss_2022_key_len(obj.get("method").and_then(Value::as_str).unwrap_or(""))
-            {
-                let decoded = decode_base64_std(password)
-                    .ok_or_else(|| format!("{at}: decode key: encoding/base64: invalid input"))?;
-                if decoded.len() != required_len {
-                    return Err(format!(
-                        "{at}: bad key length, required {required_len}, got {}",
-                        decoded.len()
-                    ));
-                }
-            }
-        }
-        "snell" => {
-            // reference NewOutbound: obfs/mode parse, then psk, then userkey.
-            if snell_version(obj) == 4 {
-                let raw = obj.get("obfs_mode").and_then(Value::as_str).unwrap_or("");
-                if !matches!(raw.to_lowercase().as_str(), "" | "none" | "http" | "tls") {
-                    return Err(format!("{at}: snell: unknown obfs mode: {raw}"));
-                }
-            } else {
-                let raw = obj.get("mode").and_then(Value::as_str).unwrap_or("");
-                if !matches!(raw, "" | "default" | "unshaped" | "unsafe-raw") {
-                    return Err(format!("{at}: snell: unknown v6 mode: {raw}"));
-                }
-            }
-            let psk = obj.get("psk").and_then(Value::as_str).unwrap_or("");
-            if psk.is_empty() {
-                return Err(format!("{at}: snell: missing pre-shared key"));
-            }
-            if obj
-                .get("userkey")
-                .and_then(Value::as_str)
-                .is_some_and(|k| k.len() > 255)
-            {
-                return Err(format!("{at}: snell: user key too long"));
             }
         }
         "hysteria" => {
@@ -9170,38 +7464,6 @@ fn validate_server_tls(tls: &Value, at: &str, field_at: &str) -> Result<(), Stri
         return Err(format!("{at}: missing key"));
     }
     Ok(())
-}
-
-fn validate_ss_method(obj: &Map<String, Value>, at: &str, inbound: bool) -> Result<(), String> {
-    let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
-    if !SS_METHODS.contains(&method) {
-        if inbound {
-            return Err(format!("{at}: unsupported method: {method}"));
-        }
-        return Err(format!("{at}: unknown method: {method}"));
-    }
-    Ok(())
-}
-
-fn ss_inbound_has_password(obj: &Map<String, Value>) -> bool {
-    if obj
-        .get("password")
-        .and_then(Value::as_str)
-        .is_some_and(|p| !p.is_empty())
-    {
-        return true;
-    }
-    obj.get("users")
-        .and_then(Value::as_array)
-        .is_some_and(|users| !users.is_empty())
-}
-
-fn ss_2022_key_len(method: &str) -> Option<usize> {
-    match method {
-        "2022-blake3-aes-128-gcm" => Some(16),
-        "2022-blake3-aes-256-gcm" | "2022-blake3-chacha20-poly1305" => Some(32),
-        _ => None,
-    }
 }
 
 fn tls_enabled(tls: Option<&Value>) -> bool {
@@ -10438,30 +8700,6 @@ fn check_short_id(short_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn valid_uuid(uuid: &str) -> bool {
-    let core = uuid.strip_prefix("urn:uuid:").unwrap_or(uuid);
-    let core = match core.strip_prefix('{') {
-        Some(rest) => rest.strip_suffix('}').unwrap_or(rest),
-        None => core,
-    };
-    if core.contains('-') {
-        let parts: Vec<&str> = core.split('-').collect();
-        let expected = [8, 4, 4, 4, 12];
-        if parts.len() != expected.len() {
-            return false;
-        }
-        if parts
-            .iter()
-            .zip(expected)
-            .any(|(part, len)| part.len() != len)
-        {
-            return false;
-        }
-    }
-    let hex: String = core.chars().filter(|c| *c != '-').collect();
-    hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit())
-}
-
 /// Standard base64 with padding (Go `base64.StdEncoding`).
 /// Standard base64 with padding; anything the alphabet does not cover, or a
 /// length that is not a multiple of four, is not a key.
@@ -10927,15 +9165,6 @@ mod tests {
         assert!(check_u16(&json!(65536)).is_err());
         assert!(check_u16(&json!(-1)).is_err());
         assert!(check_u16(&json!("443")).is_err());
-    }
-
-    #[test]
-    fn uuid_forms() {
-        assert!(valid_uuid("b831381d-6324-4d53-ad4f-8cda48b30811"));
-        assert!(valid_uuid("b831381d63244d53ad4f8cda48b30811"));
-        assert!(valid_uuid("urn:uuid:b831381d-6324-4d53-ad4f-8cda48b30811"));
-        assert!(!valid_uuid("nope"));
-        assert!(!valid_uuid(""));
     }
 
     #[test]
@@ -13023,72 +11252,6 @@ const OVPN_SERVER: &str = "OpenVPNServerEndpointOptions";
 const TS_EP: &str = "TailscaleEndpointOptions";
 const OC_EP: &str = "OpenConnectEndpointOptions";
 
-/// reference `option.OpenVPNClientEndpointOptions` + wrapper + embedded
-/// `OpenVPNEndpointOptions`/`ServerOptions`/`OpenVPNEndpointOptions.dialer`
-/// (dial fields come from `DIALER_OUT_FIELDS`).
-const KNOWN_OVPN_CLIENT_FIELDS: &[&str] = &[
-    "type",
-    "tag",
-    "system",
-    "name",
-    "mtu",
-    "udp_mapping",
-    "udp_filtering",
-    "udp_nat_max",
-    "udp_timeout",
-    "server",
-    "server_port",
-    "mode",
-    "network",
-    "servers",
-    "remote_random",
-    "address",
-    "peer_address",
-    "peer_address_ipv6",
-    "topology",
-    "username",
-    "password",
-    "auth_retry",
-    "static_challenge",
-    "static_challenge_echo",
-    "static_key",
-    "static_key_path",
-    "key_direction",
-    "tls",
-    "cipher",
-    "data_ciphers",
-    "data_ciphers_fallback",
-    "auth",
-    "mss_fix",
-    "mss_fix_disabled",
-    "mss_fix_mode",
-    "fragment",
-    "replay_window",
-    "replay_window_time",
-    "compression",
-    "compression_lzo",
-    "allow_compression",
-    "route_no_pull",
-    "pull_filters",
-    "routes",
-    "route_gateway",
-    "route_metric",
-    "redirect_gateway",
-    "redirect_gateway_flags",
-    "redirect_private",
-    "block_ipv6",
-    "ping_interval",
-    "ping_restart",
-    "ping_restart_disabled",
-    "renegotiate_interval",
-    "renegotiate_disabled",
-    "renegotiate_bytes",
-    "renegotiate_packets",
-    "tls_timeout",
-    "handshake_window",
-    "explicit_exit_notify",
-];
-
 /// reference `option.OpenVPNServerEndpointOptions`: ListenOptions (incl. the
 /// embedded InboundOptions decode fields) + `OpenVPNEndpointOptions` +
 /// server fields. No dialer fields on the server side.
@@ -13232,29 +11395,6 @@ const KNOWN_OPENCONNECT_FIELDS: &[&str] = &[
     "form_entries",
 ];
 
-const KNOWN_OVPN_TLS_OUT_FIELDS: &[&str] = &[
-    "server_name",
-    "server_name_type",
-    "certificate",
-    "certificate_path",
-    "client_certificate",
-    "client_certificate_path",
-    "client_key",
-    "client_key_path",
-    "peer_fingerprint",
-    "crl_path",
-    "remote_certificate_ku",
-    "remote_certificate_eku",
-    "remote_certificate_tls",
-    "certificate_profile",
-    "ns_certificate_type",
-    "version_min",
-    "version_max",
-    "cipher",
-    "groups",
-    "control_wrap",
-];
-
 const KNOWN_OVPN_TLS_IN_FIELDS: &[&str] = &[
     "certificate",
     "certificate_path",
@@ -13282,8 +11422,6 @@ const KNOWN_OVPN_TLS_IN_FIELDS: &[&str] = &[
 const KNOWN_OVPN_CWRAP_FIELDS: &[&str] = &["type", "key", "key_path", "direction"];
 const KNOWN_OVPN_CWRAP_IN_FIELDS: &[&str] =
     &["type", "key", "key_path", "direction", "force_cookie"];
-const KNOWN_OVPN_REMOTE_FIELDS: &[&str] = &["server", "server_port", "network"];
-const KNOWN_OVPN_PULL_FILTER_FIELDS: &[&str] = &["action", "text"];
 const KNOWN_OVPN_USER_FIELDS: &[&str] = &["username", "password"];
 const KNOWN_OVPN_PUSH_FIELDS: &[&str] = &[
     "routes",
@@ -13352,414 +11490,21 @@ const KNOWN_OC_FORTINET_FIELDS: &[&str] = &["hostcheck", "check_virtual_desktop"
 const KNOWN_OC_FORM_ENTRY_FIELDS: &[&str] =
     &["form_id", "submission_key", "name", "value", "promote"];
 
-/// canonical data-cipher names accepted by the reference
-/// (`sing-openvpn validateDataCipherName`).
-const OVPN_CANONICAL_CIPHERS: &[&str] = &[
-    "",
-    "BF-CBC",
-    "DES-CBC",
-    "DES-EDE-CBC",
-    "DES-EDE3-CBC",
-    "CAST5-CBC",
-    "AES-128-CBC",
-    "AES-192-CBC",
-    "AES-256-CBC",
-    "ARIA-128-CBC",
-    "ARIA-192-CBC",
-    "ARIA-256-CBC",
-    "CAMELLIA-128-CBC",
-    "CAMELLIA-192-CBC",
-    "CAMELLIA-256-CBC",
-    "SEED-CBC",
-    "SM4-CBC",
-    "AES-128-GCM",
-    "AES-192-GCM",
-    "AES-256-GCM",
-    "CHACHA20-POLY1305",
-    "NONE",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_CHACHA20_POLY1305_SHA256",
-    "TLS_AES_128_CCM_SHA256",
-    "TLS_AES_128_CCM_8_SHA256",
-];
-
-/// ciphers usable in static_key mode (`staticCipherKeySize`).
-const OVPN_STATIC_CIPHERS: &[&str] = &[
-    "BF-CBC",
-    "DES-CBC",
-    "DES-EDE-CBC",
-    "DES-EDE3-CBC",
-    "CAST5-CBC",
-    "AES-128-CBC",
-    "AES-192-CBC",
-    "AES-256-CBC",
-    "ARIA-128-CBC",
-    "ARIA-192-CBC",
-    "ARIA-256-CBC",
-    "CAMELLIA-128-CBC",
-    "CAMELLIA-192-CBC",
-    "CAMELLIA-256-CBC",
-    "SEED-CBC",
-    "SM4-CBC",
-    "NONE",
-];
-
-const OVPN_AUTH_DIGESTS: &[&str] = &[
-    "",
-    "SHA1",
-    "SHA224",
-    "SHA256",
-    "SHA384",
-    "SHA512",
-    "RIPEMD160",
-    "MD5",
-    "NONE",
-];
-
-const OVPN_CLIENT_PROTOCOLS: &[&str] = &["", "udp", "udp4", "udp6", "tcp", "tcp4", "tcp6"];
 const OVPN_SERVER_PROTOCOLS: &[&str] = &["", "udp", "tcp"];
 const OVPN_MODES: &[&str] = &["", "tls", "static_key"];
 const OVPN_TOPOLOGIES: &[&str] = &["", "net30", "p2p", "subnet"];
 const OVPN_KEY_DIRECTIONS: &[&str] = &["", "server", "client"];
-const OVPN_AUTH_RETRIES: &[&str] = &["", "none", "nointeract", "interact"];
-const OVPN_PULL_FILTER_ACTIONS: &[&str] = &["accept", "ignore", "reject"];
 const OC_FLAVORS: &[&str] = &["", "anyconnect", "gp", "fortinet", "f5", "pulse", "nc"];
 const OVPN_REMOTE_CERT_TLS: &[&str] = &["", "server", "client", "none"];
-const OVPN_TLS_VERIFY_X509: &[&str] = &["", "subject", "name", "name-prefix"];
-const OVPN_NS_CERT_TYPES: &[&str] = &["", "server", "client"];
-const OVPN_MSS_FIX_MODES: &[&str] = &["", "mtu", "fixed"];
 
 fn endpoint_decode(i: usize, obj: &Map<String, Value>, ty: &str) -> Result<(), String> {
     match ty {
         "wireguard" => wireguard_endpoint_decode(i, obj),
-        "openvpn-client" => openvpn_client_decode(i, obj),
         "openvpn-server" => openvpn_server_decode(i, obj),
         "tailscale" => tailscale_decode(i, obj),
         "openconnect" => openconnect_decode(i, obj),
         _ => Err(format!("endpoints[{i}]: unknown endpoint type: {ty}")),
     }
-}
-
-fn openvpn_client_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
-    let at = format!("endpoints[{i}]");
-    for key in obj.keys() {
-        let k = key.as_str();
-        if !KNOWN_OVPN_CLIENT_FIELDS.contains(&k) && !DIALER_OUT_FIELDS.contains(&k) {
-            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
-        }
-    }
-    let epc = format!("{OVPN_CLIENT}.OpenVPNEndpointOptions");
-    if let Some(v) = obj.get("system") {
-        ep_bool(v, &format!("{at}.system"), &epc, "system")?;
-    }
-    if let Some(v) = obj.get("name") {
-        ep_str(v, &format!("{at}.name"), &epc, "name")?;
-    }
-    if let Some(v) = obj.get("mtu") {
-        ep_unsigned(v, &format!("{at}.mtu"), &epc, "mtu", u32::MAX as u64)?;
-    }
-    if let Some(v) = obj.get("udp_mapping") {
-        check_udp_nat(v, &format!("{at}.udp_mapping"), &epc, "udp_mapping")?;
-    }
-    if let Some(v) = obj.get("udp_filtering") {
-        check_udp_nat(v, &format!("{at}.udp_filtering"), &epc, "udp_filtering")?;
-    }
-    if let Some(v) = obj.get("udp_nat_max") {
-        ep_unsigned(
-            v,
-            &format!("{at}.udp_nat_max"),
-            &epc,
-            "udp_nat_max",
-            u32::MAX as u64,
-        )?;
-    }
-    if let Some(v) = obj.get("udp_timeout") {
-        check_duration_field(v, &format!("{at}.udp_timeout"), OVPN_CLIENT, "udp_timeout")?;
-    }
-    let srv = format!("{OVPN_CLIENT}.ServerOptions");
-    if let Some(v) = obj.get("server") {
-        ep_str(v, &format!("{at}.server"), &srv, "server")?;
-    }
-    if let Some(v) = obj.get("server_port") {
-        ep_unsigned(
-            v,
-            &format!("{at}.server_port"),
-            &srv,
-            "server_port",
-            u16::MAX as u64,
-        )?;
-    }
-    for f in [
-        "mode",
-        "network",
-        "topology",
-        "username",
-        "password",
-        "auth_retry",
-        "static_challenge",
-        "key_direction",
-        "cipher",
-        "auth",
-        "mss_fix_mode",
-        "compression",
-        "compression_lzo",
-        "allow_compression",
-    ] {
-        if let Some(v) = obj.get(f) {
-            ep_str(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
-        }
-    }
-    for f in [
-        "static_challenge_echo",
-        "remote_random",
-        "route_no_pull",
-        "redirect_gateway",
-        "redirect_private",
-        "block_ipv6",
-        "ping_restart_disabled",
-        "renegotiate_disabled",
-        "mss_fix_disabled",
-    ] {
-        if let Some(v) = obj.get(f) {
-            ep_bool(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
-        }
-    }
-    for f in [
-        "mss_fix",
-        "fragment",
-        "replay_window",
-        "route_metric",
-        "explicit_exit_notify",
-    ] {
-        if let Some(v) = obj.get(f) {
-            ep_unsigned(v, &format!("{at}.{f}"), OVPN_CLIENT, f, u32::MAX as u64)?;
-        }
-    }
-    for f in ["renegotiate_bytes", "renegotiate_packets"] {
-        if let Some(v) = obj.get(f) {
-            check_u64_field(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
-        }
-    }
-    for f in [
-        "replay_window_time",
-        "ping_interval",
-        "ping_restart",
-        "renegotiate_interval",
-        "tls_timeout",
-        "handshake_window",
-    ] {
-        if let Some(v) = obj.get(f) {
-            check_duration_field(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
-        }
-    }
-    if let Some(v) = obj.get("address") {
-        check_prefix_list(v, &format!("{at}.address"))?;
-    }
-    if let Some(v) = obj.get("routes") {
-        check_prefix_list(v, &format!("{at}.routes"))?;
-    }
-    for f in ["peer_address", "peer_address_ipv6", "route_gateway"] {
-        if let Some(v) = obj.get(f) {
-            check_addr_field(v, &format!("{at}.{f}"), OVPN_CLIENT, f)?;
-        }
-    }
-    if let Some(v) = obj.get("data_ciphers") {
-        check_listable_string(v, &format!("{at}.data_ciphers"))?;
-    }
-    if let Some(v) = obj.get("data_ciphers_fallback") {
-        ep_str(
-            v,
-            &format!("{at}.data_ciphers_fallback"),
-            OVPN_CLIENT,
-            "data_ciphers_fallback",
-        )?;
-    }
-    if let Some(v) = obj.get("static_key") {
-        check_listable_string(v, &format!("{at}.static_key"))?;
-    }
-    if let Some(v) = obj.get("static_key_path") {
-        ep_str(
-            v,
-            &format!("{at}.static_key_path"),
-            OVPN_CLIENT,
-            "static_key_path",
-        )?;
-    }
-    if let Some(v) = obj.get("redirect_gateway_flags") {
-        check_listable_string(v, &format!("{at}.redirect_gateway_flags"))?;
-    }
-    if let Some(v) = obj.get("servers") {
-        openvpn_servers_decode(i, v)?;
-    }
-    if let Some(v) = obj.get("pull_filters") {
-        openvpn_pull_filters_decode(i, v)?;
-    }
-    if let Some(v) = obj.get("tls") {
-        openvpn_client_tls_decode(i, v)?;
-    }
-    endpoint_dial_decode(
-        &at,
-        obj,
-        &format!("{OVPN_CLIENT}.DialerOptions"),
-        &format!("{OVPN_CLIENT}.DialerOptions.AbstractDialerOptions"),
-    )
-}
-
-fn openvpn_servers_decode(i: usize, value: &Value) -> Result<(), String> {
-    let at = format!("endpoints[{i}].servers");
-    let items = match value {
-        Value::Array(items) => items,
-        Value::Null => return Ok(()),
-        other => {
-            return Err(go_field_err(
-                &at,
-                other,
-                OVPN_CLIENT,
-                "servers",
-                "[]option.OpenVPNRemoteOptions",
-            ));
-        }
-    };
-    for (n, item) in items.iter().enumerate() {
-        let path = format!("{at}[{n}]");
-        let m = match item {
-            Value::Object(m) => m,
-            other => {
-                return Err(format!(
-                    "{path}: json: cannot unmarshal {} into Go value of type option.OpenVPNRemoteOptions",
-                    json_kind(other)
-                ));
-            }
-        };
-        for key in m.keys() {
-            let k = key.as_str();
-            if !KNOWN_OVPN_REMOTE_FIELDS.contains(&k) {
-                return Err(format!("{path}.{k}: json: unknown field \"{k}\""));
-            }
-        }
-        let srv = "OpenVPNRemoteOptions.servers.ServerOptions";
-        if let Some(v) = m.get("server") {
-            ep_str(v, &format!("{path}.server"), srv, "server")?;
-        }
-        if let Some(v) = m.get("server_port") {
-            ep_unsigned(
-                v,
-                &format!("{path}.server_port"),
-                srv,
-                "server_port",
-                u16::MAX as u64,
-            )?;
-        }
-        if let Some(v) = m.get("network") {
-            ep_str(
-                v,
-                &format!("{path}.network"),
-                "OpenVPNRemoteOptions",
-                "servers.network",
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn openvpn_pull_filters_decode(i: usize, value: &Value) -> Result<(), String> {
-    let at = format!("endpoints[{i}].pull_filters");
-    let items = match value {
-        Value::Array(items) => items,
-        Value::Null => return Ok(()),
-        other => {
-            return Err(go_field_err(
-                &at,
-                other,
-                OVPN_CLIENT,
-                "pull_filters",
-                "[]option.OpenVPNPullFilterOptions",
-            ));
-        }
-    };
-    for (n, item) in items.iter().enumerate() {
-        let path = format!("{at}[{n}]");
-        let m = match item {
-            Value::Object(m) => m,
-            other => {
-                return Err(format!(
-                    "{path}: json: cannot unmarshal {} into Go value of type option.OpenVPNPullFilterOptions",
-                    json_kind(other)
-                ));
-            }
-        };
-        for key in m.keys() {
-            let k = key.as_str();
-            if !KNOWN_OVPN_PULL_FILTER_FIELDS.contains(&k) {
-                return Err(format!("{path}.{k}: json: unknown field \"{k}\""));
-            }
-        }
-        for f in KNOWN_OVPN_PULL_FILTER_FIELDS {
-            if let Some(v) = m.get(*f) {
-                ep_str(v, &format!("{path}.{f}"), "OpenVPNPullFilterOptions", f)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn openvpn_client_tls_decode(i: usize, value: &Value) -> Result<(), String> {
-    let at = format!("endpoints[{i}].tls");
-    let m = match value {
-        Value::Object(m) => m,
-        Value::Null => return Ok(()),
-        other => {
-            return Err(go_field_err(
-                &at,
-                other,
-                OVPN_CLIENT,
-                "tls",
-                "option.OpenVPNOutboundTLSOptions",
-            ));
-        }
-    };
-    for key in m.keys() {
-        let k = key.as_str();
-        if !KNOWN_OVPN_TLS_OUT_FIELDS.contains(&k) {
-            return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
-        }
-    }
-    for f in [
-        "server_name",
-        "server_name_type",
-        "certificate_path",
-        "client_certificate_path",
-        "client_key_path",
-        "crl_path",
-        "remote_certificate_eku",
-        "remote_certificate_tls",
-        "certificate_profile",
-        "ns_certificate_type",
-        "version_min",
-        "version_max",
-        "cipher",
-        "groups",
-    ] {
-        if let Some(v) = m.get(f) {
-            ep_str(v, &format!("{at}.{f}"), OVPN_CLIENT, &format!("tls.{f}"))?;
-        }
-    }
-    for f in [
-        "certificate",
-        "client_certificate",
-        "client_key",
-        "peer_fingerprint",
-        "remote_certificate_ku",
-    ] {
-        if let Some(v) = m.get(f) {
-            check_listable_string(v, &format!("{at}.{f}"))?;
-        }
-    }
-    if let Some(v) = m.get("control_wrap") {
-        openvpn_control_wrap_decode(i, v, false)?;
-    }
-    Ok(())
 }
 
 fn openvpn_server_tls_decode(i: usize, value: &Value) -> Result<(), String> {
@@ -14874,102 +12619,10 @@ fn check_listable_addr_port(value: &Value, at: &str) -> Result<(), String> {
 // tls_config.go / http_client.go / flavor.go. Probed matrix: probe_ep/*.
 // ---------------------------------------------------------------------------
 
-/// reference `validateDataCipherName` switch — exactly the first 22 entries
-/// of the decode-time canonical list (TLS_* suite names are NOT data ciphers).
-fn ovpn_is_data_cipher(name: &str) -> bool {
-    OVPN_CANONICAL_CIPHERS[..22].contains(&name)
-}
-
-const OVPN_TLS_CERT_PROFILES: &[&str] = &["", "legacy", "preferred", "insecure", "suiteb"];
-const OVPN_ALLOW_COMPRESSION: &[&str] = &["", "no", "asym", "yes"];
 const OVPN_CLIENT_CERT_POLICY: &[&str] = &["", "require", "optional", "none"];
 const OC_COMPRESSION_MODES: &[&str] = &["stateless", "all"];
 const OC_TOKEN_MODES: &[&str] = &["totp", "hotp", "stoken", "oidc"];
 const OC_PROTOCOL_BAD: &[char] = &['\x00', '\r', '\n'];
-
-/// `openSSLKeyPurposeNames` (peer_certificate_verifier.go).
-const OVPN_EKU_NAMES: &[&str] = &[
-    "server",
-    "client",
-    "TLS Web Server Authentication",
-    "TLS Web Client Authentication",
-    "Code Signing",
-    "E-mail Protection",
-    "IPSec End System",
-    "IPSec Tunnel",
-    "IPSec User",
-    "Time Stamping",
-    "OCSP Signing",
-    "Any Extended Key Usage",
-    "Microsoft Server Gated Crypto",
-    "Netscape Server Gated Crypto",
-    "Microsoft Commercial Code Signing",
-    "Microsoft Individual Code Signing",
-];
-
-/// `tlsCipherTranslationTable`: OpenSSL name + Go `tls.CipherSuiteName` name.
-const OVPN_TLS_CIPHER_SUITE_NAMES: &[&str] = &[
-    "RC4-SHA",
-    "DES-CBC3-SHA",
-    "AES128-SHA",
-    "AES256-SHA",
-    "AES128-SHA256",
-    "AES128-GCM-SHA256",
-    "AES256-GCM-SHA384",
-    "ECDHE-ECDSA-AES128-SHA",
-    "ECDHE-ECDSA-AES256-SHA",
-    "ECDHE-ECDSA-RC4-SHA",
-    "ECDHE-RSA-RC4-SHA",
-    "ECDHE-RSA-DES-CBC3-SHA",
-    "ECDHE-RSA-AES128-SHA",
-    "ECDHE-RSA-AES256-SHA",
-    "ECDHE-ECDSA-AES128-SHA256",
-    "ECDHE-RSA-AES128-SHA256",
-    "ECDHE-ECDSA-AES128-GCM-SHA256",
-    "ECDHE-RSA-AES128-GCM-SHA256",
-    "ECDHE-ECDSA-AES256-GCM-SHA384",
-    "ECDHE-RSA-AES256-GCM-SHA384",
-    "ECDHE-ECDSA-CHACHA20-POLY1305",
-    "ECDHE-RSA-CHACHA20-POLY1305",
-    "TLS_RSA_WITH_RC4_128_SHA",
-    "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
-    "TLS_RSA_WITH_AES_128_CBC_SHA",
-    "TLS_RSA_WITH_AES_256_CBC_SHA",
-    "TLS_RSA_WITH_AES_128_CBC_SHA256",
-    "TLS_RSA_WITH_AES_128_GCM_SHA256",
-    "TLS_RSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
-    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
-    "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA",
-    "TLS_ECDHE_RSA_WITH_RC4_128_SHA",
-    "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
-    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
-    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-];
-
-/// `tlsGroupAliases` keys.
-const OVPN_TLS_GROUP_ALIASES: &[&str] = &[
-    "X25519",
-    "CURVE25519",
-    "SECP256R1",
-    "PRIME256V1",
-    "P-256",
-    "NISTP256",
-    "SECP384R1",
-    "P-384",
-    "NISTP384",
-    "SECP521R1",
-    "P-521",
-    "NISTP521",
-];
 
 /// reference `box.go`: empty endpoint tag falls back to the entry index, and
 /// every NewEndpoint error is wrapped `initialize endpoint[{i}]{type}[{tag}]`.
@@ -14998,7 +12651,6 @@ fn endpoint_initialize(
         ));
     }
     let result = match ty {
-        "openvpn-client" => openvpn_client_initialize(i, &tag, obj),
         "openvpn-server" => openvpn_server_initialize(i, &tag, obj),
         "tailscale" => tailscale_initialize(i, &tag, obj),
         "openconnect" => openconnect_initialize(i, &tag, obj),
@@ -15104,582 +12756,11 @@ fn ovpn_control_wrap_active(wrap: &Map<String, Value>, force_cookie_counts: bool
         || (force_cookie_counts && ep_bool_val(wrap, "force_cookie"))
 }
 
-/// reference `validateDataCipherName` + `tlsStreamCipherSpec` stream fallback.
-fn ovpn_cipher_name_ok(cipher: &str) -> bool {
-    if ovpn_is_data_cipher(cipher) {
-        return true;
-    }
-    let base = cipher
-        .strip_suffix("-CFB")
-        .or_else(|| cipher.strip_suffix("-OFB"));
-    match base {
-        Some(base) => OVPN_STATIC_CIPHERS.contains(&format!("{base}-CBC").as_str()),
-        None => false,
-    }
-}
-
-/// reference `validateDataChannelNames`.
-fn ovpn_validate_data_channel_names(
-    options_name: &str,
-    cipher: &str,
-    ciphers: &[String],
-    fallback: &str,
-    auth: &str,
-) -> Result<(), String> {
-    if !ovpn_cipher_name_ok(cipher) {
-        return Err(format!(
-            "{options_name}.Cipher must use a canonical OpenVPN cipher name"
-        ));
-    }
-    for (idx, data_cipher) in ciphers.iter().enumerate() {
-        if data_cipher.is_empty() {
-            return Err(format!("{options_name}.Ciphers[{idx}] must not be empty"));
-        }
-        if !ovpn_cipher_name_ok(data_cipher) {
-            return Err(format!(
-                "{options_name}.Ciphers[{idx}] must use a canonical OpenVPN cipher name"
-            ));
-        }
-    }
-    if !ovpn_cipher_name_ok(fallback) {
-        return Err(format!(
-            "{options_name}.FallbackCipher must use a canonical OpenVPN cipher name"
-        ));
-    }
-    if !OVPN_AUTH_DIGESTS.contains(&auth) {
-        return Err(format!(
-            "{options_name}.Auth must use a canonical OpenVPN digest name"
-        ));
-    }
-    Ok(())
-}
-
-/// reference `validateDataChannelPolicy`.
-fn ovpn_validate_data_channel_policy(
-    options_name: &str,
-    mss_fix: u64,
-    mss_fix_disabled: bool,
-    mss_fix_mode: &str,
-    replay_window: u64,
-    replay_window_time_ns: i128,
-) -> Result<(), String> {
-    if mss_fix > 0 && mss_fix_disabled {
-        return Err(format!(
-            "{options_name}.MSSFix conflicts with MSSFixDisabled"
-        ));
-    }
-    if mss_fix_disabled && !mss_fix_mode.is_empty() {
-        return Err(format!(
-            "{options_name}.MSSFixMode conflicts with MSSFixDisabled"
-        ));
-    }
-    if mss_fix == 0 && !mss_fix_mode.is_empty() {
-        return Err(format!("{options_name}.MSSFixMode requires MSSFix"));
-    }
-    if !OVPN_MSS_FIX_MODES.contains(&mss_fix_mode) {
-        return Err(format!("{options_name}.MSSFixMode must be mtu or fixed"));
-    }
-    if replay_window > 65536 {
-        return Err(format!("{options_name}.ReplayWindow must not exceed 65536"));
-    }
-    if !(0..=600_000_000_000).contains(&replay_window_time_ns) {
-        return Err(format!(
-            "{options_name}.ReplayWindowTime must be between 0s and 600s"
-        ));
-    }
-    if replay_window_time_ns % 1_000_000_000 != 0 {
-        return Err(format!(
-            "{options_name}.ReplayWindowTime must use whole seconds"
-        ));
-    }
-    Ok(())
-}
-
-/// `strconv.ParseUint(value, 16, 64)` error text (base-16, no sign/prefix).
-fn ovpn_parse_hex_u64(value: &str) -> Result<u64, String> {
-    if value.is_empty()
-        || !value.bytes().all(|b| b.is_ascii_hexdigit())
-        || value.starts_with('+')
-        || value.starts_with('-')
-    {
-        return Err(format!(
-            "strconv.ParseUint: parsing \"{value}\": invalid syntax"
-        ));
-    }
-    let digits = value.trim_start_matches('0');
-    if digits.len() > 16 {
-        return Err(format!(
-            "strconv.ParseUint: parsing \"{value}\": value out of range"
-        ));
-    }
-    if digits.is_empty() {
-        return Ok(0);
-    }
-    u64::from_str_radix(digits, 16)
-        .map_err(|_| format!("strconv.ParseUint: parsing \"{value}\": value out of range"))
-}
-
-/// `parseRemoteCertKeyUsages`.
-fn ovpn_validate_ku_values(values: &[String]) -> Result<(), String> {
-    for value in values {
-        if value.is_empty() {
-            return Err("empty key usage hex".to_string());
-        }
-        ovpn_parse_hex_u64(value)?;
-    }
-    Ok(())
-}
-
-/// `parseObjectIdentifier`: error text replaced by the caller.
-fn ovpn_parse_object_identifier(value: &str) -> Result<(), ()> {
-    let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() < 2 {
-        return Err(());
-    }
-    let mut components = Vec::with_capacity(parts.len());
-    for part in parts {
-        if part.is_empty() {
-            return Err(());
-        }
-        // Go strconv.Atoi: optional sign, base-10 digits.
-        let (sign, digits) = match part.strip_prefix('-') {
-            Some(rest) => (-1i64, rest),
-            None => match part.strip_prefix('+') {
-                Some(rest) => (1i64, rest),
-                None => (1i64, part),
-            },
-        };
-        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(());
-        }
-        let component: i64 = digits
-            .parse::<i64>()
-            .map_err(|_| ())?
-            .checked_mul(sign)
-            .ok_or(())?;
-        if component < 0 {
-            return Err(());
-        }
-        components.push(component as u64);
-    }
-    if components[0] > 2 || (components[0] < 2 && components[1] > 39) {
-        return Err(());
-    }
-    Ok(())
-}
-
-/// `parseRemoteCertExtKeyUsage`.
-fn ovpn_validate_eku_value(value: &str) -> Result<(), String> {
-    if value.is_empty() || OVPN_EKU_NAMES.contains(&value) {
-        return Ok(());
-    }
-    ovpn_parse_object_identifier(value)
-        .map_err(|_| format!("unsupported remote-cert-eku value: {value}"))
-}
-
-/// `validateTLSOptionNames` (client library order, `ClientOptions.TLS` names).
-/// `remote_certificate_tls` is an endpoint enum; after it passes, the library
-/// `expandRemoteCertTLS` check never fails.
-#[allow(clippy::too_many_arguments)]
-fn ovpn_validate_tls_option_names(
-    verify_x509_type: &str,
-    peer_fingerprints: &[String],
-    remote_cert_ku: &[String],
-    remote_cert_eku: &str,
-    ns_cert_type: &str,
-    version_min: &str,
-    version_max: &str,
-    cert_profile: &str,
-    tls_cipher: &str,
-    tls_groups: &str,
-) -> Result<(), String> {
-    if !OVPN_TLS_VERIFY_X509.contains(&verify_x509_type) {
-        return Err(
-            "ClientOptions.TLS.VerifyX509Type must be subject, name, or name-prefix".to_string(),
-        );
-    }
-    for (idx, fingerprint) in peer_fingerprints.iter().enumerate() {
-        let ok = fingerprint.len() == 64
-            && fingerprint
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if !ok {
-            return Err(format!(
-                "ClientOptions.TLS.PeerFingerprint[{idx}] must be canonical lowercase hex"
-            ));
-        }
-    }
-    ovpn_validate_ku_values(remote_cert_ku)?;
-    ovpn_validate_eku_value(remote_cert_eku)?;
-    if !OVPN_NS_CERT_TYPES.contains(&ns_cert_type) {
-        return Err("ClientOptions.TLS.NSCertificateType must be server or client".to_string());
-    }
-    // resolveTLSVersionBounds: min token, then max token.
-    ovpn_parse_tls_version_token(version_min)?;
-    ovpn_parse_tls_version_token(version_max)?;
-    let parsed_min = match version_min {
-        "" => 0x0303u16,
-        "1.0" => 0x0301,
-        "1.1" => 0x0302,
-        "1.2" => 0x0303,
-        _ => 0x0304,
-    };
-    let parsed_max = match version_max {
-        "" => 0,
-        "1.0" => 0x0301,
-        "1.1" => 0x0302,
-        "1.2" => 0x0303,
-        _ => 0x0304,
-    };
-    if parsed_max != 0 && parsed_max < parsed_min {
-        return Err("tls-version-min bigger than tls-version-max".to_string());
-    }
-    if !OVPN_TLS_CERT_PROFILES.contains(&cert_profile) {
-        return Err(format!("unknown tls-cert-profile value: {cert_profile}"));
-    }
-    if !tls_cipher.is_empty() {
-        for token in tls_cipher.split(':') {
-            if token.is_empty() {
-                return Err("tls-cipher contains an empty cipher suite".to_string());
-            }
-            if !OVPN_TLS_CIPHER_SUITE_NAMES.contains(&token) {
-                return Err(format!("unsupported tls-cipher name: {token}"));
-            }
-        }
-    }
-    if !tls_groups.is_empty() {
-        for token in tls_groups.split(':') {
-            if token.is_empty() {
-                return Err("tls-groups contains an empty group name".to_string());
-            }
-            if !OVPN_TLS_GROUP_ALIASES.contains(&token) {
-                return Err(format!("unsupported tls-groups name: {token}"));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn ovpn_parse_tls_version_token(token: &str) -> Result<(), String> {
-    match token {
-        "" | "1.0" | "1.1" | "1.2" | "1.3" => Ok(()),
-        other => Err(format!("unknown tls-version parameter: {other}")),
-    }
-}
-
-/// `validateTLSCredentialSet` with `requireCertAndKey = false` (client).
-fn ovpn_validate_tls_credential_set(
-    mode: &str,
-    ca_set: bool,
-    cert_set: bool,
-    key_set: bool,
-    fingerprint_set: bool,
-) -> Result<(), String> {
-    if !ca_set && !cert_set && !key_set && !fingerprint_set {
-        if mode == "tls" {
-            return Err(
-                "tls mode: either certificate-authority or peer-fingerprint must be configured"
-                    .to_string(),
-            );
-        }
-        return Ok(());
-    }
-    if mode != "tls" {
-        return Err(
-            "option is not supported yet: certificate material outside tls mode".to_string(),
-        );
-    }
-    if cert_set != key_set {
-        return Err("certificate and key must both be set or both omitted".to_string());
-    }
-    Ok(())
-}
-
-/// `validateClientPolicyOptions`.
-fn ovpn_validate_client_policy_options(
-    topology: &str,
-    auth_retry: &str,
-    pull_filters: &[Map<String, Value>],
-    fragment: u64,
-) -> Result<(), String> {
-    if !OVPN_TOPOLOGIES.contains(&topology) {
-        return Err("ClientOptions.Tunnel.Topology must be net30, p2p, or subnet".to_string());
-    }
-    if !OVPN_AUTH_RETRIES.contains(&auth_retry) {
-        return Err(
-            "ClientOptions.Authentication.AuthRetry must be none, nointeract, or interact"
-                .to_string(),
-        );
-    }
-    for (idx, filter) in pull_filters.iter().enumerate() {
-        let action = filter.get("action").and_then(Value::as_str).unwrap_or("");
-        if !OVPN_PULL_FILTER_ACTIONS.contains(&action) {
-            return Err(format!(
-                "ClientOptions.Pull.Filters[{idx}].Action must be accept, ignore, or reject"
-            ));
-        }
-        let text = filter.get("text").and_then(Value::as_str).unwrap_or("");
-        if text.is_empty() {
-            return Err(format!(
-                "ClientOptions.Pull.Filters[{idx}].Text must not be empty"
-            ));
-        }
-    }
-    if fragment > 0 && fragment < 68 {
-        return Err("ClientOptions.DataChannel.Fragment must be zero or at least 68".to_string());
-    }
-    Ok(())
-}
-
-/// `validateDurationOption`.
-fn ovpn_validate_duration_option(name: &str, value_ns: i128) -> Result<(), String> {
-    if value_ns < 0 {
-        return Err(format!("{name} must not be negative"));
-    }
-    if value_ns > 0 && value_ns < 1_000_000_000 {
-        return Err(format!("{name} must be zero or at least 1s"));
-    }
-    Ok(())
-}
-
-/// `validatePingDurationOption`.
-fn ovpn_validate_ping_duration_option(name: &str, value_ns: i128) -> Result<(), String> {
-    ovpn_validate_duration_option(name, value_ns)?;
-    if value_ns % 1_000_000_000 != 0 {
-        return Err(format!("{name} must use whole seconds"));
-    }
-    Ok(())
-}
-
-/// `validateClientDurationOptions`.
-fn ovpn_validate_client_duration_options(obj: &Map<String, Value>) -> Result<(), String> {
-    let reneg = ep_ns(obj, "renegotiate_interval");
-    let reneg_disabled = ep_bool_val(obj, "renegotiate_disabled");
-    if reneg_disabled && reneg > 0 {
-        return Err(
-            "ClientOptions.Timing.RenegotiationInterval conflicts with RenegotiationDisabled"
-                .to_string(),
-        );
-    }
-    ovpn_validate_duration_option("ClientOptions.Timing.RenegotiationInterval", reneg)?;
-    ovpn_validate_ping_duration_option(
-        "ClientOptions.Timing.PingInterval",
-        ep_ns(obj, "ping_interval"),
-    )?;
-    ovpn_validate_ping_duration_option(
-        "ClientOptions.Timing.PingRestart",
-        ep_ns(obj, "ping_restart"),
-    )?;
-    if ep_bool_val(obj, "ping_restart_disabled") && ep_ns(obj, "ping_restart") > 0 {
-        return Err(
-            "ClientOptions.Timing.PingRestart conflicts with PingRestartDisabled".to_string(),
-        );
-    }
-    ovpn_validate_duration_option("ClientOptions.Timing.TLSTimeout", ep_ns(obj, "tls_timeout"))?;
-    ovpn_validate_duration_option(
-        "ClientOptions.Timing.HandWindow",
-        ep_ns(obj, "handshake_window"),
-    )
-}
-
 // ---------------------------------------------------------------------------
 // openvpn client library phase helpers: compression, allow-compression,
 // remotes (resolveClientRemotes) — sing-openvpn compression_options.go,
 // allow_compression.go, client_supervisor.go.
 // ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, Default)]
-struct OvpnCompressionSettings {
-    alg: u8, // 0 none, 1 stub, 2 lzo, 3 lz4, 4 stub-v2, 5 lz4-v2
-    swap: bool,
-    adaptive: bool,
-    asymmetric: bool,
-}
-
-/// reference `compressionSettings.apply` for the `compress` directive.
-fn ovpn_apply_compress(settings: &mut OvpnCompressionSettings, value: &str) -> Result<(), String> {
-    match value {
-        "" | "stub" => {
-            settings.alg = 1;
-            settings.swap = true;
-        }
-        "stub-v2" => settings.alg = 4,
-        "lzo" => {
-            settings.alg = 2;
-            settings.adaptive = false;
-            settings.swap = false;
-        }
-        "lz4" => {
-            settings.alg = 3;
-            settings.swap = true;
-        }
-        "lz4-v2" => settings.alg = 5,
-        "migrate" | "none" | "no" | "disabled" | "off" => {
-            *settings = OvpnCompressionSettings::default();
-        }
-        other => {
-            return Err(format!("unsupported compression option: compress {other}"));
-        }
-    }
-    Ok(())
-}
-
-/// reference `compressionSettings.apply` for the `comp-lzo` directive.
-fn ovpn_apply_comp_lzo(settings: &mut OvpnCompressionSettings, value: &str) -> Result<(), String> {
-    settings.swap = false;
-    match value {
-        "" | "adaptive" => {
-            settings.alg = 2;
-            settings.adaptive = true;
-            settings.asymmetric = false;
-        }
-        "yes" => {
-            settings.alg = 2;
-            settings.adaptive = false;
-            settings.asymmetric = false;
-        }
-        "asym" => {
-            settings.alg = 2;
-            settings.adaptive = false;
-            settings.asymmetric = true;
-        }
-        "no" => {
-            settings.alg = 1;
-            settings.adaptive = false;
-        }
-        "none" | "disabled" | "off" => {
-            *settings = OvpnCompressionSettings::default();
-        }
-        other => {
-            return Err(format!("unsupported compression option: comp-lzo {other}"));
-        }
-    }
-    Ok(())
-}
-
-fn ovpn_non_stub(settings: &OvpnCompressionSettings) -> bool {
-    matches!(settings.alg, 2 | 3 | 5)
-}
-
-/// `resolveCompressionSettings` + `resolveEffectiveAllowCompressionPolicy`.
-fn ovpn_resolve_compression(obj: &Map<String, Value>) -> Result<(), String> {
-    let compression = obj
-        .get("compression")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let compression_lzo = obj
-        .get("compression_lzo")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let mut settings = OvpnCompressionSettings::default();
-    if !compression.is_empty() {
-        ovpn_apply_compress(&mut settings, &compression)?;
-    }
-    if !compression_lzo.is_empty() {
-        ovpn_apply_comp_lzo(&mut settings, &compression_lzo)?;
-    }
-    let allow = obj
-        .get("allow_compression")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if allow.is_empty() {
-        return Ok(());
-    }
-    if !OVPN_ALLOW_COMPRESSION.contains(&allow) {
-        return Err("invalid allow-compression value".to_string());
-    }
-    if allow == "no" && ovpn_non_stub(&settings) {
-        return Err(
-            "allow-compression no conflicts with statically enabled compression".to_string(),
-        );
-    }
-    Ok(())
-}
-
-/// endpoint-side remote list: global protocol defaults to `udp`.
-struct OvpnRemote {
-    host: String,
-    port: u64,
-    protocol: String,
-}
-
-fn ovpn_build_remotes(obj: &Map<String, Value>) -> (String, Vec<OvpnRemote>) {
-    let network = endpoint_str(obj, "network");
-    let global = if network.is_empty() {
-        "udp".to_string()
-    } else {
-        network.to_string()
-    };
-    if let Some(server) = obj.get("server").and_then(Value::as_str) {
-        return (
-            global,
-            vec![OvpnRemote {
-                host: server.to_string(),
-                port: obj.get("server_port").and_then(Value::as_u64).unwrap_or(0),
-                protocol: endpoint_str(obj, "network").to_string(),
-            }],
-        );
-    }
-    let mut remotes = Vec::new();
-    if let Some(Value::Array(items)) = obj.get("servers") {
-        for entry in items {
-            let Value::Object(remote) = entry else {
-                continue;
-            };
-            remotes.push(OvpnRemote {
-                host: endpoint_str(remote, "server").to_string(),
-                port: remote
-                    .get("server_port")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                protocol: endpoint_str(remote, "network").to_string(),
-            });
-        }
-    }
-    (global, remotes)
-}
-
-/// `resolveTransportProtocol`: concrete endpoint values never use "".
-fn ovpn_resolve_transport_protocol(protocol: &str) -> Result<(), String> {
-    if !protocol.is_empty() && OVPN_CLIENT_PROTOCOLS.contains(&protocol) {
-        Ok(())
-    } else {
-        Err("unsupported openvpn protocol".to_string())
-    }
-}
-
-/// `resolveClientRemotes`: global enum → per-remote host → port → enum.
-fn ovpn_resolve_client_remotes(global: &str, remotes: &[OvpnRemote]) -> Result<(), String> {
-    ovpn_resolve_transport_protocol(global)?;
-    for (idx, remote) in remotes.iter().enumerate() {
-        let host = remote.host.as_str();
-        if host.is_empty()
-            || host.contains([' ', '\t', '\r', '\n'])
-            || host.starts_with('[')
-            || host.ends_with(']')
-        {
-            return Err(format!(
-                "option is not supported yet: invalid remote host at index {idx}"
-            ));
-        }
-        if remote.port == 0 {
-            return Err(format!(
-                "option is not supported yet: empty remote port at index {idx}"
-            ));
-        }
-        let protocol = if remote.protocol.is_empty() {
-            global
-        } else {
-            remote.protocol.as_str()
-        };
-        ovpn_resolve_transport_protocol(protocol)?;
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // openvpn-client initialize — sbx-src protocol/openvpn/client.go
@@ -15687,346 +12768,6 @@ fn ovpn_resolve_client_remotes(global: &str, remotes: &[OvpnRemote]) -> Result<(
 // buildStaticKeyClientOptions (316) / tls branch (181) → NewClient library
 // phase (sing-openvpn client.go NewClient → validateImplementedClientOptions).
 // ---------------------------------------------------------------------------
-
-fn openvpn_client_initialize(i: usize, tag: &str, obj: &Map<String, Value>) -> Result<(), String> {
-    let _ = (i, tag);
-    let mode = endpoint_str(obj, "mode");
-    let mode = if mode.is_empty() { "tls" } else { mode };
-    if !OVPN_MODES.contains(&mode) {
-        return Err(format!(
-            "unsupported mode: {mode} (expected \"tls\" or \"static_key\")"
-        ));
-    }
-    let server = endpoint_str(obj, "server");
-    let servers = match obj.get("servers") {
-        Some(Value::Array(items)) => items.len(),
-        _ => 0,
-    };
-    if !server.is_empty() && servers > 0 {
-        return Err("`server` is conflict with `servers`".to_string());
-    }
-    if server.is_empty() && servers == 0 {
-        return Err("missing `server` or `servers`".to_string());
-    }
-    let (global_protocol, remotes) = ovpn_build_remotes(obj);
-
-    // buildClientTunnelOptions(options, mode == static_key)
-    let peer4 = endpoint_str(obj, "peer_address");
-    if !peer4.is_empty() && parse_ip_addr(peer4) != Some(true) {
-        return Err("`peer_address` must be an IPv4 address".to_string());
-    }
-    let peer6 = endpoint_str(obj, "peer_address_ipv6");
-    if !peer6.is_empty() && parse_ip_addr(peer6) != Some(false) {
-        return Err("`peer_address_ipv6` must be an IPv6 address".to_string());
-    }
-    let mut addresses: Vec<String> = Vec::new();
-    if let Some(Value::Array(items)) = obj.get("address") {
-        for item in items {
-            match item.as_str() {
-                Some(s) => addresses.push(s.to_string()),
-                None => return Err("`address[0]` is invalid".to_string()),
-            }
-        }
-    }
-    let mut has4 = false;
-    let mut has6 = false;
-    for (addr_index, address) in addresses.iter().enumerate() {
-        let host = address.split('/').next().unwrap_or("");
-        match parse_ip_addr(host) {
-            Some(true) => has4 = true,
-            Some(false) => has6 = true,
-            None => return Err(format!("`address[{addr_index}]` is invalid")),
-        }
-    }
-    if mode == "static_key" {
-        if addresses.is_empty() {
-            return Err("missing `address` in `static_key` mode".to_string());
-        }
-        if has4 && peer4.is_empty() {
-            return Err(
-                "missing `peer_address` for the IPv4 tunnel address in `static_key` mode"
-                    .to_string(),
-            );
-        }
-        if has6 && peer6.is_empty() {
-            return Err(
-                "missing `peer_address_ipv6` for the IPv6 tunnel address in `static_key` mode"
-                    .to_string(),
-            );
-        }
-        if !peer4.is_empty() && !has4 {
-            return Err(
-                "`peer_address` requires an IPv4 tunnel `address` in `static_key` mode".to_string(),
-            );
-        }
-        if !peer6.is_empty() && !has6 {
-            return Err(
-                "`peer_address_ipv6` requires an IPv6 tunnel `address` in `static_key` mode"
-                    .to_string(),
-            );
-        }
-    }
-
-    if mode == "static_key" {
-        openvpn_client_static_options(obj)?;
-    } else {
-        openvpn_client_tls_options(obj)?;
-    }
-
-    // NewClient library phase (endpoint defaults guarantee non-empty values).
-    ovpn_resolve_client_remotes(&global_protocol, &remotes)?;
-    let fragment = ep_u64_val(obj, "fragment");
-    if fragment > 0
-        && remotes.iter().any(|remote| {
-            let protocol = if remote.protocol.is_empty() {
-                global_protocol.as_str()
-            } else {
-                remote.protocol.as_str()
-            };
-            protocol.starts_with("tcp")
-        })
-    {
-        return Err("option is not supported yet: fragment with tcp remote".to_string());
-    }
-    ovpn_resolve_compression(obj)?;
-    ovpn_validate_client_duration_options(obj)?;
-    let cipher = endpoint_str(obj, "cipher");
-    let data_ciphers = ovpn_listable_values(obj.get("data_ciphers"));
-    let data_ciphers_fallback = endpoint_str(obj, "data_ciphers_fallback");
-    let auth = endpoint_str(obj, "auth");
-    ovpn_validate_data_channel_names(
-        "ClientOptions.DataChannel",
-        cipher,
-        &data_ciphers,
-        data_ciphers_fallback,
-        auth,
-    )?;
-    ovpn_validate_data_channel_policy(
-        "ClientOptions.DataChannel",
-        ep_u64_val(obj, "mss_fix"),
-        ep_bool_val(obj, "mss_fix_disabled"),
-        endpoint_str(obj, "mss_fix_mode"),
-        ep_u64_val(obj, "replay_window"),
-        ep_ns(obj, "replay_window_time"),
-    )?;
-    if mode == "static_key" {
-        if cipher.is_empty() {
-            return Err(
-                "ClientOptions.DataChannel.Cipher is required in static_key mode".to_string(),
-            );
-        }
-        if !OVPN_STATIC_CIPHERS.contains(&cipher) {
-            return Err(format!(
-                "ClientOptions.DataChannel.Cipher is not supported in static_key mode: {cipher}"
-            ));
-        }
-        if !data_ciphers.is_empty() || !data_ciphers_fallback.is_empty() {
-            return Err(
-                "option is not supported yet: data_ciphers in static_key mode; use Cipher"
-                    .to_string(),
-            );
-        }
-    }
-
-    // ClientTLSOptions inputs (tls branch filled them; static mode keeps "").
-    let tls = match obj.get("tls") {
-        Some(Value::Object(m)) => Some(m),
-        _ => None,
-    };
-    let tls_get = |key: &str| -> String {
-        tls.and_then(|m| m.get(key))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let mut verify_x509_type = tls_get("server_name_type");
-    if verify_x509_type.is_empty() && !tls_get("server_name").is_empty() {
-        verify_x509_type = "name".to_string();
-    }
-    let peer_fingerprints = ovpn_listable_values(tls.and_then(|m| m.get("peer_fingerprint")));
-    let remote_cert_ku = ovpn_listable_values(tls.and_then(|m| m.get("remote_certificate_ku")));
-    ovpn_validate_tls_option_names(
-        &verify_x509_type,
-        &peer_fingerprints,
-        &remote_cert_ku,
-        &tls_get("remote_certificate_eku"),
-        &tls_get("ns_certificate_type"),
-        &tls_get("version_min"),
-        &tls_get("version_max"),
-        &tls_get("certificate_profile"),
-        &tls_get("cipher"),
-        &tls_get("groups"),
-    )?;
-
-    // validateTLSCredentialSet(mode, ..., requireCertAndKey=false)
-    let ca_content = tls_listable_join(tls.and_then(|m| m.get("certificate")));
-    let ca_path = tls_get("certificate_path");
-    let cert_content = tls_listable_join(tls.and_then(|m| m.get("client_certificate")));
-    let cert_path = tls_get("client_certificate_path");
-    let key_content = tls_listable_join(tls.and_then(|m| m.get("client_key")));
-    let key_path = tls_get("client_key_path");
-    ovpn_validate_tls_credential_set(
-        mode,
-        ovpn_material_is_set(&ca_content, &ca_path),
-        ovpn_material_is_set(&cert_content, &cert_path),
-        ovpn_material_is_set(&key_content, &key_path),
-        !peer_fingerprints.is_empty(),
-    )?;
-
-    let topology = endpoint_str(obj, "topology");
-    let auth_retry = endpoint_str(obj, "auth_retry");
-    let mut pull_filters: Vec<Map<String, Value>> = Vec::new();
-    if let Some(Value::Array(items)) = obj.get("pull_filters") {
-        for item in items {
-            if let Value::Object(m) = item {
-                pull_filters.push(m.clone());
-            }
-        }
-    }
-    ovpn_validate_client_policy_options(topology, auth_retry, &pull_filters, fragment)
-}
-
-/// buildStaticKeyClientOptions (client.go:316).
-fn openvpn_client_static_options(obj: &Map<String, Value>) -> Result<(), String> {
-    if ovpn_nested_present(obj, "tls") {
-        return Err("`tls` options are not supported in `static_key` mode".to_string());
-    }
-    let auth_retry = endpoint_str(obj, "auth_retry");
-    if !endpoint_str(obj, "username").is_empty()
-        || !endpoint_str(obj, "password").is_empty()
-        || (!auth_retry.is_empty() && auth_retry != "none")
-        || !endpoint_str(obj, "static_challenge").is_empty()
-        || ep_bool_val(obj, "static_challenge_echo")
-    {
-        return Err(
-            "username/password authentication is not supported in `static_key` mode".to_string(),
-        );
-    }
-    if ep_bool_val(obj, "route_no_pull") || ovpn_listable_len(obj.get("pull_filters")) > 0 {
-        return Err("pull options are not supported in `static_key` mode".to_string());
-    }
-    if ep_ns(obj, "renegotiate_interval") != 0
-        || ep_bool_val(obj, "renegotiate_disabled")
-        || ep_u64_val(obj, "renegotiate_bytes") != 0
-        || ep_u64_val(obj, "renegotiate_packets") != 0
-        || ep_ns(obj, "tls_timeout") != 0
-        || ep_ns(obj, "handshake_window") != 0
-    {
-        return Err(
-            "TLS timing and renegotiation options are not supported in `static_key` mode"
-                .to_string(),
-        );
-    }
-    if ovpn_listable_len(obj.get("data_ciphers")) > 0
-        || !endpoint_str(obj, "data_ciphers_fallback").is_empty()
-    {
-        return Err(
-            "`data_ciphers` and `data_ciphers_fallback` are not supported in `static_key` mode; use `cipher`"
-                .to_string(),
-        );
-    }
-    ovpn_required_material_source(
-        "static_key",
-        obj.get("static_key"),
-        endpoint_str(obj, "static_key_path"),
-    )?;
-    ovpn_key_direction_value(endpoint_str(obj, "key_direction"))?;
-    Ok(())
-}
-
-/// tls branch (client.go:181).
-fn openvpn_client_tls_options(obj: &Map<String, Value>) -> Result<(), String> {
-    if !ovpn_nested_present(obj, "tls") {
-        return Err("missing `tls` options".to_string());
-    }
-    if ovpn_listable_len(obj.get("static_key")) > 0
-        || !endpoint_str(obj, "static_key_path").is_empty()
-    {
-        return Err(
-            "`static_key` and `static_key_path` are only supported in `static_key` mode"
-                .to_string(),
-        );
-    }
-    if !endpoint_str(obj, "key_direction").is_empty() {
-        return Err(
-            "`key_direction` is only supported in `static_key` mode; use `tls.control_wrap.direction` for `tls_auth`"
-                .to_string(),
-        );
-    }
-    if !endpoint_str(obj, "cipher").is_empty() {
-        return Err(
-            "`cipher` is only supported in `static_key` mode; use `data_ciphers` or `data_ciphers_fallback` in TLS mode"
-                .to_string(),
-        );
-    }
-    let tls = match obj.get("tls") {
-        Some(Value::Object(m)) => m,
-        _ => return Err("missing `tls` options".to_string()),
-    };
-    ovpn_material_source(
-        "tls.certificate",
-        tls.get("certificate"),
-        &tls_str(tls, "certificate_path"),
-    )?;
-    ovpn_material_source(
-        "tls.client_certificate",
-        tls.get("client_certificate"),
-        &tls_str(tls, "client_certificate_path"),
-    )?;
-    ovpn_material_source(
-        "tls.client_key",
-        tls.get("client_key"),
-        &tls_str(tls, "client_key_path"),
-    )?;
-    // control wrap
-    if let Some(Value::Object(wrap)) = tls.get("control_wrap")
-        && ovpn_control_wrap_active(wrap, false)
-    {
-        let control_key = ovpn_required_material_source(
-            "tls.control_wrap.key",
-            wrap.get("key"),
-            &tls_str(wrap, "key_path"),
-        )?;
-        let _ = control_key;
-        let wrap_type = tls_str(wrap, "type");
-        let direction = tls_str(wrap, "direction");
-        match wrap_type.as_str() {
-            "tls_auth" => {
-                ovpn_key_direction_value(&direction)?;
-            }
-            "tls_crypt" | "tls_crypt_v2" => {
-                if !direction.is_empty() {
-                    return Err(
-                        "`tls.control_wrap.direction` is only supported by `tls_auth`".to_string(),
-                    );
-                }
-            }
-            "" => return Err("missing control wrap type".to_string()),
-            other => return Err(format!("unknown control wrap type: {other}")),
-        }
-    }
-    let remote_certificate_tls = tls_str(tls, "remote_certificate_tls");
-    if !OVPN_REMOTE_CERT_TLS.contains(&remote_certificate_tls.as_str()) {
-        return Err(format!(
-            "invalid `tls.remote_certificate_tls`: {remote_certificate_tls}"
-        ));
-    }
-    let remote_certificate_eku = tls_str(tls, "remote_certificate_eku");
-    if !remote_certificate_eku.is_empty() && !remote_certificate_tls.is_empty() {
-        return Err(
-            "`tls.remote_certificate_eku` is conflict with `tls.remote_certificate_tls`"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn tls_str(map: &Map<String, Value>, key: &str) -> String {
-    map.get(key)
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string()
-}
 
 // ---------------------------------------------------------------------------
 // openvpn-server initialize — sbx-src protocol/openvpn/server.go

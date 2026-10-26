@@ -1657,12 +1657,6 @@ async fn probe_delay(router: &Router, index: usize, url: &str) -> Option<u16> {
     let dialled = router.connect_index(index, &target).await;
     let conn = match dialled {
         Ok(crate::inbound::Conn::Plain(conn)) => conn,
-        Ok(_) => {
-            crate::logging::debug(format_args!(
-                "delay[{index}]: dial {host}:{port}: non-plain connection"
-            ));
-            return None;
-        }
         Err(e) => {
             crate::logging::debug(format_args!("delay[{index}]: dial {host}:{port}: {e}"));
             return None;

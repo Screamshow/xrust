@@ -1,5 +1,4 @@
 pub mod asn1_x509;
-pub mod fptn;
 pub mod go_regex;
 pub mod netip_parse;
 pub mod srs;
@@ -26,21 +25,14 @@ pub fn xhttp_session_table(table: &str) -> &str {
 
 /// Full `sing-box check` equivalent plus the reference's warning lines
 /// (deprecated `route.lx_idle_*` aliases and friends), which do not fail the
-/// check. FPTN token outbounds are validated as written, then expanded into
-/// per-server outbounds + urltest group and validated again.
+/// check.
 ///
 /// The config is read as a `Value` and every section is taken apart by the
 /// module that needs it: a struct with one `Option<Value>` per section was only
 /// ever a second copy of the schema.
 pub fn check_str_warnings(raw: &str) -> Result<Vec<String>, String> {
     let value: Value = serde_json::from_str(raw).map_err(|e| e.to_string())?;
-    // as written first (an fptn `token` field is not part of the schema)
-    validate::validate(&value)?;
-    match fptn::expand(&value) {
-        Ok(Some(expanded)) => validate::validate_with_warnings(&expanded),
-        Ok(None) => Ok(validate::take_warnings()),
-        Err(e) => Err(e),
-    }
+    validate::validate_with_warnings(&value)
 }
 
 /// Full `sing-box check` equivalent: schema parse + semantic validation.

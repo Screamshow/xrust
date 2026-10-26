@@ -456,7 +456,7 @@ fn parse_len(val: &str) -> Result<usize, String> {
 }
 
 fn parse_header_key(spec: &str, at: &str) -> anyhow::Result<[u8; 32]> {
-    let decoded = super::super::shadowsocks::crypto::decode_base64_std(spec).map_err(|e| {
+    let decoded = crate::util::decode_base64_std(spec).map_err(|e| {
         anyhow!(
             "{at}: amneziawg: decode header_protection_key \
                  (expected base64, as printed by `awg genkey`): {e}"

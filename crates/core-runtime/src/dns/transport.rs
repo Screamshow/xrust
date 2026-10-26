@@ -1791,7 +1791,7 @@ async fn quic_endpoint(
     let socket = dialer.udp(cfg, addr).await?.into_std()?;
     socket.set_nonblocking(true)?;
     let mut reset = [0u8; 32];
-    let _ = crate::outbound::shadowsocks::crypto::random_bytes(&mut reset);
+    let _ = crate::util::random_bytes(&mut reset);
     let endpoint_config = quinn::EndpointConfig::new(Arc::new(
         crate::outbound::quic::HmacSha256Wrapper::new(&reset),
     ));

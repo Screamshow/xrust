@@ -17,8 +17,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::inbound::Target;
 use crate::logging;
-use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::outbound::urltest::parse_duration;
+use crate::util::random_bytes;
 
 /// Reference `hysteria.MbpsToBps`.
 pub(crate) const MBPS_TO_BPS: u64 = 125_000;

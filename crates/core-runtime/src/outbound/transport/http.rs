@@ -11,7 +11,7 @@ use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::inbound::AnyStream;
-use crate::outbound::shadowsocks::crypto::random_bytes;
+use crate::util::random_bytes;
 
 use super::authority;
 use super::h2io::{H2Io, H2Stream};

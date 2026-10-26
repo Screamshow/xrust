@@ -38,8 +38,8 @@ use crate::inbound::udp::DEFAULT_UDP_TIMEOUT;
 use crate::inbound::{AnyStream, Target};
 use crate::logging;
 use crate::outbound::quic::udp_loopback_pair;
-use crate::outbound::shadowsocks::crypto::decode_base64_std;
 use crate::outbound::urltest::parse_duration;
+use crate::util::decode_base64_std;
 
 const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 const REKEY_AFTER_TIME: Duration = Duration::from_secs(120);

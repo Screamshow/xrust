@@ -22,8 +22,8 @@ use tokio::net::TcpStream;
 
 use crate::inbound::AnyStream;
 use crate::outbound::proxy::base64_std;
-use crate::outbound::shadowsocks::crypto::random_bytes;
 use crate::tls_client::TlsOptions;
+use crate::util::random_bytes;
 
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const OP_BINARY: u8 = 0x2;

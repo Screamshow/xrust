@@ -42,7 +42,6 @@ base64.workspace = true
 blake2.workspace = true
 blake3.workspace = true
 bytes.workspace = true
-cfb-mode.workspace = true
 chacha20 = "0.9"
 crypto_box = { version = "0.9", default-features = false, features = ["alloc", "salsa20"] }
 chacha20poly1305.workspace = true
@@ -60,14 +59,12 @@ hmac.workspace = true
 http.workspace = true
 # raw DEFLATE for the external_ui bundle; miniz_oxide keeps it pure Rust
 flate2.workspace = true
-md-5.workspace = true
 quinn.workspace = true
 regex.workspace = true
 aho-corasick.workspace = true
 rustls-pemfile.workspace = true
 sha1.workspace = true
 sha2.workspace = true
-sha3.workspace = true
 tokio-rustls.workspace = true
 tokio = { version = "1", features = [
     "rt-multi-thread",
@@ -80,7 +77,6 @@ tokio = { version = "1", features = [
 ] }
 socket2 = { version = "0.6", features = ["all"] }
 lru.workspace = true
-cipher = "0.4"
 # 64-bit atomics on mips32: std::sync::atomic::AtomicU64 does not exist
 # there and the mips build dies on the import. On every target that has
 # native LL/SC for 64 bits this is the same type std uses, so nothing

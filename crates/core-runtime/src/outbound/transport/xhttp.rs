@@ -131,7 +131,7 @@ impl Range {
             return self.0;
         }
         let mut b = [0u8; 8];
-        let _ = crate::outbound::shadowsocks::crypto::random_bytes(&mut b);
+        let _ = crate::util::random_bytes(&mut b);
         self.0 + u64::from_le_bytes(b) % (self.1 - self.0 + 1)
     }
 }
@@ -2117,7 +2117,7 @@ fn new_session_id(meta: &Meta) -> String {
     const HEX: &[u8] = b"0123456789abcdef";
     if meta.session_table.is_empty() || meta.session_len.0 == 0 {
         let mut b = [0u8; 16];
-        let _ = crate::outbound::shadowsocks::crypto::random_bytes(&mut b);
+        let _ = crate::util::random_bytes(&mut b);
         let mut h = String::with_capacity(36);
         for (i, v) in b.iter().enumerate() {
             if matches!(i, 4 | 6 | 8 | 10) {
@@ -2135,7 +2135,7 @@ fn new_session_id(meta: &Meta) -> String {
     let mut out = String::with_capacity(len);
     let mut buf = [0u8; 8];
     for _ in 0..len {
-        let _ = crate::outbound::shadowsocks::crypto::random_bytes(&mut buf);
+        let _ = crate::util::random_bytes(&mut buf);
         out.push(table[u64::from_le_bytes(buf) as usize % table.len()]);
     }
     out
@@ -2168,7 +2168,7 @@ fn tokenish(target: usize) -> String {
     const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let rng_byte = || -> u8 {
         let mut b = [0u8; 1];
-        let _ = crate::outbound::shadowsocks::crypto::random_bytes(&mut b);
+        let _ = crate::util::random_bytes(&mut b);
         b[0]
     };
     // base62 chars are ~0.8 huffman bytes of entropy each on average.

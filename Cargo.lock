@@ -200,15 +200,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cfb-mode"
-version = "0.8.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "738b8d467867f80a71351933f70461f5b56f24d5c93e0cf216e59229c968d330"
-dependencies = [
- "cipher",
-]
-
-[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -364,10 +355,8 @@ dependencies = [
  "blake2",
  "blake3",
  "bytes",
- "cfb-mode",
  "chacha20 0.9.1",
  "chacha20poly1305",
- "cipher",
  "core-config",
  "core-crypto",
  "core-experimental",
@@ -386,7 +375,6 @@ dependencies = [
  "if-addrs",
  "libc",
  "lru",
- "md-5",
  "ml-kem",
  "portable-atomic",
  "quinn",
@@ -397,7 +385,6 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
- "sha3",
  "smoltcp",
  "socket2",
  "tokio",
@@ -1341,16 +1328,6 @@ name = "managed"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
-
-[[package]]
-name = "md-5"
-version = "0.10.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d89e7ee0cfbedfc4da3340218492196241d89eefb6dab27de5df917a6d2e78cf"
-dependencies = [
- "cfg-if",
- "digest",
-]
 
 [[package]]
 name = "memchr"

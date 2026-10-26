@@ -104,7 +104,7 @@ impl H3Conn {
 
         let sock = bind_udp(server)?;
         let mut reset = [0u8; 32];
-        crate::outbound::shadowsocks::crypto::random_bytes(&mut reset)?;
+        crate::util::random_bytes(&mut reset)?;
         let endpoint_config = quinn::EndpointConfig::new(Arc::new(
             crate::outbound::quic::HmacSha256Wrapper::new(&reset),
         ));

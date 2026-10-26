@@ -6,12 +6,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
 use crate::clash_state;
 use crate::logging;
-use crate::outbound::shadowsocks::stream::{SsReader, SsWriter};
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
 pub mod direct;
@@ -128,7 +127,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any> ProxyStream for T
     }
 }
 pub type AnyStream = Box<dyn ProxyStream>;
-pub type AnyRead = Box<dyn AsyncRead + Send + Unpin>;
 pub type AnyWrite = Box<dyn AsyncWrite + Send + Unpin>;
 
 /// Vision's peer can stop outer TLS encryption independently of our writes.
@@ -243,23 +241,18 @@ pub fn stream_alpn(stream: &AnyStream) -> Option<&[u8]> {
     None
 }
 
-/// An established upstream connection: raw streams or a shadowsocks codec.
+/// An established upstream connection.
 pub enum Conn {
     Plain(AnyStream),
-    Shadowsocks(Box<SsReader<AnyRead>>, SsWriter<AnyWrite>),
 }
 
 // A `Conn` is a finished upstream stream; the runtime fetches (rule-sets,
 // provider updates) read and write one directly.
 impl Conn {
-    /// Box a plain upstream stream; shadowsocks connections cannot be split
-    /// into a reader/writer pair, so they are rejected here.
+    /// The upstream stream.
     pub fn into_plain(self) -> io::Result<AnyStream> {
         match self {
             Conn::Plain(stream) => Ok(stream),
-            Conn::Shadowsocks(_, _) => Err(io::Error::other(
-                "runtime fetch does not support the shadowsocks codec stream",
-            )),
         }
     }
 }
@@ -686,71 +679,6 @@ where
             }
             Ok(())
         }
-        Conn::Shadowsocks(mut reader, mut writer) => {
-            if !prefix.is_empty() {
-                writer.write_chunk(prefix).await?;
-            }
-            let chunk_size = usize::from(writer.max_chunk());
-            let ss_buf_size = match relay_buf().checked_div(chunk_size) {
-                Some(whole) => (whole * chunk_size).max(chunk_size),
-                None => relay_buf(),
-            };
-            let mut up_buf = take_buf();
-            up_buf.resize(ss_buf_size, 0);
-            let mut down_buf = take_buf();
-            down_buf.resize(ss_buf_size, 0);
-            let (mut client_read, mut client_write) = tokio::io::split(client);
-            let up = async {
-                loop {
-                    let n = client_read.read(&mut up_buf).await?;
-                    if n == 0 {
-                        half.finish();
-                        return Ok(());
-                    }
-                    writer.write_chunk(&up_buf[..n]).await?;
-                    if let Some(tracker) = tracker {
-                        tracker.add_upload(n as u64);
-                    }
-                }
-            };
-            let down = async {
-                loop {
-                    match reader.read(&mut down_buf).await {
-                        Ok(0) => {
-                            half.finish();
-                            return Ok(());
-                        }
-                        Ok(n) => {
-                            client_write.write_all(&down_buf[..n]).await?;
-                            if let Some(tracker) = tracker {
-                                tracker.add_download(n as u64);
-                            }
-                        }
-                        Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
-                            half.finish();
-                            return Ok(());
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
-            };
-            let result = match tracker {
-                Some(tracker) => {
-                    let signal = tracker.close_signal();
-                    let relay = async { tokio::try_join!(up, down).map(|_| ()) };
-                    tokio::pin!(relay);
-                    tokio::select! {
-                        biased;
-                        result = &mut relay => result,
-                        _ = signal.wait() => Err(closed_by_api()),
-                    }
-                }
-                None => tokio::try_join!(up, down).map(|_| ()),
-            };
-            give_buf(up_buf);
-            give_buf(down_buf);
-            result
-        }
     }
 }
 
@@ -759,9 +687,9 @@ fn closed_by_api() -> io::Error {
     io::Error::other("connection closed by clash api")
 }
 
-/// Each direction of a userspace relay moves up to this much per read. Sized
-/// to two whole shadowsocks 2022 chunks (2 * 65535 ~ 128 KiB) so a steady transfer
-/// costs one write per two chunks or eight TLS records, halving syscalls on routers.
+/// Each direction of a userspace relay moves up to this much per read
+/// (2 * 65535 ~ 128 KiB), so a steady transfer costs one write per eight TLS
+/// records, halving syscalls on routers.
 ///
 /// Buffers are recycled through `BUF_POOL`. The pool retains at most
 /// `POOL_CAP * relay_buf()` (2 MiB); directions with pending data own additional
@@ -1002,6 +930,7 @@ impl Drop for PooledBuffer {
 #[cfg(test)]
 mod relay_buffer_tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn drained_buffer_is_released_and_reused_without_losing_data() {
@@ -1175,6 +1104,7 @@ where
 mod half_open_tests {
     use super::*;
     use std::time::Duration;
+    use tokio::io::AsyncReadExt;
     use tokio::io::duplex;
     use tokio::time::{Instant, timeout};
 

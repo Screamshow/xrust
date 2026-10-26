@@ -39,10 +39,10 @@ fn encode_vless_target(target: &Target) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// vless wants a canonical UUID and nothing else, which is not what vmess and
-/// tuic want: those fall back to a UUIDv5 of the raw string
-/// (`vmess::kdf::parse_uuid`). Two functions on purpose -- sharing one would
-/// either hand vless a UUID nobody configured, or refuse vmess names.
+/// vless wants a canonical UUID and nothing else. The server side falls back
+/// to a UUIDv5 of the raw string (`inbound::proxy::parse_user_uuid`), as the
+/// reference does for users; a client must not dial with a UUID nobody
+/// configured, so the two stay apart.
 fn parse_uuid(raw: &str) -> io::Result<[u8; 16]> {
     let hex: String = raw.chars().filter(|c| *c != '-').collect();
     if hex.len() != 16 * 2 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
