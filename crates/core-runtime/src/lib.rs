@@ -561,17 +561,21 @@ pub async fn run_with_loader(
             .and_then(|raw| checked_reload_config(&raw, &instance.router()));
         let next = match checked {
             Ok(next) => next,
-            Err((_, error)) => {
+            Err((parsed, error)) => {
                 logging::warn(format_args!(
                     "reload configuration rejected; keeping current runtime: {error:#}"
                 ));
+                instance.router().record_rejected_reload(parsed.as_ref());
                 continue;
             }
         };
         if can_reload_in_place(&root, &next) {
             match instance.reload_in_place(&next).await {
                 Ok(()) => root = next,
-                Err(error) => logging::warn(format_args!("hot reload failed: {error:#}")),
+                Err(error) => {
+                    logging::warn(format_args!("hot reload failed: {error:#}"));
+                    instance.router().record_rejected_reload(Some(&next));
+                }
             }
             continue;
         }
@@ -674,6 +678,38 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_reload_is_reported_without_changing_the_applied_generation() {
+        let root = json!({"outbounds":[{"type":"direct","tag":"old"}],"route":{"final":"old"}});
+        let mut instance = start(&root).await.unwrap();
+        let router = instance.router();
+        let before = router.applied_config();
+        assert_eq!(before["reload_attempt"], 1);
+        let refused =
+            json!({"outbounds":[{"type":"direct","tag":"x"}],"route":{"final":"missing"}});
+        router.record_rejected_reload(Some(&refused));
+        let after = router.applied_config();
+        assert_eq!(after["generation"], before["generation"]);
+        assert_eq!(after["config_sha256"], before["config_sha256"]);
+        assert_eq!(after["reload_attempt"], 2);
+        assert_eq!(
+            after["rejected_sha256"],
+            json!(configuration_fingerprint(&refused))
+        );
+        router.record_rejected_reload(None);
+        assert_eq!(router.applied_config()["rejected_sha256"], Value::Null);
+        // a later success clears the rejection
+        let mut next = root.clone();
+        next["outbounds"][0]["tag"] = json!("new");
+        next["route"]["final"] = json!("new");
+        instance.reload_in_place(&next).await.unwrap();
+        let applied = router.applied_config();
+        assert_eq!(applied["generation"], 2);
+        assert_eq!(applied["reload_attempt"], 4);
+        assert!(applied.get("rejected_sha256").is_none());
+        instance.shutdown_wait().await;
     }
 
     #[test]

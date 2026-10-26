@@ -1328,11 +1328,25 @@ impl Router {
         let hash = crate::configuration_fingerprint(root);
         let mut state = self.applied_config.lock().expect("applied config");
         let generation = state["generation"].as_u64().unwrap_or(0) + 1;
+        let attempt = state["reload_attempt"].as_u64().unwrap_or(0) + 1;
         *state = serde_json::json!({
             "pid": std::process::id(), "generation": generation,
             "config_sha256": hash, "ready": true,
-            "hot_reload": true, "connection_revalidation": true, "schema": 1
+            "hot_reload": true, "connection_revalidation": true, "schema": 1,
+            "reload_attempt": attempt
         });
+    }
+
+    /// A reload that left the running configuration in place. The generation
+    /// and hash stay; `rejected_sha256` names the refused configuration when
+    /// it was valid JSON, so a waiting manager can stop waiting for it.
+    pub(crate) fn record_rejected_reload(&self, rejected: Option<&Value>) {
+        let mut state = self.applied_config.lock().expect("applied config");
+        let attempt = state["reload_attempt"].as_u64().unwrap_or(0) + 1;
+        state["reload_attempt"] = attempt.into();
+        state["rejected_sha256"] = rejected
+            .map(crate::configuration_fingerprint)
+            .map_or(Value::Null, Value::String);
     }
 
     pub fn defaults(&self) -> RouteDefaults {
