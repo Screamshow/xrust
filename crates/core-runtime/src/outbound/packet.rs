@@ -29,7 +29,9 @@ pub(crate) const CMD_MUX: u8 = 3;
 /// `packetaddr.SeqPacketMagicAddress`
 pub(crate) const SEQ_PACKET_MAGIC: &str = "sp.packet-addr.v2fly.arpa";
 
-const MAX_DATAGRAM: usize = 65_535;
+/// Framed-datagram buffer a UDP bridge keeps between datagrams; a larger one
+/// left by a jumbo datagram is dropped once written.
+const FRAMED_KEEP: usize = 16 * 1024;
 /// the largest address: type + 16 bytes + port
 pub(crate) const MAX_ADDR_PORT: usize = 19;
 
@@ -324,18 +326,26 @@ fn spawn_packet_bridge_with_timeout(
     let in_socket = Arc::clone(&out_socket);
     let mut out = PacketWriter::new(mode);
     let upstream = async move {
-        let mut buf = vec![0u8; MAX_DATAGRAM];
+        // Datagrams land in the per-thread receive scratch; only the framed
+        // copy is owned here.
         let mut framed = Vec::new();
         loop {
-            let Ok(n) = in_socket.recv(&mut buf).await else {
+            let framing = crate::inbound::udp::recv_with(&in_socket, |datagram| {
+                out.frame_into(&target, datagram, &mut framed)
+            })
+            .await;
+            let Ok(framing) = framing else {
                 break;
             };
             sent.send_replace(tokio::time::Instant::now());
-            if out.frame_into(&target, &buf[..n], &mut framed).is_err() {
+            if framing.is_err() {
                 break;
             }
             if writer.write_all(&framed).await.is_err() {
                 break;
+            }
+            if framed.capacity() > FRAMED_KEEP {
+                framed = Vec::new();
             }
         }
     };
@@ -425,6 +435,51 @@ mod tests {
                 })
                 .await
                 .expect("idle packet socket retained");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_bridge_keeps_datagram_order_and_bytes_through_shared_scratch() {
+        // two flows on one thread share the receive scratch
+        let mut flows = Vec::new();
+        for _ in 0..2 {
+            let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
+            let (stream, remote) = tokio::io::duplex(1024);
+            spawn_packet_bridge_with_timeout(
+                Box::new(stream),
+                peer,
+                PacketEncoding::LengthPrefixed,
+                Target::Ip("127.0.0.1:53".parse().unwrap()),
+                std::time::Duration::from_secs(5),
+            );
+            flows.push((
+                client,
+                remote,
+                PacketReader::new(PacketEncoding::LengthPrefixed),
+            ));
+        }
+        let sizes = [
+            1usize, 7, 1200, 1500, 40_000, 3, 65_000, 512, 17_000, 2, 9000, 1,
+        ];
+        for round in 0..4 {
+            for (index, &size) in sizes.iter().enumerate() {
+                for (flow, (client, remote, reader)) in flows.iter_mut().enumerate() {
+                    let seed = (round * 31 + index * 7 + flow * 101) as u8;
+                    let datagram: Vec<u8> = (0..size)
+                        .map(|i| (i as u8).wrapping_mul(13).wrapping_add(seed))
+                        .collect();
+                    client.send(&datagram).await.unwrap();
+                    let got = tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        reader.read(remote),
+                    )
+                    .await
+                    .expect("datagram not bridged")
+                    .unwrap();
+                    assert_eq!(got.len(), size);
+                    assert!(got == datagram, "flow {flow} datagram {index} differs");
+                }
             }
         }
     }

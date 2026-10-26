@@ -575,16 +575,14 @@ impl WireGuard {
 
         // sends: loopback peer socket → stack (mirrors the hysteria2 bridge).
         tokio::spawn(async move {
-            let mut buf = vec![0u8; MAX_DATAGRAM];
-            while let Ok(Ok(n)) = tokio::time::timeout(udp_timeout, peer.recv(&mut buf)).await {
-                if cmd_tx
-                    .send(Cmd::UdpSend {
-                        port,
-                        bytes: buf[..n].to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
+            // read through the per-thread scratch; only the datagram is copied
+            while let Ok(Ok(bytes)) = tokio::time::timeout(
+                udp_timeout,
+                crate::inbound::udp::recv_with(&peer, <[u8]>::to_vec),
+            )
+            .await
+            {
+                if cmd_tx.send(Cmd::UdpSend { port, bytes }).await.is_err() {
                     break;
                 }
             }
