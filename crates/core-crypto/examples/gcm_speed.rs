@@ -17,6 +17,10 @@ fn main() {
     let kind = match &gcm {
         #[cfg(target_arch = "x86_64")]
         Gcm::Ni(_) => "ni",
+        #[cfg(target_arch = "aarch64")]
+        Gcm::V8(_) => "v8",
+        #[cfg(target_os = "linux")]
+        Gcm::Alg(_) => "afalg",
         Gcm::Soft128(_) | Gcm::Soft256(_) => "soft",
         #[allow(unreachable_patterns)]
         _ => "other",
