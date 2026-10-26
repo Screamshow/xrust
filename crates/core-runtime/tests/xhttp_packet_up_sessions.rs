@@ -623,6 +623,10 @@ async fn server_fault_ends_the_session(fault: Fault) {
     let base = open_fds();
     let mut s = socks_connect(socks, target).await.expect("connect");
     s.write_all(b"request\n").await.unwrap();
+    // the first payload rides in POST 0 with the request head; a second write
+    // is what makes an upload POST the faulty server can refuse
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = s.write_all(b"more\n").await;
     let mut buf = [0u8; 64];
     let end = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
         .await

@@ -182,28 +182,21 @@ impl Vless {
         let request = if rest.is_empty() {
             // ws early data carried all of it in the upgrade request
             PendingHead::sent()
-        } else if self.transport.is_xhttp() {
-            // XHTTP keeps the head on a write of its own. In packet-up every
-            // write is a sequenced POST, and a POST carrying the head *and* the
-            // first payload was read back twice by Xray 26.9, so the far end got
-            // the payload two times (measured with tests/spikes/xhttp: one
-            // 13-byte payload and a 26-byte head, `firstLen = 156` and a broken
-            // tunnel glued, `firstLen = 26` and a healthy one split, which is also
-            // what sing-box sends there). The head is inside the HTTP body of
-            // an encrypted request in every XHTTP mode, so its size does not
-            // stand alone as a record the way it does on a stream transport.
-            stream.write_all(rest).await?;
-            stream.flush().await?;
-            PendingHead::sent()
         } else {
-            // Everywhere else the head waits for the first payload and both go
-            // in one write, as Xray's client sends them (`proxy/vless/outbound`:
+            // The head waits for the first payload and both go in one write, as
+            // Xray's client sends them (`proxy/vless/outbound`:
             // the head goes into a `BufferedWriter`, the first payload read
             // within 500 ms is written behind it, `SetBuffered(false)` flushes
             // both). Over TLS one write is one record, so the head alone would
             // be a first application-data record of a few dozen bytes, a shape no
             // browser sends; on ws, gRPC and the rest it would be a frame or a
-            // message of its own. A destination that talks first gets the head
+            // message of its own, and on XHTTP packet-up a POST of its own.
+            // (A glued POST was once read back twice by Xray 26.9; the cause was
+            // our client sending each POST's payload in the body *and* in an
+            // `x-data` header, fixed since, not the gluing: Xray's own client
+            // glues, and ours glued passes against Xray 26.10.21 in packet-up,
+            // stream-up and stream-one, see tests/vless_first_record.rs.)
+            // A destination that talks first gets the head
             // when the wait is over, with Vision's padded empty frame behind it
             // ("Insert padding with empty content to camouflage VLESS header").
             let mut head = rest.to_vec();

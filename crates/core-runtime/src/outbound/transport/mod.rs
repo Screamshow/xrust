@@ -235,13 +235,6 @@ impl Transport {
         Ok(Self { kind })
     }
 
-    /// XHTTP turns writes into HTTP requests (one POST per write in
-    /// packet-up), so how a protocol head is cut into writes is visible to the
-    /// server's request handling there, not only as record sizes.
-    pub(crate) fn is_xhttp(&self) -> bool {
-        matches!(self.kind, Kind::Xhttp(_))
-    }
-
     /// The ALPN this transport asks for when the config sets none.
     ///
     /// XHTTP is HTTP/1.1 and nothing else: the reference refuses h2 there even
