@@ -50,7 +50,9 @@ const FRAME_HEADER: usize = 7;
 /// frame payloads carry a u16 length, so the frame takes the whole field
 const MAX_FRAME_PAYLOAD: usize = u16::MAX as usize;
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const CLIENT_VERSION: &str = "tachyon-core/anytls";
+/// What sing-box 1.14.3 sends (its bundled sing-anytls v0.0.11), so the
+/// settings frame does not single this client out.
+const CLIENT_VERSION: &str = "sing-anytls/0.0.11";
 /// Concurrent TLS sessions: below it a stream dials its own, at it streams
 /// share the least-loaded one. One session per connection made 1000 idle
 /// connections cost 1000 handshakes and ~1 GiB of RSS.
@@ -713,7 +715,7 @@ mod tests {
         let payload = settings_payload(None);
         let text = String::from_utf8(payload.clone()).expect("utf8");
         assert!(text.contains("v=2"), "{text}");
-        assert!(text.contains("client=tachyon-core/anytls"), "{text}");
+        assert!(text.contains("client=sing-anytls/0.0.11"), "{text}");
         assert_eq!(settings_version(&payload), Some(2));
         let custom = settings_payload(Some("curl/8"));
         assert!(
