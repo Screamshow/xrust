@@ -3020,6 +3020,9 @@ fn validate_rule_sets(route: &Map<String, Value>) -> Result<(), String> {
                 let absolute = std::path::absolute(path)
                     .map(|path| path.to_string_lossy().to_string())
                     .unwrap_or_else(|_| path.to_string());
+                if loaded_rule_set_file(path) {
+                    continue;
+                }
                 let data = std::fs::read(path).map_err(|err| {
                     format!("{at_init}: {}", go_path_error("open", &absolute, &err))
                 })?;
@@ -14403,6 +14406,32 @@ fn record_warnings(warnings: Vec<String>) {
     if let Ok(mut slot) = WARNINGS.lock() {
         slot.extend(warnings);
     }
+}
+
+thread_local! {
+    /// Local rule-set paths whose payload the caller has already verified.
+    static LOADED_RULE_SET_FILES: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::default();
+}
+
+/// Run `check` with `loaded` treated as verified local rule-set files.
+pub(crate) fn with_loaded_rule_set_files<T>(
+    loaded: &std::collections::HashSet<String>,
+    check: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LOADED_RULE_SET_FILES.with(|slot| slot.borrow_mut().clear());
+        }
+    }
+    LOADED_RULE_SET_FILES.with(|slot| slot.borrow_mut().clone_from(loaded));
+    let _reset = Reset;
+    check()
+}
+
+fn loaded_rule_set_file(path: &str) -> bool {
+    LOADED_RULE_SET_FILES.with(|slot| slot.borrow().contains(path))
 }
 
 /// Drain the warnings collected by the last `validate()` call.

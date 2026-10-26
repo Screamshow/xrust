@@ -369,6 +369,16 @@ pub(crate) fn build_rule_sets(
     route: &serde_json::Map<String, Value>,
     clients: &crate::http_client::Registry,
 ) -> anyhow::Result<rule_set::RuleSetRegistry> {
+    build_rule_sets_reusing(route, clients, None)
+}
+
+/// Build `route.rule_set`, sharing inline and local sets that `previous`
+/// already built from the same entry and the same file.
+pub(crate) fn build_rule_sets_reusing(
+    route: &serde_json::Map<String, Value>,
+    clients: &crate::http_client::Registry,
+    previous: Option<&rule_set::RuleSetRegistry>,
+) -> anyhow::Result<rule_set::RuleSetRegistry> {
     let mut registry = rule_set::RuleSetRegistry::new();
     let mut remotes = rule_set_remote::RemoteRegistry::new();
     let Some(list) = route.get("rule_set").filter(|value| !value.is_null()) else {
@@ -394,6 +404,21 @@ pub(crate) fn build_rule_sets(
             "mmap" => mmap_set::MmapMode::Mmap,
             _ => mmap_set::MmapMode::Auto,
         };
+        let origin = match ty {
+            "inline" => rule_set::RuleSetOrigin::new(entry, None),
+            "local" => {
+                let path = entry.get("path").and_then(Value::as_str).unwrap_or("");
+                rule_set::RuleSetOrigin::new(entry, Some(&resolve_rule_set_path(path, &tags)))
+            }
+            _ => None,
+        };
+        if let (Some(origin), Some(previous)) = (&origin, previous)
+            && let Some(set) = previous.reusable(origin)
+        {
+            logging::info(format_args!("kept unchanged rule-set {}", tags.join(",")));
+            registry.insert_built(set, Some(origin.clone()));
+            continue;
+        }
 
         match ty {
             "inline" => {
@@ -423,14 +448,15 @@ pub(crate) fn build_rule_sets(
                         "compiled and mmapped inline rule-set {}",
                         tags.join(",")
                     ));
-                    registry.insert(std::sync::Arc::new(rule_set::RuleSet::new_with_mmap(
-                        tags, mmap_set,
-                    )));
+                    registry.insert_built(
+                        std::sync::Arc::new(rule_set::RuleSet::new_with_mmap(tags, mmap_set)),
+                        origin.clone(),
+                    );
                 } else {
                     let set = rule_set::RuleSet::new(tags, rules)
                         .map_err(|err| anyhow::anyhow!("{at}: {err}"))?;
                     logging::info(format_args!("loaded rule-set {}", set.tags().join(",")));
-                    registry.insert(std::sync::Arc::new(set));
+                    registry.insert_built(std::sync::Arc::new(set), origin.clone());
                 }
             }
             "local" => {
@@ -448,9 +474,10 @@ pub(crate) fn build_rule_sets(
                         tags.join(","),
                         resolved_path
                     ));
-                    registry.insert(std::sync::Arc::new(rule_set::RuleSet::new_with_mmap(
-                        tags, mmap_set,
-                    )));
+                    registry.insert_built(
+                        std::sync::Arc::new(rule_set::RuleSet::new_with_mmap(tags, mmap_set)),
+                        origin.clone(),
+                    );
                 } else {
                     let rules = parse_rule_set_payload(&data, entry, &at)?;
                     // the file is not needed once decoded
@@ -477,14 +504,15 @@ pub(crate) fn build_rule_sets(
                             tags.join(","),
                             rules.len()
                         ));
-                        registry.insert(std::sync::Arc::new(rule_set::RuleSet::new_with_mmap(
-                            tags, mmap_set,
-                        )));
+                        registry.insert_built(
+                            std::sync::Arc::new(rule_set::RuleSet::new_with_mmap(tags, mmap_set)),
+                            origin.clone(),
+                        );
                     } else {
                         let set = rule_set::RuleSet::new(tags, rules)
                             .map_err(|err| anyhow::anyhow!("{at}: {err}"))?;
                         logging::info(format_args!("loaded rule-set {}", set.tags().join(",")));
-                        registry.insert(std::sync::Arc::new(set));
+                        registry.insert_built(std::sync::Arc::new(set), origin.clone());
                     }
                 }
             }
@@ -746,6 +774,8 @@ pub struct RouterInner {
     /// single record per proxy, replaced by every successful probe.
     pub(crate) delay_history: Vec<std::sync::Mutex<Option<(String, u32)>>>,
     setup_timeouts: Vec<std::time::Duration>,
+    /// Lease files for the neighbour resolver, when anything reads it.
+    neighbor_lease_files: Option<Vec<String>>,
 }
 
 pub struct Router {
@@ -844,12 +874,16 @@ impl RouterInner {
     }
 
     pub(crate) fn build(root: &Value) -> anyhow::Result<Self> {
+        Self::build_reusing(root, None)
+    }
+
+    /// Build without touching process-wide state; `publish` installs that
+    /// once this inner is the one that serves traffic.
+    pub(crate) fn build_reusing(
+        root: &Value,
+        previous: Option<&rule_set::RuleSetRegistry>,
+    ) -> anyhow::Result<Self> {
         let defaults = RouteDefaults::parse(root.get("route"))?;
-        if let Some(tag) = &defaults.default_domain_resolver {
-            crate::dns::set_default_domain_resolver(Some(tag.clone()));
-        } else {
-            crate::dns::set_default_domain_resolver(None);
-        }
         let bind_iface = defaults.bind_interface();
         let empty = Vec::new();
         let outbounds_list = root
@@ -924,7 +958,11 @@ impl RouterInner {
                     logging::warn(format_args!("route.{key} is not implemented yet (ignored)"));
                 }
             }
-            registry = build_rule_sets(map, &crate::http_client::Registry::from_config(root)?)?;
+            registry = build_rule_sets_reusing(
+                map,
+                &crate::http_client::Registry::from_config(root)?,
+                previous,
+            )?;
             if let Some(list) = map.get("rules").and_then(Value::as_array) {
                 for (i, obj) in list.iter().enumerate() {
                     rules.push(Rule::build_with_rule_sets(
@@ -971,14 +1009,10 @@ impl RouterInner {
             .and_then(Value::as_bool)
             == Some(true)
             || rules.iter().any(Rule::needs_process);
-        if defaults.find_neighbor
+        let neighbor_lease_files = (defaults.find_neighbor
             || rules.iter().any(Rule::needs_neighbor)
-            || neighbor_domain_configured(root)
-        {
-            let resolver = neighbor::NeighborResolver::new(&lease_files);
-            resolver.start();
-            neighbor::install(resolver);
-        }
+            || neighbor_domain_configured(root))
+        .then_some(lease_files);
         let delay_history = (0..outbounds.len())
             .map(|_| std::sync::Mutex::new(None))
             .collect();
@@ -996,7 +1030,16 @@ impl RouterInner {
             probe_tasks: std::sync::Mutex::new(Vec::new()),
             delay_history,
             setup_timeouts,
+            neighbor_lease_files,
         })
+    }
+
+    /// Install the process-wide settings this inner was built with.
+    fn publish(&self) {
+        crate::dns::set_default_domain_resolver(self.defaults.default_domain_resolver.clone());
+        if let Some(lease_files) = &self.neighbor_lease_files {
+            neighbor::ensure(lease_files);
+        }
     }
 
     /// Start listening endpoints (e.g. WireGuard server listeners).
@@ -1147,9 +1190,13 @@ impl RouterInner {
 }
 
 impl Router {
-    pub(crate) fn prepare(root: &Value) -> anyhow::Result<Arc<Self>> {
+    /// A router for a hot reload: built beside the running `previous` and
+    /// sharing its unchanged inline and local rule sets.
+    pub(crate) fn prepare(root: &Value, previous: &Router) -> anyhow::Result<Arc<Self>> {
+        let previous = previous.inner();
+        let inner = RouterInner::build_reusing(root, previous.rule_sets.as_deref())?;
         Ok(Arc::new(Self {
-            inner: std::sync::RwLock::new(Arc::new(RouterInner::build(root)?)),
+            inner: std::sync::RwLock::new(Arc::new(inner)),
             connection_scope: Arc::new(()),
             applied_config: std::sync::Mutex::new(serde_json::json!({"generation": 0})),
             selection_cache: std::sync::RwLock::new(None),
@@ -1158,6 +1205,7 @@ impl Router {
 
     pub fn new(root: &Value) -> anyhow::Result<Arc<Router>> {
         let inner = RouterInner::build(root)?;
+        inner.publish();
         let router = Arc::new(Router {
             inner: std::sync::RwLock::new(Arc::new(inner)),
             connection_scope: Arc::new(()),
@@ -1474,6 +1522,7 @@ impl Router {
         }
 
         // 4. Atomically install new inner router
+        new_inner.publish();
         *self.inner.write().expect("router inner lock") = Arc::clone(&new_inner);
         self.prune_selection_cache();
 

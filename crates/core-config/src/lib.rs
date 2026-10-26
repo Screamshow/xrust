@@ -40,6 +40,18 @@ pub fn check_str(raw: &str) -> Result<(), String> {
     check_str_warnings(raw).map(|_| ())
 }
 
+/// `check` of a parsed document whose local rule-set files named in `loaded`
+/// were already decoded and verified by the caller (a running instance that
+/// loaded the very same files). Their payload is not decoded again; every
+/// other part of the document is checked as `check_str` does.
+pub fn check_value_with_loaded_rule_sets(
+    value: &Value,
+    loaded: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    validate::with_loaded_rule_set_files(loaded, || validate::validate_with_warnings(value))
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,6 +59,28 @@ mod tests {
     #[test]
     fn rejects_invalid_json() {
         assert!(check_str("{not json").is_err());
+    }
+
+    #[test]
+    fn loaded_rule_set_files_are_not_decoded_again() {
+        let path =
+            std::env::temp_dir().join(format!("xrust-loaded-set-{}.json", std::process::id()));
+        std::fs::write(&path, "{broken").unwrap();
+        let path_text = path.to_string_lossy().to_string();
+        let root = serde_json::json!({"route": {"rule_set": [
+            {"type": "local", "tag": "set", "format": "source", "path": path_text}
+        ]}});
+        let mut loaded = std::collections::HashSet::new();
+        assert!(check_value_with_loaded_rule_sets(&root, &loaded).is_err());
+        loaded.insert(path_text.clone());
+        assert!(check_value_with_loaded_rule_sets(&root, &loaded).is_ok());
+        // the exemption ends with the call
+        assert!(check_str(&root.to_string()).is_err());
+        // the rest of the document is still checked
+        let mut bad = root.clone();
+        bad["inbounds"] = serde_json::json!([{"type": "unknown"}]);
+        assert!(check_value_with_loaded_rule_sets(&bad, &loaded).is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -196,6 +196,61 @@ impl RuleSetIndexClone {
 pub struct RuleSetRegistry {
     sets: HashMap<String, Arc<RuleSet>>,
     remotes: Option<Arc<tokio::sync::Mutex<super::rule_set_remote::RemoteRegistry>>>,
+    /// Inline and local sets by what they were built from, so a hot reload
+    /// can share a set whose declaration and file did not change.
+    origins: HashMap<RuleSetOrigin, Arc<RuleSet>>,
+}
+
+/// What an inline or local set was built from: a digest of its `route.rule_set`
+/// entry and, for a local set, the identity of the file it read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RuleSetOrigin {
+    entry: [u8; 32],
+    file: Option<FileStamp>,
+}
+
+/// Device, inode, size and both change times. `ctime` cannot be set back by
+/// a writer, so a rewritten file never looks unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl RuleSetOrigin {
+    /// `None` when the file cannot be identified: such a set is always rebuilt.
+    pub(crate) fn new(entry: &serde_json::Map<String, Value>, file: Option<&str>) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        let file = match file {
+            Some(path) => Some(FileStamp::of(path)?),
+            None => None,
+        };
+        let entry = Sha256::digest(serde_json::to_vec(entry).ok()?).into();
+        Some(Self { entry, file })
+    }
+}
+
+impl FileStamp {
+    #[cfg(unix)]
+    fn of(path: &str) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn of(_path: &str) -> Option<Self> {
+        None
+    }
 }
 
 impl RuleSetRegistry {
@@ -207,6 +262,49 @@ impl RuleSetRegistry {
         for tag in set.tags() {
             self.sets.insert(tag.clone(), set.clone());
         }
+    }
+
+    /// Insert a set and remember what it was built from.
+    pub(crate) fn insert_built(&mut self, set: Arc<RuleSet>, origin: Option<RuleSetOrigin>) {
+        if let Some(origin) = origin {
+            self.origins.insert(origin, set.clone());
+        }
+        self.insert(set);
+    }
+
+    /// The set built earlier from exactly this origin.
+    pub(crate) fn reusable(&self, origin: &RuleSetOrigin) -> Option<Arc<RuleSet>> {
+        self.origins.get(origin).cloned()
+    }
+
+    /// The `path` values of local entries in `root` that this registry has
+    /// already loaded from the same declaration and the same file.
+    pub fn unchanged_local_paths(&self, root: &Value) -> std::collections::HashSet<String> {
+        let mut paths = std::collections::HashSet::new();
+        if self.origins.is_empty() {
+            return paths;
+        }
+        let entries = root
+            .get("route")
+            .and_then(|route| route.get("rule_set"))
+            .and_then(Value::as_array);
+        for entry in entries.into_iter().flatten().filter_map(Value::as_object) {
+            if entry.get("type").and_then(Value::as_str) != Some("local") {
+                continue;
+            }
+            let Some(path) = entry.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            // the check reads the literal path; only that one is vouched for
+            if path.contains("{tag}") {
+                continue;
+            }
+            if RuleSetOrigin::new(entry, Some(path)).is_some_and(|o| self.origins.contains_key(&o))
+            {
+                paths.insert(path.to_string());
+            }
+        }
+        paths
     }
 
     pub fn get(&self, tag: &str) -> Option<&Arc<RuleSet>> {

@@ -40,6 +40,17 @@ pub fn current() -> Option<Arc<NeighborResolver>> {
     slot().read().expect("neighbor resolver").clone()
 }
 
+/// Keep the running resolver when it reads the same lease files; otherwise
+/// start and install a new one. A replaced resolver's refresh task ends.
+pub fn ensure(lease_files: &[String]) {
+    let wanted = NeighborResolver::new(lease_files);
+    if current().is_some_and(|running| running.lease_files == wanted.lease_files) {
+        return;
+    }
+    wanted.start();
+    install(wanted);
+}
+
 /// The lease files a Linux router is known to keep, in the reference's order.
 const DEFAULT_LEASE_FILES: &[&str] = &[
     "/tmp/dhcp.leases",
@@ -103,12 +114,16 @@ impl NeighborResolver {
     /// Load once, then keep both tables fresh in the background.
     pub fn start(self: &Arc<Self>) {
         self.reload(true);
-        let resolver = Arc::clone(self);
+        // Weak: the task ends once this resolver is no longer installed.
+        let resolver = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                let Some(resolver) = resolver.upgrade() else {
+                    break;
+                };
                 resolver.reload(false);
             }
         });

@@ -699,3 +699,131 @@ async fn mmap_local_set_switches_to_memory_when_reloaded_with_regex() {
     assert!(!routed(&instance, "plain.com").await);
     instance.shutdown_wait().await;
 }
+
+/// A private directory for rule-set files of one test.
+fn rule_set_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("xrust-hot-reload-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn write_source_set(path: &std::path::Path, domains: &[&str]) {
+    // rename like a list update does, so the file gets a new identity
+    let staged = path.with_extension("tmp");
+    std::fs::write(
+        &staged,
+        json!({"version": 3, "rules": [{"domain_suffix": domains}]}).to_string(),
+    )
+    .unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
+#[tokio::test]
+async fn unchanged_rule_sets_are_shared_and_changed_ones_rebuilt() {
+    let dir = rule_set_dir("share");
+    let kept = dir.join("kept.json");
+    let edited = dir.join("edited.json");
+    write_source_set(&kept, &["kept.example"]);
+    write_source_set(&edited, &["old.example"]);
+    let config = |tag: &str| {
+        json!({
+            "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "direct", "tag": tag}],
+            "route": {"final": "direct", "rule_set": [
+                {"type": "local", "tag": "kept", "format": "source", "path": kept},
+                {"type": "local", "tag": "edited", "format": "source", "path": edited},
+                {"type": "inline", "tag": "inline", "rules": [{"domain": ["inline.example"]}]}
+            ], "rules": [{"rule_set": ["kept", "edited", "inline"], "outbound": tag}]}
+        })
+    };
+    let mut instance = core_runtime::start(&config("first")).await.unwrap();
+    let before = instance.router().rule_sets();
+
+    // only an outbound changes: every set is the very same one
+    instance.reload_in_place(&config("second")).await.unwrap();
+    let after = instance.router().rule_sets();
+    for tag in ["kept", "edited", "inline"] {
+        assert!(
+            std::sync::Arc::ptr_eq(before.get(tag).unwrap(), after.get(tag).unwrap()),
+            "{tag} was rebuilt"
+        );
+    }
+
+    // a rewritten file and a changed inline entry are loaded again
+    write_source_set(&edited, &["new.example", "other.example"]);
+    let mut next = config("third");
+    next["route"]["rule_set"][2]["rules"][0]["domain"] = json!(["inline2.example"]);
+    instance.reload_in_place(&next).await.unwrap();
+    let third = instance.router().rule_sets();
+    assert!(std::sync::Arc::ptr_eq(
+        after.get("kept").unwrap(),
+        third.get("kept").unwrap()
+    ));
+    for tag in ["edited", "inline"] {
+        assert!(
+            !std::sync::Arc::ptr_eq(after.get(tag).unwrap(), third.get(tag).unwrap()),
+            "{tag} was not rebuilt"
+        );
+    }
+    let ctx = |host: &str| {
+        core_runtime::route::ConnContext::new(
+            "in",
+            "127.0.0.1:1".parse().unwrap(),
+            core_runtime::inbound::Target::Domain(host.into(), 443),
+            "tcp",
+        )
+    };
+    let edited_set = third.get("edited").unwrap();
+    assert!(edited_set.matches(&ctx("new.example")));
+    assert!(!edited_set.matches(&ctx("old.example")));
+    assert!(
+        third
+            .get("inline")
+            .unwrap()
+            .matches(&ctx("inline2.example"))
+    );
+
+    // a changed declaration of the same file is not taken for the old one
+    let mut next = config("fourth");
+    next["route"]["rule_set"][0]["tag"] = json!("renamed");
+    next["route"]["rules"][0]["rule_set"] = json!(["renamed", "edited", "inline"]);
+    instance.reload_in_place(&next).await.unwrap();
+    let fourth = instance.router().rule_sets();
+    assert!(fourth.get("kept").is_none());
+    assert!(!std::sync::Arc::ptr_eq(
+        third.get("kept").unwrap(),
+        fourth.get("renamed").unwrap()
+    ));
+    instance.shutdown_wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn reload_check_skips_only_files_the_router_loaded_unchanged() {
+    let dir = rule_set_dir("check");
+    let path = dir.join("set.json");
+    write_source_set(&path, &["kept.example"]);
+    let root = json!({
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"final": "direct", "rule_set": [
+            {"type": "local", "tag": "set", "format": "source", "path": path}
+        ]}
+    });
+    let instance = core_runtime::start(&root).await.unwrap();
+    let rule_sets = instance.router().rule_sets();
+    let loaded = rule_sets.unchanged_local_paths(&root);
+    assert!(loaded.contains(path.to_str().unwrap()));
+
+    // another declaration of the same file is not vouched for
+    let mut other = root.clone();
+    other["route"]["rule_set"][0]["format"] = json!("binary");
+    assert!(rule_sets.unchanged_local_paths(&other).is_empty());
+
+    // a rewritten file is checked again, and a broken one is refused
+    std::fs::write(dir.join("broken.tmp"), "{broken").unwrap();
+    std::fs::rename(dir.join("broken.tmp"), &path).unwrap();
+    let loaded = rule_sets.unchanged_local_paths(&root);
+    assert!(loaded.is_empty());
+    assert!(core_config::check_value_with_loaded_rule_sets(&root, &loaded).is_err());
+    instance.shutdown_wait().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}

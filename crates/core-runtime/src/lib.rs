@@ -134,7 +134,7 @@ impl BoxInstance {
         warn_unhonored_options(new_root);
 
         // 1. Build and validate new router inner BEFORE mutating anything running
-        let prepared = Router::prepare(new_root)?;
+        let prepared = Router::prepare(new_root, &self.router)?;
         let new_inner = prepared.inner();
 
         // 2. Build and validate new DNS service BEFORE mutating anything running
@@ -427,6 +427,23 @@ fn checked_config(raw: &str) -> anyhow::Result<Value> {
     serde_json::from_str(raw).context("decode config")
 }
 
+/// The full check of a reloaded file, except that local rule-set files the
+/// running router loaded from the same entry and the same file are not
+/// decoded a second time. A rejection keeps the parsed value, when there is
+/// one, so the status can name the configuration it rejected.
+fn checked_reload_config(
+    raw: &str,
+    running: &Router,
+) -> Result<Value, (Option<Value>, anyhow::Error)> {
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|error| (None, anyhow::Error::new(error).context("decode config")))?;
+    let unchanged = running.rule_sets().unchanged_local_paths(&value);
+    match core_config::check_value_with_loaded_rule_sets(&value, &unchanged) {
+        Ok(()) => Ok(value),
+        Err(error) => Err((Some(value), anyhow::Error::msg(error))),
+    }
+}
+
 async fn reload_instance(
     instance: BoxInstance,
     previous: &Value,
@@ -539,9 +556,12 @@ pub async fn run_with_loader(
             instance.shutdown_wait().await;
             return Ok(());
         }
-        let next = match load().and_then(|raw| checked_config(&raw)) {
+        let checked = load()
+            .map_err(|error| (None, error))
+            .and_then(|raw| checked_reload_config(&raw, &instance.router()));
+        let next = match checked {
             Ok(next) => next,
-            Err(error) => {
+            Err((_, error)) => {
                 logging::warn(format_args!(
                     "reload configuration rejected; keeping current runtime: {error:#}"
                 ));
