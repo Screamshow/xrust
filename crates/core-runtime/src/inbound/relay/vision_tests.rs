@@ -374,16 +374,13 @@ async fn run(version: [u8; 2], direct: bool, up: Vec<u8>, down: Vec<u8>) -> (u8,
     assert_eq!(first, want_first);
     lan_w.write_all(&client_app_data()).await.expect("app data");
 
-    // Our TLS stops reading once its write side is shut, so with the outer
-    // TLS still on the upload closes only after the whole download is in.
-    // Direct reads do not depend on it: there the upload half-closes at once.
+    // The upload half-closes as soon as it is sent, in both modes: the
+    // download, through outer TLS or Direct, must still arrive in full.
     let write = {
         let up = up.clone();
         async move {
             lan_w.write_all(&up).await.expect("upload");
-            if direct {
-                lan_w.shutdown().await.expect("lan shutdown");
-            }
+            lan_w.shutdown().await.expect("lan shutdown");
             lan_w
         }
     };
@@ -392,12 +389,9 @@ async fn run(version: [u8; 2], direct: bool, up: Vec<u8>, down: Vec<u8>) -> (u8,
         lan_r.read_to_end(&mut got).await.expect("download");
         got
     };
-    let (mut lan_w, got_down) = tokio::time::timeout(LIMIT, async { tokio::join!(write, read) })
+    let (_lan_w, got_down) = tokio::time::timeout(LIMIT, async { tokio::join!(write, read) })
         .await
         .expect("lan side in time");
-    if !direct {
-        lan_w.shutdown().await.expect("lan shutdown");
-    }
     let (command, got_up) = tokio::time::timeout(LIMIT, server)
         .await
         .expect("server in time")
