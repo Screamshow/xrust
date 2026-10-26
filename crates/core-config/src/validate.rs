@@ -5643,7 +5643,14 @@ fn validate_inbound(i: usize, ty: &str, tag: &str, obj: &Map<String, Value>) -> 
     }
 
     if tls_enabled(obj.get("tls")) && SERVER_TLS_INBOUNDS.contains(&ty) {
-        validate_server_tls(obj.get("tls").unwrap(), &at, &format!("inbounds[{i}].tls"))?;
+        let tls = obj.get("tls").unwrap();
+        // reference `NewServerWithOptions`: REALITY has its own server and
+        // never reaches the certificate checks of the standard one
+        if reality_enabled(tls) {
+            validate_reality_server(tls, &at)?;
+        } else {
+            validate_server_tls(tls, &at, &format!("inbounds[{i}].tls"))?;
+        }
     }
 
     Ok(())
@@ -8874,6 +8881,159 @@ const ACME_PROVIDER_FIELDS: &[&str] = &["http", "dns01", "ip"];
 
 /// reference `option.ACMEProviderDNS01ChallengeOptions` common fields.
 const ACME_DNS01_FIELDS: &[&str] = &["provider", "disable_glob"];
+
+fn reality_enabled(tls: &Value) -> bool {
+    tls.get("reality")
+        .and_then(|reality| reality.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// reference `common/tls.NewRealityServer`, in its order. The server answers
+/// with the certificate of `handshake.server`, so it takes no certificate or
+/// key of its own and refuses every source of one.
+fn validate_reality_server(tls: &Value, at: &str) -> Result<(), String> {
+    let tls = tls
+        .as_object()
+        .ok_or_else(|| format!("{at}: tls: must be a JSON object"))?;
+    // `Listable` fields: a string counts as one item, even an empty one
+    let listed = |key: &str| match tls.get(key) {
+        Some(Value::String(_)) => true,
+        Some(Value::Array(items)) => !items.is_empty(),
+        _ => false,
+    };
+    let non_empty_str = |key: &str| {
+        tls.get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty())
+    };
+    // a pointer in Go: `null` and a pruned `{}` both leave it nil
+    if tls
+        .get("certificate_provider")
+        .is_some_and(|value| !value.is_null() && !prunes_value(value))
+    {
+        return Err(format!(
+            "{at}: certificate_provider is unavailable in reality"
+        ));
+    }
+    let acme_domain = tls
+        .get("acme")
+        .and_then(|acme| acme.get("domain"))
+        .is_some_and(|domain| match domain {
+            Value::String(_) => true,
+            Value::Array(items) => !items.is_empty(),
+            _ => false,
+        });
+    if acme_domain {
+        return Err(format!("{at}: acme is unavailable in reality"));
+    }
+    for field in ["min_version", "max_version"] {
+        let version = tls.get(field).and_then(Value::as_str).unwrap_or("");
+        if !version.is_empty() && !TLS_VERSIONS.contains(&version) {
+            return Err(format!(
+                "{at}: parse {field}: unknown tls version:{version}"
+            ));
+        }
+    }
+    if let Some(ciphers) = tls.get("cipher_suites").and_then(Value::as_array) {
+        for cipher in ciphers {
+            let name = cipher.as_str().unwrap_or("");
+            if !TLS_CIPHER_SUITES.contains(&name) {
+                return Err(format!("{at}: unknown cipher_suite: {name}"));
+            }
+        }
+    }
+    if listed("curve_preferences") {
+        return Err(format!("{at}: curve preferences is unavailable in reality"));
+    }
+    if listed("certificate")
+        || non_empty_str("certificate_path")
+        || listed("client_certificate_public_key_sha256")
+    {
+        return Err(format!("{at}: certificate is unavailable in reality"));
+    }
+    if listed("key") || non_empty_str("key_path") {
+        return Err(format!("{at}: key is unavailable in reality"));
+    }
+
+    let reality = tls.get("reality").and_then(Value::as_object);
+    let private_key = reality
+        .and_then(|reality| reality.get("private_key"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if let Some(idx) = go_b64_rawurl_error_index(private_key) {
+        return Err(format!(
+            "{at}: decode private key: illegal base64 data at input byte {idx}"
+        ));
+    }
+    if go_b64_rawurl_decoded_len(private_key) != 32 {
+        return Err(format!("{at}: invalid private key"));
+    }
+    let short_ids: Vec<&Value> = match reality.and_then(|reality| reality.get("short_id")) {
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(value @ Value::String(_)) => vec![value],
+        _ => Vec::new(),
+    };
+    for (idx, short_id) in short_ids.into_iter().enumerate() {
+        let short_id = short_id
+            .as_str()
+            .ok_or_else(|| format!("{at}: decode short_id[{idx}]: must be a string"))?;
+        reality_server_short_id(idx, short_id).map_err(|message| format!("{at}: {message}"))?;
+    }
+
+    let ech = tls
+        .get("ech")
+        .and_then(|ech| ech.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if ech {
+        return Err(format!("{at}: Reality is conflict with ECH"));
+    }
+    Ok(())
+}
+
+/// One server `short_id` as Go `hex.Decode` into `[8]byte` sees it. The
+/// reference panics on more than 16 hex digits (index out of range); it is
+/// refused here with the error the reference meant to give.
+fn reality_server_short_id(idx: usize, short_id: &str) -> Result<(), String> {
+    let bytes = short_id.as_bytes();
+    let invalid = |c: u8| {
+        format!(
+            "decode short_id[{idx}]: {short_id}: encoding/hex: invalid byte: {}",
+            go_quote_rune(c)
+        )
+    };
+    let (pairs, _) = bytes.as_chunks::<2>();
+    for pair in pairs {
+        if let Some(&c) = pair.iter().find(|c| !c.is_ascii_hexdigit()) {
+            return Err(invalid(c));
+        }
+    }
+    if pairs.len() > 8 {
+        return Err(format!("invalid short_id[{idx}]: {short_id}"));
+    }
+    if bytes.len() % 2 == 1 {
+        let last = bytes[bytes.len() - 1];
+        if !last.is_ascii_hexdigit() {
+            return Err(invalid(last));
+        }
+        return Err(format!(
+            "decode short_id[{idx}]: {short_id}: encoding/hex: odd length hex string"
+        ));
+    }
+    Ok(())
+}
+
+/// Go `%#U` of one byte as a rune, as `InvalidByteError` prints it:
+/// `U+007A 'z'`, or just `U+0001` when the rune is not printable.
+fn go_quote_rune(c: u8) -> String {
+    let printable = c.is_ascii_graphic() || c == b' ' || (c >= 0xA1 && c != 0xAD);
+    if printable {
+        format!("U+{:04X} '{}'", c, c as char)
+    } else {
+        format!("U+{:04X}", c)
+    }
+}
 
 /// reference `common/tls.NewSTDServer`: a `certificate_provider` or an inline
 /// `acme` block with a domain supplies the certificate, and `insecure` generates
