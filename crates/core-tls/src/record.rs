@@ -14,15 +14,42 @@ use std::io;
 
 use rustls::CipherSuite;
 
+use crate::fastchacha::ChaChaPoly;
 use crate::fastgcm::Gcm;
 use crate::tls13::TrafficKeys;
 
-/// The in-house AES-GCM for the two AES suites; chacha stays with the provider.
-fn aes_gcm(suite: CipherSuite, keys: &TrafficKeys) -> Option<Gcm> {
-    match (suite, keys.key.len()) {
-        (CipherSuite::TLS13_AES_128_GCM_SHA256, 16)
-        | (CipherSuite::TLS13_AES_256_GCM_SHA384, 32) => Some(Gcm::new(&keys.key)),
-        _ => None,
+/// The in-house AEADs, which seal and open in place.
+enum Aead {
+    Gcm(Gcm),
+    ChaCha(ChaChaPoly),
+}
+
+impl Aead {
+    /// The in-house AEAD for `suite`, or `None` to leave it to the provider.
+    fn new(suite: CipherSuite, keys: &TrafficKeys) -> Option<Aead> {
+        match (suite, keys.key.len()) {
+            (CipherSuite::TLS13_AES_128_GCM_SHA256, 16)
+            | (CipherSuite::TLS13_AES_256_GCM_SHA384, 32) => Some(Aead::Gcm(Gcm::new(&keys.key))),
+            (CipherSuite::TLS13_CHACHA20_POLY1305_SHA256, 32) => {
+                Some(Aead::ChaCha(ChaChaPoly::new(&keys.key)))
+            }
+            _ => None,
+        }
+    }
+
+    fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+        match self {
+            Aead::Gcm(c) => c.seal(nonce, aad, buf),
+            Aead::ChaCha(c) => c.seal(nonce, aad, buf),
+        }
+    }
+
+    /// On a bad tag `buf` holds no plaintext and the answer is `false`.
+    fn open(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8], tag: &[u8; 16]) -> bool {
+        match self {
+            Aead::Gcm(c) => c.open(nonce, aad, buf, tag),
+            Aead::ChaCha(c) => c.open(nonce, aad, buf, tag),
+        }
     }
 }
 
@@ -101,7 +128,7 @@ pub fn take_record(input: &mut &[u8]) -> io::Result<(u8, [u8; 2], Vec<u8>)> {
 pub struct Sealer {
     suite: CipherSuite,
     keys: TrafficKeys,
-    gcm: Option<Gcm>,
+    aead: Option<Aead>,
     seq: u64,
 }
 
@@ -109,7 +136,7 @@ impl Sealer {
     pub fn new(suite: CipherSuite, keys: TrafficKeys) -> Self {
         Sealer {
             suite,
-            gcm: aes_gcm(suite, &keys),
+            aead: Aead::new(suite, &keys),
             keys,
             seq: 0,
         }
@@ -119,7 +146,7 @@ impl Sealer {
     /// the handshake and application levels of one connection number their
     /// records from a single counter (RFC 8446 §5.3).
     pub fn set_keys(&mut self, keys: TrafficKeys) {
-        self.gcm = aes_gcm(self.suite, &keys);
+        self.aead = Aead::new(self.suite, &keys);
         self.keys = keys;
     }
 
@@ -160,8 +187,8 @@ impl Sealer {
         // the inner plaintext: the content, then its type
         out.extend_from_slice(payload);
         out.push(kind as u8);
-        if let Some(gcm) = &self.gcm {
-            let tag = gcm.seal(&nonce, &aad, &mut out[start + 5..]);
+        if let Some(aead) = &self.aead {
+            let tag = aead.seal(&nonce, &aad, &mut out[start + 5..]);
             out.extend_from_slice(&tag);
         } else {
             let sealed = core_crypto::tls13_seal(
@@ -184,7 +211,7 @@ impl Sealer {
 pub struct Opener {
     suite: CipherSuite,
     keys: TrafficKeys,
-    gcm: Option<Gcm>,
+    aead: Option<Aead>,
     seq: u64,
 }
 
@@ -192,14 +219,14 @@ impl Opener {
     pub fn new(suite: CipherSuite, keys: TrafficKeys) -> Self {
         Opener {
             suite,
-            gcm: aes_gcm(suite, &keys),
+            aead: Aead::new(suite, &keys),
             keys,
             seq: 0,
         }
     }
 
     pub fn set_keys(&mut self, keys: TrafficKeys) {
-        self.gcm = aes_gcm(self.suite, &keys);
+        self.aead = Aead::new(self.suite, &keys);
         self.keys = keys;
     }
 
@@ -238,10 +265,10 @@ impl Opener {
         }
         let nonce = self.keys.nonce(self.seq);
         let (aad, body) = record.split_at_mut(5);
-        let inner = if let Some(gcm) = &self.gcm {
+        let inner = if let Some(aead) = &self.aead {
             let (data, tag) = body.split_at_mut(body.len() - 16);
             let tag: [u8; 16] = (&*tag).try_into().expect("tag is 16 bytes");
-            if !gcm.open(&nonce, aad, data, &tag) {
+            if !aead.open(&nonce, aad, data, &tag) {
                 return Err(err("record tag did not verify"));
             }
             data.len()
@@ -387,6 +414,108 @@ mod tests {
         let (kind, back) = opener.open(&record).expect("open");
         assert_eq!(kind, ContentType::ApplicationData);
         assert_eq!(back, b"hello");
+    }
+
+    const LENGTHS: [usize; 7] = [0, 1, 255, 256, 257, 1400, 16384];
+
+    fn pattern(n: usize, seed: u8) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    /// Records sealed in place open with the provider's generic AEAD, at the
+    /// same sequence numbers, and are byte for byte what it would have sealed.
+    #[test]
+    fn sealed_records_match_the_provider() {
+        for suite in SUITES {
+            let keys = keys(suite);
+            let mut sealer = Sealer::new(suite, keys.clone());
+            for (seq, len) in LENGTHS.into_iter().enumerate() {
+                let payload = pattern(len, seq as u8);
+                let record = sealer
+                    .seal(ContentType::ApplicationData, &payload)
+                    .expect("seal");
+                let nonce = keys.nonce(seq as u64);
+                let aad = header(ContentType::ApplicationData, (len + 1 + 16) as u16);
+                assert_eq!(record[..5], aad, "{suite:?} {len}");
+                let mut inner = payload.clone();
+                inner.push(ContentType::ApplicationData as u8);
+                let want = core_crypto::tls13_seal(suite, &keys.key, &nonce, &aad, &inner)
+                    .expect("reference seal");
+                assert_eq!(record[5..], want[..], "{suite:?} {len}");
+                let plain = core_crypto::tls13_open(suite, &keys.key, &nonce, &aad, &record[5..])
+                    .expect("reference open");
+                assert_eq!(plain, inner, "{suite:?} {len}");
+            }
+        }
+    }
+
+    /// Records sealed by the provider's generic AEAD open in place, and a
+    /// flipped tag or body byte is refused.
+    #[test]
+    fn provider_records_open_and_tampering_is_refused() {
+        for suite in SUITES {
+            let keys = keys(suite);
+            let mut opener = Opener::new(suite, keys.clone());
+            for (seq, len) in LENGTHS.into_iter().enumerate() {
+                let payload = pattern(len, 0x40 + seq as u8);
+                let mut inner = payload.clone();
+                inner.push(ContentType::Handshake as u8);
+                let nonce = keys.nonce(seq as u64);
+                let aad = header(ContentType::ApplicationData, (inner.len() + 16) as u16);
+                let sealed = core_crypto::tls13_seal(suite, &keys.key, &nonce, &aad, &inner)
+                    .expect("reference seal");
+                let mut record = aad.to_vec();
+                record.extend_from_slice(&sealed);
+
+                let mut bad = Vec::new();
+                let mut tag = record.clone();
+                *tag.last_mut().expect("tag") ^= 0x80;
+                bad.push(tag);
+                if len > 0 {
+                    let mut body = record.clone();
+                    body[5 + len / 2] ^= 0x01;
+                    bad.push(body);
+                }
+                for broken in bad {
+                    let err = opener.open(&broken).expect_err("a tampered record opened");
+                    assert!(err.to_string().contains("did not verify"), "{err}");
+                    assert_eq!(opener.seq(), seq as u64, "a failed open moved the sequence");
+                }
+
+                let (kind, back) = opener.open(&record).expect("open");
+                assert_eq!(kind, ContentType::Handshake, "{suite:?} {len}");
+                assert_eq!(back, payload, "{suite:?} {len}");
+            }
+        }
+    }
+
+    /// New keys take effect for the next record and the count goes on.
+    #[test]
+    fn set_keys_keeps_the_sequence() {
+        for suite in SUITES {
+            let first = keys(suite);
+            let hash = match suite {
+                CipherSuite::TLS13_AES_256_GCM_SHA384 => Hash::Sha384,
+                _ => Hash::Sha256,
+            };
+            let key_len = core_crypto::tls13_key_len(suite).expect("a TLS 1.3 suite");
+            let second = KeySchedule::traffic_keys(b"the next secret", hash, key_len);
+            let mut sealer = Sealer::new(suite, first.clone());
+            let mut opener = Opener::new(suite, first);
+            let one = sealer.seal(ContentType::Handshake, b"one").expect("seal");
+            assert_eq!(opener.open(&one).expect("open").1, b"one");
+            sealer.set_keys(second.clone());
+            opener.set_keys(second.clone());
+            let two = sealer.seal(ContentType::Handshake, b"two").expect("seal");
+            let nonce = second.nonce(1);
+            let plain = core_crypto::tls13_open(suite, &second.key, &nonce, &two[..5], &two[5..])
+                .expect("reference open");
+            assert_eq!(plain, b"two\x16");
+            assert_eq!(opener.open(&two).expect("open").1, b"two");
+            assert_eq!((sealer.seq(), opener.seq()), (2, 2));
+        }
     }
 
     #[test]

@@ -9,7 +9,6 @@
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
 
-use aead::AeadInPlace;
 use chacha20poly1305::KeyInit;
 use rustls::crypto::cipher::{self, AeadKey, Iv};
 use rustls::{Error, quic};
@@ -293,7 +292,7 @@ pub struct PacketKey {
 enum Ready {
     Aes128(crate::fastgcm::Gcm),
     Aes256(crate::fastgcm::Gcm),
-    ChaCha(chacha20poly1305::ChaCha20Poly1305),
+    ChaCha(crate::fastchacha::ChaChaPoly),
 }
 
 impl PacketKey {
@@ -314,10 +313,9 @@ impl PacketKey {
         let ready = match cipher {
             PacketCipher::Aes128Gcm => Ready::Aes128(crate::fastgcm::Gcm::new(&buf[..n])),
             PacketCipher::Aes256Gcm => Ready::Aes256(crate::fastgcm::Gcm::new(&buf[..n])),
-            PacketCipher::ChaCha20Poly1305 => Ready::ChaCha(
-                chacha20poly1305::ChaCha20Poly1305::new_from_slice(&buf[..n])
-                    .expect("chacha key length"),
-            ),
+            PacketCipher::ChaCha20Poly1305 => {
+                Ready::ChaCha(crate::fastchacha::ChaChaPoly::new(&buf[..n]))
+            }
         };
         Self { iv, ready }
     }
@@ -338,10 +336,7 @@ impl quic::PacketKey for PacketKey {
         let nonce = nonce(&self.iv, packet_number);
         let tag = match &self.ready {
             Ready::Aes128(cipher) | Ready::Aes256(cipher) => cipher.seal(&nonce, aad, payload),
-            Ready::ChaCha(cipher) => cipher
-                .encrypt_in_place_detached((&nonce).into(), aad, payload)
-                .map_err(|_| Error::EncryptError)?
-                .into(),
+            Ready::ChaCha(cipher) => cipher.seal(&nonce, aad, payload),
         };
         Ok(quic::Tag::from(tag.as_ref()))
     }
@@ -369,9 +364,7 @@ impl quic::PacketKey for PacketKey {
             Ready::Aes128(cipher) | Ready::Aes256(cipher) => {
                 cipher.open(&nonce, aad, ciphertext, &tag)
             }
-            Ready::ChaCha(cipher) => cipher
-                .decrypt_in_place_detached((&nonce).into(), aad, ciphertext, (&tag).into())
-                .is_ok(),
+            Ready::ChaCha(cipher) => cipher.open(&nonce, aad, ciphertext, &tag),
         };
         if !ok {
             return Err(Error::DecryptError);
@@ -744,6 +737,59 @@ mod tests {
                 .decrypt_in_place(7, aad, &mut sealed)
                 .expect("decrypt should succeed");
             assert_eq!(plain, plaintext, "round-trip mismatch for {cipher:?}");
+        }
+    }
+
+    /// ChaCha20-Poly1305 packets match RustCrypto's AEAD byte for byte around
+    /// the 256-byte fast-path threshold, and a bad tag or body is refused.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn chacha_packets_match_rustcrypto() {
+        use aead::AeadInPlace;
+
+        let key = [0x5cu8; 32];
+        let iv = [0x11u8; 12];
+        let pk = PacketKey::new(
+            PacketCipher::ChaCha20Poly1305,
+            AeadKey::from(key),
+            Iv::from(iv),
+        );
+        let soft = chacha20poly1305::ChaCha20Poly1305::new((&key).into());
+        let aad = decode_hex("4200bff4");
+        for (pn, len) in [0usize, 1, 255, 256, 257, 1200, 1350]
+            .into_iter()
+            .enumerate()
+        {
+            let pn = 0x1_0000_0000 + pn as u64;
+            let plain: alloc::vec::Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+
+            let mut sealed = plain.clone();
+            let tag = pk
+                .encrypt_in_place(pn, &aad, &mut sealed)
+                .expect("encrypt should succeed");
+            let mut want = plain.clone();
+            let want_tag = soft
+                .encrypt_in_place_detached((&nonce(&Iv::from(iv), pn)).into(), &aad, &mut want)
+                .expect("reference seal");
+            assert_eq!(sealed, want, "ciphertext, len {len}");
+            assert_eq!(tag.as_ref(), want_tag.as_slice(), "tag, len {len}");
+            sealed.extend_from_slice(tag.as_ref());
+
+            let mut bad = sealed.clone();
+            *bad.last_mut().expect("tag") ^= 0x01;
+            assert!(pk.decrypt_in_place(pn, &aad, &mut bad).is_err());
+            if len > 0 {
+                let mut bad = sealed.clone();
+                bad[len / 2] ^= 0x80;
+                assert!(pk.decrypt_in_place(pn, &aad, &mut bad).is_err());
+            }
+            let mut bad = sealed.clone();
+            assert!(pk.decrypt_in_place(pn + 1, &aad, &mut bad).is_err());
+
+            let plain_back = pk
+                .decrypt_in_place(pn, &aad, &mut sealed)
+                .expect("decrypt should succeed");
+            assert_eq!(plain_back, &plain[..], "plaintext, len {len}");
         }
     }
 
