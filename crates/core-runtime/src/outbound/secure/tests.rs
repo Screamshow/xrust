@@ -423,13 +423,30 @@ mod trojan {
 
     /// A client that closes without a byte gets nothing sent: Xray's
     /// `CopyOnceTimeout` returns the end of stream as an error before the
-    /// buffered head is flushed (`proxy/trojan/client.go`).
+    /// buffered head is flushed (`proxy/trojan/client.go`). The end of the
+    /// upload is not passed on either: the transport stays open.
     #[tokio::test]
     async fn closing_before_any_payload_sends_nothing() {
         let (mut stream, _, writes, shut) = stream(b"", Duration::from_millis(100));
         stream.shutdown().await.unwrap();
         assert!(writes.lock().unwrap().is_empty());
-        assert!(*shut.lock().unwrap());
+        assert!(!*shut.lock().unwrap());
+    }
+
+    /// The end of the upload after a payload is not passed on either, as with
+    /// Xray's client: the transport is not shut down and reads go on.
+    #[tokio::test]
+    async fn the_end_of_the_upload_is_not_passed_on() {
+        let (mut stream, head, writes, shut) = stream(b"answer", Duration::from_millis(100));
+        stream.write_all(b"request").await.unwrap();
+        stream.shutdown().await.unwrap();
+        assert!(!*shut.lock().unwrap());
+        let mut answer = [0u8; 6];
+        stream.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"answer");
+        let mut first = head;
+        first.extend_from_slice(b"request");
+        assert_eq!(writes.lock().unwrap().clone(), vec![first]);
     }
 
     /// `trojan.WritePacket`/`ReadPacket`: socksaddr, length, CRLF, payload.
@@ -569,14 +586,14 @@ mod vless_head {
         assert_eq!((command, &content[..]), (0x00, &b"EHLO"[..]));
     }
 
-    /// A client that closes without a byte: nothing is sent, as with Xray,
-    /// and the transport is shut down.
+    /// A client that closes without a byte: nothing is sent and the
+    /// transport is not shut down, as with Xray.
     #[tokio::test]
     async fn closing_a_vision_client_before_any_payload_sends_nothing() {
         let (mut stream, _, writes, shut) = vision(b"", Duration::from_secs(30));
         stream.shutdown().await.unwrap();
         assert!(writes.lock().unwrap().is_empty());
-        assert!(*shut.lock().unwrap());
+        assert!(!*shut.lock().unwrap());
     }
 
     /// A first payload larger than Xray's 8 KiB write buffer: the head and as

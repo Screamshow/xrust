@@ -147,10 +147,13 @@ async fn skip_vless_head(from: &TcpStream) -> io::Result<()> {
 
 /// Move bytes `from` -> `to` until `from` reaches EOF, then half-close `to`.
 /// With `head` the source first owes a vless response head, which is dropped.
+/// `close` passes the end of `from` on to `to` as a FIN; without it `to`
+/// is left open (a VLESS upstream, see `relay`).
 async fn one_way(
     from: &TcpStream,
     to: &TcpStream,
     head: bool,
+    close: bool,
     count: impl Fn(u64),
 ) -> io::Result<()> {
     if head {
@@ -159,7 +162,7 @@ async fn one_way(
     // an idle connection takes no pipe: wait for the first byte
     from.readable().await?;
     let Ok(pipe) = Pipe::new() else {
-        return one_way_buffered(from, to, count).await;
+        return one_way_buffered(from, to, close, count).await;
     };
     let (from_fd, to_fd) = (from.as_raw_fd(), to.as_raw_fd());
     loop {
@@ -172,7 +175,9 @@ async fn one_way(
             Err(e) => return Err(e),
         };
         if n == 0 {
-            shutdown_write(to);
+            if close {
+                shutdown_write(to);
+            }
             return Ok(());
         }
         let mut left = n;
@@ -195,7 +200,12 @@ async fn one_way(
 }
 
 /// The same direction through a small userspace buffer.
-async fn one_way_buffered(from: &TcpStream, to: &TcpStream, count: impl Fn(u64)) -> io::Result<()> {
+async fn one_way_buffered(
+    from: &TcpStream,
+    to: &TcpStream,
+    close: bool,
+    count: impl Fn(u64),
+) -> io::Result<()> {
     let mut buf = vec![0u8; FALLBACK_CHUNK];
     loop {
         let n = match from.try_read(&mut buf) {
@@ -207,7 +217,9 @@ async fn one_way_buffered(from: &TcpStream, to: &TcpStream, count: impl Fn(u64))
             Err(e) => return Err(e),
         };
         if n == 0 {
-            shutdown_write(to);
+            if close {
+                shutdown_write(to);
+            }
             return Ok(());
         }
         write_all(to, &buf[..n]).await?;
@@ -239,7 +251,9 @@ pub(crate) async fn relay(
     let both = async {
         tokio::try_join!(
             async {
-                one_way(client, upstream, false, |n| {
+                // a VLESS upstream is not told the upload ended, as Xray's
+                // client does not tell it (see `VlessStream::poll_shutdown`)
+                one_way(client, upstream, false, !vless_head, |n| {
                     if let Some(tracker) = tracker {
                         tracker.add_upload(n)
                     }
@@ -248,7 +262,7 @@ pub(crate) async fn relay(
                 .inspect(|()| half.finish())
             },
             async {
-                one_way(upstream, client, vless_head, |n| {
+                one_way(upstream, client, vless_head, true, |n| {
                     if let Some(tracker) = tracker {
                         tracker.add_download(n)
                     }

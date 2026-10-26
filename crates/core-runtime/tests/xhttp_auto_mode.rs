@@ -3,11 +3,14 @@
 //! both in this process.
 //!
 //! Xray resolves `auto` to stream-one under REALITY and to packet-up
-//! otherwise (splithttp/dialer.go). The two are told apart on the far side by
-//! the client's half-close: stream-one ends its request body, so the upstream
-//! reads EOF; packet-up has no end-of-upload on the wire, so it never does.
+//! otherwise (splithttp/dialer.go). The two are told apart by the TCP
+//! connections the client opens to the server over HTTP/1.1: stream-one
+//! carries the session in one request on one connection, packet-up opens its
+//! download GET and its upload POSTs on connections of their own.
 
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use base64::Engine;
@@ -62,6 +65,8 @@ struct Stand {
     _client: core_runtime::BoxInstance,
     _server: core_runtime::BoxInstance,
     socks: SocketAddr,
+    /// TCP connections the client opened to the server
+    connections: Arc<AtomicUsize>,
 }
 
 async fn stand(mode: &str, security: Security) -> Stand {
@@ -94,6 +99,7 @@ async fn stand(mode: &str, security: Security) -> Stand {
                 "enabled": true,
                 "server_name": "www.example.com",
                 "utls": {"enabled": true, "fingerprint": "chrome"},
+                "alpn": ["http/1.1"],
                 "reality": {
                     "enabled": true,
                     "public_key": reality_public(),
@@ -106,13 +112,13 @@ async fn stand(mode: &str, security: Security) -> Stand {
                 "enabled": true,
                 "certificate_path": cert_file("localhost.crt"),
                 "key_path": cert_file("localhost.key"),
-                "alpn": ["h2"]
+                "alpn": ["http/1.1"]
             });
             client_out["tls"] = json!({
                 "enabled": true,
                 "server_name": "localhost",
                 "insecure": true,
-                "alpn": ["h2"]
+                "alpn": ["http/1.1"]
             });
         }
     }
@@ -125,8 +131,9 @@ async fn stand(mode: &str, security: Security) -> Stand {
     .await
     .expect("start server");
     let server_addr = inbound_addr(&server, "vless-in");
+    let (front, connections) = counting_forwarder(server_addr).await;
     client_out["server"] = json!("127.0.0.1");
-    client_out["server_port"] = json!(server_addr.port());
+    client_out["server_port"] = json!(front.port());
     let client = core_runtime::start(&json!({
         "log": {"level": "error"},
         "inbounds": [{
@@ -145,6 +152,7 @@ async fn stand(mode: &str, security: Security) -> Stand {
         _client: client,
         _server: server,
         socks,
+        connections,
     }
 }
 
@@ -167,39 +175,44 @@ async fn socks_connect(socks: SocketAddr, target: SocketAddr) -> TcpStream {
     stream
 }
 
-/// Echoes what it reads, and once it reads EOF writes `|eof` and closes.
-async fn spawn_eof_echo() -> SocketAddr {
+/// Echoes what it reads.
+async fn spawn_echo() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) => {
-                            let _ = stream.write_all(b"|eof").await;
-                            let _ = stream.shutdown().await;
-                            return;
-                        }
-                        Err(_) => return,
-                        Ok(n) => {
-                            if stream.write_all(&buf[..n]).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                }
+                let (mut rd, mut wr) = stream.split();
+                let _ = tokio::io::copy(&mut rd, &mut wr).await;
             });
         }
     });
     addr
 }
 
-/// Send `hello`, read the echo, half-close, and report whether the upstream
-/// saw the EOF within `wait`.
-async fn half_close_reaches_upstream(stand: &Stand, wait: Duration) -> bool {
-    let echo = spawn_eof_echo().await;
+/// A TCP forwarder in front of `to` that counts the connections it takes.
+async fn counting_forwarder(to: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&count);
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = listener.accept().await {
+            seen.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let Ok(mut outbound) = TcpStream::connect(to).await else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    });
+    (addr, count)
+}
+
+/// One echo exchange through the stand: how many connections it took.
+async fn connections_for_one_session(stand: &Stand) -> usize {
+    let echo = spawn_echo().await;
     let mut s = socks_connect(stand.socks, echo).await;
     s.write_all(b"hello").await.unwrap();
     let mut got = [0u8; 5];
@@ -208,36 +221,31 @@ async fn half_close_reaches_upstream(stand: &Stand, wait: Duration) -> bool {
         .expect("echo timed out")
         .expect("echo");
     assert_eq!(&got, b"hello");
-    s.shutdown().await.expect("half-close");
-    let mut rest = Vec::new();
-    match tokio::time::timeout(wait, s.read_to_end(&mut rest)).await {
-        Ok(Ok(_)) => rest == b"|eof",
-        Ok(Err(_)) | Err(_) => false,
-    }
+    stand.connections.load(Ordering::SeqCst)
 }
 
 #[tokio::test]
 async fn auto_over_reality_is_stream_one() {
     let stand = stand("auto", Security::Reality).await;
-    // well inside the 10 s half-close idle limit packet-up would fall back on
-    assert!(
-        half_close_reaches_upstream(&stand, Duration::from_secs(5)).await,
-        "auto over REALITY must run stream-one: the half-close never reached the upstream"
+    assert_eq!(
+        connections_for_one_session(&stand).await,
+        1,
+        "auto over REALITY must run stream-one: one request on one connection"
     );
 }
 
 #[tokio::test]
-async fn explicit_stream_one_over_reality_carries_the_half_close() {
+async fn explicit_stream_one_over_reality_is_one_connection() {
     let stand = stand("stream-one", Security::Reality).await;
-    assert!(half_close_reaches_upstream(&stand, Duration::from_secs(5)).await);
+    assert_eq!(connections_for_one_session(&stand).await, 1);
 }
 
 #[tokio::test]
 async fn explicit_packet_up_over_reality_stays_packet_up() {
     let stand = stand("packet-up", Security::Reality).await;
     assert!(
-        !half_close_reaches_upstream(&stand, Duration::from_millis(1500)).await,
-        "packet-up has no end of upload, so the upstream must not see EOF"
+        connections_for_one_session(&stand).await >= 2,
+        "packet-up opens its download and its uploads apart"
     );
 }
 
@@ -245,7 +253,7 @@ async fn explicit_packet_up_over_reality_stays_packet_up() {
 async fn auto_over_plain_tls_stays_packet_up() {
     let stand = stand("auto", Security::Tls).await;
     assert!(
-        !half_close_reaches_upstream(&stand, Duration::from_millis(1500)).await,
-        "auto without REALITY is packet-up, which has no end of upload"
+        connections_for_one_session(&stand).await >= 2,
+        "auto without REALITY is packet-up"
     );
 }

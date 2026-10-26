@@ -1009,3 +1009,84 @@ async fn upgrade_transports_offer_http1_alone() {
         }
     }
 }
+
+// ---- the end of the upload ----
+
+/// A local application that half-closes its upload: like Xray's client we do
+/// not pass that on (no close_notify, no FIN), a response that comes after it
+/// is still delivered, and the connection closes with close_notify once the
+/// download has been quiet for the relay's idle limit (Xray's `downlinkOnly`,
+/// 1 s), not at the half-close.
+#[tokio::test]
+async fn a_half_closed_upload_is_not_passed_on() {
+    let private = [15u8; 32];
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut handshake = core_tls::server::Handshake::new(reality_config(private)).unwrap();
+        handshake.run(&mut socket).await.expect("handshake");
+        let (mut sealer, mut opener) = handshake.application.take().unwrap();
+        let mut records = Vec::new();
+        let mut first_at = None;
+        loop {
+            let mut head = [0u8; 5];
+            let read = tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut head));
+            if !matches!(read.await, Ok(Ok(_))) {
+                break;
+            }
+            let len = u16::from_be_bytes([head[3], head[4]]) as usize;
+            let mut record = head.to_vec();
+            record.resize(5 + len, 0);
+            if socket.read_exact(&mut record[5..]).await.is_err() {
+                break;
+            }
+            let Ok((kind, data)) = opener.open(&record) else {
+                break;
+            };
+            let at = *first_at.get_or_insert_with(Instant::now);
+            records.push((at.elapsed(), kind, data.to_vec()));
+            if records.len() == 1 {
+                let pong = sealer
+                    .seal(ContentType::ApplicationData, b"\x00\x00pong")
+                    .unwrap();
+                socket.write_all(&pong).await.unwrap();
+                // the answer's tail comes well after the client half-closed
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let late = sealer.seal(ContentType::ApplicationData, b"late").unwrap();
+                socket.write_all(&late).await.unwrap();
+            }
+        }
+        // whatever follows the last record: the FIN
+        let mut rest = Vec::new();
+        let _ = socket.read_to_end(&mut rest).await;
+        (records, first_at.map(|at| at.elapsed()))
+    });
+    let (instance, proxy) = start_client(json!({
+        "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
+        "uuid": UUID_TEXT, "tls": reality_tls(&private)
+    }))
+    .await;
+    let mut stream = socks_connect(proxy, "127.0.0.1:9".parse().unwrap()).await;
+    stream.write_all(b"GET").await.unwrap();
+    stream.shutdown().await.unwrap();
+    let mut answer = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut answer))
+        .await
+        .expect("the session ends")
+        .unwrap();
+    assert_eq!(answer, b"ponglate", "the response after the half-close");
+    let (records, closed_at) = server.await.unwrap();
+    instance.shutdown();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].1, ContentType::ApplicationData);
+    let (alert_at, kind, data) = &records[1];
+    assert_eq!((kind, &data[..]), (&ContentType::Alert, &[1u8, 0][..]));
+    // the half-close itself sent nothing: the alert comes a quiet second
+    // after the late answer, not right after "GET"
+    assert!(
+        *alert_at >= Duration::from_millis(1200),
+        "close_notify at {alert_at:?}"
+    );
+    assert!(closed_at.unwrap() >= *alert_at);
+}

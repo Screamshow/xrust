@@ -1071,10 +1071,12 @@ impl HalfOpen {
 /// other before it ends. Neither side can do anything about a peer that keeps
 /// its half open and silent: the session, its sockets and buffers would live
 /// until that peer gives up. Xray ends the same case with its `uplinkOnly` and
-/// `downlinkOnly` timers (1 s by default); this is ten times that, so a slow
-/// answer to a half-closed request still comes through.
+/// `downlinkOnly` timers, 1 s by default (`features/policy/policy.go`), and so does this: a
+/// VLESS or trojan upstream is not told the upload ended, as with Xray, so
+/// this limit is what ends such a session and closes its connection, when
+/// Xray's client would. A download that keeps moving is never cut.
 /// `XRUST_HALF_CLOSE_IDLE_MS` overrides it.
-const HALF_CLOSE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+const HALF_CLOSE_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 fn half_close_idle() -> std::time::Duration {
     static IDLE: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();

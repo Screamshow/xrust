@@ -399,9 +399,15 @@ impl tokio::io::AsyncWrite for VlessStream {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        // The end of the upload is not passed on: Xray's client never tells
+        // the server (its request copy just returns, `outbound.go`
+        // `postRequest`), so neither close_notify nor a FIN goes out here, and
+        // the download stays open. The session ends when the relay gives up
+        // on the quiet half (`end_half_open`) and drops the stream, which
+        // then closes the connection with close_notify, as Xray's `Close`.
         let this = self.get_mut();
         std::task::ready!(this.request.poll_before_shutdown(&mut this.inner, cx))?;
-        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
     }
 }
 
@@ -579,9 +585,15 @@ impl tokio::io::AsyncWrite for TrojanStream {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<io::Result<()>> {
+        // The end of the upload is not passed on: Xray's client never tells
+        // the server (its request copy just returns, `outbound.go`
+        // `postRequest`), so neither close_notify nor a FIN goes out here, and
+        // the download stays open. The session ends when the relay gives up
+        // on the quiet half (`end_half_open`) and drops the stream, which
+        // then closes the connection with close_notify, as Xray's `Close`.
         let this = self.get_mut();
         std::task::ready!(this.head.poll_before_shutdown(&mut this.inner, cx))?;
-        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
     }
 }
 
