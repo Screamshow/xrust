@@ -85,7 +85,10 @@ fn rebuilds_captured_hello_byte_for_byte() {
     assert_eq!(left.random, hello.random);
     assert_eq!(left.session_id, hello.session_id);
     assert_eq!(left.sni, hello.sni);
-    assert_eq!(left.template.cipher_suites, hello.template.cipher_suites);
+    assert_eq!(
+        ungrease_list(&left.template.cipher_suites, 0),
+        ungrease_list(&hello.template.cipher_suites, 0)
+    );
     assert_eq!(
         left.template.extensions.len(),
         hello.template.extensions.len()
@@ -98,8 +101,15 @@ fn rebuilds_captured_hello_byte_for_byte() {
     {
         let same = match (a, b) {
             (Ext::Static(id_a, body_a), Ext::Static(id_b, body_b)) => {
+                // supported_groups and supported_versions carry a GREASE
+                // value of their own, drawn per hello like the ids
+                let skip = match id_a {
+                    0x000a => 2,
+                    0x002b => 1,
+                    _ => body_a.len(),
+                };
                 (keyshare::is_grease(*id_a) && keyshare::is_grease(*id_b))
-                    || (id_a == id_b && body_a == body_b)
+                    || (id_a == id_b && ungrease_list(body_a, skip) == ungrease_list(body_b, skip))
             }
             (Ext::Sni, Ext::Sni) | (Ext::Alpn, Ext::Alpn) => true,
             (Ext::KeyShare(a), Ext::KeyShare(b)) => {
@@ -168,8 +178,8 @@ fn rebuild_with_fresh_randomness_differs_only_in_random_fields() {
     );
     assert_eq!(reparsed.sni, hello.sni);
     assert_eq!(
-        reparsed.template.cipher_suites,
-        hello.template.cipher_suites
+        ungrease_list(&reparsed.template.cipher_suites, 0),
+        ungrease_list(&hello.template.cipher_suites, 0)
     );
     // the extension list is the same, GREASE ids aside: they are drawn fresh
     let ids: Vec<u16> = reparsed
@@ -185,6 +195,18 @@ fn rebuild_with_fresh_randomness_differs_only_in_random_fields() {
         .map(|e| ungrease(ext_id(e)))
         .collect();
     assert_eq!(ids, orig_ids);
+}
+
+/// `body` with every GREASE u16 after `skip` bytes set to 0x0a0a.
+fn ungrease_list(body: &[u8], skip: usize) -> Vec<u8> {
+    let mut out = body.to_vec();
+    let start = skip.min(out.len());
+    for pair in out[start..].as_chunks_mut::<2>().0 {
+        if keyshare::is_grease(u16::from_be_bytes(*pair)) {
+            *pair = [0x0a, 0x0a];
+        }
+    }
+    out
 }
 
 fn ungrease(id: u16) -> u16 {

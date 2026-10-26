@@ -135,29 +135,54 @@ fn hello(template: &Template, shares: Option<&Shares>) -> Vec<u8> {
     .expect("build")
 }
 
-/// Everything but GREASE ids and the ECH body equals the template.
-fn check_against_template(name: &str, template: &Template, exts: &[(u16, Vec<u8>)]) {
-    let present: Vec<&Ext> = template.extensions.iter().collect();
-    assert_eq!(present.len(), exts.len(), "{name}: extension count");
-    for (want, (id, body)) in present.iter().zip(exts) {
-        match want {
-            Ext::Static(want_id, want_body) if keyshare::is_grease(*want_id) => {
-                assert!(
-                    keyshare::is_grease(*id),
-                    "{name}: GREASE slot holds {id:#06x}"
-                );
-                assert_eq!(want_body, body, "{name}: GREASE body");
-            }
-            Ext::Static(ECH, _) => assert_eq!(*id, ECH, "{name}: ECH slot"),
-            Ext::Static(want_id, want_body) => {
-                assert_eq!((*want_id, want_body), (*id, body), "{name}: static body");
-            }
-            Ext::Sni => assert_eq!(*id, 0x0000, "{name}: SNI slot"),
-            Ext::Alpn => assert_eq!(*id, 0x0010, "{name}: ALPN slot"),
-            Ext::KeyShare(_) => assert_eq!(*id, 0x0033, "{name}: key share slot"),
-            _ => assert_eq!(*id, ECH, "{name}: ECH slot"),
+/// GREASE set aside: an id becomes 0x0a0a, and so does every GREASE value in
+/// supported_groups and supported_versions (all drawn per hello).
+fn ungrease(id: u16, body: &[u8]) -> (u16, Vec<u8>) {
+    let mut body = body.to_vec();
+    let skip = match id {
+        0x000a => 2,
+        0x002b => 1,
+        _ => body.len(),
+    };
+    let start = skip.min(body.len());
+    for pair in body[start..].as_chunks_mut::<2>().0 {
+        if keyshare::is_grease(u16::from_be_bytes(*pair)) {
+            *pair = [0x0a, 0x0a];
         }
     }
+    let id = if keyshare::is_grease(id) { 0x0a0a } else { id };
+    (id, body)
+}
+
+/// Everything but GREASE values and the ECH body equals the template. SNI,
+/// ALPN, key share and ECH are compared by id only.
+fn check_against_template(name: &str, template: &Template, exts: &[(u16, Vec<u8>)]) {
+    let want: Vec<(u16, Option<Vec<u8>>)> = template
+        .extensions
+        .iter()
+        .map(|e| match e {
+            Ext::Static(ECH, _) | Ext::EchGrease(_) => (ECH, None),
+            Ext::Static(id, body) => {
+                let (id, body) = ungrease(*id, body);
+                (id, Some(body))
+            }
+            Ext::Sni => (0x0000, None),
+            Ext::Alpn => (0x0010, None),
+            Ext::KeyShare(_) => (0x0033, None),
+        })
+        .collect();
+    let got: Vec<(u16, Option<Vec<u8>>)> = exts
+        .iter()
+        .map(|(id, body)| match *id {
+            ECH | 0x0000 | 0x0010 | 0x0033 => (*id, None),
+            id => {
+                let (id, body) = ungrease(id, body);
+                (id, Some(body))
+            }
+        })
+        .collect();
+    assert_eq!(want.len(), got.len(), "{name}: extension count");
+    assert_eq!(want, got, "{name}: extensions");
 }
 
 fn collect(name: &str, template: &Template) -> Vec<Outer> {

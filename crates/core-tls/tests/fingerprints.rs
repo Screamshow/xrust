@@ -216,10 +216,13 @@ fn is_grease(value: u16) -> bool {
 /// only in them compare equal.
 fn mask_body(id: u16, body: &[u8]) -> Vec<u8> {
     let mut out = body.to_vec();
-    // a list of u16 values: supported_groups, key_share group ids
-    let u16_list = matches!(id, 0x000a | 0x0023 | 0x0033 | 0x001d);
+    // a list of u16 values: supported_groups, key_share group ids, and
+    // supported_versions after its one-byte length
+    let skip = if id == 0x002b { 1 } else { 0 };
+    let u16_list = matches!(id, 0x000a | 0x0023 | 0x0033 | 0x001d | 0x002b);
     if u16_list {
-        for pair in out.chunks_mut(2) {
+        let start = skip.min(out.len());
+        for pair in out[start..].chunks_mut(2) {
             if pair.len() == 2 {
                 let value = u16::from_be_bytes([pair[0], pair[1]]);
                 if is_grease(value) {

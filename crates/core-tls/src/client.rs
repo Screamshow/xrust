@@ -87,7 +87,8 @@ pub struct Handshake<'a> {
     config: Config<'a>,
     shares: Shares,
     /// the suite ids the fingerprint offers, so we can tell whether the server
-    /// answered our hello or one of its own
+    /// answered our hello or one of its own; GREASE is drawn per hello and is
+    /// never a choice a server may make (RFC 8701), so it is not listed
     offered: Vec<u16>,
     session_id: Vec<u8>,
     suite: CipherSuite,
@@ -131,6 +132,7 @@ impl<'a> Handshake<'a> {
                 .step_by(2)
                 .zip(suites.iter().skip(1).step_by(2))
                 .map(|(high, low)| u16::from_be_bytes([*high, *low]))
+                .filter(|suite| !crate::keyshare::is_grease(*suite))
                 .collect()
         };
         Ok(Handshake {
@@ -761,6 +763,7 @@ mod tests {
             .0
             .iter()
             .map(|w| u16::from_be_bytes([w[0], w[1]]))
+            .filter(|suite| !crate::keyshare::is_grease(*suite))
             .collect();
         assert_eq!(hs.offered, on_wire);
     }

@@ -22,4 +22,9 @@ bodies are not replayed: the tables keep only the profile's HPKE suites and
 payload lengths, and config_id, enc and payload are drawn per hello. Real ECH and
 TLS session resumption are not implemented.
 
+Like uTLS (and Sing-Box X 1.0.3/1.0.4 and Xray 26.10.21 on the wire), every
+hello draws five GREASE values -- cipher, group (supported_groups and the
+key_share entry alike), the two extension ids (never equal) and version --
+independently of one another.
+
 Regenerate tables with `python3 tools/fingerprint_tables.py`, then `cargo fmt`.

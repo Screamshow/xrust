@@ -221,6 +221,9 @@ fn extract_x25519(body: &[u8]) -> io::Result<Option<[u8; 32]>> {
     Ok(None)
 }
 
+/// One ClientHello record from a template. Per hello, like uTLS: the GREASE
+/// values (`Grease`), the GREASE ECH body and -- through the caller -- random,
+/// session id and key shares.
 pub fn build(
     template: &Template,
     random: &[u8; 32],
@@ -237,52 +240,43 @@ pub fn build(
     }
     hs.push(session_id.len() as u8);
     hs.extend_from_slice(session_id);
-    hs.extend_from_slice(&(template.cipher_suites.len() as u16).to_be_bytes());
-    hs.extend_from_slice(&template.cipher_suites);
+    let grease = Grease::draw()?;
+    let ciphers = grease.cipher_suites(&template.cipher_suites);
+    hs.extend_from_slice(&(ciphers.len() as u16).to_be_bytes());
+    hs.extend_from_slice(&ciphers);
     hs.push(template.compression.len() as u8);
     hs.extend_from_slice(&template.compression);
 
     let mut exts = Vec::new();
-    // GREASE ids must not repeat inside one hello. The key share keeps the
-    // captured GREASE id (it has to equal supported_groups' -- servers check),
-    // so reserve it here before the extension list draws from the pool.
-    let mut grease_used = Vec::new();
-    for e in &template.extensions {
-        if let Ext::Static(0x000a, body) = e {
-            for w in body.as_chunks::<2>().0 {
-                let v = u16::from_be_bytes([w[0], w[1]]);
-                if keyshare::is_grease(v) {
-                    grease_used.push(v);
-                }
-            }
-            break;
-        }
-    }
+    let mut grease_exts = 0;
     for e in &template.extensions {
         let (id, body): (u16, Vec<u8>) = match e {
-            // a GREASE extension id is reserved and fresh per handshake, the
-            // way BoringSSL draws one
-            Ext::Static(id, body) => (
-                if keyshare::is_grease(*id) {
-                    keyshare::unique_grease(&mut grease_used)
-                } else {
-                    *id
-                },
-                body.clone(),
-            ),
+            // the first GREASE extension takes ext1, the second ext2
+            Ext::Static(id, body) if keyshare::is_grease(*id) => {
+                grease_exts += 1;
+                (grease.extension(grease_exts)?, body.clone())
+            }
+            Ext::Static(id @ 0x000a, body) => (*id, grease.u16_list(body, 2, grease.group)),
+            Ext::Static(id @ 0x002b, body) => (*id, grease.u16_list(body, 1, grease.version)),
+            Ext::Static(id, body) => (*id, body.clone()),
             // an empty name is `disable_sni`: the extension is left out rather
             // than sent with a zero-length host, which is not the same thing
             Ext::Sni if sni.is_empty() => continue,
             Ext::Sni => (0x0000, build_sni(sni)?),
             Ext::Alpn if alpn.is_empty() => continue,
             Ext::Alpn => (0x0010, build_alpn(alpn)?),
-            Ext::KeyShare(raw) => (
-                0x0033,
-                match shares {
-                    Some(s) => s.body(raw)?,
-                    None => raw.clone(),
-                },
-            ),
+            Ext::KeyShare(raw) => {
+                // the GREASE share carries the supported_groups GREASE value:
+                // servers check that the two agree
+                let raw = grease.key_share(raw)?;
+                (
+                    0x0033,
+                    match shares {
+                        Some(s) => s.body(&raw)?,
+                        None => raw,
+                    },
+                )
+            }
             Ext::EchGrease(ech) => (0xfe0d, ech.body()?),
         };
         exts.extend_from_slice(&id.to_be_bytes());
@@ -303,6 +297,90 @@ pub fn build(
     record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
     record.extend_from_slice(&handshake);
     Ok(record)
+}
+
+/// The GREASE values of one hello, drawn the way uTLS draws its
+/// `greaseSeed` per handshake (utls aa6edf4b11af, u_parrots.go:3049-3061 and
+/// GetBoringGREASEValue in u_tls_extensions.go:983): one value each for the
+/// cipher list, the groups (supported_groups and key_share alike), the two
+/// GREASE extensions and supported_versions. They are independent of one
+/// another -- the cipher value may equal the group value -- except that the
+/// two extension ids differ, since a repeated id is a duplicate extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Grease {
+    cipher: u16,
+    group: u16,
+    ext1: u16,
+    ext2: u16,
+    version: u16,
+}
+
+impl Grease {
+    fn draw() -> io::Result<Self> {
+        let mut seed = [0u8; 5];
+        getrandom::fill(&mut seed).map_err(|e| err(&format!("no entropy: {e}")))?;
+        Ok(Self::from_seed(seed))
+    }
+
+    /// 0xωaωa from the high nibble of each seed byte.
+    fn from_seed(seed: [u8; 5]) -> Self {
+        let value = |byte: u8| {
+            let v = (byte & 0xf0) as u16 | 0x0a;
+            v << 8 | v
+        };
+        let ext1 = value(seed[2]);
+        let mut ext2 = value(seed[3]);
+        if ext2 == ext1 {
+            ext2 ^= 0x1010;
+        }
+        Grease {
+            cipher: value(seed[0]),
+            group: value(seed[1]),
+            ext1,
+            ext2,
+            version: value(seed[4]),
+        }
+    }
+
+    /// The `n`th (1-based) GREASE extension's id; uTLS supports two.
+    fn extension(&self, n: usize) -> io::Result<u16> {
+        match n {
+            1 => Ok(self.ext1),
+            2 => Ok(self.ext2),
+            _ => Err(err("at most two GREASE extensions are supported")),
+        }
+    }
+
+    fn cipher_suites(&self, suites: &[u8]) -> Vec<u8> {
+        self.u16_list(suites, 0, self.cipher)
+    }
+
+    /// `body` with every GREASE u16 after `skip` length bytes set to `value`.
+    fn u16_list(&self, body: &[u8], skip: usize, value: u16) -> Vec<u8> {
+        let mut out = body.to_vec();
+        if let Some(list) = out.get_mut(skip..) {
+            for pair in list.as_chunks_mut::<2>().0 {
+                if keyshare::is_grease(u16::from_be_bytes(*pair)) {
+                    *pair = value.to_be_bytes();
+                }
+            }
+        }
+        out
+    }
+
+    /// A captured `key_share` body with its GREASE entries' group set to the
+    /// group value; their data is kept.
+    fn key_share(&self, body: &[u8]) -> io::Result<Vec<u8>> {
+        let mut out = body.to_vec();
+        let mut off = 2;
+        for (group, key) in keyshare::entries(body)? {
+            if keyshare::is_grease(group) {
+                out[off..off + 2].copy_from_slice(&self.group.to_be_bytes());
+            }
+            off += 4 + key.len();
+        }
+        Ok(out)
+    }
 }
 
 fn build_sni(name: &str) -> io::Result<Vec<u8>> {
@@ -348,6 +426,26 @@ pub fn key_share_group(body: &[u8]) -> io::Result<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// uTLS's mapping from seed to GREASE value, over every seed byte: the
+    /// high nibble picks ω in 0xωaωa, and a second extension id equal to the
+    /// first is moved by 0x1010 (u_parrots.go:3059-3061).
+    #[test]
+    fn grease_seed_maps_like_utls() {
+        for byte in 0..=255u8 {
+            let hi = (byte >> 4) as u16;
+            let want = (hi << 12) | 0x0a00 | (hi << 4) | 0x0a;
+            let g = Grease::from_seed([byte, byte, byte, 0x00, byte]);
+            assert_eq!(g.cipher, want);
+            assert_eq!(g.group, want);
+            assert_eq!(g.version, want);
+            assert_eq!(g.ext1, want);
+            let same = Grease::from_seed([0, 0, byte, byte, 0]);
+            assert_eq!(same.ext2, want ^ 0x1010);
+            assert!(keyshare::is_grease(same.ext2));
+        }
+        assert!(Grease::from_seed([0; 5]).extension(3).is_err());
+    }
 
     /// The sniffers hand this parser whatever a client sent. It may refuse,
     /// it may not panic: release builds abort on panic.

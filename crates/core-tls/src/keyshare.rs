@@ -22,7 +22,7 @@ use std::io;
 use ml_kem::kem::{Decapsulate, DecapsulationKey, EncapsulationKey};
 use ml_kem::{EncodedSizeUser, KemCore, MlKem768, MlKem768Params};
 use p256::elliptic_curve::sec1::ToEncodedPoint;
-use rand_core::{OsRng, RngCore};
+use rand_core::OsRng;
 
 pub const X25519MLKEM768: u16 = 0x11ec;
 pub const X25519: u16 = 0x001d;
@@ -37,33 +37,10 @@ fn err(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// A GREASE value (RFC 8701): reserved, and a fresh one per handshake.
+/// A GREASE value (RFC 8701): reserved, and a fresh one per handshake
+/// (`hello::build` draws them).
 pub fn is_grease(value: u16) -> bool {
     (value & 0x0f) == 0x0a && (value >> 8) as u8 == (value & 0xff) as u8
-}
-
-/// A fresh GREASE value the way BoringSSL picks one: a random byte repeated,
-/// with the low nibble set.
-///
-/// `used` collects the values already written into this hello, because Chrome
-/// sends *two* GREASE extensions and a repeated id is a duplicate extension,
-/// which every server rejects. A failure to read entropy would leave every
-/// handshake with the same GREASE, which is legal, so it is not worth failing a
-/// connection over; the 16 reserved values cannot all be taken by one hello, so
-/// neither can the retries run out.
-pub fn unique_grease(used: &mut Vec<u16>) -> u16 {
-    for _ in 0..16 {
-        let mut byte = [0u8; 1];
-        let _ = RngCore::try_fill_bytes(&mut OsRng, &mut byte);
-        // the byte's *high* nibble, repeated, with the low one set to 0xa
-        let v = (byte[0] & 0xf0) as u16;
-        let value = (v << 8 | v) | 0x0a0a;
-        if !used.contains(&value) {
-            used.push(value);
-            return value;
-        }
-    }
-    0x0a0a
 }
 
 /// The `(group, key_exchange)` entries of a `key_share` extension body.
@@ -182,9 +159,9 @@ impl Shares {
 
     /// The `key_share` body to write: the template's group list in the
     /// template's order, with our data in place of the captured data. A GREASE
-    /// group keeps its captured data *and* its captured id: real clients send
-    /// one GREASE value for both `supported_groups` and `key_share`, and
-    /// OpenSSL rejects a hello whose two GREASE ids differ.
+    /// entry is copied as given: `hello::build` has already set its id to the
+    /// hello's supported_groups GREASE value -- real clients send one value
+    /// for both, and OpenSSL rejects a hello whose two GREASE ids differ.
     pub fn body(&self, template: &[u8]) -> io::Result<Vec<u8>> {
         let mut list = Vec::new();
         for (group, data) in entries(template)? {
@@ -454,27 +431,8 @@ mod tests {
         assert!(err.to_string().contains("0x0018"), "{err}");
     }
 
-    /// Chrome sends two GREASE extensions, and a repeated id is a duplicate
-    /// extension that every server rejects -- so the draws have to differ.
-    #[test]
-    fn grease_values_never_repeat_within_one_hello() {
-        for _ in 0..64 {
-            let mut used = Vec::new();
-            let first = unique_grease(&mut used);
-            let second = unique_grease(&mut used);
-            let third = unique_grease(&mut used);
-            assert_ne!(first, second);
-            assert_ne!(second, third);
-            assert_ne!(first, third);
-        }
-    }
-
     #[test]
     fn grease_values_are_the_reserved_shape() {
-        for _ in 0..64 {
-            let value = unique_grease(&mut Vec::new());
-            assert!(is_grease(value), "{value:#06x} is not GREASE");
-        }
         for value in [0x0a0a, 0xfafa, 0x1a1a, 0x0a0b, 0x0a00, 0x001d] {
             assert_eq!(
                 is_grease(value),
