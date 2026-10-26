@@ -175,40 +175,30 @@ impl Vless {
             crate::inbound::disable_tls_read_batching(&mut stream);
         }
         let rest = &header[consumed..];
-        // Vision's UUID travels with the head when there is one left to send,
-        // so the frame that follows -- a payload or the padded empty one -- is
-        // the same bytes Xray's `VisionWriter` puts behind it
-        let mut uuid_sent = false;
-        let request = if rest.is_empty() {
-            // ws early data carried all of it in the upgrade request
-            PendingHead::sent()
-        } else {
-            // The head waits for the first payload and both go in one write, as
-            // Xray's client sends them (`proxy/vless/outbound`:
-            // the head goes into a `BufferedWriter`, the first payload read
-            // within 500 ms is written behind it, `SetBuffered(false)` flushes
-            // both). Over TLS one write is one record, so the head alone would
-            // be a first application-data record of a few dozen bytes, a shape no
-            // browser sends; on ws, gRPC and the rest it would be a frame or a
-            // message of its own, and on XHTTP packet-up a POST of its own.
-            // (A glued POST was once read back twice by Xray 26.9; the cause was
-            // our client sending each POST's payload in the body *and* in an
-            // `x-data` header, fixed since, not the gluing: Xray's own client
-            // glues, and ours glued passes against Xray 26.10.21 in packet-up,
-            // stream-up and stream-one, see tests/vless_first_record.rs.)
-            // A destination that talks first gets the head
-            // when the wait is over, with Vision's padded empty frame behind it
-            // ("Insert padding with empty content to camouflage VLESS header").
-            let mut head = rest.to_vec();
-            let mut alone_tail = Vec::new();
-            if self.vision {
-                head.extend_from_slice(&self.uuid);
-                uuid_sent = true;
-                alone_tail = crate::outbound::vision::empty_frame();
-            }
-            PendingHead::new(head, VLESS_FIRST_PAYLOAD_WAIT, VLESS_FIRST_WRITE)
-                .with_alone_tail(alone_tail)
-        };
+        // The head waits for the first payload and both go in one write, as
+        // Xray's client sends them (`proxy/vless/outbound`: the head goes into
+        // a `BufferedWriter`, the first payload read within 500 ms is written
+        // behind it, `SetBuffered(false)` flushes both). Over TLS one write is
+        // one record, so the head alone would be a first application-data
+        // record of a few dozen bytes, a shape no browser sends; on ws, gRPC
+        // and the rest it would be a frame or a message of its own, and on
+        // XHTTP packet-up a POST of its own. (A glued POST was once read back
+        // twice by Xray 26.9; the cause was our client sending each POST's
+        // payload in the body *and* in an `x-data` header, fixed since, not the
+        // gluing: Xray's own client glues, and ours glued passes against Xray
+        // 26.10.21 in packet-up, stream-up and stream-one, see
+        // tests/vless_first_record.rs.)
+        //
+        // With Vision the first write above is the UUID and the first frame,
+        // so they ride with the head too. A destination that talks first gets
+        // the head alone when the wait is over, and the UUID with the first
+        // frame after it: that is what the Xray binary sends. Its source
+        // writes a padded empty Vision frame behind the head on that timeout,
+        // but the inbounds hand the outbound a reader whose timeout reports
+        // no data rather than `ErrReadTimeout`, so the branch never runs. A
+        // client that leaves before its first byte gets nothing sent at all,
+        // also as with Xray.
+        let request = PendingHead::new(rest.to_vec(), VLESS_FIRST_PAYLOAD_WAIT, VLESS_FIRST_WRITE);
         let framed: AnyStream = Box::new(VlessStream {
             inner: stream,
             request,
@@ -218,9 +208,9 @@ impl Vless {
         });
         if self.vision {
             // Vision frames the payload that follows the request header
-            Ok(Box::new(
-                crate::outbound::vision::VisionStream::with_uuid_sent(framed, self.uuid, uuid_sent),
-            ))
+            Ok(Box::new(crate::outbound::vision::VisionStream::new(
+                framed, self.uuid,
+            )))
         } else {
             Ok(framed)
         }
@@ -324,13 +314,19 @@ impl VlessStream {
                 Ok(ready) => ready?,
             }
             match client.try_read(&mut first) {
+                Ok(0) => {
+                    // the client left before its first byte
+                    self.request.abandon();
+                    return Ok(0);
+                }
                 Ok(n) => break n,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(error) => return Err(error),
             }
         };
         if got == 0 {
-            // the wait is over or the client is done: the head goes alone
+            // the wait is over: the head goes alone. (A client that is done
+            // already leaves the head unsent, see `PendingHead::abandon`.)
             self.request.start_alone();
         } else {
             self.write_all(&first[..got]).await?;

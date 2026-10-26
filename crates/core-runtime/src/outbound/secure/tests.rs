@@ -421,12 +421,14 @@ mod trojan {
         assert_eq!(&sent[head.len()..], &payload[..]);
     }
 
-    /// A client that closes without a byte still sends the head, as Xray does.
+    /// A client that closes without a byte gets nothing sent: Xray's
+    /// `CopyOnceTimeout` returns the end of stream as an error before the
+    /// buffered head is flushed (`proxy/trojan/client.go`).
     #[tokio::test]
-    async fn closing_before_any_payload_still_sends_the_head() {
-        let (mut stream, head, writes, shut) = stream(b"", Duration::from_millis(100));
+    async fn closing_before_any_payload_sends_nothing() {
+        let (mut stream, _, writes, shut) = stream(b"", Duration::from_millis(100));
         stream.shutdown().await.unwrap();
-        assert_eq!(writes.lock().unwrap().clone(), vec![head]);
+        assert!(writes.lock().unwrap().is_empty());
         assert!(*shut.lock().unwrap());
     }
 
@@ -505,35 +507,30 @@ mod vless_head {
     use super::super::{PendingHead, VLESS_FIRST_WRITE, VlessStream};
     use super::UUID;
     use super::trojan::Wire;
-    use crate::outbound::vision::{VisionStream, empty_frame};
+    use crate::outbound::vision::VisionStream;
 
     type Writes = Arc<Mutex<Vec<Vec<u8>>>>;
 
-    /// What `Vless::dial` builds for Vision on a stream transport: the UUID
-    /// rides with the head, and the padded empty frame follows it when it
-    /// goes alone.
-    fn vision(answer: &[u8], wait: Duration) -> (VisionStream, Vec<u8>, Writes) {
+    /// What `Vless::dial` builds for Vision: the head waits in the VLESS
+    /// stream, and the Vision stream above it writes the UUID with its first
+    /// frame.
+    fn vision(answer: &[u8], wait: Duration) -> (VisionStream, Vec<u8>, Writes, Arc<Mutex<bool>>) {
         let writes = Arc::new(Mutex::new(Vec::new()));
+        let shut = Arc::new(Mutex::new(false));
         let wire = Wire {
             writes: Arc::clone(&writes),
             answer: answer.to_vec(),
-            shut: Arc::new(Mutex::new(false)),
+            shut: Arc::clone(&shut),
         };
-        let mut head = super::vision_request_head();
-        head.extend_from_slice(&UUID);
+        let head = super::vision_request_head();
         let vless = VlessStream {
             inner: Box::new(wire),
-            request: PendingHead::new(head.clone(), wait, VLESS_FIRST_WRITE)
-                .with_alone_tail(empty_frame()),
+            request: PendingHead::new(head.clone(), wait, VLESS_FIRST_WRITE),
             header_pending: true,
             need: 2,
             buf: Vec::new(),
         };
-        (
-            VisionStream::with_uuid_sent(Box::new(vless), UUID, true),
-            head,
-            writes,
-        )
+        (VisionStream::new(Box::new(vless), UUID), head, writes, shut)
     }
 
     /// `[command][content:u16][padding:u16][content][zeros]`, all of `data`
@@ -545,39 +542,56 @@ mod vless_head {
         (data[0], data[5..5 + content].to_vec(), padding)
     }
 
-    /// Nothing written within the wait: one write with the head, the UUID and
-    /// an empty Continue frame padded 900 to 1399 bytes; the frames after it
-    /// carry no UUID.
+    /// The first payload: head, UUID and its frame in one write.
     #[tokio::test]
-    async fn a_silent_vision_client_sends_the_head_with_a_padded_empty_frame() {
+    async fn a_vision_client_sends_head_uuid_and_frame_in_one_write() {
+        let (mut stream, head, writes, _) = vision(b"", Duration::from_secs(30));
+        stream
+            .write_all(b"\x16\x03\x01\x00\x05hello")
+            .await
+            .unwrap();
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(&writes[0][..head.len()], &head[..]);
+        assert_eq!(&writes[0][head.len()..head.len() + 16], &UUID);
+        let (command, content, _) = frame(&writes[0][head.len() + 16..]);
+        assert_eq!(
+            (command, &content[..]),
+            (0x00, &b"\x16\x03\x01\x00\x05hello"[..])
+        );
+    }
+
+    /// Nothing written within the wait: the head goes alone, as the Xray
+    /// binary sends it, and the UUID rides with the first frame after it.
+    #[tokio::test]
+    async fn a_silent_vision_client_sends_the_bare_head_after_the_wait() {
         let mut answer = vec![0x00, 0x00];
         answer.extend_from_slice(&UUID);
         answer.extend_from_slice(&[0x01, 0x00, 0x03, 0x00, 0x00]);
         answer.extend_from_slice(b"220");
-        let (mut stream, head, writes) = vision(&answer, Duration::from_millis(50));
+        let (mut stream, head, writes, _) = vision(&answer, Duration::from_millis(50));
+        let started = tokio::time::Instant::now();
         let mut banner = [0u8; 3];
         stream.read_exact(&mut banner).await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(&banner, b"220");
         stream.write_all(b"EHLO").await.unwrap();
         let writes = writes.lock().unwrap().clone();
         assert_eq!(writes.len(), 2);
-        assert_eq!(&writes[0][..head.len()], &head[..]);
-        let (command, content, padding) = frame(&writes[0][head.len()..]);
-        assert_eq!((command, content.len()), (0x00, 0));
-        assert!((900..1400).contains(&padding), "{padding}");
-        let (command, content, _) = frame(&writes[1]);
+        assert_eq!(writes[0], head);
+        assert_eq!(&writes[1][..16], &UUID);
+        let (command, content, _) = frame(&writes[1][16..]);
         assert_eq!((command, &content[..]), (0x00, &b"EHLO"[..]));
     }
 
-    /// A client that closes without a byte: the same head and empty frame.
+    /// A client that closes without a byte: nothing is sent, as with Xray,
+    /// and the transport is shut down.
     #[tokio::test]
-    async fn closing_a_vision_client_before_any_payload_sends_the_padded_head() {
-        let (mut stream, head, writes) = vision(b"", Duration::from_secs(30));
+    async fn closing_a_vision_client_before_any_payload_sends_nothing() {
+        let (mut stream, _, writes, shut) = vision(b"", Duration::from_secs(30));
         stream.shutdown().await.unwrap();
-        let writes = writes.lock().unwrap().clone();
-        assert_eq!(writes.len(), 1);
-        let (command, content, _) = frame(&writes[0][head.len()..]);
-        assert_eq!((command, content.len()), (0x00, 0));
+        assert!(writes.lock().unwrap().is_empty());
+        assert!(*shut.lock().unwrap());
     }
 
     /// A first payload larger than Xray's 8 KiB write buffer: the head and as

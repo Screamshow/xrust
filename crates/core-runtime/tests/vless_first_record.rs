@@ -3,8 +3,9 @@
 //!
 //! - Against our own TLS server (REALITY, or a certificate), which opens every
 //!   record on its own: the request head shares the first record with the first
-//!   payload, and a client that stays silent sends it after Xray's 500 ms wait,
-//!   with Vision's padded empty frame behind it.
+//!   payload, a client that stays silent sends it alone after Xray's 500 ms
+//!   wait, and a client that leaves before its first byte sends nothing --
+//!   the shapes the Xray 26.10.21 binary puts on the wire.
 //! - Against Xray as the server when `XRAY_REF` names its binary: REALITY with
 //!   Vision, TLS with ws and gRPC, XHTTP packet-up, stream-up and stream-one.
 //! - Against the reference sing-box as the server when `SING_BOX_REF` names its
@@ -226,10 +227,10 @@ async fn reality_vision_sends_head_and_first_frame_in_one_record() {
 }
 
 /// A destination that talks first, REALITY with Vision: after 500 ms the head
-/// goes with the UUID and an empty frame padded 900 to 1399 bytes, as Xray's
-/// client sends it, and the answer comes back.
+/// goes alone, as the Xray binary sends it (a 61-byte record for an IPv4
+/// target in its capture), and the UUID rides with the first frame after it.
 #[tokio::test]
-async fn reality_vision_silent_client_sends_head_and_padded_empty_frame() {
+async fn reality_vision_silent_client_sends_the_bare_head_after_the_wait() {
     let private = [11u8; 32];
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -251,15 +252,31 @@ async fn reality_vision_silent_client_sends_head_and_padded_empty_frame() {
     let records = server.await.unwrap();
     assert_eq!(records.len(), 2);
     assert!(records[0].0 >= Duration::from_millis(450), "{records:?}");
-    let first = &records[0].1;
-    let head = expected_head(true, "smtp.example", 25);
-    assert_eq!(&first[..head.len()], &head[..]);
-    assert_eq!(&first[head.len()..head.len() + 16], &UUID);
-    let (command, content, padding) = vision_frame(&first[head.len() + 16..]);
-    assert_eq!((command, content.len()), (0x00, 0));
-    assert!((900..1400).contains(&padding), "{padding}");
-    let (command, content, _) = vision_frame(&records[1].1);
+    assert_eq!(records[0].1, expected_head(true, "smtp.example", 25));
+    let second = &records[1].1;
+    assert_eq!(&second[..16], &UUID, "the UUID with the first frame");
+    let (command, content, padding) = vision_frame(&second[16..]);
     assert_eq!((command, content), (0x00, &b"EHLO\r\n"[..]));
+    assert!(padding < 256, "no TLS seen: short padding, {padding}");
+}
+
+/// A client that leaves before its first byte: no application data at all,
+/// as with Xray, whose request returns before the buffered head is flushed.
+#[tokio::test]
+async fn a_client_that_leaves_before_its_first_byte_sends_no_head() {
+    let private = [12u8; 32];
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = record_server(listener, reality_config(private), vision_answer());
+    let client = vless(port, reality_tls(&private), "xtls-rprx-vision");
+    let mut stream = client
+        .connect(&Target::Domain("example.com".to_string(), 443))
+        .await
+        .expect("connect");
+    stream.shutdown().await.unwrap();
+    drop(stream);
+    let records = server.await.unwrap();
+    assert!(records.is_empty(), "{records:?}");
 }
 
 /// Plain VLESS over TLS and over REALITY: head and payload share a record when

@@ -495,3 +495,22 @@ async fn plain_vless_head_leaves_with_the_sniffed_prefix() {
     drop(server);
     let _ = tokio::time::timeout(LIMIT, relay).await;
 }
+
+/// A caller that closes before its first byte: the head is never sent, as
+/// with Xray, and the server sees the stream end empty.
+#[tokio::test]
+async fn plain_vless_sends_no_head_when_the_caller_leaves_first() {
+    let (relay_client, caller) = pair().await;
+    let (upstream, mut server, _) = vless_upstream().await;
+    let relay = tokio::spawn(async move {
+        pump_conn_tracked(relay_client, Conn::Plain(upstream), &[], None).await
+    });
+    drop(caller);
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), server.read_to_end(&mut got))
+        .await
+        .expect("the upstream ends")
+        .expect("server read");
+    assert!(got.is_empty(), "{got:?}");
+    let _ = tokio::time::timeout(LIMIT, relay).await;
+}

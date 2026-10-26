@@ -203,41 +203,12 @@ pub struct VisionStream {
     server_hello: ServerHello,
 }
 
-/// The frame Xray's client puts behind the request head when no payload came
-/// within the wait: `XtlsPadding(nil, CommandPaddingContinue, .., true, ..)`,
-/// a Continue frame with no content and the long padding, 900 to 1399 bytes.
-/// The UUID in front of it travels with the request head.
-pub(crate) fn empty_frame() -> Vec<u8> {
-    let padding = random_below(TLS_PADDING_SPREAD) + TLS_PADDING_FLOOR;
-    let mut frame = Vec::with_capacity(5 + padding);
-    frame.push(PADDING_CONTINUE);
-    frame.extend_from_slice(&[0, 0]);
-    frame.extend_from_slice(&(padding as u16).to_be_bytes());
-    frame.resize(5 + padding, 0);
-    frame
-}
-
-fn random_below(limit: usize) -> usize {
-    if limit == 0 {
-        return 0;
-    }
-    let mut byte = [0u8; 8];
-    getrandom::fill(&mut byte).unwrap_or_default();
-    (u64::from_le_bytes(byte) % limit as u64) as usize
-}
-
 impl VisionStream {
     pub fn new(inner: AnyStream, uuid: [u8; 16]) -> Self {
-        Self::with_uuid_sent(inner, uuid, false)
-    }
-
-    /// A client whose UUID already went out with the request head: the first
-    /// frame starts at its command.
-    pub(crate) fn with_uuid_sent(inner: AnyStream, uuid: [u8; 16], uuid_sent: bool) -> Self {
         Self {
             inner,
             uuid,
-            write_uuid: !uuid_sent,
+            write_uuid: true,
             padding: true,
             saw_tls: false,
             packets_to_filter: PACKETS_TO_FILTER,
@@ -274,13 +245,22 @@ impl VisionStream {
         (self.direct_read && drained).then_some(&self.inner)
     }
 
+    fn random_below(limit: usize) -> usize {
+        if limit == 0 {
+            return 0;
+        }
+        let mut byte = [0u8; 8];
+        getrandom::fill(&mut byte).unwrap_or_default();
+        (u64::from_le_bytes(byte) % limit as u64) as usize
+    }
+
     /// `VisionConn.padding`, built into `self.framed` so the phase costs no
     /// allocation per write.
     fn build_frame(&mut self, content: &[u8], command: u8) {
         let padding_len = if content.len() < TLS_PADDING_FLOOR && self.saw_tls {
-            random_below(TLS_PADDING_SPREAD) + TLS_PADDING_FLOOR - content.len()
+            Self::random_below(TLS_PADDING_SPREAD) + TLS_PADDING_FLOOR - content.len()
         } else {
-            random_below(PLAIN_PADDING_SPREAD)
+            Self::random_below(PLAIN_PADDING_SPREAD)
         };
         let uuid = self.write_uuid;
         self.framed.clear();

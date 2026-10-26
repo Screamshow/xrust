@@ -5,13 +5,14 @@
 //! Xray's clients never do that while the client talks first: the head goes into
 //! a `BufferedWriter`, the first payload read within a short wait is written
 //! behind it, and one flush sends both. When nothing comes in time -- a
-//! destination that speaks first, such as SSH or SMTP -- the head goes without
-//! a payload (VLESS with Vision adds a padded empty frame, see `alone_tail`).
+//! destination that speaks first, such as SSH or SMTP -- the head goes alone.
+//! When the client is gone before it sent anything, Xray sends nothing at all.
 //!
 //! The streams that use this keep it next to the transport they write to and
 //! drive it from all four poll functions: a write joins the head, a read
 //! waits out the deadline (nothing can come back before the server has the
-//! head), a flush or a shutdown sends the head if it is still waiting.
+//! head), a flush sends the head if the deadline already let it go, and a
+//! shutdown before any payload drops it.
 
 use std::future::Future;
 use std::io;
@@ -31,13 +32,13 @@ enum State {
         pos: usize,
         claimed: usize,
     },
-    Sent,
+    /// Written, or dropped because the client left first: every call passes
+    /// straight through.
+    Done,
 }
 
 pub(crate) struct PendingHead {
     state: State,
-    /// written behind the head when it goes without a payload
-    alone_tail: Vec<u8>,
     /// the most bytes the head's write may carry, head included
     first_write: usize,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -54,7 +55,6 @@ impl PendingHead {
         }
         Self {
             state: State::Waiting(head),
-            alone_tail: Vec::new(),
             first_write,
             deadline: Some(Box::pin(tokio::time::sleep(wait))),
             flush_head: false,
@@ -64,22 +64,15 @@ impl PendingHead {
     /// Nothing to send: every call passes straight through.
     pub(crate) fn sent() -> Self {
         Self {
-            state: State::Sent,
-            alone_tail: Vec::new(),
+            state: State::Done,
             first_write: 0,
             deadline: None,
             flush_head: false,
         }
     }
 
-    /// Bytes that follow the head when it goes without a payload.
-    pub(crate) fn with_alone_tail(mut self, tail: Vec<u8>) -> Self {
-        self.alone_tail = tail;
-        self
-    }
-
     pub(crate) fn is_sent(&self) -> bool {
-        matches!(self.state, State::Sent)
+        matches!(self.state, State::Done)
     }
 
     /// The head is still waiting for its payload, and when it stops waiting.
@@ -107,22 +100,29 @@ impl PendingHead {
             *pos += n;
         }
         let claimed = *claimed;
-        self.state = State::Sent;
+        self.state = State::Done;
         self.deadline = None;
         Poll::Ready(Ok(claimed))
     }
 
-    /// Send the head without a payload (the wait is over, or the stream is
-    /// closing).
+    /// Send the head without a payload: the wait is over.
     pub(crate) fn start_alone(&mut self) {
         if let State::Waiting(head) = &mut self.state {
-            let mut buf = std::mem::take(head);
-            buf.append(&mut self.alone_tail);
+            let buf = std::mem::take(head);
             self.state = State::Writing {
                 buf,
                 pos: 0,
                 claimed: 0,
             };
+        }
+    }
+
+    /// The client left before its first byte: like Xray, which returns from
+    /// the request without flushing the buffered head, nothing is sent.
+    pub(crate) fn abandon(&mut self) {
+        if matches!(self.state, State::Waiting(_)) {
+            self.state = State::Done;
+            self.deadline = None;
         }
     }
 
@@ -172,7 +172,7 @@ impl PendingHead {
     {
         loop {
             match &mut self.state {
-                State::Sent => return Pin::new(&mut *inner).poll_write(cx, buf),
+                State::Done => return Pin::new(&mut *inner).poll_write(cx, buf),
                 State::Waiting(head) => {
                     if buf.is_empty() {
                         return Poll::Ready(Ok(0));
@@ -182,7 +182,6 @@ impl PendingHead {
                         .min(self.first_write.saturating_sub(head.len()).max(1));
                     let mut joined = std::mem::take(head);
                     joined.extend_from_slice(&buf[..take]);
-                    self.alone_tail = Vec::new();
                     self.state = State::Writing {
                         buf: joined,
                         pos: 0,
@@ -216,8 +215,8 @@ impl PendingHead {
         Pin::new(&mut *inner).poll_flush(cx)
     }
 
-    /// Before a shutdown: the head goes out even when the client closed
-    /// without a byte, so the server sees the request it was promised.
+    /// Before a shutdown: a head still waiting for its payload is dropped, one
+    /// already on its way is finished.
     pub(crate) fn poll_before_shutdown<S>(
         &mut self,
         inner: &mut S,
@@ -226,7 +225,7 @@ impl PendingHead {
     where
         S: AsyncWrite + Unpin + ?Sized,
     {
-        self.start_alone();
+        self.abandon();
         if matches!(self.state, State::Writing { .. }) {
             ready!(self.poll_head(inner, cx))?;
         }
