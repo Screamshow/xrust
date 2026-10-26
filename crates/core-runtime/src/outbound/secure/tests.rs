@@ -269,3 +269,227 @@ async fn udp_relay_frames_datagrams_over_one_stream() {
     assert_eq!(&meta[9..20], b"example.com");
     assert_eq!(&data, b"ping");
 }
+
+mod trojan {
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+    use std::time::Duration;
+
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    use super::super::{Trojan, TrojanStream, trojan_request_head};
+    use crate::inbound::Target;
+    use crate::outbound::packet::{PacketEncoding, PacketReader, PacketWriter};
+
+    /// sha224("password"), hex
+    const KEY: &str = "d63dc919e201d7bc4c825630d2cf25fdc93d4b2f0d46706d29038d01";
+
+    /// Keeps every write call apart, so a head that went out on its own shows
+    /// up as a chunk of its own. Reads hand out `answer` once, then wait.
+    struct Wire {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        answer: Vec<u8>,
+        shut: Arc<Mutex<bool>>,
+    }
+
+    impl AsyncRead for Wire {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.answer.is_empty() {
+                return Poll::Pending;
+            }
+            let answer = std::mem::take(&mut self.answer);
+            buf.put_slice(&answer);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Wire {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            // one TLS record per call at most, like the real stream under it
+            let take = buf.len().min(core_tls::record::MAX_FRAGMENT);
+            self.writes.lock().unwrap().push(buf[..take].to_vec());
+            Poll::Ready(Ok(take))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            *self.shut.lock().unwrap() = true;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    type Writes = Arc<Mutex<Vec<Vec<u8>>>>;
+
+    fn stream(answer: &[u8], wait: Duration) -> (TrojanStream, Vec<u8>, Writes, Arc<Mutex<bool>>) {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let shut = Arc::new(Mutex::new(false));
+        let head = trojan_request_head(KEY, 0x01, &Target::Domain("example.com".to_string(), 443))
+            .unwrap();
+        let wire = Wire {
+            writes: Arc::clone(&writes),
+            answer: answer.to_vec(),
+            shut: Arc::clone(&shut),
+        };
+        (
+            TrojanStream::with_wait(Box::new(wire), head.clone(), wait),
+            head,
+            writes,
+            shut,
+        )
+    }
+
+    /// `[56 hex][CRLF][cmd][socksaddr][CRLF]`, sing-box `ClientHandshake`.
+    #[test]
+    fn the_request_head_is_key_crlf_command_address_crlf() {
+        let head = trojan_request_head(KEY, 0x01, &Target::Domain("example.com".to_string(), 443))
+            .unwrap();
+        let mut want = KEY.as_bytes().to_vec();
+        want.extend_from_slice(b"\r\n\x01\x03\x0bexample.com\x01\xbb\r\n");
+        assert_eq!(head, want);
+        let udp =
+            trojan_request_head(KEY, 0x03, &Target::Ip("1.2.3.4:53".parse().unwrap())).unwrap();
+        assert_eq!(&udp[56..], b"\r\n\x03\x01\x01\x02\x03\x04\x00\x35\r\n");
+    }
+
+    /// The key is what sing-box's `trojan.Key` makes of the password.
+    #[test]
+    fn the_key_is_hex_sha224_of_the_password() {
+        let obj = serde_json::json!({
+            "type": "trojan", "tag": "t", "server": "127.0.0.1", "server_port": 443,
+            "password": "password", "tls": {"enabled": true, "server_name": "example.com"}
+        });
+        let trojan = Trojan::build(obj.as_object().unwrap(), "t").unwrap();
+        assert_eq!(trojan.password_hash, KEY);
+    }
+
+    /// The first payload goes out in the head's write -- one TLS record -- the
+    /// way both references send it; nothing waits for the timer.
+    #[tokio::test]
+    async fn the_first_payload_rides_with_the_head() {
+        let (mut stream, head, writes, _) = stream(b"", Duration::from_secs(30));
+        let started = tokio::time::Instant::now();
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no wait with a payload at hand"
+        );
+        stream.write_all(b"more").await.unwrap();
+        let writes = writes.lock().unwrap().clone();
+        let mut first = head.clone();
+        first.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        assert_eq!(writes, vec![first, b"more".to_vec()]);
+    }
+
+    /// A destination that talks first never sees a payload from us; the head
+    /// goes out alone once the wait is over and the answer comes back.
+    #[tokio::test]
+    async fn a_server_first_destination_gets_the_head_after_the_wait() {
+        let (mut stream, head, writes, _) = stream(b"220 ready\r\n", Duration::from_millis(100));
+        let started = tokio::time::Instant::now();
+        let mut banner = [0u8; 11];
+        stream.read_exact(&mut banner).await.unwrap();
+        assert_eq!(&banner, b"220 ready\r\n");
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(writes.lock().unwrap().clone(), vec![head]);
+        stream.write_all(b"EHLO x\r\n").await.unwrap();
+        assert_eq!(writes.lock().unwrap()[1], b"EHLO x\r\n");
+    }
+
+    /// A payload larger than a record: the head and as much as fits share the
+    /// first record, and nothing is lost or repeated.
+    #[tokio::test]
+    async fn a_large_first_payload_fills_the_first_record() {
+        let (mut stream, head, writes, _) = stream(b"", Duration::from_millis(100));
+        let payload: Vec<u8> = (0..40_000u32).map(|i| i as u8).collect();
+        stream.write_all(&payload).await.unwrap();
+        let writes = writes.lock().unwrap().clone();
+        assert_eq!(writes[0].len(), core_tls::record::MAX_FRAGMENT);
+        assert_eq!(&writes[0][..head.len()], &head[..]);
+        let sent: Vec<u8> = writes.concat();
+        assert_eq!(&sent[head.len()..], &payload[..]);
+    }
+
+    /// A client that closes without a byte still sends the head, as Xray does.
+    #[tokio::test]
+    async fn closing_before_any_payload_still_sends_the_head() {
+        let (mut stream, head, writes, shut) = stream(b"", Duration::from_millis(100));
+        stream.shutdown().await.unwrap();
+        assert_eq!(writes.lock().unwrap().clone(), vec![head]);
+        assert!(*shut.lock().unwrap());
+    }
+
+    /// ws early data took the whole head into the upgrade request.
+    #[tokio::test]
+    async fn a_head_carried_by_early_data_is_not_sent_again() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let wire = Wire {
+            writes: Arc::clone(&writes),
+            answer: Vec::new(),
+            shut: Arc::new(Mutex::new(false)),
+        };
+        let mut stream =
+            TrojanStream::with_wait(Box::new(wire), Vec::new(), Duration::from_millis(100));
+        stream.write_all(b"payload").await.unwrap();
+        assert_eq!(writes.lock().unwrap().clone(), vec![b"payload".to_vec()]);
+    }
+
+    /// `trojan.WritePacket`/`ReadPacket`: socksaddr, length, CRLF, payload.
+    #[tokio::test]
+    async fn udp_packets_carry_address_length_and_crlf() {
+        let mut writer = PacketWriter::new(PacketEncoding::Trojan);
+        let target = Target::Ip("1.2.3.4:53".parse().unwrap());
+        let framed = writer.frame(&target, b"query").unwrap();
+        assert_eq!(framed, b"\x01\x01\x02\x03\x04\x00\x35\x00\x05\r\nquery");
+        let named = writer
+            .frame(&Target::Domain("dns.example".to_string(), 53), b"q")
+            .unwrap();
+        assert_eq!(named, b"\x03\x0bdns.example\x00\x35\x00\x01\r\nq");
+
+        // what a server sends back, from IPv4, IPv6 and a name
+        let mut wire = framed.clone();
+        wire.extend_from_slice(b"\x04");
+        wire.extend_from_slice(&[0u8; 15]);
+        wire.extend_from_slice(b"\x01\x00\x35\x00\x02\r\nv6");
+        wire.extend_from_slice(&named);
+        let mut reader = PacketReader::new(PacketEncoding::Trojan);
+        let mut input = &wire[..];
+        assert_eq!(reader.read(&mut input).await.unwrap(), b"query");
+        assert_eq!(reader.read(&mut input).await.unwrap(), b"v6");
+        assert_eq!(reader.read(&mut input).await.unwrap(), b"q");
+        let mut bad = &b"\x01\x01\x02\x03\x04\x00\x35\x00\x01XXq"[..];
+        assert!(reader.read(&mut bad).await.is_err(), "the CRLF is checked");
+    }
+
+    /// The client has no mux and no plain mode, and says so.
+    #[test]
+    fn multiplex_and_plain_trojan_are_refused() {
+        let base = serde_json::json!({
+            "type": "trojan", "tag": "t", "server": "127.0.0.1", "server_port": 443,
+            "password": "p", "tls": {"enabled": true, "server_name": "example.com"}
+        });
+        let mut mux = base.clone();
+        mux["multiplex"] = serde_json::json!({"enabled": true});
+        let err = Trojan::build(mux.as_object().unwrap(), "t").err().unwrap();
+        assert!(err.to_string().contains("multiplex"), "{err}");
+        let mut off = base.clone();
+        off["multiplex"] = serde_json::json!({"enabled": false, "protocol": "h2mux"});
+        assert!(Trojan::build(off.as_object().unwrap(), "t").is_ok());
+        let mut plain = base.clone();
+        plain["tls"] = serde_json::json!({"enabled": false});
+        let err = Trojan::build(plain.as_object().unwrap(), "t")
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("requires TLS"), "{err}");
+    }
+}

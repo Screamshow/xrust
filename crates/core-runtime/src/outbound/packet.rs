@@ -42,6 +42,10 @@ pub(crate) enum PacketEncoding {
     Xudp,
     /// `[address][port][data]`
     PacketAddr,
+    /// trojan's own form, `[address][port][len:u16][CRLF][data]` with the
+    /// SOCKS family bytes (`trojan.WritePacket`); never chosen by
+    /// `packet_encoding`.
+    Trojan,
 }
 
 impl PacketEncoding {
@@ -60,6 +64,7 @@ impl PacketEncoding {
     pub(crate) fn command(self) -> u8 {
         match self {
             PacketEncoding::LengthPrefixed => CMD_UDP,
+            PacketEncoding::Trojan => crate::outbound::secure::TROJAN_CMD_UDP,
             _ => CMD_MUX,
         }
     }
@@ -172,6 +177,13 @@ impl PacketWriter {
                 out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 out.extend_from_slice(payload);
             }
+            PacketEncoding::Trojan => {
+                out.reserve(MAX_ADDR_PORT + 256 + 4 + payload.len());
+                out.extend_from_slice(&crate::outbound::proxy::encode_target_with(target, 0x03)?);
+                out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(payload);
+            }
             PacketEncoding::PacketAddr => {
                 let len_offset = out.len();
                 out.extend_from_slice(&[0, 0]);
@@ -238,6 +250,33 @@ impl PacketReader {
                     let mut len = [0u8; 2];
                     stream.read_exact(&mut len).await?;
                     let mut payload = vec![0u8; u16::from_be_bytes(len) as usize];
+                    stream.read_exact(&mut payload).await?;
+                    return Ok(payload);
+                }
+                PacketEncoding::Trojan => {
+                    // the source address is read and dropped: the relay is
+                    // bound to one destination
+                    let mut family = [0u8; 1];
+                    stream.read_exact(&mut family).await?;
+                    let skip = match family[0] {
+                        0x01 => 4,
+                        0x04 => 16,
+                        0x03 => {
+                            let mut len = [0u8; 1];
+                            stream.read_exact(&mut len).await?;
+                            usize::from(len[0])
+                        }
+                        _ => return Err(io::Error::other("trojan: unknown address type")),
+                    };
+                    // address, port, length and CRLF
+                    let mut rest = [0u8; 255 + 6];
+                    let rest = &mut rest[..skip + 6];
+                    stream.read_exact(rest).await?;
+                    if &rest[skip + 4..] != b"\r\n" {
+                        return Err(io::Error::other("trojan: bad packet delimiter"));
+                    }
+                    let len = u16::from_be_bytes([rest[skip + 2], rest[skip + 3]]);
+                    let mut payload = vec![0u8; usize::from(len)];
                     stream.read_exact(&mut payload).await?;
                     return Ok(payload);
                 }

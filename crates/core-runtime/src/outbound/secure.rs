@@ -2,7 +2,7 @@ use std::io;
 use std::sync::Arc;
 
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::mux;
@@ -349,6 +349,7 @@ impl tokio::io::AsyncWrite for VlessStream {
 }
 
 /// trojan outbound: TLS is mandatory; password is SHA224-hex authenticated.
+#[derive(Clone)]
 pub struct Trojan {
     server: String,
     port: u16,
@@ -357,6 +358,11 @@ pub struct Trojan {
     tls: Option<TlsOptions>,
     pub dial: crate::outbound::dial::DialOptions,
 }
+
+/// `trojan.CommandTCP`
+const TROJAN_CMD_TCP: u8 = 0x01;
+/// `trojan.CommandUDP`
+pub(crate) const TROJAN_CMD_UDP: u8 = 0x03;
 
 impl Trojan {
     pub fn build(obj: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Self> {
@@ -371,8 +377,21 @@ impl Trojan {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
+        // Mux sessions are not wired for trojan; carrying on without them would
+        // put every connection on its own tunnel behind the user's back.
+        if obj
+            .get("multiplex")
+            .and_then(|m| m.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            anyhow::bail!("{at}: multiplex is not supported on the trojan outbound");
+        }
         let transport = Transport::parse(obj, at)?;
         let tls = TlsOptions::from_outbound(obj, &server, at)?;
+        if tls.is_none() {
+            anyhow::bail!("{at}: trojan requires TLS");
+        }
         Ok(Self {
             server,
             port,
@@ -384,37 +403,239 @@ impl Trojan {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
-        self.dial(0x01, target).await
+        Ok(Box::new(self.dial(TROJAN_CMD_TCP, target).await?))
     }
 
     /// trojan has one datagram form: the request head names the target and
-    /// every packet is length-prefixed on the same stream.
+    /// every packet carries its own address, length and CRLF on the same
+    /// stream (`trojan.WritePacket`).
     pub async fn connect_udp(&self, target: &Target) -> io::Result<tokio::net::UdpSocket> {
         let (local, peer) = crate::outbound::quic::udp_loopback_pair().await?;
-        let stream = self.dial(0x03, target).await?;
-        spawn_packet_bridge(stream, peer, PacketEncoding::LengthPrefixed, target.clone());
+        let stream = self.dial(TROJAN_CMD_UDP, target).await?;
+        spawn_packet_bridge(
+            Box::new(stream),
+            peer,
+            PacketEncoding::Trojan,
+            target.clone(),
+        );
         Ok(local)
     }
 
-    async fn dial(&self, command: u8, target: &Target) -> io::Result<AnyStream> {
+    async fn dial(&self, command: u8, target: &Target) -> io::Result<TrojanStream> {
         let Some(tls) = &self.tls else {
             return Err(io::Error::other("trojan requires TLS"));
         };
-        let mut header = Vec::with_capacity(64);
-        header.extend_from_slice(self.password_hash.as_bytes());
-        header.extend_from_slice(b"\r\n");
-        header.push(command);
-        // trojan uses `M.SocksaddrSerializer`, so the family bytes are the
-        // SOCKS ones: 1 = IPv4, 4 = IPv6, 3 = domain
-        header.extend_from_slice(&crate::outbound::proxy::encode_target_with(target, 0x03)?);
-        header.extend_from_slice(b"\r\n");
-        let (mut stream, consumed) = self
+        let header = trojan_request_head(&self.password_hash, command, target)?;
+        let (stream, consumed) = self
             .transport
             .connect_or_dial(Some(tls), &self.server, self.port, &header, &self.dial)
             .await?;
-        stream.write_all(&header[consumed..]).await?;
-        stream.flush().await?;
-        Ok(stream)
+        Ok(TrojanStream::new(stream, header[consumed..].to_vec()))
+    }
+}
+
+/// `[hex(sha224(password))][CRLF][command][address][port][CRLF]`. The
+/// destination block is `M.SocksaddrSerializer`, whose family bytes are the
+/// SOCKS ones: 1 = IPv4, 4 = IPv6, 3 = domain.
+pub(crate) fn trojan_request_head(
+    password_hash: &str,
+    command: u8,
+    target: &Target,
+) -> io::Result<Vec<u8>> {
+    let mut header = Vec::with_capacity(64 + crate::outbound::packet::MAX_ADDR_PORT + 256);
+    header.extend_from_slice(password_hash.as_bytes());
+    header.extend_from_slice(b"\r\n");
+    header.push(command);
+    header.extend_from_slice(&crate::outbound::proxy::encode_target_with(target, 0x03)?);
+    header.extend_from_slice(b"\r\n");
+    Ok(header)
+}
+
+/// How long the request head waits for the first payload to travel with it.
+/// Xray's client copies once with this timeout before it flushes the head
+/// (`buf.CopyOnceTimeout(link.Reader, bodyWriter, 100ms)`), so a client that
+/// talks first sends head and payload in one write, and a server-first
+/// destination gets the head on its own once the wait is over.
+pub(crate) const TROJAN_FIRST_PAYLOAD_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// The most payload that joins the head in its write: one TLS record's worth
+/// for both together, which is the cut sing-box's single `Write` gets from
+/// its TLS layer too.
+const TROJAN_FIRST_WRITE: usize = core_tls::record::MAX_FRAGMENT;
+
+enum TrojanHead {
+    /// Not written yet; joins the first payload, or goes alone at the deadline.
+    Waiting(Vec<u8>),
+    /// On its way: `buf[pos..]` is left, and `claimed` bytes of it are the
+    /// caller's payload (0 when the head went alone).
+    Writing {
+        buf: Vec<u8>,
+        pos: usize,
+        claimed: usize,
+    },
+    Sent,
+}
+
+/// A trojan connection whose request head waits for the first payload, like
+/// both references: sing-box's `ClientConn.Write` prepends the head to the first
+/// write, and Xray buffers the head with the first payload and flushes them
+/// together. Either way the head is never a record of its own while the client
+/// talks first -- a 56-byte hex key, CRLF and an address alone in the first
+/// application-data record would be a shape no browser produces.
+pub(crate) struct TrojanStream {
+    inner: AnyStream,
+    head: TrojanHead,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+    /// the head went out from the read side and still needs a flush
+    flush_head: bool,
+}
+
+impl TrojanStream {
+    pub(crate) fn new(inner: AnyStream, head: Vec<u8>) -> Self {
+        Self::with_wait(inner, head, TROJAN_FIRST_PAYLOAD_WAIT)
+    }
+
+    pub(crate) fn with_wait(inner: AnyStream, head: Vec<u8>, wait: std::time::Duration) -> Self {
+        Self {
+            inner,
+            head: if head.is_empty() {
+                // ws early data carried all of it in the upgrade request
+                TrojanHead::Sent
+            } else {
+                TrojanHead::Waiting(head)
+            },
+            deadline: Box::pin(tokio::time::sleep(wait)),
+            flush_head: false,
+        }
+    }
+
+    /// Write out the head in flight; ready with the payload bytes it carried.
+    fn poll_head(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<usize>> {
+        let TrojanHead::Writing { buf, pos, claimed } = &mut self.head else {
+            return std::task::Poll::Ready(Ok(0));
+        };
+        while *pos < buf.len() {
+            let n = std::task::ready!(
+                std::pin::Pin::new(&mut self.inner).poll_write(cx, &buf[*pos..])
+            )?;
+            if n == 0 {
+                return std::task::Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            *pos += n;
+        }
+        let claimed = *claimed;
+        self.head = TrojanHead::Sent;
+        std::task::Poll::Ready(Ok(claimed))
+    }
+
+    /// Send the head alone (the wait is over, or the stream is closing).
+    fn start_head_alone(&mut self) {
+        if let TrojanHead::Waiting(head) = &mut self.head {
+            let buf = std::mem::take(head);
+            self.head = TrojanHead::Writing {
+                buf,
+                pos: 0,
+                claimed: 0,
+            };
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for TrojanStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::future::Future;
+        let this = self.get_mut();
+        loop {
+            match &this.head {
+                // nothing can come back before the server has the head
+                TrojanHead::Waiting(_) => {
+                    std::task::ready!(this.deadline.as_mut().poll(cx));
+                    this.start_head_alone();
+                }
+                TrojanHead::Writing { claimed: 0, .. } => {
+                    std::task::ready!(this.poll_head(cx))?;
+                    this.flush_head = true;
+                }
+                // a write is carrying the head with its payload: that write
+                // finishes it, and reading meanwhile is fine
+                _ => break,
+            }
+        }
+        if this.flush_head {
+            std::task::ready!(std::pin::Pin::new(&mut this.inner).poll_flush(cx))?;
+            this.flush_head = false;
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(cx, out)
+    }
+}
+
+impl tokio::io::AsyncWrite for TrojanStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        loop {
+            match &mut this.head {
+                TrojanHead::Sent => {
+                    return std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+                }
+                TrojanHead::Waiting(head) => {
+                    if buf.is_empty() {
+                        return std::task::Poll::Ready(Ok(0));
+                    }
+                    let take = buf
+                        .len()
+                        .min(TROJAN_FIRST_WRITE.saturating_sub(head.len()).max(1));
+                    let mut joined = std::mem::take(head);
+                    joined.extend_from_slice(&buf[..take]);
+                    this.head = TrojanHead::Writing {
+                        buf: joined,
+                        pos: 0,
+                        claimed: take,
+                    };
+                }
+                TrojanHead::Writing { .. } => {
+                    let claimed = std::task::ready!(this.poll_head(cx))?;
+                    if claimed > 0 {
+                        // this write's payload went out with the head
+                        return std::task::Poll::Ready(Ok(claimed));
+                    }
+                    // the head went alone; `buf` follows it as usual
+                }
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if matches!(this.head, TrojanHead::Writing { claimed: 0, .. }) {
+            std::task::ready!(this.poll_head(cx))?;
+        }
+        this.flush_head = false;
+        std::pin::Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        // Xray sends the head even when the client closed without a byte
+        this.start_head_alone();
+        if matches!(this.head, TrojanHead::Writing { .. }) {
+            std::task::ready!(this.poll_head(cx))?;
+        }
+        std::pin::Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
