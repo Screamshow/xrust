@@ -568,6 +568,13 @@ impl Connection {
             .seal_into(ContentType::ApplicationData, data, out)
     }
 
+    /// A `close_notify` alert (warning level, as Go's `crypto/tls` sends it)
+    /// sealed into `out`: what a client says before it closes its side.
+    pub fn close_notify_into(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
+        out.clear();
+        self.sealer.seal_into(ContentType::Alert, &[1, 0], out)
+    }
+
     /// The same, into a buffer the caller owns: one sealed record.
     pub fn write_record(&mut self, data: &[u8]) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();

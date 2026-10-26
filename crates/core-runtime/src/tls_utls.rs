@@ -9,7 +9,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -26,7 +26,7 @@ static READ_POOL: Pool = Pool::new();
 static WRITE_POOL: Pool = Pool::new();
 
 /// TLS over `S`, established by us rather than by a library.
-pub struct FingerprintStream<S> {
+pub struct FingerprintStream<S: AsyncWrite + Unpin> {
     inner: S,
     connection: Connection,
     /// transport bytes, and where the opened plaintext of the record at the front
@@ -65,9 +65,11 @@ pub struct FingerprintStream<S> {
     /// a record error met after plaintext was already handed over in the same
     /// call, kept for the next read
     read_error: Option<io::Error>,
+    /// our close_notify went out (or is on its way in `wbuf`)
+    close_notify_sent: bool,
 }
 
-impl<S> FingerprintStream<S> {
+impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
     /// Wrap a transport whose handshake is already finished.
     pub fn new(inner: S, connection: Connection) -> Self {
         FingerprintStream {
@@ -87,7 +89,38 @@ impl<S> FingerprintStream<S> {
             direct_write: false,
             batch_reads: true,
             read_error: None,
+            close_notify_sent: false,
         }
+    }
+
+    /// Whether closing our side should say close_notify first. Go's
+    /// `tls.Conn` does on `Close` and `CloseWrite`; Xray suppresses it once
+    /// Vision went Direct either way (`proxy.go` `SuppressOuterCloseNotify`),
+    /// since the outer TLS no longer frames what follows.
+    fn owes_close_notify(&self) -> bool {
+        !self.close_notify_sent && !self.write_closed && !self.direct_read && !self.direct_write
+    }
+
+    /// Write out what `wbuf` holds from `out` on.
+    fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while let Some(pos) = self.out {
+            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.wbuf[pos..]))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+            }
+            let pos = pos + n;
+            self.out = (pos < self.wbuf.len()).then_some(pos);
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    /// Seal close_notify into `wbuf`, to go out with `poll_drain`.
+    fn queue_close_notify(&mut self) -> io::Result<()> {
+        self.close_notify_sent = true;
+        self.connection.close_notify_into(&mut self.wbuf)?;
+        self.out = Some(0);
+        self.pending_plaintext = 0;
+        Ok(())
     }
 
     /// Return from a read after one record, as Vision needs: it decides
@@ -102,10 +135,6 @@ impl<S> FingerprintStream<S> {
 
     pub fn get_mut(&mut self) -> &mut S {
         &mut self.inner
-    }
-
-    pub fn into_inner(self) -> S {
-        self.inner
     }
 
     pub(crate) fn enable_direct_read(&mut self) {
@@ -355,10 +384,42 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Only our direction ends here. A client that half-closes its upload
-        // still expects the rest of the download.
+        // still expects the rest of the download: close_notify ends our
+        // direction only, and the peer may go on sending (RFC 8446 6.1), as
+        // after Go's `CloseWrite`.
         let me = self.get_mut();
-        me.write_closed = true;
+        if !me.write_closed {
+            // a record a write left half way out goes first
+            ready!(me.poll_drain(cx))?;
+            if me.owes_close_notify() {
+                me.queue_close_notify()?;
+                ready!(me.poll_drain(cx))?;
+            }
+            ready!(Pin::new(&mut me.inner).poll_flush(cx))?;
+            me.write_closed = true;
+        }
         Pin::new(&mut me.inner).poll_shutdown(cx)
+    }
+}
+
+/// A stream dropped without a shutdown still says close_notify, as Go's
+/// `tls.Conn.Close` does (it is what Xray's client sends when a connection
+/// ends: a 19-byte encrypted alert record before the FIN). There is no
+/// waiting in a drop, so this is one attempt: whatever the socket takes now.
+impl<S: AsyncWrite + Unpin> Drop for FingerprintStream<S> {
+    fn drop(&mut self) {
+        if !self.owes_close_notify() {
+            return;
+        }
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        if !matches!(self.poll_drain(&mut cx), Poll::Ready(Ok(()))) {
+            // a record still half way out: an alert behind it would not parse
+            return;
+        }
+        if self.queue_close_notify().is_ok() {
+            let _ = self.poll_drain(&mut cx);
+            let _ = Pin::new(&mut self.inner).poll_flush(&mut cx);
+        }
     }
 }
 
@@ -636,8 +697,8 @@ mod read_batching_tests {
                 match tls.read(&mut chunk).await {
                     Ok(0) => break,
                     Ok(n) => request.extend_from_slice(&chunk[..n]),
-                    // a TCP EOF without close_notify, which is what we send
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                    // a clean end: our shutdown says close_notify first, so
+                    // rustls does not report a truncation
                     Err(e) => panic!("{e}"),
                 }
             }
@@ -659,6 +720,57 @@ mod read_batching_tests {
         stream.read_to_end(&mut response).await.unwrap();
         assert_eq!(response.len(), 3 * RECORD);
         assert!(response.iter().all(|b| *b == 0x5a));
+    }
+
+    /// How the server's read of our upload ends: `Ok` for a clean end after
+    /// close_notify, the error kind for a bare TCP EOF.
+    async fn upload_end() -> (
+        FingerprintStream<DuplexStream>,
+        tokio::sync::oneshot::Receiver<Result<Vec<u8>, io::ErrorKind>>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut stream = connected(|mut tls| async move {
+            // the server is past its handshake writes before the client goes
+            tls.write_all(b"go").await.unwrap();
+            let mut got = Vec::new();
+            let end = tls.read_to_end(&mut got).await;
+            let _ = tx.send(end.map(|_| got).map_err(|e| e.kind()));
+        })
+        .await;
+        let mut go = [0u8; 2];
+        stream.read_exact(&mut go).await.unwrap();
+        (stream, rx)
+    }
+
+    /// Dropped without a shutdown, the stream still says close_notify, as
+    /// Go's `tls.Conn.Close` does: the server sees a clean end of stream.
+    #[tokio::test]
+    async fn a_dropped_stream_says_close_notify() {
+        let (mut stream, end) = upload_end().await;
+        stream.write_all(b"bye").await.unwrap();
+        drop(stream);
+        assert_eq!(end.await.unwrap(), Ok(b"bye".to_vec()));
+    }
+
+    /// Once Vision went Direct the outer TLS frames nothing any more, and no
+    /// close_notify goes out, as with Xray (`SuppressOuterCloseNotify`).
+    #[tokio::test]
+    async fn no_close_notify_after_direct() {
+        for write in [true, false] {
+            let (mut stream, end) = upload_end().await;
+            stream.write_all(b"bye").await.unwrap();
+            if write {
+                assert!(stream.enable_direct_write());
+            } else {
+                stream.enable_direct_read();
+            }
+            drop(stream);
+            assert_eq!(
+                end.await.unwrap(),
+                Err(io::ErrorKind::UnexpectedEof),
+                "direct write: {write}"
+            );
+        }
     }
 
     /// A write after shutdown is refused and puts nothing on the wire; the

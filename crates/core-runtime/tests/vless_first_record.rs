@@ -260,14 +260,57 @@ async fn reality_vision_silent_client_sends_the_bare_head_after_the_wait() {
     assert!(padding < 256, "no TLS seen: short padding, {padding}");
 }
 
+/// Every record our REALITY server opens after the handshake, alerts too,
+/// answering the first application-data record with `answer`.
+fn all_records_server(
+    listener: TcpListener,
+    private: [u8; 32],
+    answer: Vec<u8>,
+) -> tokio::task::JoinHandle<Vec<(ContentType, Vec<u8>)>> {
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut handshake = core_tls::server::Handshake::new(reality_config(private)).unwrap();
+        handshake.run(&mut socket).await.expect("handshake");
+        let (mut sealer, mut opener) = handshake.application.take().unwrap();
+        let mut records = Vec::new();
+        loop {
+            let mut head = [0u8; 5];
+            let read = tokio::time::timeout(Duration::from_secs(3), socket.read_exact(&mut head));
+            if !matches!(read.await, Ok(Ok(_))) {
+                break;
+            }
+            let len = u16::from_be_bytes([head[3], head[4]]) as usize;
+            let mut record = head.to_vec();
+            record.resize(5 + len, 0);
+            if socket.read_exact(&mut record[5..]).await.is_err() {
+                break;
+            }
+            let Ok((kind, data)) = opener.open(&record) else {
+                break;
+            };
+            if kind == ContentType::ApplicationData
+                && !records
+                    .iter()
+                    .any(|(k, _)| *k == ContentType::ApplicationData)
+            {
+                let sealed = sealer.seal(ContentType::ApplicationData, &answer).unwrap();
+                let _ = socket.write_all(&sealed).await;
+            }
+            records.push((kind, data.to_vec()));
+        }
+        records
+    })
+}
+
 /// A client that leaves before its first byte: no application data at all,
-/// as with Xray, whose request returns before the buffered head is flushed.
+/// as with Xray, whose request returns before the buffered head is flushed;
+/// only close_notify, which Go's `tls.Conn.Close` sends.
 #[tokio::test]
 async fn a_client_that_leaves_before_its_first_byte_sends_no_head() {
     let private = [12u8; 32];
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = record_server(listener, reality_config(private), vision_answer());
+    let server = all_records_server(listener, private, vision_answer());
     let client = vless(port, reality_tls(&private), "xtls-rprx-vision");
     let mut stream = client
         .connect(&Target::Domain("example.com".to_string(), 443))
@@ -276,7 +319,30 @@ async fn a_client_that_leaves_before_its_first_byte_sends_no_head() {
     stream.shutdown().await.unwrap();
     drop(stream);
     let records = server.await.unwrap();
-    assert!(records.is_empty(), "{records:?}");
+    assert_eq!(records, vec![(ContentType::Alert, vec![1, 0])]);
+}
+
+/// A connection that ends without a shutdown still says close_notify last,
+/// as Xray's client does on close (a 19-byte record on the wire).
+#[tokio::test]
+async fn a_dropped_connection_ends_with_close_notify() {
+    let private = [14u8; 32];
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = all_records_server(listener, private, b"\x00\x00pong".to_vec());
+    let client = vless(port, reality_tls(&private), "");
+    let mut stream = client
+        .connect(&Target::Domain("example.com".to_string(), 80))
+        .await
+        .expect("connect");
+    stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let mut pong = [0u8; 4];
+    stream.read_exact(&mut pong).await.unwrap();
+    drop(stream);
+    let records = server.await.unwrap();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert_eq!(records[0].0, ContentType::ApplicationData);
+    assert_eq!(records[1], (ContentType::Alert, vec![1, 0]));
 }
 
 /// Plain VLESS over TLS and over REALITY: head and payload share a record when

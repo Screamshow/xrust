@@ -729,7 +729,10 @@ impl TlsOptions {
             alpn = vec![b"h2", b"http/1.1"];
         }
         if !self.own_stack() {
-            return Ok(Box::new(self.connect_stream(stream, default_alpn).await?));
+            return Ok(Box::new(ClosingTls {
+                inner: self.connect_stream(stream, default_alpn).await?,
+                shut: false,
+            }));
         }
         // With no fingerprint named, present chrome: ours always writes its own
         // hello, so there is a template to pick either way.
@@ -945,6 +948,83 @@ fn load_pem_certs(
 fn load_pem_key(mut pem: &[u8]) -> io::Result<()> {
     private_key(&mut pem)?;
     Ok(())
+}
+
+/// A rustls client stream that says close_notify when it is dropped without a
+/// shutdown, as Go's `tls.Conn.Close` does; a shutdown already sends it
+/// (tokio-rustls). There is no waiting in a drop, so this is one attempt:
+/// whatever the socket takes now.
+struct ClosingTls<S: AsyncWrite + Unpin> {
+    inner: TlsStream<S>,
+    shut: bool,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ClosingTls<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClosingTls<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        self.shut = true;
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// `io::Write` over an async writer, for one attempt with nobody to wake.
+struct NowWriter<'a, S>(&'a mut S);
+
+impl<S: AsyncWrite + Unpin> io::Write for NowWriter<'_, S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        match std::pin::Pin::new(&mut *self.0).poll_write(&mut cx, buf) {
+            std::task::Poll::Ready(result) => result,
+            std::task::Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<S: AsyncWrite + Unpin> Drop for ClosingTls<S> {
+    fn drop(&mut self) {
+        if self.shut {
+            return;
+        }
+        let (io, connection) = self.inner.get_mut();
+        connection.send_close_notify();
+        while connection.wants_write() {
+            match connection.write_tls(&mut NowWriter(io)) {
+                Ok(n) if n > 0 => {}
+                _ => break,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1435,6 +1515,70 @@ tKRtIBbVNqzAuojxmi55s2+rAP2MkmRaA4dJ5cDEEsVBbwnQkkEKHOPK
                 "tls": {"enabled": true, "reality": {"enabled": true, "public_key": bad}}
             });
             assert!(options(value).is_err(), "public_key {bad:?} was accepted");
+        }
+    }
+
+    /// The rustls path says close_notify when its stream is dropped without
+    /// a shutdown, as Go's `tls.Conn.Close` does, and on a shutdown, keeping
+    /// the download open.
+    #[tokio::test]
+    async fn the_rustls_path_says_close_notify_on_drop_and_shutdown() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        core_tls::install_default_provider();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
+        let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.crt")).unwrap(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.key")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+        );
+        for shutdown in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::clone(&config));
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut tls = acceptor.accept(socket).await.unwrap();
+                tls.write_all(b"go").await.unwrap();
+                let mut got = Vec::new();
+                let end = tls.read_to_end(&mut got).await.map_err(|e| e.kind());
+                // the download goes on after the client's close_notify
+                let _ = tls.write_all(b"late").await;
+                let _ = tls.shutdown().await;
+                end.map(|_| got)
+            });
+            let tls = options(json!({"tls": {"enabled": true, "server_name": "localhost",
+                "insecure": true}}))
+            .unwrap()
+            .unwrap();
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut stream = tls.establish(tcp, &[]).await.unwrap();
+            let mut go = [0u8; 2];
+            stream.read_exact(&mut go).await.unwrap();
+            stream.write_all(b"bye").await.unwrap();
+            if shutdown {
+                stream.shutdown().await.unwrap();
+                let mut late = Vec::new();
+                stream.read_to_end(&mut late).await.unwrap();
+                assert_eq!(late, b"late");
+            }
+            drop(stream);
+            assert_eq!(
+                server.await.unwrap(),
+                Ok(b"bye".to_vec()),
+                "shutdown {shutdown}"
+            );
         }
     }
 }
