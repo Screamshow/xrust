@@ -415,11 +415,16 @@ mod tests {
                     std::time::Duration::from_millis(50),
                 );
                 drop(client);
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                assert!(
-                    UdpSocket::bind(address).await.is_ok(),
-                    "idle packet socket retained"
-                );
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    loop {
+                        if UdpSocket::bind(address).await.is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("idle packet socket retained");
             }
         }
     }

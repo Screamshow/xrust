@@ -379,7 +379,7 @@ async fn redirect_inbound_without_nat_closes_connection() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn tproxy_inbound_linux_accepts_and_routes() {
+async fn tproxy_inbound_linux_refuses_connections_to_its_own_listener() {
     let _g = test_guard().await;
     let echo = spawn_echo().await;
     // IP_TRANSPARENT requires CAP_NET_ADMIN; without it bind fails with
@@ -416,10 +416,19 @@ async fn tproxy_inbound_linux_accepts_and_routes() {
     let addr = inbound_addr(&instance, "tproxy-in");
 
     let mut stream = TcpStream::connect(addr).await.expect("connect tproxy");
-    stream.write_all(b"hello-tproxy").await.expect("write");
+    // This is a direct connection to the listener, not a packet intercepted
+    // by a TPROXY rule. The loop-prevention guard must reject it before the
+    // route override can forward it to the echo server.
+    let _ = stream.write_all(b"hello-tproxy").await;
     let mut buf = [0u8; 64];
-    let n = stream.read(&mut buf).await.expect("read echo");
-    assert_eq!(&buf[..n], b"hello-tproxy");
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("self-addressed tproxy connection was not closed");
+    match result {
+        Ok(0) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("expected EOF or reset, got {other:?}"),
+    }
     instance.shutdown();
 }
 
