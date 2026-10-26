@@ -118,6 +118,16 @@ impl<S> FingerprintStream<S> {
         true
     }
 
+    /// The transport, once reads are raw and every byte taken off it before
+    /// the switch has been handed over: what it yields next is payload as is.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn direct_read_transport(&self) -> Option<&S> {
+        let drained = self.plain_at == self.plain_end
+            && self.rpos == self.raw.len()
+            && self.read_error.is_none();
+        (self.direct_read && drained).then_some(&self.inner)
+    }
+
     fn release_direct_read_buffer(&mut self) {
         if self.direct_read && self.plain_at == self.plain_end {
             release_drained_raw(&mut self.raw, &mut self.rpos);

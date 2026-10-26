@@ -227,6 +227,24 @@ impl VisionStream {
         }
     }
 
+    /// Whether this stream sits on a transport that can go Direct.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn supports_direct(&mut self) -> bool {
+        crate::inbound::supports_vision_direct(&mut self.inner)
+    }
+
+    /// The stream underneath, once reads are Direct and nothing read off it
+    /// still waits here: every later byte comes straight from it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn direct_read_inner(&self) -> Option<&AnyStream> {
+        let drained = self.raw.is_empty()
+            && self.payload.is_empty()
+            && self.current_command == PADDING_DIRECT
+            && self.remaining_content == 0
+            && self.remaining_padding == 0;
+        (self.direct_read && drained).then_some(&self.inner)
+    }
+
     fn random_below(limit: usize) -> usize {
         if limit == 0 {
             return 0;

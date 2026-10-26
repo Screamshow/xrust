@@ -574,6 +574,34 @@ fn client_raw_tcp(client: &dyn std::any::Any) -> Option<&TcpStream> {
     client.downcast_ref::<ClientConn>()?.raw_tcp()
 }
 
+/// A Vision stream on a raw-capable TLS-over-TCP upstream: the only upstream
+/// whose download may leave userspace later on.
+#[cfg(target_os = "linux")]
+fn vision_splice_candidate(stream: &mut AnyStream) -> bool {
+    (**stream)
+        .as_any_mut()
+        .downcast_mut::<crate::outbound::vision::VisionStream>()
+        .is_some_and(|vision| vision.supports_direct())
+}
+
+/// The socket under a Vision upstream whose reads are Direct with nothing left
+/// in any layer above it: from here on it carries the payload as is.
+#[cfg(target_os = "linux")]
+fn vision_direct_socket(stream: &dyn std::any::Any) -> Option<&TcpStream> {
+    if let Some(vision) = stream.downcast_ref::<crate::outbound::vision::VisionStream>() {
+        return vision_direct_socket((**vision.direct_read_inner()?).as_any());
+    }
+    if let Some(vless) = stream.downcast_ref::<crate::outbound::secure::VlessStream>() {
+        return vision_direct_socket((**vless.read_inner()?).as_any());
+    }
+    if let Some(alpn) = stream.downcast_ref::<AlpnStream>() {
+        return vision_direct_socket((*alpn.inner).as_any());
+    }
+    stream
+        .downcast_ref::<crate::tls_utls::FingerprintStream<TcpStream>>()?
+        .direct_read_transport()
+}
+
 /// Relay the client stream into an established upstream connection, replaying
 /// any sniff-read `prefix` upstream first. With a `tracker` the connection is
 /// registered in the Clash connection view: byte counters feed `/connections`
@@ -632,6 +660,20 @@ where
                 {
                     return relay::relay(client_tcp, upstream_tcp, prefix, tracker, true).await;
                 }
+            }
+            // Vision on TLS over TCP: userspace until its download is Direct
+            // and drained, then the kernel for that direction
+            #[cfg(target_os = "linux")]
+            if client_raw_tcp(&client).is_some() && vision_splice_candidate(&mut upstream) {
+                if !prefix.is_empty() {
+                    upstream.write_all(prefix).await?;
+                    if let Some(tracker) = tracker {
+                        tracker.add_upload(prefix.len() as u64);
+                    }
+                }
+                return relay::relay_vision(&mut client, &mut upstream, tracker)
+                    .await
+                    .map(|_| ());
             }
 
             if !prefix.is_empty() {
@@ -772,7 +814,7 @@ fn give_buf(buf: Vec<u8>) {
 /// view: bytes read from it are upload, bytes written to it are download.
 struct Counted<'a, S> {
     inner: &'a mut S,
-    tracker: &'a clash_state::ConnHandle,
+    tracker: Option<&'a clash_state::ConnHandle>,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for Counted<'_, S> {
@@ -783,9 +825,8 @@ impl<S: AsyncRead + Unpin> AsyncRead for Counted<'_, S> {
     ) -> std::task::Poll<io::Result<()>> {
         let before = buf.filled().len();
         let poll = std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf);
-        if let std::task::Poll::Ready(Ok(())) = &poll {
-            self.tracker
-                .add_upload((buf.filled().len() - before) as u64);
+        if let (std::task::Poll::Ready(Ok(())), Some(tracker)) = (&poll, self.tracker) {
+            tracker.add_upload((buf.filled().len() - before) as u64);
         }
         poll
     }
@@ -798,8 +839,8 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Counted<'_, S> {
         data: &[u8],
     ) -> std::task::Poll<io::Result<usize>> {
         let poll = std::pin::Pin::new(&mut *self.inner).poll_write(cx, data);
-        if let std::task::Poll::Ready(Ok(n)) = &poll {
-            self.tracker.add_download(*n as u64);
+        if let (std::task::Poll::Ready(Ok(n)), Some(tracker)) = (&poll, self.tracker) {
+            tracker.add_download(*n as u64);
         }
         poll
     }
@@ -1130,7 +1171,7 @@ where
     let signal = tracker.close_signal();
     let mut counted = Counted {
         inner: client,
-        tracker,
+        tracker: Some(tracker),
     };
     tokio::select! {
         biased;

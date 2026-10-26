@@ -11,13 +11,19 @@
 //! connection costs two sockets and nothing else. When a pipe cannot be had
 //! (fd limit) that one direction drops to a small buffered loop instead of
 //! failing the connection.
+//!
+//! A Vision upstream on TLS over TCP joins once its download is Direct: see
+//! `relay_vision`.
 
 use std::io;
 use std::os::fd::{AsRawFd, RawFd};
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
 
-use tokio::io::Interest;
+use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
 use tokio::net::TcpStream;
 
+use super::{AnyStream, Counted, PooledBuffer, TransferState, take_buf, transfer_one_direction};
 use crate::clash_state::ConnHandle;
 
 /// Largest bytes asked from one splice, and the size a busy pipe grows to. One
@@ -252,3 +258,209 @@ pub(crate) async fn relay(
         _ = signal.wait() => Err(super::closed_by_api()),
     }
 }
+
+/// Download of a Vision connection. Vision lets the server stop outer TLS
+/// ("Direct"); after that the upstream socket carries the payload as is, and
+/// once every byte read off it before the switch has reached the client the
+/// kernel can take over. Xray splices this direction only, and so do we.
+enum Down {
+    /// userspace, until the upstream reports its reads raw and drained
+    Watch(PooledBuffer, bool),
+    /// userspace for good: no pipe could be had
+    Copy(PooledBuffer),
+    /// the kernel, with how much of the last chunk is still in the pipe
+    Splice(Option<Pipe>, usize),
+    /// download over, the write half to the client is being shut
+    Closing,
+    Done,
+}
+
+/// Reads the upstream until its Vision reads are Direct with nothing left in
+/// any buffer above the socket, then reports end of stream and sets `switch`.
+struct UntilRaw<'a> {
+    inner: &'a mut AnyStream,
+    switch: &'a mut bool,
+}
+
+impl AsyncRead for UntilRaw<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if *this.switch || super::vision_direct_socket((**this.inner).as_any()).is_some() {
+            *this.switch = true;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut *this.inner).poll_read(cx, buf)
+    }
+}
+
+/// `one_way` as a poll: socket -> pipe -> socket until `from` reaches EOF,
+/// then half-close `to`. `left` is what the pipe still holds.
+fn poll_spliced(
+    cx: &mut Context<'_>,
+    pipe: &Pipe,
+    left: &mut usize,
+    from: &TcpStream,
+    to: &TcpStream,
+    count: impl Fn(u64),
+) -> Poll<io::Result<()>> {
+    let (from_fd, to_fd) = (from.as_raw_fd(), to.as_raw_fd());
+    loop {
+        while *left > 0 {
+            ready!(to.poll_write_ready(cx))?;
+            let want = *left;
+            match to.try_io(Interest::WRITABLE, || splice(pipe.read, to_fd, want)) {
+                Ok(0) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                Ok(m) => {
+                    *left -= m;
+                    count(m as u64);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+        // the pipe is empty here, so EAGAIN means the socket has nothing
+        ready!(from.poll_read_ready(cx))?;
+        match from.try_io(Interest::READABLE, || splice(from_fd, pipe.write, CHUNK)) {
+            Ok(0) => {
+                shutdown_write(to);
+                return Poll::Ready(Ok(()));
+            }
+            Ok(n) => *left = n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => return Poll::Ready(Err(e)),
+        }
+    }
+}
+
+fn poll_down<S>(
+    cx: &mut Context<'_>,
+    state: &mut Down,
+    client: &mut S,
+    upstream: &mut AnyStream,
+    tracker: Option<&ConnHandle>,
+    spliced: &mut bool,
+) -> Poll<io::Result<()>>
+where
+    S: AsyncRead + AsyncWrite + Unpin + std::any::Any,
+{
+    loop {
+        match state {
+            Down::Watch(buf, switch) => {
+                let mut reader = UntilRaw {
+                    inner: &mut *upstream,
+                    switch: &mut *switch,
+                };
+                let mut writer = Counted {
+                    inner: &mut *client,
+                    tracker,
+                };
+                ready!(buf.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer)))?;
+                // the buffer is empty and flushed: everything read so far is
+                // with the client
+                let switched = *switch;
+                *state = if switched {
+                    Down::Splice(None, 0)
+                } else {
+                    Down::Closing
+                };
+            }
+            Down::Copy(buf) => {
+                let mut writer = Counted {
+                    inner: &mut *client,
+                    tracker,
+                };
+                ready!(buf.poll_copy(cx, Pin::new(&mut *upstream), Pin::new(&mut writer)))?;
+                *state = Down::Closing;
+            }
+            Down::Splice(pipe, left) => {
+                let from = super::vision_direct_socket((**upstream).as_any());
+                let to = super::client_raw_tcp(&*client);
+                let (Some(from), Some(to)) = (from, to) else {
+                    return Poll::Ready(Err(io::Error::other("vision splice lost its socket")));
+                };
+                if pipe.is_none() {
+                    // an idle download takes no pipe until its next byte
+                    ready!(from.poll_read_ready(cx))?;
+                    match Pipe::new() {
+                        Ok(new) => *pipe = Some(new),
+                        Err(_) => {
+                            // nothing was taken off the socket: the stream
+                            // reads it straight through from here
+                            *state = Down::Copy(PooledBuffer::new(take_buf()));
+                            continue;
+                        }
+                    }
+                    *spliced = true;
+                }
+                let Some(pipe) = pipe.as_ref() else {
+                    continue;
+                };
+                ready!(poll_spliced(cx, pipe, left, from, to, |n| {
+                    if let Some(tracker) = tracker {
+                        tracker.add_download(n)
+                    }
+                }))?;
+                *state = Down::Done;
+            }
+            Down::Closing => {
+                let mut writer = Counted {
+                    inner: &mut *client,
+                    tracker,
+                };
+                ready!(Pin::new(&mut writer).poll_shutdown(cx))?;
+                *state = Down::Done;
+            }
+            Down::Done => return Poll::Ready(Ok(())),
+        }
+    }
+}
+
+/// Relay a client socket and a Vision upstream until both directions are
+/// done. The upload stays in userspace (Vision writes raw by itself once
+/// Direct). The download is copied like `copy_bidirectional_pooled` until the
+/// upstream's reads are Direct and every buffered byte is with the client,
+/// then moves socket to socket in the kernel. Returns whether it did.
+///
+/// Counters and half-close follow the userspace relay; `DELETE
+/// /connections/{id}` is the caller's `select!`.
+pub(crate) async fn relay_vision<S>(
+    client: &mut S,
+    upstream: &mut AnyStream,
+    tracker: Option<&ConnHandle>,
+) -> io::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin + std::any::Any,
+{
+    let mut up = TransferState::Running(PooledBuffer::new(take_buf()));
+    let mut down = Down::Watch(PooledBuffer::new(take_buf()), false);
+    let mut spliced = false;
+    std::future::poll_fn(|cx| {
+        let res_up = {
+            let mut counted = Counted {
+                inner: &mut *client,
+                tracker,
+            };
+            transfer_one_direction(cx, &mut up, &mut counted, &mut *upstream)?
+        };
+        let res_down = poll_down(
+            cx,
+            &mut down,
+            &mut *client,
+            &mut *upstream,
+            tracker,
+            &mut spliced,
+        )?;
+        ready!(res_up);
+        ready!(res_down);
+        Poll::Ready(Ok::<(), io::Error>(()))
+    })
+    .await?;
+    Ok(spliced)
+}
+
+#[cfg(test)]
+mod vision_tests;

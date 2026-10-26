@@ -273,6 +273,12 @@ impl VlessStream {
         }
         (&*self.inner as &dyn std::any::Any).downcast_ref::<tokio::net::TcpStream>()
     }
+
+    /// The stream underneath, once the response head is consumed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn read_inner(&self) -> Option<&AnyStream> {
+        (!self.header_pending && self.buf.is_empty()).then_some(&self.inner)
+    }
 }
 
 impl tokio::io::AsyncRead for VlessStream {
