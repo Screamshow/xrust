@@ -461,18 +461,20 @@ impl DirectMesh {
                 peer.last_attempt = None;
                 return Ok(());
             }
-            let handshake = peer.initiation.get_or_insert_with(|| {
-                noise::build_initiation(
-                    &private.to_bytes(),
-                    public,
-                    key,
-                    None,
-                    &noise::tai64n_now(),
-                    1,
-                )
-            });
+            // Every retry is a new initiation (new ephemeral key and timestamp),
+            // as WireGuard's REKEY_TIMEOUT does: a responder drops a repeated
+            // timestamp, so resending the first one could never succeed once
+            // its response was lost.
+            let handshake = peer.initiation.insert(noise::build_initiation(
+                &private.to_bytes(),
+                public,
+                key,
+                None,
+                &noise::tai64n_now(),
+                1,
+            ));
             for endpoint in &peer.endpoints {
-                socket.send_to(handshake.initiation(), endpoint).await?;
+                send_datagram(socket, handshake.initiation(), *endpoint).await;
             }
             if let (Some(relay), Some(region)) = (relay.as_mut(), peer.derp_region) {
                 relay.send(region, *key, handshake.initiation());
@@ -491,9 +493,7 @@ impl DirectMesh {
         packet: &[u8],
     ) -> io::Result<()> {
         match path {
-            Path::Udp(endpoint) => {
-                socket.send_to(packet, endpoint).await?;
-            }
+            Path::Udp(endpoint) => send_datagram(socket, packet, endpoint).await,
             Path::Derp(region) => {
                 if let Some(relay) = relay {
                     relay.send(region, destination, packet);
@@ -850,6 +850,16 @@ impl DirectMesh {
     }
 }
 
+/// A failed datagram send (no route while the WAN is down, a firewall
+/// refusal) is a lost packet, as on any UDP path. It must not fail the poll:
+/// that would drop the packets already decrypted in it and skip the other
+/// peers, including ones still reachable on the LAN.
+async fn send_datagram(socket: &UdpSocket, packet: &[u8], endpoint: SocketAddr) {
+    if let Err(error) = socket.send_to(packet, endpoint).await {
+        crate::logging::debug(format_args!("tailscale: send to {endpoint}: {error}"));
+    }
+}
+
 pub(crate) fn packet_ips(packet: &[u8]) -> Option<(IpAddr, IpAddr, usize)> {
     match packet.first()? >> 4 {
         4 if packet.len() >= 20 => {
@@ -1038,6 +1048,45 @@ mod tests {
         let response = packet([100, 64, 0, 2], [100, 64, 0, 1], 43);
         b.send(response.clone()).await.unwrap();
         assert_eq!(receive(&mut b, &mut a).await, response);
+    }
+
+    #[tokio::test]
+    async fn handshake_retry_after_a_lost_response_is_accepted() {
+        let (mut a, mut b) = pair().await;
+        let request = packet([100, 64, 0, 1], [100, 64, 0, 2], 7);
+        a.send(request.clone()).await.unwrap();
+        // b answers the first initiation; the answer is lost on the way
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while b.peers[&a.public].latest_timestamp.is_none() {
+                b.poll().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut lost = [0; 2048];
+        let mut responses = 0;
+        while let Ok((length, _)) = a.socket.try_recv_from(&mut lost) {
+            responses += usize::from(noise::type_word(&lost[..length]) == Some(2));
+        }
+        assert_eq!(responses, 1);
+        // a retries after RETRY; b must not take it for a replay
+        a.peers.get_mut(&b.public).unwrap().last_attempt = Some(Instant::now() - RETRY);
+        assert_eq!(receive(&mut a, &mut b).await, request);
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_to_one_endpoint_does_not_fail_the_peer() {
+        let (mut a, mut b) = pair().await;
+        let mut unsendable = peer(b.public, "100.64.0.2", b.local_addr().unwrap().port());
+        // a broadcast address without SO_BROADCAST: the send fails with EACCES
+        let reachable = unsendable.endpoints.take().unwrap();
+        unsendable.endpoints = Some([vec!["255.255.255.255:9".to_string()], reachable].concat());
+        a.update_peers(&[unsendable]);
+        let request = packet([100, 64, 0, 1], [100, 64, 0, 2], 9);
+        a.send(request.clone()).await.unwrap();
+        assert_eq!(receive(&mut a, &mut b).await, request);
     }
 
     #[tokio::test]
