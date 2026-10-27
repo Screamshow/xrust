@@ -411,7 +411,7 @@ impl RelayManager {
                         "tailscale: DERP region {} connected",
                         region
                     ));
-                    backoff = 1;
+                    let connected_at = std::time::Instant::now();
                     let _ = client.tx.try_send(
                         encode_note_preferred(*preferred_rx.borrow_and_update()).to_vec(),
                     );
@@ -445,6 +445,12 @@ impl RelayManager {
                                 if to_mesh.try_send((region, packet)).is_ok() {notify.notify_one();}
                             }
                         }
+                    }
+                    // Only a connection that stayed up resets the backoff; a
+                    // server that accepts and drops at once is not retried
+                    // every second.
+                    if connected_at.elapsed() >= Duration::from_secs(30) {
+                        backoff = 1;
                     }
                 }
                 let _ = health_tx.try_send(RelayHealth {

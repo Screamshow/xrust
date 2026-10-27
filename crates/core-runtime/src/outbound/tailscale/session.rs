@@ -193,7 +193,18 @@ impl ControlSession {
         )
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "tailscale: announce timeout"))??;
-        self.send = self.send.clone().ready().await.map_err(io::Error::other)?;
+        // A half-open control connection must not hold the loop: bound the
+        // request the way announce and the stream reads are bounded.
+        let timed_out = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tailscale: map stream start timeout",
+            )
+        };
+        self.send = tokio::time::timeout(Duration::from_secs(30), self.send.clone().ready())
+            .await
+            .map_err(|_| timed_out())?
+            .map_err(io::Error::other)?;
         let payload=serde_json::to_vec(&serde_json::json!({"Version":CAPABILITY_VERSION,"NodeKey":node,"DiscoKey":format!("discokey:{}",super::control::to_hex(&disco)),
             "Stream":true,"KeepAlive":true,"Compress":"","Endpoints":network.endpoints.iter().map(ToString::to_string).collect::<Vec<_>>(),"Hostinfo":map_network_hostinfo(hostname,routes,network)})).map_err(io::Error::other)?;
         let request = http::Request::builder()
@@ -209,7 +220,10 @@ impl ControlSession {
             .map_err(io::Error::other)?;
         send.send_data(Bytes::from(payload), true)
             .map_err(io::Error::other)?;
-        let response = response.await.map_err(io::Error::other)?;
+        let response = tokio::time::timeout(Duration::from_secs(30), response)
+            .await
+            .map_err(|_| timed_out())?
+            .map_err(io::Error::other)?;
         if !response.status().is_success() {
             return Err(bad("tailscale: map stream rejected"));
         }

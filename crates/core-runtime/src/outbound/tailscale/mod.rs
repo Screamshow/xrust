@@ -43,6 +43,12 @@ use crate::outbound::tailscale::session::{CAPABILITY_VERSION, ControlSession};
 const CALLER_BUF: usize = 65_536;
 const REPLY_QUEUE: usize = 32;
 const SCRATCH_BUF: usize = 16_384;
+
+/// Seconds before the next control attempt. A success sets the delay to 0
+/// so the stream reads on at once; a failure after it must still wait.
+fn retry_delay(previous: u64) -> u64 {
+    (previous * 2).clamp(1, 30)
+}
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn assigned_addresses(node: &control::NodeObj) -> io::Result<Vec<IpAddr>> {
@@ -213,7 +219,6 @@ impl Tailscale {
                 home,
             ));
         }
-        let _network_tx = network_tx;
         mesh.update_peers(map.as_ref().and_then(|m| m.peers.as_deref()).unwrap_or(&[]));
         crate::logging::debug(format_args!("tailscale: selected home relay {:?}", home));
         let disco = mesh.disco_public();
@@ -236,6 +241,9 @@ impl Tailscale {
         let cfg = self.cfg.clone();
         let node = node_key_str(&x25519_dalek::PublicKey::from(&node_key));
         tokio::spawn(async move {
+            // Without a DERP map nothing else holds the sender; a dropped one
+            // would end every map stream at once.
+            let _network_tx = network_tx;
             let mut session = None;
             let mut delay = 1;
             let mut stream = None;
@@ -444,7 +452,7 @@ impl Tailscale {
                         {
                             break;
                         }
-                        delay = (delay * 2).min(30);
+                        delay = retry_delay(delay);
                     }
                 }
                 drop(shared);
@@ -596,6 +604,15 @@ impl Tailscale {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn control_retry_waits_after_a_success() {
+        // after a success the delay is 0: the first failure still waits
+        assert_eq!(super::retry_delay(0), 1);
+        assert_eq!(super::retry_delay(1), 2);
+        assert_eq!(super::retry_delay(16), 30);
+        assert_eq!(super::retry_delay(30), 30);
+    }
+
     use super::*;
 
     #[test]
