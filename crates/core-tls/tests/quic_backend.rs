@@ -383,6 +383,78 @@ fn quic_handshake(server_crypto: Arc<QuicServerConfig>) -> (Vec<u8>, Vec<u8>) {
     (flight1.concat(), flight2[0].clone())
 }
 
+/// Split a `quic_transport_parameters` body into `(id, value)` pairs.
+fn transport_params(body: &[u8]) -> Vec<(u64, Vec<u8>)> {
+    fn varint(bytes: &[u8]) -> (u64, &[u8]) {
+        let first = bytes[0];
+        let len = 1usize << (first >> 6);
+        let mut value = u64::from(first & 0x3f);
+        for byte in &bytes[1..len] {
+            value = (value << 8) | u64::from(*byte);
+        }
+        (value, &bytes[len..])
+    }
+    let mut out = Vec::new();
+    let mut rest = body;
+    while !rest.is_empty() {
+        let (id, tail) = varint(rest);
+        let (len, tail) = varint(tail);
+        let len = len as usize;
+        out.push((id, tail[..len].to_vec()));
+        rest = &tail[len..];
+    }
+    out
+}
+
+/// The `quic_transport_parameters` extension carries what a quic-go client
+/// sends, in its order: an observer reads this straight out of the Initial
+/// packet, since its keys come from the connection id. quinn's own set, and
+/// the order it shuffles per connection, would name the stack instead.
+#[test]
+fn quic_transport_parameters_are_in_the_reference_order() {
+    let (certs, key) = load_certs();
+    let server_crypto = Arc::new(QuicServerConfig::new(certs, key).expect("server config"));
+    // `quic_handshake` asserts both sides complete, so the rewritten
+    // parameters are also proven acceptable to a real peer.
+    let (hello, _) = quic_handshake(server_crypto);
+    let exts = hello_extensions(&hello);
+    let params = transport_params(extension(&exts, 0x0039));
+    let ids: Vec<u64> = params.iter().map(|(id, _)| *id).collect();
+
+    // ids outside a quic-go client's set are gone, a greased one aside
+    for unexpected in [0x2ab2, 0xff04_de1b] {
+        assert!(!ids.contains(&unexpected), "{ids:?}");
+    }
+    let fixed: Vec<u64> = ids.iter().copied().filter(|id| id % 31 != 27).collect();
+    let order = [
+        0x05, 0x06, 0x07, 0x04, 0x08, 0x09, 0x01, 0x03, 0x0b, 0x0a, 0x0c, 0x0e, 0x0f, 0x20,
+    ];
+    let mut at = 0usize;
+    for id in &fixed {
+        let found = order[at..]
+            .iter()
+            .position(|want| want == id)
+            .unwrap_or_else(|| panic!("{id:#x} is out of the reference order: {fixed:?}"));
+        at += found + 1;
+    }
+    // the ones a quic-go client always writes
+    for required in [0x05u64, 0x06, 0x07, 0x04, 0x08, 0x09, 0x01, 0x0f] {
+        assert!(
+            ids.contains(&required),
+            "{required:#x} missing from {ids:?}"
+        );
+    }
+    // and a greased parameter, when there is one, comes first
+    if let Some(grease) = ids.iter().find(|id| *id % 31 == 27) {
+        assert_eq!(ids[0], *grease, "a greased parameter leads: {ids:?}");
+        assert!(
+            params[0].1.len() < 16,
+            "payload {} bytes",
+            params[0].1.len()
+        );
+    }
+}
+
 /// The QUIC hello offers X25519MLKEM768 first with its 1216-byte share,
 /// then the X25519 component share, like Go's crypto/tls; a rustls server
 /// with the same provider picks the hybrid group.

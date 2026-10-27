@@ -63,10 +63,20 @@ pub(crate) fn size_network_udp_buffers(sock: socket2::SockRef<'_>) {
 /// Size of the client's first-flight datagrams in the quic-go based
 /// reference clients (hysteria2, sing-box, Xray: Chrome's 1250 bytes).
 /// quinn otherwise uses 1200.
+///
+/// This sets the size of the datagrams quinn fills. The second Initial of a
+/// post-quantum hello still leaves at 1200, the minimum RFC 9000 asks of an
+/// Initial, where the reference pads every client Initial to the full size:
+/// quinn pads to that minimum and the choice is inside quinn-proto, so
+/// closing that last difference means patching it.
 pub(crate) const QUIC_GO_INITIAL_MTU: u16 = 1250;
 /// Length of the Destination Connection ID in a quic-go client's first
 /// Initial (quinn otherwise picks 20 bytes).
 const QUIC_GO_INITIAL_DCID_LEN: usize = 8;
+/// `protocol.MaxPacketBufferSize` in quic-go: an ethernet frame less the IPv6
+/// and UDP headers. It is what the reference clients are willing to receive,
+/// so it is what their `max_udp_payload_size` advertises.
+pub(crate) const QUIC_GO_MAX_PACKET_BUFFER: u16 = 1452;
 
 /// Zero-length Source Connection IDs, as the reference clients use. Safe
 /// here because every hysteria2 connection has its own endpoint and socket:
@@ -219,10 +229,19 @@ impl QuicTunnelOptions {
         let mut endpoint = quinn::EndpointConfig::new(Arc::new(
             crate::outbound::quic::HmacSha256Wrapper::new(&reset),
         ));
-        if let Some(size) = self.initial_packet_size
-            && let Err(e) = endpoint.max_udp_payload_size(size)
-        {
-            logging::warn(format_args!("initial_packet_size: {e}"));
+        // What we are willing to receive, which is also the
+        // `max_udp_payload_size` the hello advertises: a quic-go client sends
+        // its `MaxPacketBufferSize`, an ethernet frame less the IPv6 and UDP
+        // headers, where quinn would advertise its 65527-byte default. The
+        // size we *send* is `initial_mtu` below, and a config that asks to
+        // send more than the reference receives still has to receive its own
+        // size.
+        let receive_size = self
+            .initial_packet_size
+            .unwrap_or(0)
+            .max(QUIC_GO_MAX_PACKET_BUFFER);
+        if let Err(e) = endpoint.max_udp_payload_size(receive_size) {
+            logging::warn(format_args!("max_udp_payload_size: {e}"));
         }
 
         let mut transport = quinn::TransportConfig::default();

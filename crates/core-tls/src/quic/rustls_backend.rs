@@ -436,7 +436,7 @@ impl crypto::ClientConfig for QuicClientConfig {
                     ServerName::try_from(server_name)
                         .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?
                         .to_owned(),
-                    to_vec(params),
+                    client_params(params),
                 )
                 .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?,
             ),
@@ -599,6 +599,14 @@ fn to_vec(params: &TransportParameters) -> Vec<u8> {
     let mut bytes = Vec::new();
     params.write(&mut bytes);
     bytes
+}
+
+/// The client's parameters as a quic-go client sends them: quinn writes its
+/// own set in an order it shuffles per connection, and an observer can read
+/// all of it out of the Initial packet (see [`super::params`]). The server
+/// path above keeps quinn's own shape -- an inbound here imitates nobody.
+fn client_params(params: &TransportParameters) -> Vec<u8> {
+    super::params::in_quic_go_order(&to_vec(params))
 }
 
 /// Derive QUIC initial keys for a connection ID / side.

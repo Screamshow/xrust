@@ -7,6 +7,7 @@
 //! `quic: Some(..)` suites) and RustCrypto primitives (`aes-gcm`, `hmac`,
 //! `hkdf`). No `ring`, no C.
 
+mod params;
 pub mod rustcrypto;
 pub mod rustls_backend;
 

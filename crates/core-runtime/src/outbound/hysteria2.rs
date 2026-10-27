@@ -827,6 +827,9 @@ mod tests {
             if i == 0 {
                 assert_eq!(n, 1250, "first Initial datagram size");
             } else {
+                // quinn pads this one to the 1200-byte minimum, where the
+                // reference pads every client Initial to its send size; see
+                // the note in `outbound::quic`.
                 assert!(n >= 1200, "padded Initial datagram, got {n}");
             }
         }
