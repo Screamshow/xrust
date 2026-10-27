@@ -1,10 +1,17 @@
-//! Process-stable random policies, distinct from the captured browser tables.
+//! The two random fingerprint names, neither of which is a captured table.
 //!
-//! `random` chooses a modern browser, like the reference. `randomized` builds
-//! a native randomized TLS 1.3 profile: cipher order, optional extensions and
-//! extension order vary, while the negotiation essentials stay consistent.
-//! This does not reproduce uTLS's seeded byte distribution. Always retain ALPN
-//! for HTTP/2 callers, and keep supported groups paired with their key shares.
+//! `random` picks a modern browser once per process in the reference; here it
+//! is always firefox, by the owner's decision: of the tables we keep, firefox
+//! is the one verified byte for byte against the reference, and a name that
+//! resolves differently on every start is a profile nobody can reason about
+//! when a node misbehaves.
+//!
+//! `randomized` builds a native randomized TLS 1.3 profile: cipher order,
+//! optional extensions and extension order vary, while the negotiation
+//! essentials stay consistent. It does not reproduce uTLS's seeded byte
+//! distribution and is not meant to: it is the name for "look like nothing in
+//! particular". ALPN stays for HTTP/2 callers, and supported groups stay
+//! paired with their key shares.
 
 use std::sync::OnceLock;
 
@@ -13,19 +20,8 @@ use rand_core::{OsRng, RngCore};
 use crate::fingerprints;
 use crate::hello::{Ext, Template};
 
-const BROWSERS: &[fn() -> Template] = &[
-    fingerprints::chrome,
-    fingerprints::firefox,
-    fingerprints::edge,
-    fingerprints::safari,
-    fingerprints::ios,
-];
-
 pub(crate) fn random() -> Template {
-    static PROFILE: OnceLock<Template> = OnceLock::new();
-    PROFILE
-        .get_or_init(|| BROWSERS[index(&mut OsRng, BROWSERS.len())]())
-        .clone()
+    fingerprints::firefox()
 }
 
 pub(crate) fn randomized() -> Template {

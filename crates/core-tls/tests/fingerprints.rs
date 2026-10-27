@@ -52,9 +52,7 @@ fn alpn_of(hello: &core_tls::hello::ParsedHello) -> Vec<Vec<u8>> {
 /// per handshake (three handshakes from one process give three different
 /// hellos: tests/spikes/clienthello/chrome_stability.sh), so an alias capture
 /// is some *other* version and cannot be diffed against our table.
-const CANONICAL: &[&str] = &[
-    "chrome", "firefox", "edge", "safari", "360", "qq", "ios", "android",
-];
+const CANONICAL: &[&str] = &["chrome", "firefox", "edge", "safari", "ios"];
 
 #[test]
 fn every_table_rebuilds_its_capture() {
@@ -161,7 +159,7 @@ fn the_names_the_reference_accepts_all_resolve() {
 }
 
 #[test]
-fn random_policies_are_process_stable_and_random_is_a_browser() {
+fn random_policies_are_process_stable_and_random_is_firefox() {
     for name in ["random", "randomized"] {
         let first = fingerprints::by_name(name).unwrap();
         for _ in 0..16 {
@@ -170,16 +168,11 @@ fn random_policies_are_process_stable_and_random_is_a_browser() {
             assert_eq!(first.extensions, next.extensions);
         }
     }
+    // The owner's decision: `random` is firefox, not a draw per process.
     let random = fingerprints::by_name("random").unwrap();
-    assert!(
-        ["chrome", "firefox", "edge", "safari", "ios"]
-            .iter()
-            .any(|name| {
-                let browser = fingerprints::by_name(name).unwrap();
-                browser.cipher_suites == random.cipher_suites
-                    && browser.extensions == random.extensions
-            })
-    );
+    let firefox = fingerprints::firefox();
+    assert_eq!(random.cipher_suites, firefox.cipher_suites);
+    assert_eq!(random.extensions, firefox.extensions);
 }
 
 /// The modern chrome hello must still offer the hybrid share current Xray

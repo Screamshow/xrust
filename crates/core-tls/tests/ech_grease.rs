@@ -349,7 +349,7 @@ fn chrome_variant_tables_draw_fresh_ech_grease() {
     }
 }
 
-/// `random` is one browser per process and `randomized` a reshuffled chrome:
+/// `random` is firefox and `randomized` a reshuffled chrome with no ECH:
 /// whichever carries ECH draws it fresh too.
 #[test]
 fn random_policies_draw_fresh_ech_grease() {
@@ -369,10 +369,12 @@ fn random_policies_draw_fresh_ech_grease() {
     }
 }
 
-/// Where the reference sends no ECH, neither do we.
+/// Where the reference sends no ECH, neither do we. `randomized` is in the
+/// list because uTLS's randomized profiles send none either, and a
+/// chrome-shaped ECH would name the table it is built from.
 #[test]
 fn profiles_without_ech_in_the_reference_send_none() {
-    for name in ["safari", "edge", "ios", "qq", "360", "android"] {
+    for name in ["safari", "edge", "ios", "randomized"] {
         let template = fingerprints::by_name(name).unwrap();
         let record = hello(&template, shares_for(&template).as_ref());
         assert!(

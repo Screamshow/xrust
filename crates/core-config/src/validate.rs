@@ -389,13 +389,18 @@ const UTLS_FINGERPRINTS: &[&str] = &[
     "firefox",
     "safari",
     "edge",
-    "360",
-    "qq",
     "ios",
-    "android",
     "randomized",
     "random",
 ];
+
+/// Names the reference knows and this core does not serve. The `android` and
+/// `360` hellos of the reference are TLS 1.2 only, which our TLS stack does
+/// not write at all, so they could never complete a handshake here; `qq` is
+/// dropped with them by the owner's decision. A config that names one is
+/// refused here rather than failing at the first dial, and Forkop X puts
+/// `chrome` in their place with a warning.
+const UNSUPPORTED_UTLS_FINGERPRINTS: &[&str] = &["android", "360", "qq"];
 
 const TLS_REQUIRED_OUTBOUNDS: &[&str] = &["hysteria2", "hysteria"];
 
@@ -6643,6 +6648,12 @@ fn validate_utls_reality(tls: &Value, at: &str) -> Result<(), String> {
             .and_then(|u| u.get("fingerprint"))
             .and_then(Value::as_str)
             .unwrap_or("");
+        if UNSUPPORTED_UTLS_FINGERPRINTS.contains(&fingerprint) {
+            return Err(format!(
+                "{at}: uTLS fingerprint {fingerprint} is not supported; use one of: {}",
+                UTLS_FINGERPRINTS.join(", ")
+            ));
+        }
         if !fingerprint.is_empty() && !UTLS_FINGERPRINTS.contains(&fingerprint) {
             return Err(format!("{at}: unknown uTLS fingerprint: {fingerprint}"));
         }
@@ -8758,6 +8769,45 @@ mod tests {
             "network_namespaces": [entry],
         }))
         .expect_err("should be rejected")
+    }
+
+    /// The reference knows `android`, `360` and `qq`; this core does not serve
+    /// them, and a config that names one is refused here rather than at the
+    /// first dial. The names it does serve are accepted.
+    #[test]
+    fn unsupported_utls_fingerprints_are_refused() {
+        let with = |fingerprint: &str| {
+            validate(&json!({
+                "outbounds": [{"type": "vless", "tag": "o", "server": "example.com",
+                    "server_port": 443, "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+                    "tls": {"enabled": true, "utls": {"enabled": true,
+                        "fingerprint": fingerprint}}}],
+            }))
+        };
+        for name in ["android", "360", "qq"] {
+            let message = with(name).expect_err("should be refused");
+            assert!(
+                message.contains(&format!("uTLS fingerprint {name} is not supported")),
+                "{message}"
+            );
+            assert!(
+                message.contains("chrome"),
+                "the message lists what works: {message}"
+            );
+        }
+        for name in [
+            "chrome",
+            "firefox",
+            "safari",
+            "edge",
+            "ios",
+            "random",
+            "randomized",
+        ] {
+            assert!(with(name).is_ok(), "{name} must stay supported");
+        }
+        let unknown = with("netscape").expect_err("should be refused");
+        assert!(unknown.contains("unknown uTLS fingerprint"), "{unknown}");
     }
 
     #[test]
