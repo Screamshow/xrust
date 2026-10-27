@@ -128,7 +128,7 @@ mod hostinfo_tests {
         let parse = |raw: &str| serde_json::from_str::<super::MapResponse>(raw).unwrap();
         assert!(parse(r#"{"KeepAlive":true}"#).is_keep_alive_only());
         assert!(!parse(r#"{"KeepAlive":true,"PeersRemoved":[7]}"#).is_keep_alive_only());
-        assert!(!parse(r#"{"KeepAlive":true,"Node":{}}"#).is_keep_alive_only());
+        assert!(!parse(r#"{"KeepAlive":true,"PacketFilter":[]}"#).is_keep_alive_only());
         assert!(!parse(r#"{"PeersChanged":[]}"#).is_keep_alive_only());
     }
 
