@@ -299,6 +299,7 @@ impl Tailscale {
                 match result {
                     Ok(None) => {
                         stream = None;
+                        named_rules.clear();
                         continue;
                     }
                     Ok(Some(map)) => {
@@ -411,15 +412,12 @@ impl Tailscale {
                             .store(addresses_valid, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(error) => {
-                        shared.routes_approved.store(false, Ordering::Relaxed);
-                        shared.exit_approved.store(false, Ordering::Relaxed);
-                        let _ = shared
-                            .cmd_tx
-                            .send(Cmd::UpdateLanApproval {
-                                approved: false,
-                                exit_approved: false,
-                            })
-                            .await;
+                        // Like the reference client, keep the last network map
+                        // while control is away: peers, WireGuard sessions,
+                        // access rules and route approvals stay as they were,
+                        // so tailnet SSH/LuCI sessions survive a control
+                        // reconnect. The next stream starts with a full map
+                        // that replaces all of it.
                         shared
                             .control_connected
                             .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -427,31 +425,11 @@ impl Tailscale {
                             "tailscale: map synchronization failed: {}",
                             error
                         ));
-                        if shared
-                            .cmd_tx
-                            .send(Cmd::UpdateAccess { rules: vec![] })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
                         session = None;
                         stream = None;
-                        peers.clear();
-                        rules.clear();
+                        // Filters arrive as deltas within one stream; a new
+                        // stream must not inherit names the old one set.
                         named_rules.clear();
-                        // Fail closed during control outages; snapshots restore peers.
-                        if shared
-                            .cmd_tx
-                            .send(Cmd::UpdatePeers {
-                                peers: vec![],
-                                derp_map: None,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
                         delay = retry_delay(delay);
                     }
                 }
