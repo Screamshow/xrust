@@ -50,6 +50,23 @@ const PACKETS_TO_FILTER: usize = 8;
 /// Content is a `u16` on the wire, so a bigger write is more than one frame.
 const MAX_CONTENT: usize = u16::MAX as usize;
 
+/// The size the reference bounds a padded frame to: its `buf.Size`, the size
+/// of the buffer every frame is built in. `ReshapeMultiBuffer` splits a write
+/// that would not fit and `XtlsPadding` trims the padding to the rest of the
+/// buffer, so no frame of the reference's ever passes this, and with it no
+/// record of its TLS writer either. A larger frame is a length no Xray client
+/// sends.
+const MAX_FRAME: usize = 8192;
+
+/// What a frame costs besides its content: the user UUID of the first frame
+/// and the five bytes of command and lengths. The reference reserves this on
+/// every frame, UUID or not.
+const FRAME_OVERHEAD: usize = 16 + 5;
+
+/// Where the reference splits a write with no record boundary to split at:
+/// `buf.Size / 2`.
+const BLIND_SPLIT: usize = MAX_FRAME / 2;
+
 /// How much is asked of the inner stream per read. It lands straight in the
 /// framing buffer, so there is nothing to copy it out of.
 const READ_CHUNK: usize = 32 * 1024;
@@ -254,6 +271,27 @@ impl VisionStream {
         (u64::from_le_bytes(byte) % limit as u64) as usize
     }
 
+    /// How much of a write the next frame carries, `ReshapeMultiBuffer` in the
+    /// reference: content enough to leave the frame inside [`MAX_FRAME`], cut
+    /// at the last record boundary that fits so a frame ends where a record
+    /// does, and at [`BLIND_SPLIT`] when there is no boundary to cut at.
+    fn frame_take(buf: &[u8]) -> usize {
+        const MAX_FRAME_CONTENT: usize = MAX_FRAME - FRAME_OVERHEAD;
+        debug_assert!(MAX_FRAME_CONTENT <= MAX_CONTENT);
+        if buf.len() <= MAX_FRAME_CONTENT {
+            return buf.len();
+        }
+        let window = &buf[..MAX_FRAME_CONTENT];
+        match window
+            .windows(TLS_APP_DATA.len())
+            .rposition(|bytes| bytes == TLS_APP_DATA)
+            .filter(|index| *index >= FRAME_OVERHEAD)
+        {
+            Some(index) => index,
+            None => BLIND_SPLIT,
+        }
+    }
+
     /// `VisionConn.padding`, built into `self.framed` so the phase costs no
     /// allocation per write.
     fn build_frame(&mut self, content: &[u8], command: u8) {
@@ -262,6 +300,8 @@ impl VisionStream {
         } else {
             Self::random_below(PLAIN_PADDING_SPREAD)
         };
+        // `XtlsPadding` trims the padding to what is left of the frame buffer
+        let padding_len = padding_len.min(MAX_FRAME.saturating_sub(FRAME_OVERHEAD + content.len()));
         let uuid = self.write_uuid;
         self.framed.clear();
         self.framed
@@ -543,8 +583,7 @@ impl AsyncWrite for VisionStream {
                 // header, no padding and no copy
                 return std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
             }
-            // one frame per `u16` of content
-            let take = buf.len().min(MAX_CONTENT);
+            let take = Self::frame_take(buf);
             this.filter(&buf[..take]);
             let command = this.next_command(&buf[..take]);
             this.build_frame(&buf[..take], command);
@@ -816,6 +855,64 @@ mod tests {
             !VisionStream::is_tls_app_data(&record[..20]),
             "half a record is not a reason to stop padding"
         );
+    }
+
+    /// No frame passes the reference's frame buffer, padding included, so no
+    /// record of the TLS writer under it carries a length no Xray client
+    /// sends. `XtlsPadding` trims the padding for that.
+    #[test]
+    fn a_frame_stays_inside_the_reference_buffer() {
+        let (mut vision, _) = pair();
+        // long padding applies under the floor, so the clamp is what bounds
+        // the frames above it
+        vision.saw_tls = true;
+        for len in [0, 1, 899, 900, 4096, MAX_FRAME - FRAME_OVERHEAD] {
+            let content = vec![0x5Au8; len];
+            let frame = frame_of(&mut vision, &content);
+            assert!(
+                frame.len() <= MAX_FRAME,
+                "{len} bytes of content made a {}-byte frame",
+                frame.len()
+            );
+            assert_eq!(
+                frame.len(),
+                FRAME_OVERHEAD + len + padding_of(&frame),
+                "the header still describes the frame"
+            );
+        }
+        // the largest content leaves no room for padding at all
+        let full = vec![0x5Au8; MAX_FRAME - FRAME_OVERHEAD];
+        let frame = frame_of(&mut vision, &full);
+        assert_eq!(padding_of(&frame), 0);
+        assert_eq!(frame.len(), MAX_FRAME);
+    }
+
+    /// `ReshapeMultiBuffer`: a write that would not fit one frame is cut at
+    /// the last record boundary inside the frame, and halfway through the
+    /// buffer when there is no boundary to cut at.
+    #[test]
+    fn an_oversized_write_is_cut_like_the_reference() {
+        let small = vec![0u8; 100];
+        assert_eq!(VisionStream::frame_take(&small), 100);
+        let exact = vec![0u8; MAX_FRAME - FRAME_OVERHEAD];
+        assert_eq!(VisionStream::frame_take(&exact), exact.len());
+
+        // nothing that looks like a record start: the blind split
+        let blind = vec![0xABu8; MAX_FRAME * 3];
+        assert_eq!(VisionStream::frame_take(&blind), BLIND_SPLIT);
+
+        // two record starts inside the frame: the last one is the cut
+        let mut records = vec![0xABu8; MAX_FRAME * 3];
+        records[1000..1003].copy_from_slice(&TLS_APP_DATA);
+        records[7000..7003].copy_from_slice(&TLS_APP_DATA);
+        assert_eq!(VisionStream::frame_take(&records), 7000);
+
+        // a record start past the frame does not count, nor one at the very
+        // front: the reference refuses an index under its header length
+        let mut late = vec![0xABu8; MAX_FRAME * 3];
+        late[MAX_FRAME..MAX_FRAME + 3].copy_from_slice(&TLS_APP_DATA);
+        late[3..6].copy_from_slice(&TLS_APP_DATA);
+        assert_eq!(VisionStream::frame_take(&late), BLIND_SPLIT);
     }
 
     /// A frame larger than a `u16` is two frames, and no byte of the second is
