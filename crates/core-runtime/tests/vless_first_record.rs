@@ -1001,8 +1001,9 @@ async fn first_hello(outbound: Value) -> Vec<u8> {
 }
 
 /// ws and httpupgrade over TLS offer `http/1.1` alone when the config names
-/// no ALPN, as sing-box and Xray do; gRPC keeps `h2`, plain TLS the
-/// fingerprint's own pair, and a configured ALPN wins.
+/// no ALPN, as sing-box and Xray do; gRPC keeps `h2`, plain TLS offers
+/// `h2, http/1.1` whether or not a fingerprint is named, and a configured
+/// ALPN wins over all of it.
 #[tokio::test]
 async fn upgrade_transports_offer_http1_alone() {
     let tls = json!({"enabled": true, "server_name": "localhost", "insecure": true,
@@ -1051,11 +1052,9 @@ async fn upgrade_transports_offer_http1_alone() {
             }
             let hello = first_hello(outbound).await;
             let label = format!("{transport:?} alpn={alpn:?} utls={fingerprinted}");
-            if !fingerprinted && transport.is_none() && alpn.is_none() {
-                // rustls with nothing configured sends no ALPN at all
-                assert!(hello_alpn(&hello).is_empty(), "{label}");
-                continue;
-            }
+            // Nothing configured offers `h2, http/1.1`, with or without a
+            // fingerprint named: Xray's `GetTLSConfig` defaults to those two,
+            // and a hello with no ALPN at all is one no browser sends.
             assert_eq!(hello_alpn(&hello), want, "{label}");
         }
     }

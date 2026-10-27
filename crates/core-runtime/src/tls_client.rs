@@ -720,18 +720,32 @@ impl TlsOptions {
     /// Both are returned as the same boxed stream, so nothing downstream has to
     /// know which one it got: that is the only reason the signature is this
     /// rather than two functions at every call site.
-    pub async fn establish<S>(&self, stream: S, default_alpn: &[&[u8]]) -> io::Result<AnyStream>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let mut alpn: Vec<&[u8]> = if self.alpn.is_empty() {
+    /// What the hello offers: `tls.alpn`, else what the transport asks for,
+    /// else `h2, http/1.1`.
+    ///
+    /// Xray's `GetTLSConfig` leaves no connection without ALPN: with nothing
+    /// in the config it offers `h2, http/1.1`, whether or not a fingerprint
+    /// is named. Our own stack writes a browser template either way, and a
+    /// browser hello with no ALPN extension at all is one no browser sends,
+    /// so the default covers every connection it writes rather than the
+    /// REALITY and fingerprint ones alone.
+    fn offered_alpn<'a>(&'a self, default_alpn: &[&'a [u8]]) -> Vec<&'a [u8]> {
+        let offered: Vec<&[u8]> = if self.alpn.is_empty() {
             default_alpn.to_vec()
         } else {
             self.alpn.iter().map(|p| p.as_slice()).collect()
         };
-        if alpn.is_empty() && (self.reality.is_some() || self.fingerprint.is_some()) {
-            alpn = vec![b"h2", b"http/1.1"];
+        if offered.is_empty() {
+            return vec![b"h2", b"http/1.1"];
         }
+        offered
+    }
+
+    pub async fn establish<S>(&self, stream: S, default_alpn: &[&[u8]]) -> io::Result<AnyStream>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let alpn = self.offered_alpn(default_alpn);
         if !self.own_stack() {
             return Ok(Box::new(ClosingTls {
                 inner: self.connect_stream(stream, default_alpn).await?,
@@ -1051,6 +1065,27 @@ mod tests {
     fn options(value: Value) -> anyhow::Result<Option<TlsOptions>> {
         let obj = value.as_object().expect("an object").clone();
         TlsOptions::from_outbound(&obj, "example.com", "443")
+    }
+
+    /// No connection goes out without ALPN, as in Xray: `tls.alpn` wins,
+    /// then what the transport asks for, then `h2, http/1.1`.
+    #[test]
+    fn a_hello_always_offers_alpn() {
+        let plain = options(json!({"tls": {"enabled": true}})).unwrap().unwrap();
+        assert_eq!(
+            plain.offered_alpn(&[]),
+            vec![b"h2".as_slice(), b"http/1.1".as_slice()],
+            "a raw TLS outbound with no fingerprint used to offer none"
+        );
+        // what the transport asks for is left alone
+        assert_eq!(
+            plain.offered_alpn(&[b"http/1.1"]),
+            vec![b"http/1.1".as_slice()]
+        );
+        let configured = options(json!({"tls": {"enabled": true, "alpn": ["h3"]}}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(configured.offered_alpn(&[b"h2"]), vec![b"h3".as_slice()]);
     }
 
     #[test]
