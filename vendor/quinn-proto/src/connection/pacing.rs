@@ -38,6 +38,40 @@ impl Pacer {
         self.tokens = self.tokens.saturating_sub(packet_length.into())
     }
 
+    /// xrust: Explicit byte-rate pacing for bandwidth controllers. A bounded burst
+    /// amortizes timer wakeups without replacing the configured rate with cwnd/RTT.
+    pub(super) fn delay_at_rate(
+        &mut self,
+        rate: Option<u64>,
+        smoothed_rtt: Duration,
+        bytes_to_send: u64,
+        mtu: u16,
+        window: u64,
+        now: Instant,
+    ) -> Option<Instant> {
+        let Some(rate) = rate else {
+            return self.delay(smoothed_rtt, bytes_to_send, mtu, window, now);
+        };
+        let rate = rate.max(1);
+        let capacity = (rate / 1000).max(10 * u64::from(mtu)).max(bytes_to_send);
+        // Clamp before accounting elapsed time, including on the first call.
+        self.capacity = capacity;
+        self.tokens = self.tokens.min(capacity);
+        let elapsed = now.saturating_duration_since(self.prev).as_nanos();
+        let added = elapsed.saturating_mul(u128::from(rate)) / 1_000_000_000;
+        self.tokens = self
+            .tokens
+            .saturating_add(added.min(u128::from(u64::MAX)) as u64)
+            .min(capacity);
+        self.prev = now;
+        if self.tokens >= bytes_to_send {
+            return None;
+        }
+        let nanos =
+            (u128::from(bytes_to_send - self.tokens) * 1_000_000_000).div_ceil(u128::from(rate));
+        Some(now + Duration::from_nanos(nanos.min(u128::from(u64::MAX)) as u64))
+    }
+
     /// Return how long we need to wait before sending `bytes_to_send`
     ///
     /// If we can send a packet right away, this returns `None`. Otherwise, returns `Some(d)`,
@@ -304,5 +338,78 @@ mod tests {
             None
         );
         assert_eq!(pacer.tokens, pacer.capacity);
+    }
+}
+
+// xrust: the explicit-rate pacer above
+#[cfg(test)]
+mod explicit_rate_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_rate_is_independent_of_rtt_and_window() {
+        for rtt in [Duration::from_millis(10), Duration::from_millis(200)] {
+            let start = Instant::now();
+            let mut pacer = Pacer::new(rtt, 5_000_000, 1200, start);
+            let mut sent = 0u64;
+            // A deterministic virtual clock; no scheduler or network noise.
+            for ms in 0..1000 {
+                let now = start + Duration::from_millis(ms);
+                while pacer
+                    .delay_at_rate(Some(1_000_000), rtt, 1200, 1200, 5_000_000, now)
+                    .is_none()
+                {
+                    pacer.on_transmit(1200);
+                    sent += 1200;
+                }
+            }
+            assert!((995_000..=1_012_000).contains(&sent), "sent={sent}");
+        }
+    }
+
+    #[test]
+    fn no_override_preserves_standard_pacing() {
+        let now = Instant::now();
+        let rtt = Duration::from_millis(100);
+        let mut original = Pacer::new(rtt, 12000, 1200, now);
+        let mut patched = Pacer::new(rtt, 12000, 1200, now);
+        for ms in 0..100 {
+            let t = now + Duration::from_millis(ms);
+            assert_eq!(
+                original.delay(rtt, 1200, 1200, 12000, t),
+                patched.delay_at_rate(None, rtt, 1200, 1200, 12000, t)
+            );
+            original.on_transmit(1200);
+            patched.on_transmit(1200);
+        }
+    }
+
+    #[test]
+    fn rate_change_clamps_burst_and_extreme_rate_does_not_overflow() {
+        let now = Instant::now();
+        let mut pacer = Pacer::new(Duration::from_millis(50), u64::MAX, 1200, now);
+        pacer.delay_at_rate(
+            Some(u64::MAX),
+            Duration::ZERO,
+            1200,
+            1200,
+            u64::MAX,
+            now + Duration::from_secs(10),
+        );
+        let t = now + Duration::from_secs(10);
+        let mut burst = 0;
+        while pacer
+            .delay_at_rate(Some(1), Duration::ZERO, 1200, 1200, u64::MAX, t)
+            .is_none()
+        {
+            pacer.on_transmit(1200);
+            burst += 1;
+        }
+        assert!(burst <= 10);
+        assert!(
+            pacer
+                .delay_at_rate(Some(1), Duration::ZERO, 1200, 1200, u64::MAX, t)
+                .is_some()
+        );
     }
 }

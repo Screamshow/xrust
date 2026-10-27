@@ -41,6 +41,9 @@ pub struct Hysteria2 {
     hop_interval_max: Option<Duration>,
     password: String,
     receive_bps: u64,
+    /// `up_mbps` in bytes per second, 0 when the config names no rate: what
+    /// Brutal sends at, and the reference only uses Brutal when it is set.
+    send_bps: u64,
     want_tcp: bool,
     want_udp: bool,
     obfs_password: Option<Vec<u8>>,
@@ -150,11 +153,8 @@ impl Hysteria2 {
 
         let down_mbps = obj.get("down_mbps").and_then(Value::as_u64).unwrap_or(0);
         let receive_bps = down_mbps.saturating_mul(MBPS_TO_BPS);
-        if obj.get("up_mbps").and_then(Value::as_u64).unwrap_or(0) > 0 {
-            logging::warn(format_args!(
-                "{at}: hysteria brutal congestion control is not implemented; using BBR"
-            ));
-        }
+        let up_mbps = obj.get("up_mbps").and_then(Value::as_u64).unwrap_or(0);
+        let send_bps = up_mbps.saturating_mul(MBPS_TO_BPS);
         if let Some(p) = obj.get("bbr_profile").and_then(Value::as_str)
             && !p.is_empty()
             && p != "standard"
@@ -164,9 +164,15 @@ impl Hysteria2 {
             ));
         }
         if obj.get("brutal_debug").and_then(Value::as_bool) == Some(true) {
-            logging::warn(format_args!(
-                "{at}: brutal_debug is not implemented (ignored)"
-            ));
+            if send_bps > 0 {
+                logging::info(format_args!(
+                    "{at}: using hysteria brutal congestion control ({up_mbps} Mbps)"
+                ));
+            } else {
+                logging::warn(format_args!(
+                    "{at}: brutal_debug without up_mbps: brutal needs a send rate, using BBR"
+                ));
+            }
         }
 
         let tls = TlsOptions::from_outbound(obj, &server, at)?
@@ -186,6 +192,7 @@ impl Hysteria2 {
             hop_interval_max,
             password,
             receive_bps,
+            send_bps,
             want_tcp: network_includes_tcp(obj),
             want_udp: network_includes_udp(obj),
             obfs_password,
@@ -230,6 +237,21 @@ impl Hysteria2 {
         Ok(shared)
     }
 
+    /// The reference paces its upload at the rate the config names and
+    /// leaves congestion control alone when it names none, so Brutal runs
+    /// only with an `up_mbps`.
+    ///
+    /// `send_bps` is already bytes a second (`MBPS_TO_BPS` is 125_000) and so
+    /// is what the controller takes. The port this came from divided it by
+    /// eight here, which paced an upload at an eighth of the configured rate.
+    fn congestion(&self) -> CongestionKind {
+        if self.send_bps > 0 {
+            CongestionKind::Brutal(self.send_bps.max(1))
+        } else {
+            CongestionKind::Bbr
+        }
+    }
+
     async fn dial(&self) -> io::Result<Arc<Hy2Shared>> {
         let port = self.pick_port();
         let addr = resolve_host(&self.server, port).await?;
@@ -241,7 +263,7 @@ impl Hysteria2 {
         };
         let (mut ep_config, transport) =
             self.quic
-                .build_configs(CongestionKind::Bbr, None, self.want_udp);
+                .build_configs(self.congestion(), None, self.want_udp);
         let quic_tls = self.tls.quic_config(&[b"h3"])?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
         client_config.transport_config(Arc::new(transport));
@@ -833,6 +855,44 @@ mod tests {
         }
         assert_eq!(dcids[0], dcids[1], "one connection");
         dial.abort();
+    }
+
+    /// Brutal runs only when the config names an upload rate, as the
+    /// reference does: `up_mbps` becomes its byte rate and nothing else
+    /// changes the controller.
+    #[test]
+    fn brutal_follows_the_configured_upload_rate() {
+        let build = |extra: Value| {
+            let mut cfg = serde_json::json!({
+                "server": "127.0.0.1", "server_port": 443, "password": "p",
+                "tls": {"enabled": true, "insecure": true}
+            });
+            for (key, value) in extra.as_object().expect("an object") {
+                cfg[key] = value.clone();
+            }
+            Hysteria2::build(cfg.as_object().unwrap(), "test").unwrap()
+        };
+        assert_eq!(
+            build(serde_json::json!({})).congestion(),
+            crate::outbound::quic::CongestionKind::Bbr,
+            "no rate, no brutal"
+        );
+        assert_eq!(
+            build(serde_json::json!({"down_mbps": 100})).congestion(),
+            crate::outbound::quic::CongestionKind::Bbr,
+            "a download rate is the server's business"
+        );
+        // 50 Mbps is 6_250_000 bytes a second, and the controller takes bytes
+        assert_eq!(
+            build(serde_json::json!({"up_mbps": 50})).congestion(),
+            crate::outbound::quic::CongestionKind::Brutal(6_250_000)
+        );
+        // `Hysteria-CC-RX` carries the download rate the server paces by, in
+        // bytes a second as the protocol asks: 8 Mbps is 1_000_000
+        assert_eq!(
+            build(serde_json::json!({"down_mbps": 8})).receive_bps,
+            1_000_000
+        );
     }
 
     #[test]

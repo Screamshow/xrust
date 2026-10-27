@@ -622,7 +622,9 @@ impl Connection {
 
                     // Check whether the next datagram is blocked by pacing
                     let smoothed_rtt = self.path.rtt.get();
-                    if let Some(delay) = self.path.pacing.delay(
+                    // xrust: a bandwidth controller paces at its own rate
+                    if let Some(delay) = self.path.pacing.delay_at_rate(
+                        self.path.congestion.pacing_rate_bytes(),
                         smoothed_rtt,
                         bytes_to_send,
                         self.path.current_mtu(),
@@ -1794,6 +1796,11 @@ impl Connection {
                     now,
                     self.orig_rem_cid,
                 );
+                // xrust: one call per lost packet, for a controller that
+                // counts losses; `on_congestion_event` arrives per batch.
+                if info.ack_eliciting && self.path.challenge.is_none() {
+                    self.path.congestion.on_packet_lost(now);
+                }
                 self.remove_in_flight(&info);
                 for frame in info.stream_frames {
                     self.streams.retransmit(frame);

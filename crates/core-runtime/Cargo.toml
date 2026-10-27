@@ -52,6 +52,9 @@ getrandom.workspace = true
 h2.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
+# For the congestion controller trait's own types (`RttEstimator`), which quinn
+# does not re-export; the workspace patch points this at vendor/quinn-proto.
+quinn-proto = { version = "0.11.18", default-features = false }
 hickory-proto.workspace = true
 if-addrs.workspace = true
 hkdf.workspace = true

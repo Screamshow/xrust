@@ -62,6 +62,22 @@ pub trait Controller: Send + Sync {
     /// The known MTU for the current network path has been updated
     fn on_mtu_update(&mut self, new_mtu: u16);
 
+    /// xrust: Optional explicit pacing rate in bytes per second
+    ///
+    /// `None` keeps the standard window/RTT pacer. A bandwidth controller
+    /// paces at a rate of its own instead, which is what hysteria's Brutal
+    /// does; this is independent of the qlog metric below.
+    fn pacing_rate_bytes(&self) -> Option<u64> {
+        None
+    }
+
+    /// xrust: An ack-eliciting packet that was not an MTU probe was declared
+    /// lost
+    ///
+    /// `on_congestion_event` arrives per batch and carries ECN triggers with
+    /// it; a controller that counts losses needs one call per packet.
+    fn on_packet_lost(&mut self, _now: Instant) {}
+
     /// Number of ack-eliciting bytes that may be in flight
     fn window(&self) -> u64;
 

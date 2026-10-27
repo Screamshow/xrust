@@ -149,7 +149,15 @@ impl Drop for PoolLease {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CongestionKind {
     Bbr,
+    /// hysteria's Brutal, at this many bytes per second.
+    Brutal(u64),
 }
+
+mod brutal;
+use brutal::BrutalConfig;
+
+#[cfg(test)]
+mod brutal_wire_tests;
 
 /// Parsed `QUICOutFields` with per-protocol defaults applied at build time.
 #[derive(Debug)]
@@ -297,6 +305,9 @@ impl QuicTunnelOptions {
         transport.ack_frequency_config(Some(ack));
         transport.congestion_controller_factory(match congestion {
             CongestionKind::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
+            CongestionKind::Brutal(bytes_per_second) => {
+                Arc::new(BrutalConfig::new(bytes_per_second))
+            }
         });
         (endpoint, transport)
     }
