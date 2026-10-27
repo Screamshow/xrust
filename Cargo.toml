@@ -19,6 +19,12 @@ members = [
 h2 = { path = "vendor/h2" }
 # Library API extension for binary VLESS contexts; hash implementation unchanged.
 blake3 = { path = "vendor/blake3" }
+# quinn-proto padding every client Initial datagram to the send size, the way
+# quic-go pads them, instead of to RFC 9000's 1200-byte minimum. A
+# post-quantum hello spans two Initial datagrams, so the minimum left the
+# lengths 1280/1200 on the wire where every quic-go client sends 1280/1280.
+# Vendored: the choice sits inside quinn-proto with no knob for it.
+quinn-proto = { path = "vendor/quinn-proto" }
 
 [workspace.package]
 version = "0.0.27"

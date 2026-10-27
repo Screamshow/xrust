@@ -70,11 +70,9 @@ pub(crate) fn size_network_udp_buffers(sock: socket2::SockRef<'_>) {
 /// split of 1252 for IPv4 and 1232 for IPv6. A node that would rather look
 /// like sing-box can say so with `initial_packet_size`.
 ///
-/// This sets the size of the datagrams quinn fills. The second Initial of a
-/// post-quantum hello still leaves at 1200, the minimum RFC 9000 asks of an
-/// Initial, where the reference pads every client Initial to the full size:
-/// quinn pads to that minimum and the choice is inside quinn-proto, so
-/// closing that last difference means patching it.
+/// This sets the size of the datagrams quinn fills, and `pad_initial_to_mtu`
+/// below makes every client Initial leave at that size, as the reference
+/// sends them.
 pub(crate) const QUIC_GO_INITIAL_MTU: u16 = 1280;
 /// Length of the Destination Connection ID in a quic-go client's first
 /// Initial (quinn otherwise picks 20 bytes).
@@ -273,6 +271,12 @@ impl QuicTunnelOptions {
             transport.max_concurrent_uni_streams(VarInt::from_u64(v).unwrap_or(VarInt::MAX));
         }
         transport.initial_mtu(self.initial_packet_size.unwrap_or(QUIC_GO_INITIAL_MTU));
+        // Every client Initial goes out at that size, as the reference sends
+        // them: a post-quantum hello spans two Initial datagrams, and quinn
+        // would pad the second to RFC 9000's 1200-byte minimum instead, which
+        // put a 1280/1200 pair on the wire where the reference puts two equal
+        // lengths. The knob is ours, in the vendored quinn-proto.
+        transport.pad_initial_to_mtu(true);
         if self.disable_path_mtu_discovery {
             transport.mtu_discovery_config(None);
         }

@@ -792,10 +792,10 @@ mod tests {
         }
     }
 
-    /// The first Initial is shaped like a quic-go client's: a datagram of
-    /// `protocol.InitialPacketSize`, an 8-byte DCID, a zero-length SCID and
-    /// no token; the rest of the first flight keeps the same zero-length
-    /// SCID.
+    /// Every Initial of the first flight is shaped like a quic-go client's:
+    /// a datagram of `protocol.InitialPacketSize`, an 8-byte DCID, a
+    /// zero-length SCID and no token. The post-quantum hello spans two of
+    /// them and both leave at the full size, as the reference sends them.
     #[tokio::test]
     async fn first_initial_has_quic_go_shape() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -825,18 +825,11 @@ mod tests {
             dcids.push(dg[6..6 + dcid_len].to_vec());
             assert_eq!(dg[6 + dcid_len], 0, "zero-length SCID");
             assert_eq!(dg[7 + dcid_len], 0, "no token");
-            if i == 0 {
-                assert_eq!(
-                    n,
-                    usize::from(crate::outbound::quic::QUIC_GO_INITIAL_MTU),
-                    "first Initial datagram size"
-                );
-            } else {
-                // quinn pads this one to the 1200-byte minimum, where the
-                // reference pads every client Initial to its send size; see
-                // the note in `outbound::quic`.
-                assert!(n >= 1200, "padded Initial datagram, got {n}");
-            }
+            assert_eq!(
+                n,
+                usize::from(crate::outbound::quic::QUIC_GO_INITIAL_MTU),
+                "Initial datagram {i} size"
+            );
         }
         assert_eq!(dcids[0], dcids[1], "one connection");
         dial.abort();
