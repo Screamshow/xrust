@@ -282,6 +282,9 @@ pub struct RelayHealth {
     pub region: u16,
     pub latency_ms: Option<u64>,
 }
+/// How long a region other than home stays open without use.
+const REGION_IDLE: Duration = Duration::from_secs(60);
+
 struct RegionTask {
     tx: mpsc::Sender<([u8; 32], Vec<u8>)>,
     task: JoinHandle<()>,
@@ -471,8 +474,21 @@ impl RelayManager {
             },
         );
     }
+    /// A busy peer may need this region; keep it open while it does.
     pub fn prepare(&mut self, region: u16) {
         self.ensure(region);
+        if let Some(task) = self.regions.get_mut(&region) {
+            task.last_used = std::time::Instant::now();
+        }
+    }
+
+    /// Close regions other than home that carried nothing for a minute; a
+    /// burst to a peer homed elsewhere no longer holds a TLS connection and
+    /// its pings for good.
+    pub fn release_idle(&mut self) {
+        let home = self.home;
+        self.regions
+            .retain(|id, task| Some(*id) == home || task.last_used.elapsed() < REGION_IDLE);
     }
     pub fn send(&mut self, region: u16, destination: [u8; 32], packet: &[u8]) {
         self.ensure(region);
@@ -486,6 +502,29 @@ impl RelayManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn idle_regions_close_except_home() {
+        let mut manager = RelayManager::new(StaticSecret::from([9; 32]), DerpMap::default(), None);
+        let region = |age: u64| {
+            let (tx, _) = mpsc::channel(1);
+            let (preferred, _) = watch::channel(false);
+            RegionTask {
+                tx,
+                preferred,
+                task: tokio::spawn(std::future::pending()),
+                last_used: std::time::Instant::now() - Duration::from_secs(age),
+            }
+        };
+        manager.regions.insert(1, region(600));
+        manager.regions.insert(2, region(600));
+        manager.regions.insert(3, region(1));
+        manager.home = Some(1);
+        manager.release_idle();
+        let mut open: Vec<_> = manager.regions.keys().copied().collect();
+        open.sort();
+        assert_eq!(open, [1, 3]);
+    }
 
     #[tokio::test]
     async fn home_change_preserves_existing_region_connections() {

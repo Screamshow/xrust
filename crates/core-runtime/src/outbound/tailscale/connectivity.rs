@@ -240,6 +240,10 @@ pub struct Connectivity {
     last_recheck: Instant,
     last_local_check: Instant,
     locals: Vec<SocketAddr>,
+    /// Whether any peer carried data lately; see `tick`.
+    active: watch::Sender<bool>,
+    /// A STUN round owed regardless of activity (start, local address change).
+    stun_due: bool,
 }
 impl Drop for Connectivity {
     fn drop(&mut self) {
@@ -257,6 +261,7 @@ impl Connectivity {
         let (map_tx, mut map_rx) = watch::channel(map.clone());
         let task_info = info.clone();
         let (recheck_tx, mut recheck_rx) = watch::channel(0u64);
+        let (active, mut active_rx) = watch::channel(true);
         let tcp_task = tokio::spawn(async move {
             let mut failures = 0;
             loop {
@@ -267,7 +272,19 @@ impl Connectivity {
                     delay = apply_measurement(info, &map, scores, &mut failures)
                 });
                 tokio::select! {
-                    _=tokio::time::sleep(delay)=>{},
+                    _=tokio::time::sleep(delay)=>{
+                        // The periodic round measures every region (TCP to
+                        // each, TLS to four). While no peer carries data it
+                        // waits for traffic; a failed home relay, a local
+                        // address change or a new map still measure at once.
+                        while !*active_rx.borrow_and_update() {
+                            tokio::select! {
+                                result=active_rx.changed()=>{if result.is_err(){return;}},
+                                result=recheck_rx.changed()=>{if result.is_err(){return;} break;},
+                                result=map_rx.changed()=>{if result.is_err(){return;} break;},
+                            }
+                        }
+                    },
                     result=recheck_rx.changed()=>{if result.is_err(){break;}},
                     result=map_rx.changed()=>{if result.is_err(){break;}},
                 }
@@ -286,9 +303,11 @@ impl Connectivity {
             last_recheck: Instant::now() - Duration::from_secs(11),
             last_local_check: Instant::now(),
             locals: local_endpoints(port),
+            active,
+            stun_due: true,
         };
         this.update_map(map);
-        this.tick(socket).await;
+        this.tick(socket, false).await;
         // Only this code reads the socket before the engine starts.
         let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
         let mut bytes = [0; 2048];
@@ -375,7 +394,17 @@ impl Connectivity {
             self.recheck_tx.send_modify(|n| *n = n.wrapping_add(1));
         }
     }
-    pub async fn tick(&mut self, socket: &UdpSocket) {
+    /// `active`: a peer carried data in the last 30 s. Like the reference
+    /// client, an idle node does not re-STUN every 30 s; it keeps its last
+    /// endpoints and STUNs again once traffic starts or its addresses change.
+    pub async fn tick(&mut self, socket: &UdpSocket, active: bool) {
+        if self
+            .active
+            .send_if_modified(|was| std::mem::replace(was, active) != active)
+            && active
+        {
+            self.stun_due = true;
+        }
         if self.last_local_check.elapsed() >= Duration::from_secs(2) {
             self.last_local_check = Instant::now();
             let locals = local_endpoints(self.port);
@@ -383,13 +412,14 @@ impl Connectivity {
                 self.locals = locals;
                 self.observations.clear();
                 self.pending.clear();
-                self.last_stun = Instant::now() - Duration::from_secs(31);
+                self.stun_due = true;
                 self.recheck();
             }
         }
-        if self.last_stun.elapsed() < Duration::from_secs(30) {
+        if !self.stun_due && (!active || self.last_stun.elapsed() < Duration::from_secs(30)) {
             return;
         }
+        self.stun_due = false;
         self.last_stun = Instant::now();
         self.pending
             .retain(|_, t| t.sent.elapsed() < Duration::from_secs(5));
@@ -533,6 +563,27 @@ mod tests {
             latency_ms: None,
         });
         assert!(c.info.borrow().home_derp.is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_node_skips_periodic_stun_until_traffic_starts() {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut c = Connectivity::start(&socket, DerpMap::default())
+            .await
+            .unwrap();
+        // the start round ran; the next periodic one is due
+        let due = Instant::now() - Duration::from_secs(31);
+        c.last_stun = due;
+        c.tick(&socket, false).await;
+        assert_eq!(c.last_stun, due, "an idle node re-STUNed");
+        // traffic starts: STUN at once
+        c.tick(&socket, true).await;
+        assert!(c.last_stun > due);
+        // and periodically while traffic lasts
+        c.last_stun = due;
+        c.tick(&socket, true).await;
+        assert!(c.last_stun > due);
+        assert!(*c.active.borrow());
     }
 
     #[tokio::test]

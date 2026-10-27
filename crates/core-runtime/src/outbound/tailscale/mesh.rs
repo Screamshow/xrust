@@ -512,7 +512,8 @@ impl DirectMesh {
                     c.relay_health(health);
                 }
             }
-            c.tick(&self.socket).await;
+            let active = self.peers.values().any(Peer::busy);
+            c.tick(&self.socket, active).await;
             let endpoints = c.info.borrow().endpoints.clone();
             if endpoints != self.network_endpoints {
                 self.network_endpoints = endpoints;
@@ -553,6 +554,7 @@ impl DirectMesh {
             inbound.push((buffer[..length].to_vec(), Path::Udp(endpoint), None));
         }
         if let Some(relay) = &mut self.relay {
+            relay.release_idle();
             for index in 0..256 {
                 let Ok((region, packet)) = relay.rx.try_recv() else {
                     break;
