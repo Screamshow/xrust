@@ -399,7 +399,7 @@ const UTLS_FINGERPRINTS: &[&str] = &[
 /// not write at all, so they could never complete a handshake here; `qq` is
 /// dropped with them by the owner's decision. A config that names one is
 /// refused here rather than failing at the first dial, and Forkop X puts
-/// `chrome` in their place with a warning.
+/// `firefox` in their place with a warning.
 const UNSUPPORTED_UTLS_FINGERPRINTS: &[&str] = &["android", "360", "qq"];
 
 const TLS_REQUIRED_OUTBOUNDS: &[&str] = &["hysteria2", "hysteria"];
