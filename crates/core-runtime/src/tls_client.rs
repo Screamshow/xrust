@@ -745,6 +745,25 @@ impl TlsOptions {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.establish_with_record_cap(stream, default_alpn, core_tls::record::MAX_FRAGMENT)
+            .await
+    }
+
+    /// The same, told the steady-state record size of the transport that will
+    /// run on this connection: a transport whose reference client writes in
+    /// `buf.Size` pieces asks for 8192, so the records on the wire are the
+    /// lengths that client's writes produce. It is a parameter rather than a
+    /// field so a dial does not have to clone the options (certificates and
+    /// the fingerprint template included) to set it.
+    pub async fn establish_with_record_cap<S>(
+        &self,
+        stream: S,
+        default_alpn: &[&[u8]],
+        record_cap: usize,
+    ) -> io::Result<AnyStream>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let alpn = self.offered_alpn(default_alpn);
         if !self.own_stack() {
             return Ok(Box::new(ClosingTls {
@@ -835,7 +854,9 @@ impl TlsOptions {
                 .collect::<Vec<_>>()
                 .join(",")
         ));
-        let tls_stream = Box::new(crate::tls_utls::FingerprintStream::new(stream, connection));
+        let tls_stream = Box::new(crate::tls_utls::FingerprintStream::with_record_cap(
+            stream, connection, record_cap,
+        ));
         Ok(Box::new(crate::inbound::AlpnStream::new(tls_stream, alpn)))
     }
 
@@ -849,6 +870,18 @@ impl TlsOptions {
         default_alpn: &[&[u8]],
     ) -> io::Result<AnyStream> {
         self.establish(stream, default_alpn).await
+    }
+
+    /// Like [`Self::wrap_with_defaults`], with the records of the transport
+    /// that will run on the connection.
+    pub(crate) async fn wrap_with_record_cap(
+        &self,
+        stream: TcpStream,
+        default_alpn: &[&[u8]],
+        record_cap: usize,
+    ) -> io::Result<AnyStream> {
+        self.establish_with_record_cap(stream, default_alpn, record_cap)
+            .await
     }
 
     /// Replace whatever `tls.alpn` said: a transport that knows which protocol

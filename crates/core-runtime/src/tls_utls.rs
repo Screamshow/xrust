@@ -71,17 +71,51 @@ pub struct FingerprintStream<S: AsyncWrite + Unpin> {
     /// of a connection (see `record_limit`)
     bytes_sent: u64,
     packets_sent: u64,
+    /// The most plaintext a record may carry once the connection is past the
+    /// growth at its start: what the transport above this one would hand a
+    /// reference client in one write (see [`FingerprintStream::with_record_cap`]).
+    record_cap: usize,
 }
 
-/// Go's `tcpMSSEstimate`: records at the start of a connection grow by this
-/// much, less the header, the AEAD tag and the content type byte.
-const BOOST_STEP: usize = 1208 - 5 - 16 - 1;
+/// Records at the start of a connection grow by this much
+/// ([`core_tls::record::BOOST_STEP`], derived there from Go's segment
+/// estimate).
+const BOOST_STEP: usize = core_tls::record::BOOST_STEP;
 /// Go's `recordSizeBoostThreshold`: after this many bytes, full records.
 const BOOST_UNTIL: u64 = 128 * 1024;
+
+/// `XRUST_TLS_MAX_RECORD` sets the steady-state record size for every
+/// connection, whatever the transport asked for. The reference's size costs
+/// one write and one record's framing per 8 KiB instead of per 16 KiB, which
+/// measured ~10% of a multi-gigabit bulk upload and nothing at a router's
+/// link rate; this is the way out if that ever turns out to matter on a slow
+/// CPU, without touching the growth at the start of a connection.
+fn max_record_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        crate::env_var("TLS_MAX_RECORD")
+            .and_then(|val| val.parse::<usize>().ok())
+            .filter(|cap| *cap > 0)
+    })
+}
 
 impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
     /// Wrap a transport whose handshake is already finished.
     pub fn new(inner: S, connection: Connection) -> Self {
+        Self::with_record_cap(inner, connection, core_tls::record::MAX_FRAGMENT)
+    }
+
+    /// The same, with the steady-state record size of the transport that will
+    /// run on top.
+    ///
+    /// A record is as big as the write that seals it, so the sizes on the wire
+    /// are the sizes of the reference client's writes. Xray relays raw, ws and
+    /// httpupgrade streams through `buf.Size` buffers and so never writes more
+    /// than 8192 bytes at a time, which is 8214 bytes of record; its h2
+    /// transports (xhttp, grpc, h2) write whole frames and reach the fragment
+    /// limit. A relay here reads up to 128 KiB in one go, so without this the
+    /// first group would run at 16384 and stand out by length alone.
+    pub fn with_record_cap(inner: S, connection: Connection, record_cap: usize) -> Self {
         FingerprintStream {
             inner,
             raw: Vec::new(),
@@ -101,6 +135,9 @@ impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
             close_notify_sent: false,
             bytes_sent: connection.handshake_bytes(),
             packets_sent: 0,
+            record_cap: max_record_override()
+                .unwrap_or(record_cap)
+                .clamp(1, core_tls::record::MAX_FRAGMENT),
             connection,
         }
     }
@@ -112,8 +149,11 @@ impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
     /// bytes of plaintext, then up to 2372, 3558 and so on to 16384. A bulk
     /// transfer, or a first write bigger than a segment -- the Vision head
     /// with a client hello -- is cut that way at the start, and the same here.
+    /// Past the growth the limit is the transport's own steady-state size
+    /// (`record_cap`), so a raw or ws stream keeps writing the 8192 bytes a
+    /// reference client's relay buffer holds instead of twice that.
     fn record_limit(&mut self) -> usize {
-        let max = core_tls::record::MAX_FRAGMENT;
+        let max = self.record_cap;
         if self.bytes_sent >= BOOST_UNTIL {
             return max;
         }
@@ -1139,5 +1179,305 @@ mod close_notify_tests {
         // and it stays ended
         let mut more = [0u8; 8];
         assert_eq!(stream.read(&mut more).await.unwrap(), 0);
+    }
+}
+
+#[cfg(test)]
+mod record_shape_tests {
+    use super::*;
+    use core_tls::client::{Config, Connection, Handshake};
+    use core_tls::rustls::{RootCertStore, ServerConfig};
+    use core_tls::verify::WebpkiVerifier;
+    use std::sync::Arc;
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+
+    const RECORD: usize = core_tls::record::MAX_FRAGMENT;
+    /// A sealed record is its plaintext, the content type byte and the tag,
+    /// behind a five-byte header.
+    const OVERHEAD: usize = 5 + 1 + 16;
+
+    /// A transport that records the length of every write that reaches it.
+    /// One record leaves in one write -- Go writes a record per `conn.Write`
+    /// as well, which is what keeps record boundaries and segment boundaries
+    /// together -- so these lengths are the records on the wire.
+    ///
+    /// Once `capture` is on the bytes stop here: a long upload then needs no
+    /// reader on the other end, and every write is taken whole, so one record
+    /// is one entry.
+    struct RecordTap {
+        inner: DuplexStream,
+        capture: bool,
+        writes: Vec<usize>,
+    }
+
+    impl RecordTap {
+        fn payloads(&self) -> Vec<usize> {
+            self.writes.iter().map(|n| n - OVERHEAD).collect()
+        }
+    }
+
+    impl AsyncRead for RecordTap {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for RecordTap {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let me = self.get_mut();
+            if me.capture {
+                me.writes.push(buf.len());
+                return Poll::Ready(Ok(buf.len()));
+            }
+            Pin::new(&mut me.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let me = self.get_mut();
+            if me.capture {
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut me.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let me = self.get_mut();
+            if me.capture {
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut me.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A handshaked stream whose transport is a tap, with `cap` as the
+    /// steady-state record size. The server side only has to finish the
+    /// handshake: what the test writes afterwards is captured, not delivered.
+    /// The handshake runs through the tap so that `bytes_sent` starts where a
+    /// real connection's does.
+    async fn tapped(cap: usize) -> FingerprintStream<RecordTap> {
+        core_tls::install_default_provider();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
+        let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.crt")).unwrap(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.key")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(certs[0].clone()).unwrap();
+        let verifier = WebpkiVerifier::new(Arc::new(roots)).unwrap();
+        let template = core_tls::fingerprints::by_name("chrome").unwrap();
+        let (client, peer) = tokio::io::duplex(4 * CHUNK);
+        tokio::spawn(async move {
+            let _tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+                .accept(peer)
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut tap = RecordTap {
+            inner: client,
+            capture: false,
+            writes: Vec::new(),
+        };
+        let mut handshake = Handshake::new(Config {
+            template: &template,
+            server_name: "localhost",
+            alpn: &[],
+            verifier: &verifier,
+            reality: None,
+            fragment: false,
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        handshake.run(&mut tap).await.unwrap();
+        let connection = Connection::new(&mut handshake).unwrap();
+        let mut stream = FingerprintStream::with_record_cap(tap, connection, cap);
+        stream.get_mut().capture = true;
+        stream
+    }
+
+    /// The growth at the start of a connection is covered by
+    /// `records_grow_like_gos_at_the_start`, which checks the plaintext each
+    /// write takes. What only the wire shows is the length that growth is
+    /// there for: the first record is one segment, 1208 bytes, the figure
+    /// Go's `tcpMSSEstimate` is named after.
+    #[tokio::test]
+    async fn the_first_record_is_one_segment_on_the_wire() {
+        let mut stream = tapped(RECORD).await;
+        stream.write_all(&vec![0x5a; 64 * 1024]).await.unwrap();
+        assert_eq!(stream.get_mut().writes[0], BOOST_STEP + OVERHEAD);
+        assert_eq!(stream.get_mut().writes[0], 1208);
+    }
+
+    /// A transport whose reference writes at most `buf.Size` keeps that size
+    /// after the ramp instead of the fragment limit: Xray relays raw, ws and
+    /// httpupgrade streams through 8192-byte buffers, so its steady-state
+    /// record is 8214 bytes on the wire, not 16406.
+    #[tokio::test]
+    async fn a_capped_transport_keeps_the_reference_record_size() {
+        let mut stream = tapped(8192).await;
+        stream.write_all(&vec![0x5a; 256 * 1024]).await.unwrap();
+        let got = stream.get_mut().payloads();
+        assert_eq!(got[..6], [1186, 2372, 3558, 4744, 5930, 7116], "the ramp");
+        // past the ramp, every record but the write's remainder is the cap
+        let capped = &got[6..got.len() - 1];
+        assert!(
+            capped.iter().all(|n| *n == 8192),
+            "capped at the reference's write size: {:?}",
+            &capped[..capped.len().min(4)]
+        );
+        let wire = &stream.get_mut().writes[6..got.len() - 1];
+        assert!(wire.iter().all(|n| *n == 8214), "8214 bytes on the wire");
+        assert!(capped.len() > 20, "a long enough run: {}", capped.len());
+    }
+
+    /// The cap holds for vectored writes too, and the pieces still share one
+    /// record: h2 hands over a frame header and its payload apart, and sealed
+    /// one by one they made the 1041-byte pairs no reference client sends.
+    #[tokio::test]
+    async fn vectored_pieces_fill_one_capped_record() {
+        let mut stream = tapped(8192).await;
+        stream
+            .write_all(&vec![0u8; BOOST_UNTIL as usize])
+            .await
+            .unwrap();
+        stream.get_mut().writes.clear();
+        let header = [1u8; 9];
+        let payload = vec![2u8; 16375];
+        let bufs = [io::IoSlice::new(&header), io::IoSlice::new(&payload)];
+        let n = stream.write_vectored(&bufs).await.unwrap();
+        assert_eq!(n, 8192, "one capped record's worth");
+        assert_eq!(stream.get_mut().writes, vec![8214], "one record, one write");
+    }
+
+    /// A handshaked stream over a loopback socket, with `cap` as the
+    /// steady-state record size and a server that reads and drops: the record
+    /// count then shows up as write syscalls, which the tap hides.
+    async fn over_loopback(cap: usize) -> FingerprintStream<tokio::net::TcpStream> {
+        core_tls::install_default_provider();
+        let dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/certs");
+        let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.crt")).unwrap(),
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+            std::fs::File::open(dir.join("localhost.key")).unwrap(),
+        ))
+        .unwrap()
+        .unwrap();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key)
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(certs[0].clone()).unwrap();
+        let verifier = WebpkiVerifier::new(Arc::new(roots)).unwrap();
+        let template = core_tls::fingerprints::by_name("chrome").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+                .accept(socket)
+                .await
+                .unwrap();
+            let mut sink = vec![0u8; 256 * 1024];
+            while tokio::io::AsyncReadExt::read(&mut tls, &mut sink)
+                .await
+                .unwrap_or(0)
+                > 0
+            {}
+        });
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut handshake = Handshake::new(Config {
+            template: &template,
+            server_name: "localhost",
+            alpn: &[],
+            verifier: &verifier,
+            reality: None,
+            fragment: false,
+            cipher_suites: Vec::new(),
+        })
+        .unwrap();
+        handshake.run(&mut socket).await.unwrap();
+        let connection = Connection::new(&mut handshake).unwrap();
+        FingerprintStream::with_record_cap(socket, connection, cap)
+    }
+
+    /// What the smaller steady-state record costs: the same bytes at 8192 and
+    /// at 16384, once with the transport's cost taken out (so what is left is
+    /// the sealing) and once over a loopback socket (so the extra record is
+    /// also an extra write). Ignored by default, as the other microbenchmarks
+    /// here are: run with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "microbenchmark"]
+    async fn the_capped_record_size_costs_little() {
+        const BYTES: usize = 256 * 1024 * 1024;
+        let payload = vec![0x5a; 256 * 1024];
+        for cap in [RECORD, 8192] {
+            let mut stream = tapped(cap).await;
+            stream.get_mut().writes = Vec::new();
+            let start = std::time::Instant::now();
+            for _ in 0..BYTES / payload.len() {
+                stream.write_all(&payload).await.unwrap();
+            }
+            let secs = start.elapsed().as_secs_f64();
+            let records = stream.get_mut().writes.len();
+            println!(
+                "sealing only, cap {cap}: {:.0} MiB/s, {records} records",
+                BYTES as f64 / secs / (1024.0 * 1024.0)
+            );
+        }
+        for cap in [RECORD, 8192] {
+            let mut stream = over_loopback(cap).await;
+            let start = std::time::Instant::now();
+            for _ in 0..BYTES / payload.len() {
+                stream.write_all(&payload).await.unwrap();
+            }
+            stream.flush().await.unwrap();
+            let secs = start.elapsed().as_secs_f64();
+            println!(
+                "loopback, cap {cap}: {:.0} MiB/s",
+                BYTES as f64 / secs / (1024.0 * 1024.0)
+            );
+        }
+    }
+
+    /// One record per write, as from Go: 64 KiB past the ramp is four full
+    /// records in four writes, not a header write and a payload write each.
+    #[tokio::test]
+    async fn a_record_leaves_in_one_write() {
+        let mut stream = tapped(RECORD).await;
+        stream
+            .write_all(&vec![0u8; BOOST_UNTIL as usize])
+            .await
+            .unwrap();
+        stream.get_mut().writes.clear();
+        stream.write_all(&vec![7u8; 4 * RECORD]).await.unwrap();
+        assert_eq!(
+            stream.get_mut().writes,
+            vec![RECORD + OVERHEAD; 4],
+            "four records, four writes"
+        );
     }
 }

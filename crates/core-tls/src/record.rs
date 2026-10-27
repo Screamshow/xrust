@@ -87,6 +87,20 @@ pub const VERSION_1_3: [u8; 2] = [0x03, 0x03];
 /// RFC 8446 §5.1: 2^14 bytes of plaintext, and 2^14 + 256 with expansion.
 pub const MAX_FRAGMENT: usize = 16384;
 
+/// Go's `tcpMSSEstimate`: the segment its record sizing assumes, whatever the
+/// route's real MTU turns out to be.
+const MSS_ESTIMATE: usize = 1208;
+
+/// The most plaintext the first application-data record of a connection may
+/// carry for the records to grow the way Go's `crypto/tls` grows them
+/// (`maxPayloadSizeForWrite`, which uTLS keeps as it is, so every Xray and
+/// sing-box client writes this shape): one segment, less the record header,
+/// less the AEAD tag, less the content type byte TLS 1.3 seals with the
+/// plaintext. 1186 for all three suites this record layer runs, since they
+/// share a 16-byte tag and an implicit nonce. TLS 1.2, where the nonce is
+/// explicit, never reaches here -- that is rustls' side of the house.
+pub const BOOST_STEP: usize = MSS_ESTIMATE - 5 - 16 - 1;
+
 /// An unencrypted record, the only kind sent before the handshake keys exist.
 pub fn plaintext_record(
     kind: ContentType,
@@ -397,6 +411,21 @@ mod tests {
         let mut broken = record.clone();
         broken[3] ^= 0x01;
         assert!(opener.open(&broken).is_err(), "a rewritten length opened");
+    }
+
+    /// The step is derived, not copied: Go reaches 1186 for a TLS 1.3 AEAD
+    /// suite as `tcpMSSEstimate - recordHeaderLen - explicitNonceLen(0) -
+    /// ciph.Overhead()(16) - 1`, and a sealed record of that plaintext is one
+    /// segment on the wire.
+    #[test]
+    fn the_boost_step_is_one_segment() {
+        assert_eq!(BOOST_STEP, 1186);
+        let suite = CipherSuite::TLS13_AES_128_GCM_SHA256;
+        let mut sealer = Sealer::new(suite, keys(suite));
+        let record = sealer
+            .seal(ContentType::ApplicationData, &vec![0u8; BOOST_STEP])
+            .expect("seal");
+        assert_eq!(record.len(), MSS_ESTIMATE);
     }
 
     /// The key length in the suite table is what the AEAD takes; a wrong one

@@ -93,6 +93,41 @@ fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The records a transport settles on: the streams a reference client relays
+/// through its `buf.Size` buffers ask for 8192, the h2 transports take the
+/// fragment limit.
+#[test]
+fn the_record_size_follows_the_reference_client() {
+    let cap = |transport: serde_json::Value| {
+        let obj = serde_json::json!({"transport": transport});
+        Transport::parse(obj.as_object().expect("an object"), "outbounds[0]")
+            .expect("parse")
+            .record_cap()
+    };
+    assert_eq!(
+        Transport::default().record_cap(),
+        Some(REFERENCE_WRITE),
+        "a raw stream carries the relay buffer's size"
+    );
+    assert_eq!(
+        cap(serde_json::json!({"type": "ws", "path": "/ws"})),
+        Some(REFERENCE_WRITE)
+    );
+    assert_eq!(
+        cap(serde_json::json!({"type": "httpupgrade", "path": "/up"})),
+        Some(REFERENCE_WRITE)
+    );
+    assert_eq!(
+        cap(serde_json::json!({"type": "grpc", "service_name": "s"})),
+        None
+    );
+    assert_eq!(cap(serde_json::json!({"type": "http", "path": "/h"})), None);
+    assert_eq!(
+        cap(serde_json::json!({"type": "xhttp", "path": "/x"})),
+        None
+    );
+}
+
 #[tokio::test]
 async fn a_ws_upgrade_carries_the_browser_headers() {
     let head = ws_head(&[]).await;

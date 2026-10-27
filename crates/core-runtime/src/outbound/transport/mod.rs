@@ -27,6 +27,9 @@ use crate::tls_client::TlsOptions;
 use crate::util::random_bytes;
 
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+/// What a reference client hands its TLS writer in one go on a raw, ws or
+/// httpupgrade stream: Go's `buf.Size`, the size of every relay buffer there.
+const REFERENCE_WRITE: usize = 8192;
 const OP_BINARY: u8 = 0x2;
 const OP_CLOSE: u8 = 0x8;
 const OP_PING: u8 = 0x9;
@@ -246,6 +249,22 @@ impl Transport {
     /// lx SPEC 104) — a non-nil empty `TLSNextProto` map turns HTTP/2 off for
     /// the whole transport. Offering `h2` instead is what made Xray 26.9 hand
     /// the far end our request head plus the payload twice.
+    /// The record size this transport settles on, `None` for the fragment
+    /// limit.
+    ///
+    /// A record is as big as the write that seals it. Xray relays a raw, ws
+    /// or httpupgrade stream through `buf.Size` buffers, so its records stop
+    /// at [`REFERENCE_WRITE`] bytes of plaintext; its h2 transports write
+    /// whole frames and reach the limit. A relay here reads up to 128 KiB at
+    /// a time, so without this the first group would run at full-size records
+    /// and stand out by length alone.
+    fn record_cap(&self) -> Option<usize> {
+        match &self.kind {
+            Kind::None | Kind::Ws { .. } | Kind::HttpUpgrade { .. } => Some(REFERENCE_WRITE),
+            Kind::Grpc { .. } | Kind::Http { .. } | Kind::Xhttp(_) => None,
+        }
+    }
+
     fn default_alpn(&self, secure: bool) -> &'static [&'static [u8]] {
         match &self.kind {
             Kind::Grpc { .. } => &[b"h2"],
@@ -336,8 +355,14 @@ impl Transport {
         let tls_forced = self.h1_forced_tls(tls);
         let tls = tls_forced.as_ref().or(tls);
         let default_alpn = self.default_alpn(tls.is_some());
+        // The transport knows how big its reference client's writes are, and
+        // the records follow the writes.
+        let record_cap = self.record_cap().unwrap_or(core_tls::record::MAX_FRAGMENT);
         let stream: AnyStream = match tls {
-            Some(tls) => tls.wrap_with_defaults(tcp, default_alpn).await?,
+            Some(tls) => {
+                tls.wrap_with_record_cap(tcp, default_alpn, record_cap)
+                    .await?
+            }
             None => Box::new(tcp),
         };
         let stream = match &self.kind {
