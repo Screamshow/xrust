@@ -792,9 +792,10 @@ mod tests {
         }
     }
 
-    /// The first Initial is shaped like a quic-go client's: a 1250-byte
-    /// datagram, an 8-byte DCID, a zero-length SCID and no token; the rest
-    /// of the first flight keeps the same zero-length SCID.
+    /// The first Initial is shaped like a quic-go client's: a datagram of
+    /// `protocol.InitialPacketSize`, an 8-byte DCID, a zero-length SCID and
+    /// no token; the rest of the first flight keeps the same zero-length
+    /// SCID.
     #[tokio::test]
     async fn first_initial_has_quic_go_shape() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -825,7 +826,11 @@ mod tests {
             assert_eq!(dg[6 + dcid_len], 0, "zero-length SCID");
             assert_eq!(dg[7 + dcid_len], 0, "no token");
             if i == 0 {
-                assert_eq!(n, 1250, "first Initial datagram size");
+                assert_eq!(
+                    n,
+                    usize::from(crate::outbound::quic::QUIC_GO_INITIAL_MTU),
+                    "first Initial datagram size"
+                );
             } else {
                 // quinn pads this one to the 1200-byte minimum, where the
                 // reference pads every client Initial to its send size; see

@@ -60,16 +60,22 @@ pub(crate) fn size_network_udp_buffers(sock: socket2::SockRef<'_>) {
     }
 }
 
-/// Size of the client's first-flight datagrams in the quic-go based
-/// reference clients (hysteria2, sing-box, Xray: Chrome's 1250 bytes).
-/// quinn otherwise uses 1200.
+/// Size of the client's first-flight datagrams, `protocol.InitialPacketSize`
+/// in the quic-go fork Xray and the hysteria client both build on
+/// (apernet/quic-go, the same value as upstream quic-go). quinn otherwise
+/// uses 1200, and the 1250 here before this was Chrome's QUIC size, which
+/// matched no quic-go client.
+///
+/// sing-box's fork is the one family member that differs: it keeps the older
+/// split of 1252 for IPv4 and 1232 for IPv6. A node that would rather look
+/// like sing-box can say so with `initial_packet_size`.
 ///
 /// This sets the size of the datagrams quinn fills. The second Initial of a
 /// post-quantum hello still leaves at 1200, the minimum RFC 9000 asks of an
 /// Initial, where the reference pads every client Initial to the full size:
 /// quinn pads to that minimum and the choice is inside quinn-proto, so
 /// closing that last difference means patching it.
-pub(crate) const QUIC_GO_INITIAL_MTU: u16 = 1250;
+pub(crate) const QUIC_GO_INITIAL_MTU: u16 = 1280;
 /// Length of the Destination Connection ID in a quic-go client's first
 /// Initial (quinn otherwise picks 20 bytes).
 const QUIC_GO_INITIAL_DCID_LEN: usize = 8;
