@@ -61,7 +61,6 @@ pub(super) async fn connect(
     stream: AnyStream,
     service_name: &str,
     authority: &str,
-    secure: bool,
 ) -> io::Result<AnyStream> {
     let (send_request, connection) = super::h2io::grpc_client_builder()
         .handshake(stream)
@@ -75,16 +74,28 @@ pub(super) async fn connect(
         .await
         .map_err(|e| io::Error::other(format!("grpc: h2 ready: {e}")))?;
 
-    let scheme = if secure { "https" } else { "http" };
     // Escape ordinary service names as one segment, but preserve Xray's
     // explicit custom service/method path when the name starts with `/`.
     let path = service_path(service_name);
-    let request = http::Request::builder()
+    // `:scheme` is `http` even over TLS: the reference hands grpc-go insecure
+    // credentials, because the TLS is its own layer underneath, and grpc-go
+    // then has no reason to call the connection anything else
+    // (`grpc/dial.go`, `insecure.NewCredentials()`).
+    let mut request = http::Request::builder()
         .method("POST")
-        .uri(format!("{scheme}://{authority}{path}"))
-        .header("content-type", "application/grpc")
+        .uri(format!("http://{authority}{path}"))
+        // grpc-go's field order (`createHeaderFields`): content type, user
+        // agent, te, and nothing else without compression or a deadline.
+        .header("content-type", "application/grpc");
+    // The reference dresses the connection as a browser and strips grpc-go's
+    // own `grpc-go/<version>` suffix, so a gRPC node of Xray's carries a
+    // Chrome user agent and ours carried a grpc-go version that was years
+    // old. A profile that asks for no user agent at all sends none.
+    if let Some(ua) = super::browser::profile_user_agent(None) {
+        request = request.header("user-agent", ua);
+    }
+    let request = request
         .header("te", "trailers")
-        .header("user-agent", "grpc-go/1.48.0")
         .body(())
         .map_err(|e| io::Error::other(format!("grpc: build request: {e}")))?;
     let (response, send) = send_request
@@ -338,6 +349,67 @@ fn parse_hunk_head(raw: &[u8]) -> io::Result<Option<(usize, usize, usize)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The request a gRPC node gets, the way Xray's dialer sends it: `:scheme`
+    /// `http` even over TLS, the authority without a port, and a browser user
+    /// agent instead of grpc-go's own.
+    #[tokio::test]
+    async fn the_request_is_shaped_like_the_reference() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::Builder::new()
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .expect("server handshake");
+            let (request, mut respond) = connection
+                .accept()
+                .await
+                .expect("a request")
+                .expect("accepted");
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc")
+                .body(())
+                .expect("response");
+            let _send = respond.send_response(response, false).expect("respond");
+            request
+        });
+
+        let stream: AnyStream = Box::new(client_io);
+        let _tunnel = connect(stream, "GunService", "example.com")
+            .await
+            .expect("connect");
+        let request = server.await.expect("server task");
+
+        assert_eq!(request.method(), http::Method::POST);
+        assert_eq!(
+            request.uri().scheme_str(),
+            Some("http"),
+            "{:?}",
+            request.uri()
+        );
+        assert_eq!(
+            request.uri().authority().map(|a| a.as_str()),
+            Some("example.com"),
+            "the authority carries no port"
+        );
+        assert_eq!(request.uri().path(), "/GunService/Tun");
+        let header = |name: &str| {
+            request
+                .headers()
+                .get(name)
+                .map(|v| v.to_str().expect("ascii").to_string())
+        };
+        assert_eq!(header("content-type").as_deref(), Some("application/grpc"));
+        assert_eq!(header("te").as_deref(), Some("trailers"));
+        let ua = header("user-agent").expect("a user agent");
+        assert!(
+            ua.contains("Chrome/") && ua.contains("Safari/537.36"),
+            "{ua}"
+        );
+        assert!(!ua.contains("grpc-go"), "{ua}");
+        assert!(header("grpc-accept-encoding").is_none(), "no compressors");
+    }
 
     /// Everything still buffered, as one contiguous copy (test view only).
     fn buffered(pending: &VecDeque<Bytes>) -> Vec<u8> {

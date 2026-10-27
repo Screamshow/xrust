@@ -412,8 +412,15 @@ impl Transport {
                 httpupgrade_handshake(stream, path, host, headers).await?
             }
             Kind::Grpc { service_name } => {
-                let sni = tls.map(TlsOptions::server_name).unwrap_or(server);
-                grpc::connect(stream, service_name, &authority(sni, port), tls.is_some()).await?
+                // Xray's dialer hands grpc-go the TLS server name as the
+                // authority, or the destination's domain without TLS, and
+                // never a port (`grpc/dial.go`); ours used to send
+                // `host:port`, as sing-box does.
+                let sni = tls
+                    .map(TlsOptions::server_name)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(server);
+                grpc::connect(stream, service_name, sni).await?
             }
             Kind::Http {
                 host,

@@ -186,16 +186,21 @@ pub(crate) fn h1_name(lower: &str) -> &'static str {
     }
 }
 
-/// The Chrome `fetch` headers in one list, for the XHTTP request builder: the
-/// request it builds carries no header the fill set would have to step around.
-pub(crate) fn chrome_fetch_headers() -> &'static [(&'static str, String)] {
-    static HEADERS: OnceLock<Vec<(&'static str, String)>> = OnceLock::new();
-    HEADERS.get_or_init(|| {
-        let set = defaults(None, Variant::Fetch);
-        let mut all = set.force;
-        all.extend(set.fill);
-        all
-    })
+/// The `User-Agent` of a profile on its own, for a request that takes no
+/// other browser header: the reference's gRPC dialer dresses its connection
+/// in one of these and nothing else (`grpc/dial.go`, `utils.ChromeUA` and the
+/// `firefox`/`edge`/`golang` cases). `None` is a request that carries no
+/// `User-Agent` at all, which is what `golang` means there.
+pub(crate) fn profile_user_agent(configured_ua: Option<&str>) -> Option<String> {
+    match configured_ua {
+        None | Some("chrome") => Some(chrome_ua(chrome_version(), Profile::Chrome)),
+        Some("edge") => Some(chrome_ua(chrome_version(), Profile::Edge)),
+        Some("firefox") => Some(firefox_ua()),
+        Some("safari") => Some(safari_ua()),
+        Some("curl") => Some(format!("curl/{}", curl_version())),
+        Some("golang") => None,
+        Some(own) => Some(own.to_string()),
+    }
 }
 
 /// `ChromeVersion` in the reference: the major version a current Chrome has
@@ -439,12 +444,7 @@ mod tests {
         let version = chrome_version();
         // late October 2026: (286 - 35 - lag) / 35 over 144
         assert!((144..=152).contains(&version), "{version}");
-        let fetch = chrome_fetch_headers();
-        let ua = &fetch
-            .iter()
-            .find(|(name, _)| *name == "user-agent")
-            .expect("user-agent")
-            .1;
+        let ua = profile_user_agent(None).expect("a user agent");
         assert!(ua.contains(&format!("Chrome/{version}.0.0.0")), "{ua}");
     }
 
@@ -588,6 +588,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The bare `User-Agent` of a profile, for the gRPC connection.
+    #[test]
+    fn a_profile_has_a_user_agent_on_its_own() {
+        let chrome = profile_user_agent(None).expect("chrome");
+        assert!(chrome.contains("Chrome/") && chrome.contains("Windows NT 10.0"));
+        assert_eq!(profile_user_agent(Some("chrome")), Some(chrome));
+        assert!(
+            profile_user_agent(Some("firefox"))
+                .expect("firefox")
+                .contains("Firefox/")
+        );
+        assert!(
+            profile_user_agent(Some("edge"))
+                .expect("edge")
+                .contains("Edg/")
+        );
+        // `golang` means no user agent on the connection at all
+        assert_eq!(profile_user_agent(Some("golang")), None);
+        // anything else is the user's own, sent as it stands
+        assert_eq!(
+            profile_user_agent(Some("mine/1.0")),
+            Some("mine/1.0".to_string())
+        );
     }
 
     #[test]

@@ -2174,21 +2174,36 @@ impl XhttpConfig {
         }
 
         let mut builder = http::Request::builder().method(method).uri(uri);
+        // Xray's `GetRequestHeader`: with no `User-Agent` configured the
+        // request is a Chrome `fetch` (`TryDefaultHeadersWith(header,
+        // "fetch")`), one of the profile names picks another browser, and any
+        // other `User-Agent` is the user's own and leaves the request as it is.
+        let configured_ua = self
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, value)| value.as_str());
+        let browser = super::browser::defaults(configured_ua, super::browser::Variant::Fetch);
         for (name, value) in &self.headers {
             if HOP_BY_HOP.contains(&name.to_ascii_lowercase().as_str()) {
                 continue;
             }
+            if browser.replaces(name)
+                || (browser.drop_configured_ua && name.eq_ignore_ascii_case("user-agent"))
+            {
+                continue;
+            }
             builder = builder.header(name.as_str(), value.as_str());
         }
-        // Xray's `GetRequestHeader`: with no User-Agent configured, the
-        // request is a Chrome `fetch` (`TryDefaultHeadersWith(header,
-        // "fetch")`); one configured keeps the request as it is.
-        if !self
-            .headers
-            .iter()
-            .any(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
-        {
-            for (name, value) in super::browser::chrome_fetch_headers() {
+        for (name, value) in &browser.force {
+            builder = builder.header(*name, value.as_str());
+        }
+        for (name, value) in &browser.fill {
+            if !self
+                .headers
+                .iter()
+                .any(|(set, _)| set.eq_ignore_ascii_case(name))
+            {
                 builder = builder.header(*name, value.as_str());
             }
         }
@@ -2861,6 +2876,32 @@ mod tests {
             .unwrap();
         assert_eq!(req.headers().get("user-agent").unwrap(), "mine");
         assert!(!req.headers().contains_key("sec-ch-ua"));
+
+        // a profile name is not a user agent: it picks one, as
+        // `TryDefaultHeadersWith` does
+        let firefox = cfg(json!({"headers": {"User-Agent": "firefox"}}));
+        let req = firefox
+            .build_request("https", "srv:443", "GET", Some("SID"), None, false)
+            .unwrap();
+        let ua = req.headers().get("user-agent").unwrap().to_str().unwrap();
+        assert!(ua.contains("Gecko/20100101 Firefox/"), "{ua}");
+        assert!(
+            !req.headers().contains_key("sec-ch-ua"),
+            "firefox sends none"
+        );
+        assert_eq!(req.headers().get("priority").unwrap(), "u=4");
+        assert_eq!(
+            req.headers().get("accept-language").unwrap(),
+            "en-US,en;q=0.5"
+        );
+
+        // a configured header the fill set also carries stays as configured
+        let keeps = cfg(json!({"headers": {"Accept": "text/plain"}}));
+        let req = keeps
+            .build_request("https", "srv:443", "GET", Some("SID"), None, false)
+            .unwrap();
+        assert_eq!(req.headers().get("accept").unwrap(), "text/plain");
+        assert_eq!(req.headers().get("cache-control").unwrap(), "no-cache");
     }
 
     /// A packet-up upload carries no content type, as Xray's
