@@ -228,3 +228,36 @@ async fn group_limits_parallel_probes_to_eight() {
     instance.shutdown_wait().await;
     task.abort();
 }
+
+/// A target that answers as fast as it can still answers, so the endpoint owes
+/// a delay and not an error. How fast loopback actually is varies by machine,
+/// so the floor that makes a sub-millisecond answer report 1 ms is pinned by
+/// the unit test on `delay_ms`; what this one guards is the whole path: a
+/// probe that was answered comes back 200 with a delay in it.
+#[tokio::test]
+async fn an_instant_answer_is_a_delay_and_not_an_error() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (instant, task) = proxy(0, hits.clone()).await;
+    let instance = core_runtime::start(&json!({
+        "experimental":{"clash_api":{"external_controller":"127.0.0.1:0"}},
+        "outbounds":[{"type":"http","tag":"instant","server":"127.0.0.1","server_port":instant}],
+        "route":{"final":"instant"}
+    }))
+    .await
+    .unwrap();
+    stop_background(&instance).await;
+    let addr = instance.clash_api_addr().unwrap();
+    let (status, result) = api(
+        addr,
+        "/proxies/instant/delay?timeout=2000&url=http://example.test/",
+    )
+    .await;
+    assert_eq!(status, 200, "{result}");
+    assert!(
+        result["delay"].as_u64().is_some_and(|ms| ms >= 1),
+        "an answered probe reports a delay: {result}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    instance.shutdown_wait().await;
+    task.abort();
+}

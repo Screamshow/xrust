@@ -1761,7 +1761,19 @@ async fn probe_delay(router: &Router, index: usize, url: &str) -> Result<u16, Pr
     text.split_whitespace()
         .nth(1)
         .ok_or_else(|| ProbeFail::Status(text.trim_end().to_string()))?;
-    u16::try_from(start.elapsed().as_millis()).map_err(|_| ProbeFail::TooSlow)
+    delay_ms(start.elapsed())
+}
+
+/// The delay a probe reports for an answer that took `elapsed`.
+///
+/// Floored at one millisecond: a probe that was answered is a success even
+/// when the answer came back inside a millisecond, while zero is what the
+/// delay store and this endpoint mean by "nothing measured". A near target
+/// used to round to zero and be reported as a failure with no reason to give.
+fn delay_ms(elapsed: Duration) -> Result<u16, ProbeFail> {
+    u16::try_from(elapsed.as_millis())
+        .map(|ms| ms.max(1))
+        .map_err(|_| ProbeFail::TooSlow)
 }
 
 /// Minimal URL split: `(tls, host, port, authority, path-with-query)`.
@@ -2146,6 +2158,20 @@ async fn send(
 
 #[cfg(test)]
 mod tests {
+
+    /// An answered probe is a delay, never a failure: zero is what the delay
+    /// store and this endpoint mean by "nothing measured", so a sub-millisecond
+    /// answer reports one millisecond rather than rounding into an error.
+    #[test]
+    fn a_sub_millisecond_answer_still_reports_a_delay() {
+        assert_eq!(delay_ms(Duration::ZERO).ok(), Some(1));
+        assert_eq!(delay_ms(Duration::from_micros(400)).ok(), Some(1));
+        assert_eq!(delay_ms(Duration::from_millis(1)).ok(), Some(1));
+        assert_eq!(delay_ms(Duration::from_millis(1500)).ok(), Some(1500));
+        assert_eq!(delay_ms(Duration::from_millis(65535)).ok(), Some(65535));
+        // past what a delay can carry the probe says so instead of wrapping
+        assert!(delay_ms(Duration::from_millis(65536)).is_err());
+    }
     #[test]
     fn traffic_rates_use_elapsed_time_and_handle_counter_reset() {
         assert_eq!(
