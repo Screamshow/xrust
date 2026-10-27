@@ -167,6 +167,8 @@ impl Vless {
             .connect_or_dial(self.tls.as_ref(), &self.server, self.port, &self.dial)
             .await?;
         if self.vision {
+            // the transport is still bare here, which is all this needs; it
+            // walks a wrapped stream just as well (see the function)
             crate::inbound::disable_tls_read_batching(&mut stream);
         }
         // The head waits for the first payload and both go in one write, as
@@ -270,6 +272,10 @@ impl VlessStream {
 
     pub(crate) fn enable_vision_direct_read(&mut self) -> bool {
         crate::inbound::enable_vision_direct_read(&mut self.inner)
+    }
+
+    pub(crate) fn disable_tls_read_batching(&mut self) {
+        crate::inbound::disable_tls_read_batching(&mut self.inner);
     }
     /// The bare socket underneath, while the response head has not been touched:
     /// the relay can then eat the head itself and hand the rest to the kernel.

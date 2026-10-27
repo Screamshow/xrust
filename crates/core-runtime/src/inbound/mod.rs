@@ -148,10 +148,19 @@ pub(crate) fn enable_vision_direct_read(stream: &mut AnyStream) -> bool {
 
 /// Vision decides between outer TLS records whether the next bytes are still
 /// TLS, so a read must stop after each record. Called before the first read.
+///
+/// Batching left on under Vision is not a slow path but a broken one: the
+/// bytes behind the record that carried the Direct command are the inner
+/// session's, and opening them as one more outer record fails its tag and ends
+/// the download. So this walks the same layers as its neighbours rather than
+/// relying on where it happens to be called from.
 pub(crate) fn disable_tls_read_batching(stream: &mut AnyStream) {
     let stream = (**stream).as_any_mut();
     if let Some(alpn) = stream.downcast_mut::<AlpnStream>() {
         return disable_tls_read_batching(&mut alpn.inner);
+    }
+    if let Some(vless) = stream.downcast_mut::<crate::outbound::secure::VlessStream>() {
+        return vless.disable_tls_read_batching();
     }
     if let Some(tls) = stream.downcast_mut::<crate::tls_utls::FingerprintStream<TcpStream>>() {
         tls.disable_read_batching();
