@@ -1,6 +1,6 @@
 //! The shape of the websocket and HTTPUpgrade requests: with no `User-Agent`
 //! configured both carry the browser `ws` headers Xray puts on them, and the
-//! HTTPUpgrade request carries the websocket key and version its dialer adds.
+//! HTTPUpgrade keeps the websocket version and an explicitly configured key.
 
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -229,7 +229,6 @@ async fn an_httpupgrade_request_is_shaped_like_the_reference() {
             "Sec-Fetch-Dest",
             "Sec-Fetch-Mode",
             "Sec-Fetch-Site",
-            "Sec-WebSocket-Key",
             "Sec-WebSocket-Version",
             "Upgrade",
         ]
@@ -237,21 +236,17 @@ async fn an_httpupgrade_request_is_shaped_like_the_reference() {
     assert_eq!(value(&head, "Connection"), Some("Upgrade"));
     assert_eq!(value(&head, "Upgrade"), Some("websocket"));
     assert_eq!(value(&head, "Sec-WebSocket-Version"), Some("13"));
-    // 16 random bytes, standard base64 with its padding
-    let key = value(&head, "Sec-WebSocket-Key").expect("key");
-    assert_eq!(key.len(), 24, "{key}");
-    assert!(key.ends_with("=="), "{key}");
+    assert!(value(&head, "Sec-WebSocket-Key").is_none(), "{head}");
 }
 
-/// Two upgrades draw their own keys.
+/// sing-box rejects HTTPUpgrade carrying a nonempty WebSocket key, whereas
+/// Xray accepts requests without it. Repeated dials must stay compatible.
 #[tokio::test]
-async fn every_httpupgrade_request_has_its_own_key() {
+async fn httpupgrade_does_not_synthesize_a_websocket_key() {
     let first = httpupgrade_head(&[]).await;
     let second = httpupgrade_head(&[]).await;
-    assert_ne!(
-        value(&first, "Sec-WebSocket-Key"),
-        value(&second, "Sec-WebSocket-Key")
-    );
+    assert!(value(&first, "Sec-WebSocket-Key").is_none(), "{first}");
+    assert!(value(&second, "Sec-WebSocket-Key").is_none(), "{second}");
 }
 
 /// A configured key and version are left as they are, as the reference's

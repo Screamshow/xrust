@@ -1072,9 +1072,10 @@ async fn httpupgrade_handshake(
     headers: &[(String, String)],
 ) -> io::Result<AnyStream> {
     // Xray's dialer writes this request through Go's `net/http`, which puts
-    // `Host` and `User-Agent` first and the rest in name order, and it adds a
-    // `Sec-WebSocket-Key` and `Sec-WebSocket-Version` of its own on top of the
-    // browser `ws` headers (`httpupgrade/dialer.go`).
+    // `Host` and `User-Agent` first and the rest in name order. Keep a
+    // configured websocket key, but do not generate one: sing-box rejects
+    // HTTPUpgrade requests carrying a nonempty key as real WebSocket
+    // requests, while Xray accepts HTTPUpgrade without a key too.
     let browser = browser::defaults(configured_ua(headers), browser::Variant::Ws);
     let mut set: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 16);
     for (name, value) in headers {
@@ -1101,16 +1102,6 @@ async fn httpupgrade_handshake(
     });
     set.push(("Connection", "Upgrade"));
     set.push(("Upgrade", "websocket"));
-    let key = if has_header(headers, "sec-websocket-key") {
-        String::new()
-    } else {
-        let mut key_bytes = [0u8; 16];
-        random_bytes(&mut key_bytes)?;
-        base64_std(&key_bytes)
-    };
-    if !key.is_empty() {
-        set.push(("Sec-WebSocket-Key", &key));
-    }
     if !has_header(headers, "sec-websocket-version") {
         set.push(("Sec-WebSocket-Version", "13"));
     }
