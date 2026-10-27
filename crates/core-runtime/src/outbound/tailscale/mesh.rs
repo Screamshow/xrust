@@ -284,11 +284,14 @@ impl DirectMesh {
             let Some(key) = parse_key_hex(&node.key) else {
                 continue;
             };
+            // A known peer passed the low-order check when it was added;
+            // only a new key pays for the X25519 operation.
             if key == self.public
-                || !self
-                    .private
-                    .diffie_hellman(&PublicKey::from(key))
-                    .was_contributory()
+                || (!self.peers.contains_key(&key)
+                    && !self
+                        .private
+                        .diffie_hellman(&PublicKey::from(key))
+                        .was_contributory())
             {
                 continue;
             }

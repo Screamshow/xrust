@@ -123,6 +123,15 @@ fn default_os() -> String {
 
 #[cfg(test)]
 mod hostinfo_tests {
+    #[test]
+    fn only_a_bare_keepalive_is_skipped() {
+        let parse = |raw: &str| serde_json::from_str::<super::MapResponse>(raw).unwrap();
+        assert!(parse(r#"{"KeepAlive":true}"#).is_keep_alive_only());
+        assert!(!parse(r#"{"KeepAlive":true,"PeersRemoved":[7]}"#).is_keep_alive_only());
+        assert!(!parse(r#"{"KeepAlive":true,"Node":{}}"#).is_keep_alive_only());
+        assert!(!parse(r#"{"PeersChanged":[]}"#).is_keep_alive_only());
+    }
+
     use super::*;
     #[test]
     fn openwrt_hostinfo_preserves_os_family_and_reports_release() {
@@ -272,6 +281,20 @@ pub struct MapResponse {
     pub derp_map: Option<DerpMap>,
     #[serde(rename = "KeepAlive", default)]
     pub keep_alive: Option<bool>,
+}
+
+impl MapResponse {
+    /// A stream keepalive that carries no change at all.
+    pub fn is_keep_alive_only(&self) -> bool {
+        self.keep_alive == Some(true)
+            && self.peers_changed.is_none()
+            && self.peers_removed.is_none()
+            && self.packet_filter.is_none()
+            && self.packet_filters.is_none()
+            && self.node.is_none()
+            && self.peers.is_none()
+            && self.derp_map.is_none()
+    }
 }
 
 #[derive(Serialize, Deserialize)]

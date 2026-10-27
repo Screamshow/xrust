@@ -302,6 +302,9 @@ impl Tailscale {
                         named_rules.clear();
                         continue;
                     }
+                    // Control sends one about every minute; rebuilding every
+                    // peer for it only burned CPU.
+                    Ok(Some(map)) if map.is_keep_alive_only() => delay = 0,
                     Ok(Some(map)) => {
                         if let Some(filter) = map.packet_filter.clone() {
                             named_rules.insert("base".to_string(), filter);

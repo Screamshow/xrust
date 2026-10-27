@@ -298,7 +298,6 @@ pub fn spawn_tailscale_engine_with_tun(
         let mut tcp_conns: HashMap<u32, TcpConn> = HashMap::new();
         type UdpSession = (SocketHandle, SocketAddr, mpsc::Sender<Vec<u8>>, Instant);
         let mut udp_sessions: HashMap<u16, UdpSession> = HashMap::new();
-        let mut _peers: Vec<PeerObj> = Vec::new();
 
         let mut next_ephemeral_port: u16 = 40000;
         let poll_interval = Duration::from_millis(5);
@@ -486,9 +485,8 @@ pub fn spawn_tailscale_engine_with_tun(
                         peers: new_peers,
                         derp_map,
                     } => {
-                        _peers = new_peers;
                         if let Some(mesh) = &mut mesh {
-                            mesh.update_peers(&_peers);
+                            mesh.update_peers(&new_peers);
                             if let Some(map) = derp_map {
                                 mesh.update_relay_map(map);
                             }
@@ -496,7 +494,7 @@ pub fn spawn_tailscale_engine_with_tun(
                         logging::debug(format_args!(
                             "tailscale[{}]: updated peer table with {} nodes",
                             cfg.tag,
-                            _peers.len()
+                            new_peers.len()
                         ));
                     }
                 }
