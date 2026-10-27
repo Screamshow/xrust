@@ -100,6 +100,19 @@ fn tail() -> Vec<u8> {
     pattern(3000, 9)
 }
 
+/// How the scripted server ends the connection.
+#[derive(Clone)]
+enum Close {
+    /// the transport's FIN, with nothing in front of it
+    Fin,
+    /// the outer TLS says close_notify first, as Go's `crypto/tls` does on
+    /// `Close`: what every Xray and sing-box server sends
+    OuterCloseNotify,
+    /// one more record of the server's own behind the Direct stream, which is
+    /// what a server missing Xray's `SuppressOuterCloseNotify` leaks
+    Extra(Vec<u8>),
+}
+
 fn frame(command: u8, content: &[u8], padding: usize) -> Vec<u8> {
     let mut out = vec![command];
     out.extend_from_slice(&(content.len() as u16).to_be_bytes());
@@ -239,6 +252,7 @@ async fn serve_rest(
     mut outer: Outer,
     down_direct: bool,
     down: Vec<u8>,
+    close: Close,
 ) -> (u8, Vec<u8>) {
     let mut content = Vec::new();
     let command = loop {
@@ -281,6 +295,18 @@ async fn serve_rest(
                 };
                 wr.write_all(&out).await.expect("tls download");
             }
+        }
+        match &close {
+            Close::Fin => {}
+            Close::OuterCloseNotify => {
+                let out = {
+                    let mut conn = conn.lock().expect("conn");
+                    conn.send_close_notify();
+                    sealed(&mut conn)
+                };
+                wr.write_all(&out).await.expect("close_notify");
+            }
+            Close::Extra(extra) => wr.write_all(extra).await.expect("extra record"),
         }
         wr.shutdown().await.expect("server shutdown");
     };
@@ -334,14 +360,21 @@ fn meta() -> clash_state::ConnMeta {
 /// end the padding, then `up` and `down` at once, every byte and both
 /// counters checked. Returns the client's ending command and whether the
 /// download was spliced.
-async fn run(version: [u8; 2], direct: bool, up: Vec<u8>, down: Vec<u8>) -> (u8, bool) {
+async fn run(
+    version: [u8; 2],
+    direct: bool,
+    up: Vec<u8>,
+    down: Vec<u8>,
+    close: Close,
+) -> (u8, bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let server = tokio::spawn({
         let down = down.clone();
+        let close = close.clone();
         async move {
             let (tcp, outer) = serve_start(listener, version, direct).await;
-            serve_rest(tcp, outer, direct, down).await
+            serve_rest(tcp, outer, direct, down, close).await
         }
     });
     let mut upstream = vision_upstream(port).await;
@@ -406,6 +439,11 @@ async fn run(version: [u8; 2], direct: bool, up: Vec<u8>, down: Vec<u8>) -> (u8,
     want_up.extend_from_slice(&up);
     let mut want_down = tail();
     want_down.extend_from_slice(&down);
+    if let Close::Extra(extra) = &close {
+        // the relay is a pipe from the switch on: whatever the peer put behind
+        // the payload arrives as it is
+        want_down.extend_from_slice(extra);
+    }
     assert_eq!(got_up.len(), want_up.len());
     assert!(got_up == want_up, "upload corrupted");
     assert_eq!(got_down.len(), want_down.len());
@@ -429,6 +467,7 @@ async fn a_direct_download_moves_to_the_kernel_with_every_byte_in_order() {
         true,
         pattern(4 * 1024 * 1024 + 3, 1),
         pattern(8 * 1024 * 1024 + 5, 2),
+        Close::Fin,
     )
     .await;
     assert_eq!(
@@ -445,6 +484,7 @@ async fn without_direct_the_relay_stays_in_userspace() {
         false,
         pattern(1024 * 1024 + 3, 3),
         pattern(1024 * 1024 + 5, 4),
+        Close::Fin,
     )
     .await;
     assert_eq!(command, END, "TLS 1.2 inside keeps the outer TLS");
@@ -500,4 +540,54 @@ async fn the_api_still_closes_a_spliced_download() {
         "nothing after the close: {} bytes",
         rest.len()
     );
+}
+
+/// A server that ends its outer TLS the way Go's `crypto/tls` does -- an
+/// encrypted close_notify, then the socket -- must end the download as an end
+/// of stream. Our own TLS stack used to hand that record back as an error, so
+/// every TLS-wrapped Vision download died with an aborted relay just as the
+/// last bytes were due; the whole payload has to arrive and the relay has to
+/// come back `Ok`. The alert is consumed here and never reaches the LAN
+/// client: it belongs to the tunnel, not to the session inside it.
+#[tokio::test]
+async fn an_outer_close_notify_ends_a_userspace_download_cleanly() {
+    let (command, spliced) = run(
+        [3, 3],
+        false,
+        pattern(96 * 1024 + 3, 11),
+        pattern(512 * 1024 + 5, 12),
+        Close::OuterCloseNotify,
+    )
+    .await;
+    assert_eq!(command, END, "TLS 1.2 inside keeps the outer TLS");
+    assert!(!spliced, "End keeps the download in userspace");
+}
+
+/// What a peer that is missing Xray's `SuppressOuterCloseNotify` leaks: once
+/// Vision is Direct the socket carries the inner session as it is, and a
+/// close_notify of the *outer* TLS written behind it is just more bytes on
+/// that socket. The relay is a pipe from the switch on -- Xray's
+/// `CopyRawConnIfExist` is too -- so those bytes reach the client unchanged,
+/// where they are a record that cannot be decrypted: `bad record mac`, which
+/// OpenSSL 3.2 and later report as `record layer failure`, right after a
+/// complete response body.
+///
+/// The test pins our side of it: nothing is added, dropped or reordered, so a
+/// tail like this can only have come from the peer. There is no fix on this
+/// end -- the bytes are forwarded before the stream ends, and holding them
+/// back would cost every chunk its last 24 bytes of latency.
+#[tokio::test]
+async fn a_peers_extra_record_after_direct_reaches_the_client_unchanged() {
+    let mut leak = vec![0x17, 0x03, 0x03, 0x00, 0x13];
+    leak.extend_from_slice(&[0xab; 19]);
+    let (command, spliced) = run(
+        [3, 4],
+        true,
+        pattern(8 * 1024 + 1, 13),
+        pattern(512 * 1024 + 7, 14),
+        Close::Extra(leak),
+    )
+    .await;
+    assert_eq!(command, DIRECT, "the client goes Direct on its side too");
+    assert!(spliced, "the Direct download leaves userspace");
 }
