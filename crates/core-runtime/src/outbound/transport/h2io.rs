@@ -15,14 +15,58 @@ use http::Response;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::task::JoinHandle;
 
-/// Receive window per stream and per connection: 8 MiB a stream, 32 MiB a
-/// connection, sized to sustain 10+ Gbps transfers without ballooning
-/// client RSS across concurrent pooled connections. The window is also the
-/// memory ceiling for whatever a fast peer has in flight to a slow reader.
+/// Receive window per stream and per connection a server this side runs
+/// advertises: 8 MiB a stream, 32 MiB a connection, sized to sustain 10+ Gbps
+/// transfers without ballooning RSS across concurrent connections. The window
+/// is also the memory ceiling for whatever a fast peer has in flight to a slow
+/// reader.
 const STREAM_WINDOW: u32 = 8 << 20;
 const CONN_WINDOW: u32 = 32 << 20;
-/// Largest DATA frame we ask the peer to send.
+/// Largest DATA frame a server this side runs asks the peer to send.
 const MAX_FRAME: u32 = 256 * 1024;
+
+/// What a client's opening SETTINGS and connection WINDOW_UPDATE say, byte for
+/// byte what Go's `x/net/http2` Transport sends, because the reference clients
+/// are Go clients and this set is part of their HTTP/2 fingerprint:
+/// `transportDefaultStreamFlow` 4 MiB per stream, `transportDefaultConnFlow`
+/// 1 GiB a connection (the opening WINDOW_UPDATE is that minus the protocol's
+/// own 65535), `MaxReadFrameSize` 16 KiB and `maxHeaderListSize` 10 MiB. Push
+/// off, and nothing else: a HEADER_TABLE_SIZE or MAX_CONCURRENT_STREAMS
+/// setting would be one entry more than Go sends.
+///
+/// The connection window is pure flow-control credit -- no buffer is sized
+/// from it -- so what a peer can hold in our buffers stays bounded by the
+/// per-stream window times the streams on the connection.
+const GO_STREAM_WINDOW: u32 = 4 << 20;
+const GO_CONN_WINDOW: u32 = 1 << 30;
+const GO_MAX_FRAME: u32 = 16 << 10;
+const GO_MAX_HEADER_LIST: u32 = 10 << 20;
+
+/// The smallest window the protocol starts every connection with; a smaller
+/// override would mean advertising a shrink, so it is the floor.
+const MIN_WINDOW: u32 = 65_535;
+
+/// `XRUST_H2_STREAM_WINDOW` / `XRUST_H2_CONN_WINDOW`, in bytes: the escape
+/// hatch for a deployment that would rather have a tighter receive brake than
+/// the Go windows (the old values here were 8 MiB and 32 MiB). Either one is
+/// visible on the wire and takes the client's HTTP/2 fingerprint away from the
+/// reference, so neither is set by default.
+fn window_from_env(name: &str, fallback: u32) -> u32 {
+    crate::env_var(name)
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v >= MIN_WINDOW)
+        .unwrap_or(fallback)
+}
+
+fn client_stream_window() -> u32 {
+    static WINDOW: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| window_from_env("H2_STREAM_WINDOW", GO_STREAM_WINDOW))
+}
+
+fn client_conn_window() -> u32 {
+    static WINDOW: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| window_from_env("H2_CONN_WINDOW", GO_CONN_WINDOW))
+}
 
 /// Bound each owned upload allocation, including gRPC framing overhead.
 /// Partial AsyncWrite writes preserve backpressure without retaining an
@@ -30,19 +74,41 @@ const MAX_FRAME: u32 = 256 * 1024;
 /// 48 KiB also stays below musl's large-allocation threshold.
 pub(super) const WRITE_CHUNK: usize = 48 * 1024;
 
-/// The client handshake every h2-based transport shares, with windows sized
-/// for throughput.
+/// The client handshake the h2-based transports share: the SETTINGS set Go
+/// sends, the preface and window update in one write, a window update per
+/// 4 KiB read, and the request pseudo-headers in Go's order -- what the
+/// reference's HTTP/2 client (`x/net/http2`) does, which is what XHTTP, the
+/// HTTP/2 transport and the h2 mux run on. The order the settings go on the
+/// wire is by identifier, not by the calls below.
 pub(crate) fn client_builder() -> h2::client::Builder {
-    let mut builder = h2::client::Builder::new();
-    builder
-        .initial_window_size(STREAM_WINDOW)
-        .initial_connection_window_size(CONN_WINDOW)
-        .max_frame_size(MAX_FRAME);
+    let mut builder = base_client_builder();
+    builder.pseudo_header_order(h2::PseudoOrder::AuthorityMethodPathScheme);
     builder
 }
 
-/// The server half of the same handshake: same windows, so a server this side
-/// runs is measured against the same conditions the client half asks for.
+/// The same, for the gRPC transport: grpc-go sends the pseudo-headers in its
+/// own order (`createHeaderFields`), not `net/http`'s.
+pub(crate) fn grpc_client_builder() -> h2::client::Builder {
+    let mut builder = base_client_builder();
+    builder.pseudo_header_order(h2::PseudoOrder::MethodSchemePathAuthority);
+    builder
+}
+
+fn base_client_builder() -> h2::client::Builder {
+    let mut builder = h2::client::Builder::new();
+    builder
+        .enable_push(false)
+        .initial_window_size(client_stream_window())
+        .initial_connection_window_size(client_conn_window())
+        .max_frame_size(GO_MAX_FRAME)
+        .max_header_list_size(GO_MAX_HEADER_LIST)
+        .go_client_writes(true)
+        .window_update_min_refresh(Some(4 << 10));
+    builder
+}
+
+/// The server half, with the throughput windows above: a server this side runs
+/// is not imitating anyone's client.
 pub(crate) fn server_builder() -> h2::server::Builder {
     let mut builder = h2::server::Builder::new();
     builder
@@ -703,5 +769,306 @@ mod backpressure_tests {
         drop(io);
         drop(send);
         server_task.abort();
+    }
+}
+
+#[cfg(test)]
+mod settings_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Reads one HTTP/2 frame: `(type, flags, stream id, payload)`.
+    async fn read_frame<R: AsyncRead + Unpin>(io: &mut R) -> (u8, u8, u32, Vec<u8>) {
+        let mut head = [0u8; 9];
+        io.read_exact(&mut head).await.expect("frame header");
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let stream = u32::from_be_bytes([head[5] & 0x7f, head[6], head[7], head[8]]);
+        let mut payload = vec![0u8; len];
+        io.read_exact(&mut payload).await.expect("frame payload");
+        (head[3], head[4], stream, payload)
+    }
+
+    fn settings_of(payload: &[u8]) -> Vec<(u16, u32)> {
+        payload
+            .chunks(6)
+            .map(|c| {
+                (
+                    u16::from_be_bytes([c[0], c[1]]),
+                    u32::from_be_bytes([c[2], c[3], c[4], c[5]]),
+                )
+            })
+            .collect()
+    }
+
+    /// What Go's HTTP/2 client opens with, which is what we must open with:
+    /// the preface, a SETTINGS frame holding exactly ENABLE_PUSH 0,
+    /// INITIAL_WINDOW_SIZE 4 MiB, MAX_FRAME_SIZE 16 KiB and
+    /// MAX_HEADER_LIST_SIZE 10 MiB in identifier order, then a connection
+    /// WINDOW_UPDATE raising the window to 1 GiB -- all before the server has
+    /// said anything.
+    #[tokio::test]
+    async fn the_client_opens_with_gos_settings() {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let handshake = tokio::spawn(async move {
+            let _ = client_builder().handshake::<_, Bytes>(client_io).await;
+        });
+
+        let mut preface = [0u8; 24];
+        server_io.read_exact(&mut preface).await.expect("preface");
+        assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+
+        let (kind, flags, stream, payload) = read_frame(&mut server_io).await;
+        assert_eq!((kind, flags, stream), (0x4, 0, 0), "SETTINGS frame");
+        assert_eq!(
+            settings_of(&payload),
+            vec![
+                (0x2, 0),
+                (0x4, GO_STREAM_WINDOW),
+                (0x5, GO_MAX_FRAME),
+                (0x6, GO_MAX_HEADER_LIST),
+            ]
+        );
+
+        let (kind, _, stream, payload) = read_frame(&mut server_io).await;
+        assert_eq!((kind, stream), (0x8, 0), "connection WINDOW_UPDATE");
+        assert_eq!(
+            u32::from_be_bytes(payload.try_into().expect("4-byte delta")),
+            GO_CONN_WINDOW - MIN_WINDOW
+        );
+
+        handshake.abort();
+        let _ = server_io.shutdown().await;
+    }
+
+    /// The names of the header fields of the first HEADERS frame a client
+    /// sends, in the order they are encoded, decoded with a plain HPACK
+    /// decoder (the fields here are all literal, never indexed away).
+    async fn first_header_names(builder: h2::client::Builder, uri: &str) -> Vec<&'static str> {
+        let (client_io, mut server_io) = tokio::io::duplex(64 * 1024);
+        let uri = uri.to_string();
+        let handshake = tokio::spawn(async move {
+            let Ok((send, connection)) = builder.handshake::<_, Bytes>(client_io).await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let mut send = match send.ready().await {
+                Ok(send) => send,
+                Err(_) => return,
+            };
+            let request = http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(())
+                .expect("request");
+            let _ = send.send_request(request, false);
+            std::future::pending::<()>().await;
+        });
+
+        let mut preface = [0u8; 24];
+        server_io.read_exact(&mut preface).await.expect("preface");
+        // our SETTINGS and WINDOW_UPDATE, then the server's SETTINGS so the
+        // client may open a stream
+        let _ = read_frame(&mut server_io).await;
+        let _ = read_frame(&mut server_io).await;
+        server_io
+            .write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
+            .await
+            .expect("server settings");
+        let names = loop {
+            let (kind, _, stream, payload) = read_frame(&mut server_io).await;
+            // skip the SETTINGS ack and anything else before the request
+            if kind == 0x1 && stream != 0 {
+                break payload;
+            }
+        };
+
+        handshake.abort();
+        pseudo_names(&names)
+    }
+
+    /// The pseudo-header names of an HPACK block, in encoding order. The first
+    /// HEADERS frame of a connection starts with an empty dynamic table, so
+    /// every pseudo-header is either an indexed static entry (1..=7) or a
+    /// literal naming one of those indices -- enough to read their order
+    /// without a full HPACK decoder.
+    fn pseudo_names(block: &[u8]) -> Vec<&'static str> {
+        fn static_name(index: u8) -> Option<&'static str> {
+            Some(match index {
+                1 => ":authority",
+                2 | 3 => ":method",
+                4 | 5 => ":path",
+                6 | 7 => ":scheme",
+                _ => return None,
+            })
+        }
+        /// An integer with an `n`-bit prefix (RFC 7541 section 5.1).
+        fn integer(block: &[u8], at: &mut usize, mask: u8) -> usize {
+            let mut value = usize::from(block[*at] & mask);
+            *at += 1;
+            if value == usize::from(mask) {
+                let mut shift = 0;
+                loop {
+                    let byte = block[*at];
+                    *at += 1;
+                    value += usize::from(byte & 0x7f) << shift;
+                    shift += 7;
+                    if byte & 0x80 == 0 {
+                        break;
+                    }
+                }
+            }
+            value
+        }
+        /// Skips one length-prefixed string (Huffman coded or not).
+        fn skip_string(block: &[u8], at: &mut usize) {
+            let len = integer(block, at, 0x7f);
+            *at += len;
+        }
+
+        let mut names = Vec::new();
+        let mut at = 0;
+        while at < block.len() {
+            let first = block[at];
+            if first & 0x80 != 0 {
+                // indexed header field: name and value both from the table
+                let index = integer(block, &mut at, 0x7f);
+                if let Some(name) = static_name(index as u8) {
+                    names.push(name);
+                }
+                continue;
+            }
+            if first & 0xe0 == 0x20 {
+                // dynamic table size update: no field follows
+                integer(block, &mut at, 0x1f);
+                continue;
+            }
+            // literal header field; the prefix width depends on the form
+            let mask = if first & 0x40 != 0 { 0x3f } else { 0x0f };
+            let index = integer(block, &mut at, mask);
+            if index == 0 {
+                // the name is spelled out
+                skip_string(block, &mut at);
+            } else if let Some(name) = static_name(index as u8) {
+                names.push(name);
+            }
+            skip_string(block, &mut at);
+        }
+        names
+    }
+
+    /// XHTTP, the HTTP/2 transport and the h2 mux imitate Go's `net/http`
+    /// client, which encodes `:authority`, `:method`, `:path`, `:scheme`.
+    #[tokio::test]
+    async fn the_client_sends_pseudo_headers_in_gos_order() {
+        let names = first_header_names(client_builder(), "https://example.com/tunnel").await;
+        assert_eq!(
+            &names[..4],
+            [":authority", ":method", ":path", ":scheme"],
+            "{names:?}"
+        );
+    }
+
+    /// The gRPC transport imitates grpc-go, which encodes `:method`,
+    /// `:scheme`, `:path`, `:authority`.
+    #[tokio::test]
+    async fn the_grpc_client_sends_pseudo_headers_in_grpc_gos_order() {
+        let names = first_header_names(grpc_client_builder(), "https://example.com/svc/Tun").await;
+        assert_eq!(
+            &names[..4],
+            [":method", ":scheme", ":path", ":authority"],
+            "{names:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "throughput probe"]
+    async fn throughput_probe() {
+        use crate::inbound::AnyStream;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const TOTAL: usize = 512 * 1024 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut conn = server_builder().handshake::<_, Bytes>(tcp).await.unwrap();
+            let (request, mut respond) = conn.accept().await.unwrap().unwrap();
+            let send = respond
+                .send_response(http::Response::new(()), false)
+                .unwrap();
+            let upload = tokio::spawn(async move {
+                let mut writer: AnyStream = Box::new(H2Io {
+                    h2: H2Stream::server(request.into_body(), send),
+                });
+                let chunk = vec![0x5a; 256 * 1024];
+                let mut left = TOTAL;
+                while left > 0 {
+                    let n = chunk.len().min(left);
+                    writer.write_all(&chunk[..n]).await.unwrap();
+                    left -= n;
+                }
+                writer.shutdown().await.unwrap();
+            });
+            while conn.accept().await.is_some() {}
+            upload.await.unwrap();
+        });
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut send, connection) = client_builder().handshake(tcp).await.unwrap();
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        let (response, stream) = send.send_request(http::Request::new(()), true).unwrap();
+        let mut reader = H2Io {
+            h2: H2Stream::new(response, stream, driver),
+        };
+        let started = std::time::Instant::now();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut got = 0usize;
+        loop {
+            let n = reader.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            got += n;
+        }
+        let took = started.elapsed();
+        assert_eq!(got, TOTAL);
+        println!(
+            "stream window {} conn window {} max frame {}: {:.2} Gbit/s ({:?})",
+            client_stream_window(),
+            client_conn_window(),
+            GO_MAX_FRAME,
+            (got as f64 * 8.0) / took.as_secs_f64() / 1e9,
+            took
+        );
+        server.abort();
+    }
+
+    /// The server half keeps the throughput windows: it is not imitating a
+    /// client, and a 16 KiB frame cap there would cost downloads.
+    #[tokio::test]
+    async fn the_server_keeps_its_own_windows() {
+        let (server_side, mut client_side) = tokio::io::duplex(64 * 1024);
+        let handshake = tokio::spawn(async move {
+            let _ = server_builder().handshake::<_, Bytes>(server_side).await;
+        });
+        client_side
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .expect("preface");
+        // an empty client SETTINGS, so the server may send its own
+        client_side
+            .write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
+            .await
+            .expect("client settings");
+        let (kind, _, _, payload) = read_frame(&mut client_side).await;
+        assert_eq!(kind, 0x4, "SETTINGS frame");
+        let settings = settings_of(&payload);
+        assert!(
+            settings.contains(&(0x4, STREAM_WINDOW)) && settings.contains(&(0x5, MAX_FRAME)),
+            "server settings changed: {settings:?}"
+        );
+        handshake.abort();
     }
 }

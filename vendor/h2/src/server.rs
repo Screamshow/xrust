@@ -1538,6 +1538,8 @@ where
                                 .data_frame_budget
                                 .resolve(self.builder.initial_target_connection_window_size),
                             recv_min_refresh: None,
+                            // a server sends no request pseudo-headers
+                            pseudo_order: Default::default(),
                         },
                     );
 

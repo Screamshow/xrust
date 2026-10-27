@@ -86,6 +86,8 @@ pub(crate) struct Config {
     pub data_frame_budget: usize,
     /// xrust: see `FlowControl::set_min_refresh`
     pub recv_min_refresh: Option<WindowSize>,
+    /// xrust: see `frame::PseudoOrder`
+    pub pseudo_order: frame::PseudoOrder,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -148,6 +150,7 @@ where
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 data_frame_budget: config.data_frame_budget,
                 recv_min_refresh: config.recv_min_refresh,
+                pseudo_order: config.pseudo_order,
             }
         }
         let streams = Streams::new(streams_config(&config));

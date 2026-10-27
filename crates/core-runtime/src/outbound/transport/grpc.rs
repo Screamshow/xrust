@@ -63,7 +63,7 @@ pub(super) async fn connect(
     authority: &str,
     secure: bool,
 ) -> io::Result<AnyStream> {
-    let (send_request, connection) = super::h2io::client_builder()
+    let (send_request, connection) = super::h2io::grpc_client_builder()
         .handshake(stream)
         .await
         .map_err(|e| io::Error::other(format!("grpc: h2 handshake: {e}")))?;

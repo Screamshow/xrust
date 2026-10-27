@@ -524,6 +524,46 @@ impl H2Pool {
 /// the `http2.Transport` default, 15 s.
 const H2_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long a pooled connection with no stream on it is kept. Xray hands its
+/// HTTP/2 and HTTP/1 transports `net.ConnIdleTimeout`, 300 s; without it a
+/// connection nobody uses is kept alive by its own PINGs for as long as the
+/// process runs, which is both a connection the server holds open for nothing
+/// and a 45 s heartbeat an observer can follow long after the traffic stops.
+/// `XRUST_H2_IDLE_SECS` overrides it; 0 keeps connections forever.
+const H2_CONN_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn h2_conn_idle() -> Option<std::time::Duration> {
+    static IDLE: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *IDLE.get_or_init(|| {
+        match crate::env_var("H2_IDLE_SECS").and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(0) => None,
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+            None => Some(H2_CONN_IDLE),
+        }
+    })
+}
+
+/// Completes once `counter` has stood at zero streams for `limit` without
+/// interruption. A handout raises the counter without notifying, so the count
+/// is read again after the wait: the caller may close the connection only when
+/// it is still idle.
+async fn h2_idle_expired(counter: &H2Counter, limit: std::time::Duration) -> &'static str {
+    loop {
+        let notified = counter.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            notified.await;
+            continue;
+        }
+        if tokio::time::timeout(limit, notified).await.is_err()
+            && counter.load(std::sync::atomic::Ordering::Relaxed) == 0
+        {
+            return "idle with no streams";
+        }
+    }
+}
+
 /// When anything was last read from a pooled HTTP/2 connection.
 struct ReadClock {
     base: tokio::time::Instant,
@@ -641,14 +681,11 @@ async fn h2_handshake(stream: AnyStream) -> io::Result<H2Fresh> {
         clock: clock.clone(),
     };
     let (send_request, connection) = super::h2io::client_builder()
-        // what Xray's client (Go's x/net http2) puts on the wire: SETTINGS
-        // with push off, its window, frame size and header list size; the
-        // preface, SETTINGS and window update in one write; then one write
-        // per frame; window updates every 4 KiB read
-        .enable_push(false)
-        .max_header_list_size(10 << 20)
-        .go_client_writes(true)
-        .window_update_min_refresh(Some(4 << 10))
+        // what Xray's client (Go's x/net http2) puts on the wire -- SETTINGS
+        // with push off, its windows, frame size and header list size, the
+        // preface and window update in one write, then one write per frame and
+        // a window update every 4 KiB read -- is what `client_builder` sets
+        // for every h2 transport here
         .handshake(io)
         .await
         .map_err(|e| io::Error::other(format!("xhttp: h2 handshake: {e}")))?;
@@ -686,16 +723,25 @@ async fn h2_keep_alive(
     }
 }
 
-/// Drives one pooled HTTP/2 connection. When it ends or stops answering
-/// PINGs it leaves the pool; dropping it fails the streams still on it.
+/// Drives one pooled HTTP/2 connection. When it ends, stops answering PINGs or
+/// stands idle for [`H2_CONN_IDLE`] it leaves the pool; dropping it fails the
+/// streams still on it, which is why the idle arm only fires with none left.
 async fn drive_h2_connection(
     mut connection: H2Connection,
     clock: std::sync::Arc<ReadClock>,
     keep_alive: Option<(std::time::Duration, std::time::Duration)>,
     pool: std::sync::Weak<H2Pool>,
     counter: std::sync::Arc<H2Counter>,
+    idle_limit: Option<std::time::Duration>,
 ) {
     let ping_pong = keep_alive.and_then(|times| Some((connection.ping_pong()?, times)));
+    let idle = async {
+        match idle_limit {
+            Some(limit) => h2_idle_expired(&counter, limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(idle);
     match ping_pong {
         Some((mut ping_pong, (period, ping_timeout))) => {
             tokio::select! {
@@ -707,11 +753,21 @@ async fn drive_h2_connection(
                 why = h2_keep_alive(&mut ping_pong, &clock, period, ping_timeout) => {
                     crate::logging::debug(format_args!("xhttp h2 connection: {why}, closing"));
                 }
+                why = &mut idle => {
+                    crate::logging::debug(format_args!("xhttp h2 connection: {why}, closing"));
+                }
             }
         }
         None => {
-            if let Err(e) = connection.await {
-                crate::logging::debug(format_args!("xhttp h2 connection: {e}"));
+            tokio::select! {
+                res = &mut connection => {
+                    if let Err(e) = res {
+                        crate::logging::debug(format_args!("xhttp h2 connection: {e}"));
+                    }
+                }
+                why = &mut idle => {
+                    crate::logging::debug(format_args!("xhttp h2 connection: {why}, closing"));
+                }
             }
         }
     }
@@ -735,6 +791,8 @@ pub(crate) struct XhttpConfig {
     h2_pool: std::sync::Arc<H2Pool>,
     /// see [`HALF_CLOSE_IDLE`]
     half_close_idle: std::time::Duration,
+    /// see [`H2_CONN_IDLE`]; `None` keeps pooled connections forever
+    h2_idle: Option<std::time::Duration>,
 }
 
 impl XhttpConfig {
@@ -787,6 +845,7 @@ impl XhttpConfig {
             )?),
             h2_pool: std::sync::Arc::new(H2Pool::new()),
             half_close_idle: half_close_idle(),
+            h2_idle: h2_conn_idle(),
         })
     }
 }
@@ -1046,6 +1105,7 @@ impl XhttpConfig {
                 .map(|period| (period, H2_PING_TIMEOUT)),
             std::sync::Arc::downgrade(&self.h2_pool),
             counter.clone(),
+            self.h2_idle,
         ));
         counter
     }
@@ -2391,6 +2451,19 @@ mod tests {
         h2::client::SendRequest<Bytes>,
         JoinHandle<()>,
     ) {
+        pooled_with_timings(client_io, Some((TEST_PERIOD, TEST_PING_TIMEOUT)), None).await
+    }
+
+    /// The same, with the keep-alive and the idle limit given explicitly.
+    async fn pooled_with_timings(
+        client_io: tokio::io::DuplexStream,
+        keep_alive: Option<(std::time::Duration, std::time::Duration)>,
+        idle: Option<std::time::Duration>,
+    ) -> (
+        std::sync::Arc<super::H2Pool>,
+        h2::client::SendRequest<Bytes>,
+        JoinHandle<()>,
+    ) {
         let (client, connection, clock) = super::h2_handshake(Box::new(client_io)).await.unwrap();
         let pool = std::sync::Arc::new(super::H2Pool::new());
         let counter = pool.finish_dial(Some(client.clone()), 1).await.unwrap();
@@ -2398,9 +2471,10 @@ mod tests {
         let driver = tokio::spawn(super::drive_h2_connection(
             connection,
             clock,
-            Some((TEST_PERIOD, TEST_PING_TIMEOUT)),
+            keep_alive,
             std::sync::Arc::downgrade(&pool),
             counter,
+            idle,
         ));
         (pool, client, driver)
     }
@@ -2461,6 +2535,71 @@ mod tests {
             pool.acquire(1, 0).await,
             super::H2Acquire::NeedDial(_)
         ));
+    }
+
+    /// The idle limit the tests below run with, instead of the 300 s default.
+    const TEST_H2_IDLE: std::time::Duration = std::time::Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn an_idle_pooled_connection_closes_after_the_limit() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let started = std::time::Instant::now();
+        // the keep-alive answers, so only the idle limit can end this one
+        let (pool, client, driver) = pooled_with_timings(
+            client_io,
+            Some((TEST_PERIOD, TEST_PING_TIMEOUT)),
+            Some(TEST_H2_IDLE),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), driver)
+            .await
+            .expect("idle connection kept past the limit")
+            .unwrap();
+        assert!(
+            started.elapsed() >= TEST_H2_IDLE,
+            "closed before the idle limit: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(pool.acquire(1, 0).await, super::H2Acquire::NeedDial(_)),
+            "closed connection still pooled"
+        );
+        assert!(client.ready().await.is_err(), "closed connection usable");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn the_idle_limit_spares_a_connection_carrying_a_stream() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let (client, connection, clock) = super::h2_handshake(Box::new(client_io)).await.unwrap();
+        let pool = std::sync::Arc::new(super::H2Pool::new());
+        let counter = pool.finish_dial(Some(client), 1).await.unwrap();
+        // a live stream holds the counter above zero for the whole test
+        let held = super::CounterGuard::new(counter.clone());
+        let driver = tokio::spawn(super::drive_h2_connection(
+            connection,
+            clock,
+            Some((TEST_PERIOD, TEST_PING_TIMEOUT)),
+            std::sync::Arc::downgrade(&pool),
+            counter,
+            Some(TEST_H2_IDLE),
+        ));
+        tokio::time::sleep(4 * TEST_H2_IDLE).await;
+        assert!(!driver.is_finished(), "connection with a stream was closed");
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(3), driver)
+            .await
+            .expect("connection kept after its last stream left")
+            .unwrap();
+        server.abort();
     }
 
     #[tokio::test]

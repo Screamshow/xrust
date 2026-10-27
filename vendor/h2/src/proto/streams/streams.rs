@@ -78,6 +78,10 @@ struct Inner {
 
     /// The number of stream refs to this shared state.
     refs: usize,
+
+    /// xrust: the order this client's request pseudo-headers go out in, see
+    /// `frame::PseudoOrder`.
+    pseudo_order: frame::PseudoOrder,
 }
 
 #[derive(Debug)]
@@ -320,8 +324,13 @@ where
         }
 
         // Convert the message
-        let headers =
-            client::Peer::convert_send_message(stream_id, request, protocol, end_of_stream)?;
+        let headers = client::Peer::convert_send_message(
+            stream_id,
+            request,
+            protocol,
+            end_of_stream,
+            me.pseudo_order,
+        )?;
 
         let mut stream = me.store.insert(stream.id, stream);
 
@@ -452,6 +461,7 @@ impl<B> DynStreams<'_, B> {
 
 impl Inner {
     fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
+        let pseudo_order = config.pseudo_order;
         Arc::new(Mutex::new(Inner {
             counts: Counts::new(peer, &config),
             actions: Actions {
@@ -462,6 +472,7 @@ impl Inner {
             },
             store: Store::new(),
             refs: 1,
+            pseudo_order,
         }))
     }
 

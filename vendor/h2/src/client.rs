@@ -340,6 +340,9 @@ pub struct Builder {
     /// xrust: see `window_update_min_refresh`
     recv_min_refresh: Option<u32>,
 
+    /// xrust: see `pseudo_header_order`
+    pseudo_order: crate::frame::PseudoOrder,
+
     /// The stream ID of the first (lowest) stream. Subsequent streams will use
     /// monotonically increasing stream IDs.
     stream_id: StreamId,
@@ -674,6 +677,7 @@ impl Builder {
             settings: Default::default(),
             go_client_writes: false,
             recv_min_refresh: None,
+            pseudo_order: crate::frame::PseudoOrder::default(),
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
             data_frame_budget: proto::DataFrameBudget::Auto,
@@ -1145,6 +1149,16 @@ impl Builder {
         self
     }
 
+    /// xrust: the order the request pseudo-headers go into every HEADERS frame
+    /// this connection sends. A server or CDN that fingerprints HTTP/2 clients
+    /// reads that order, so a client imitating another one sends them its way:
+    /// [`frame::PseudoOrder::AuthorityMethodPathScheme`] for a Go HTTP/2
+    /// client, [`frame::PseudoOrder::MethodSchemePathAuthority`] for grpc-go.
+    pub fn pseudo_header_order(&mut self, order: crate::frame::PseudoOrder) -> &mut Self {
+        self.pseudo_order = order;
+        self
+    }
+
     /// Sets the header table size.
     ///
     /// This setting informs the peer of the maximum size of the header compression
@@ -1403,6 +1417,7 @@ where
                     .data_frame_budget
                     .resolve(builder.initial_target_connection_window_size),
                 recv_min_refresh: builder.recv_min_refresh,
+                pseudo_order: builder.pseudo_order,
             },
         );
         let send_request = SendRequest {
@@ -1683,6 +1698,7 @@ impl Peer {
         request: Request<()>,
         protocol: Option<Protocol>,
         end_of_stream: bool,
+        pseudo_order: crate::frame::PseudoOrder,
     ) -> Result<Headers, SendError> {
         use http::request::Parts;
 
@@ -1702,6 +1718,8 @@ impl Peer {
         // Build the set pseudo header set. All requests will include `method`
         // and `path`.
         let mut pseudo = Pseudo::request(method, uri, protocol);
+        // xrust: this client's pseudo-header order, see `frame::PseudoOrder`.
+        pseudo.order = pseudo_order;
 
         if pseudo.scheme.is_none() {
             // If the scheme is not set, then there are a two options.

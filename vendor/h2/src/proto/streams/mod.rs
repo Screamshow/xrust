@@ -86,6 +86,9 @@ pub struct Config {
 
     /// xrust: see `FlowControl::set_min_refresh`
     pub recv_min_refresh: Option<WindowSize>,
+
+    /// xrust: see `frame::PseudoOrder`
+    pub pseudo_order: crate::frame::PseudoOrder,
 }
 
 trait DebugStructExt<'a, 'b> {

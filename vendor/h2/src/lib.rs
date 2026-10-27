@@ -137,6 +137,11 @@ pub mod fuzz_bridge;
 
 pub use crate::error::{Error, Reason};
 pub use crate::share::{FlowControl, Ping, PingPong, Pong, RecvStream, SendStream, StreamId};
+/// xrust: the request pseudo-header order a client sends, for
+/// `client::Builder::pseudo_header_order`. The `frame` module itself is public
+/// only under the `unstable` feature, so the one type a caller needs is
+/// re-exported here.
+pub use crate::frame::PseudoOrder;
 
 #[cfg(feature = "unstable")]
 pub use codec::{Codec, SendError, UserError};

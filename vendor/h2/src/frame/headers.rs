@@ -63,6 +63,44 @@ pub struct Continuation {
     header_block: EncodingHeaderBlock,
 }
 
+/// xrust: the order the request pseudo-headers go into a HEADERS frame.
+/// Clients differ, and a server or CDN that fingerprints HTTP/2 clients reads
+/// the order as part of the fingerprint, so a client imitating another one has
+/// to send them the way it does.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub enum PseudoOrder {
+    /// `:method`, `:scheme`, `:authority`, `:path` -- this crate's own order.
+    #[default]
+    MethodSchemeAuthorityPath,
+    /// `:authority`, `:method`, `:path`, `:scheme` -- Go's `x/net/http2`
+    /// (`encodeHeaders`), so every Go HTTP/2 client.
+    AuthorityMethodPathScheme,
+    /// `:method`, `:scheme`, `:path`, `:authority` -- grpc-go
+    /// (`createHeaderFields` in `internal/transport/http2_client.go`).
+    MethodSchemePathAuthority,
+}
+
+/// xrust: one request pseudo-header, for [`PseudoOrder::sequence`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PseudoKind {
+    Method,
+    Scheme,
+    Authority,
+    Path,
+}
+
+impl PseudoOrder {
+    /// The four request pseudo-headers in the order this client sends them.
+    fn sequence(self) -> [PseudoKind; 4] {
+        use PseudoKind::*;
+        match self {
+            Self::MethodSchemeAuthorityPath => [Method, Scheme, Authority, Path],
+            Self::AuthorityMethodPathScheme => [Authority, Method, Path, Scheme],
+            Self::MethodSchemePathAuthority => [Method, Scheme, Path, Authority],
+        }
+    }
+}
+
 // TODO: These fields shouldn't be `pub`
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Pseudo {
@@ -75,6 +113,10 @@ pub struct Pseudo {
 
     // Response
     pub status: Option<StatusCode>,
+
+    /// xrust: the order the four request pseudo-headers above are emitted in;
+    /// responses and push promises do not carry them.
+    pub order: PseudoOrder,
 }
 
 #[derive(Debug)]
@@ -587,6 +629,7 @@ impl Pseudo {
             path,
             protocol,
             status: None,
+            order: PseudoOrder::default(),
         };
 
         // If the URI includes a scheme component, add it to the pseudo headers
@@ -611,6 +654,7 @@ impl Pseudo {
             path: None,
             protocol: None,
             status: Some(status),
+            order: PseudoOrder::default(),
         }
     }
 
@@ -717,20 +761,33 @@ impl Iterator for Iter {
         use crate::hpack::Header::*;
 
         if let Some(ref mut pseudo) = self.pseudo {
-            if let Some(method) = pseudo.method.take() {
-                return Some(Method(method));
-            }
-
-            if let Some(scheme) = pseudo.scheme.take() {
-                return Some(Scheme(scheme));
-            }
-
-            if let Some(authority) = pseudo.authority.take() {
-                return Some(Authority(authority));
-            }
-
-            if let Some(path) = pseudo.path.take() {
-                return Some(Path(path));
+            // xrust: the four request pseudo-headers leave in the order this
+            // client sends them. Each one is taken as it goes out, so walking
+            // the sequence from the start every call still yields each header
+            // once, in order.
+            for kind in pseudo.order.sequence() {
+                match kind {
+                    PseudoKind::Method => {
+                        if let Some(method) = pseudo.method.take() {
+                            return Some(Method(method));
+                        }
+                    }
+                    PseudoKind::Scheme => {
+                        if let Some(scheme) = pseudo.scheme.take() {
+                            return Some(Scheme(scheme));
+                        }
+                    }
+                    PseudoKind::Authority => {
+                        if let Some(authority) = pseudo.authority.take() {
+                            return Some(Authority(authority));
+                        }
+                    }
+                    PseudoKind::Path => {
+                        if let Some(path) = pseudo.path.take() {
+                            return Some(Path(path));
+                        }
+                    }
+                }
             }
 
             if let Some(protocol) = pseudo.protocol.take() {
