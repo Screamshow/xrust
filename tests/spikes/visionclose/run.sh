@@ -24,6 +24,8 @@
 #   REALITY=1              REALITY instead of an ordinary certificate
 #   BIG=<bytes>            ask the origin for a body of this size
 #   PROBE=raw|keepalive|half-close
+#   SELFTEST=1             check the comparator itself and exit; needs no
+#                          binaries, no network and no privileges
 #
 # `ORIGIN_CLOSE=bare-fin LEAK=1` is the combination that reproduces the report:
 # a complete body, then a record the inner session cannot decrypt. Each knob on
@@ -31,7 +33,12 @@
 set -uo pipefail
 
 OUT="${1:?usage: run.sh <outdir>}"
-OUR="${OUR_BIN:?OUR_BIN=<our xrust binary>}"
+# SELFTEST checks the comparator and needs no binaries at all
+if [ -n "${SELFTEST:-}" ]; then
+    OUR="${OUR_BIN:-}"
+else
+    OUR="${OUR_BIN:?OUR_BIN=<our xrust binary>}"
+fi
 XRAY="${XRAY_BIN:-xray}"
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 CERTS="$ROOT/tests/golden/certs"
@@ -65,7 +72,7 @@ if [ -z "$PY" ]; then
     echo "no working python: set PYTHON=..." >&2
     exit 2
 fi
-if ! command -v "$XRAY" > /dev/null 2>&1 && [ ! -x "$XRAY" ]; then
+if [ -z "${SELFTEST:-}" ] && ! command -v "$XRAY" > /dev/null 2>&1 && [ ! -x "$XRAY" ]; then
     echo "no Xray binary: set XRAY_BIN" >&2
     exit 2
 fi
@@ -394,7 +401,18 @@ PY
 
 # --------------------------------------------------------------- the compare
 cat > "$WORK/compare.py" <<'PY'
-"""Is the inner stream the client received the stream the origin sent?"""
+"""Is the inner stream the client received the stream the origin sent?
+
+The download is compared whole: a tunnel owes that direction exactly the
+origin's bytes, so anything missing is a loss and anything extra is an
+injection.
+
+The upload is the one direction where a short delivery can be legitimate --
+the origin stops reading once it has closed, so a client's own close_notify
+behind an origin that ended with a bare FIN never arrives. That is accepted
+only as its own named outcome, and only when the prefix matched and the part
+that never arrived is whole records. It is never reported as byte-exact.
+"""
 import pathlib, sys
 
 run, index = sys.argv[1], sys.argv[2]
@@ -424,7 +442,19 @@ def records(data):
     return out
 
 
+def whole_records(data):
+    """True when `data` is a whole number of complete records and nothing more."""
+    i = 0
+    while i + 5 <= len(data):
+        ln = int.from_bytes(data[i + 3 : i + 5], "big")
+        if i + 5 + ln > len(data):
+            return False
+        i += 5 + ln
+    return i == len(data)
+
+
 ok = True
+short_upload = 0
 for label, which in (("download", "down"), ("upload", "up")):
     cp = d / f"inner-{index}-{which}.bin"
     op = d / f"origin-{index}-{which}.bin"
@@ -456,17 +486,117 @@ for label, which in (("download", "down"), ("upload", "up")):
         print(f"    injected {got[len(sent) : len(sent) + 32].hex()}")
         continue
     if len(got) < len(sent):
-        # The peer that closed first stops reading, so a trailing write of the
-        # other side is legitimately not delivered -- a client's own
-        # close_notify behind an origin that ended with a bare FIN, say. Only a
-        # gap in the middle, which the prefix check above catches, is a loss.
-        print(f"  {label}: a prefix arrived; last {len(sent) - len(got)} bytes")
-        print("    were written after the receiver had closed (not delivered)")
+        missing = len(sent) - len(got)
+        if label == "download":
+            ok = False
+            print(f"  download: {missing} bytes never arrived")
+            print(f"    lost     {sent[len(got) : len(got) + 32].hex()}")
+            continue
+        # Only a trailing write the receiver was no longer reading: the part
+        # that arrived has to end where a record ends, and what stayed behind
+        # has to be whole records of its own. Anything else is a loss.
+        if whole_records(got) and whole_records(sent[len(got) :]):
+            short_upload = missing
+            print(f"  upload: a prefix arrived; the last {missing} bytes were")
+            print("    written after the receiver had closed (not delivered)")
+            continue
+        ok = False
+        print(f"  upload: {missing} bytes missing, and not as whole records")
+        print(f"    lost     {sent[len(got) : len(got) + 32].hex()}")
         continue
     print(f"  {label}: identical")
-print("VERDICT: byte-exact" if ok else "VERDICT: the stream was altered")
+if not ok:
+    print("VERDICT: the stream was altered")
+elif short_upload:
+    print(
+        f"VERDICT: download byte-exact; upload short by {short_upload} bytes"
+        " written after the receiver closed"
+    )
+else:
+    print("VERDICT: byte-exact")
 sys.exit(0 if ok else 1)
 PY
+
+# ------------------------------------------------------------- the selftest
+# The comparator is the arbiter of every run here, so it gets checked itself:
+# `SELFTEST=1 run.sh <outdir>` needs no binaries and no network.
+cat > "$WORK/selftest.py" <<'PY'
+"""Does the comparator call a short, a padded and a broken stream what it is?"""
+import pathlib, subprocess, sys
+
+compare, work = sys.argv[1], pathlib.Path(sys.argv[2])
+
+
+def rec(payload, kind=0x17):
+    return bytes([kind, 3, 3]) + len(payload).to_bytes(2, "big") + payload
+
+
+two = rec(b"a") + rec(b"b")  # 12 bytes, two whole records
+one = rec(b"a")  # 6 bytes, the first of them
+
+
+def case(index, down_sent, down_got, up_sent=two, up_got=two):
+    (work / f"origin-{index}-down.bin").write_bytes(down_sent)
+    (work / f"inner-{index}-down.bin").write_bytes(down_got)
+    (work / f"inner-{index}-up.bin").write_bytes(up_sent)
+    (work / f"origin-{index}-up.bin").write_bytes(up_got)
+    done = subprocess.run(
+        [sys.executable, "-I", compare, str(work), str(index)],
+        capture_output=True,
+        text=True,
+    )
+    return done.returncode, done.stdout
+
+
+expect = [
+    ("both directions whole", 1, dict(down_sent=two, down_got=two), 0, "VERDICT: byte-exact"),
+    # the case this selftest exists for: a download missing its last record
+    ("download short a record", 2, dict(down_sent=two, down_got=one), 1, "never arrived"),
+    ("download padded", 3, dict(down_sent=two, down_got=two + rec(b"x")), 1, "never sent"),
+    (
+        "download altered",
+        4,
+        dict(down_sent=two, down_got=two[:6] + rec(b"c")),
+        1,
+        "DIFFERS",
+    ),
+    (
+        "upload tail undelivered",
+        5,
+        dict(down_sent=two, down_got=two, up_sent=two, up_got=one),
+        0,
+        "written after the receiver closed",
+    ),
+    (
+        "upload cut mid record",
+        6,
+        dict(down_sent=two, down_got=two, up_sent=two, up_got=two[:9]),
+        1,
+        "not as whole records",
+    ),
+]
+
+bad = 0
+for name, index, kwargs, want_rc, want_text in expect:
+    rc, out = case(index, **kwargs)
+    good = rc == want_rc and want_text in out
+    if not good:
+        bad += 1
+    print(f"[{'ok' if good else 'FAIL'}] {name}: rc={rc} (want {want_rc})")
+    if not good:
+        print("  ---- comparator said ----")
+        print("  " + out.replace("\n", "\n  ").rstrip())
+    if want_rc == 0 and "VERDICT: byte-exact" in out and index == 5:
+        bad += 1
+        print("  FAIL: a short upload must not be called byte-exact")
+print(f"selftest: {len(expect) - bad} of {len(expect)} as expected")
+sys.exit(1 if bad else 0)
+PY
+
+if [ -n "${SELFTEST:-}" ]; then
+    "$PY" -I "$WORK/selftest.py" "$WORK/compare.py" "$OUT" 2>&1 | tee "$OUT/selftest.log"
+    exit "${PIPESTATUS[0]}"
+fi
 
 # ---------------------------------------------------------------- the config
 if [ "${REALITY:-0}" = "1" ]; then
@@ -592,4 +722,7 @@ echo
 cmp_rc="${PIPESTATUS[0]}"
 echo
 echo "probe rc=$rc  compare rc=$cmp_rc  artifacts in $OUT"
+# An arbiter reads the exit status: a probe that got its body while the stream
+# it travelled on was altered is not a pass.
+[ "$rc" = "0" ] && rc="$cmp_rc"
 exit "$rc"
