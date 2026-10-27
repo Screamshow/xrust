@@ -28,6 +28,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use super::h1io;
+use super::h2io::{
+    CounterGuard, H2_PING_TIMEOUT, H2Acquire, H2Connection, H2Counter, H2Fresh, H2Pool, ReadClock,
+    TrackedStream, drive_h2_connection, h2_conn_idle, h2_handshake,
+};
 use crate::inbound::AnyStream;
 
 /// Opens one more connection to the same server, with the same TCP options, the
@@ -292,370 +296,6 @@ impl Meta {
     }
 }
 
-pub(crate) struct H2Counter {
-    active: std::sync::atomic::AtomicUsize,
-    notify: std::sync::Arc<tokio::sync::Notify>,
-}
-
-impl std::ops::Deref for H2Counter {
-    type Target = std::sync::atomic::AtomicUsize;
-    fn deref(&self) -> &Self::Target {
-        &self.active
-    }
-}
-
-struct PooledClient {
-    client: h2::client::SendRequest<Bytes>,
-    active_streams: std::sync::Arc<H2Counter>,
-}
-
-struct H2PoolState {
-    clients: Vec<PooledClient>,
-    active_dials: usize,
-}
-
-pub(crate) struct H2Pool {
-    state: std::sync::Mutex<H2PoolState>,
-    notify: std::sync::Arc<tokio::sync::Notify>,
-}
-
-pub(crate) enum H2Acquire {
-    Ready(h2::client::SendRequest<Bytes>, std::sync::Arc<H2Counter>),
-    NeedDial(H2DialGuard),
-}
-
-pub(crate) struct H2DialGuard(std::sync::Arc<H2Pool>);
-
-impl Drop for H2DialGuard {
-    fn drop(&mut self) {
-        let mut state = self.0.state.lock().expect("h2 pool");
-        state.active_dials -= 1;
-        drop(state);
-        self.0.notify.notify_waiters();
-    }
-}
-
-pub(crate) struct TrackedStream {
-    inner: AnyStream,
-    counter: std::sync::Arc<H2Counter>,
-}
-
-impl Drop for TrackedStream {
-    fn drop(&mut self) {
-        self.counter
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        self.counter.notify.notify_waiters();
-    }
-}
-
-impl tokio::io::AsyncRead for TrackedStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-impl tokio::io::AsyncWrite for TrackedStream {
-    fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-struct CounterGuard(Option<std::sync::Arc<H2Counter>>);
-
-impl CounterGuard {
-    fn new(c: std::sync::Arc<H2Counter>) -> Self {
-        Self(Some(c))
-    }
-
-    fn into_inner(mut self) -> std::sync::Arc<H2Counter> {
-        self.0.take().expect("counter present")
-    }
-}
-
-impl Drop for CounterGuard {
-    fn drop(&mut self) {
-        if let Some(c) = self.0.take() {
-            c.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            c.notify.notify_waiters();
-        }
-    }
-}
-
-impl H2Pool {
-    pub(crate) fn new() -> Self {
-        Self {
-            state: std::sync::Mutex::new(H2PoolState {
-                clients: Vec::new(),
-                active_dials: 0,
-            }),
-            notify: std::sync::Arc::new(tokio::sync::Notify::new()),
-        }
-    }
-
-    pub(crate) async fn acquire(
-        self: &std::sync::Arc<Self>,
-        max_conns: usize,
-        max_concurrency: usize,
-    ) -> H2Acquire {
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let candidate = {
-                let mut guard = self.state.lock().expect("h2 pool");
-
-                let has_capacity = max_concurrency > 0
-                    && guard.clients.iter().any(|client| {
-                        client
-                            .active_streams
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                            < max_concurrency
-                    });
-                if !has_capacity && guard.clients.len() + guard.active_dials < max_conns {
-                    guard.active_dials += 1;
-                    return H2Acquire::NeedDial(H2DialGuard(self.clone()));
-                }
-
-                if guard.clients.is_empty() {
-                    None
-                } else {
-                    let best = guard
-                        .clients
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| {
-                            max_concurrency == 0
-                                || c.active_streams.load(std::sync::atomic::Ordering::Relaxed)
-                                    < max_concurrency
-                        })
-                        .min_by_key(|(_, c)| {
-                            c.active_streams.load(std::sync::atomic::Ordering::Relaxed)
-                        })
-                        .map(|(_, best)| best);
-                    if let Some(best) = best {
-                        let client = best.client.clone();
-                        let active = best.active_streams.clone();
-                        active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        Some((client, active))
-                    } else {
-                        None
-                    }
-                }
-            };
-
-            let Some((candidate, active_streams)) = candidate else {
-                notified.await;
-                continue;
-            };
-
-            let stream_guard = CounterGuard::new(active_streams.clone());
-            let client = candidate;
-            match client.ready().await {
-                Ok(client) => {
-                    return H2Acquire::Ready(client, stream_guard.into_inner());
-                }
-                Err(_) => {
-                    drop(stream_guard);
-                    self.evict(&active_streams).await;
-                }
-            }
-        }
-    }
-
-    pub(crate) async fn evict(&self, active_streams: &std::sync::Arc<H2Counter>) {
-        let mut guard = self.state.lock().expect("h2 pool");
-        guard
-            .clients
-            .retain(|c| !std::sync::Arc::ptr_eq(&c.active_streams, active_streams));
-        drop(guard);
-        self.notify.notify_waiters();
-    }
-
-    pub(crate) async fn finish_dial(
-        &self,
-        client: Option<h2::client::SendRequest<Bytes>>,
-        max_conns: usize,
-    ) -> Option<std::sync::Arc<H2Counter>> {
-        let mut guard = self.state.lock().expect("h2 pool");
-        let mut counter = None;
-        if let Some(c) = client {
-            let cnt = std::sync::Arc::new(H2Counter {
-                active: std::sync::atomic::AtomicUsize::new(1),
-                notify: self.notify.clone(),
-            });
-            if guard.clients.len() >= max_conns {
-                guard.clients.remove(0);
-            }
-            guard.clients.push(PooledClient {
-                client: c,
-                active_streams: cnt.clone(),
-            });
-            counter = Some(cnt);
-        }
-        drop(guard);
-        self.notify.notify_waiters();
-        counter
-    }
-}
-
-/// How long a pooled HTTP/2 connection waits for a PING answer. Xray takes
-/// the `http2.Transport` default, 15 s.
-const H2_PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-/// How long a pooled connection with no stream on it is kept. Xray hands its
-/// HTTP/2 and HTTP/1 transports `net.ConnIdleTimeout`, 300 s; without it a
-/// connection nobody uses is kept alive by its own PINGs for as long as the
-/// process runs, which is both a connection the server holds open for nothing
-/// and a 45 s heartbeat an observer can follow long after the traffic stops.
-/// `XRUST_H2_IDLE_SECS` overrides it; 0 keeps connections forever.
-const H2_CONN_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
-
-fn h2_conn_idle() -> Option<std::time::Duration> {
-    static IDLE: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
-    *IDLE.get_or_init(|| {
-        match crate::env_var("H2_IDLE_SECS").and_then(|v| v.trim().parse::<u64>().ok()) {
-            Some(0) => None,
-            Some(secs) => Some(std::time::Duration::from_secs(secs)),
-            None => Some(H2_CONN_IDLE),
-        }
-    })
-}
-
-/// Completes once `counter` has stood at zero streams for `limit` without
-/// interruption. A handout raises the counter without notifying, so the count
-/// is read again after the wait: the caller may close the connection only when
-/// it is still idle.
-async fn h2_idle_expired(counter: &H2Counter, limit: std::time::Duration) -> &'static str {
-    loop {
-        let notified = counter.notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if counter.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-            notified.await;
-            continue;
-        }
-        if tokio::time::timeout(limit, notified).await.is_err()
-            && counter.load(std::sync::atomic::Ordering::Relaxed) == 0
-        {
-            return "idle with no streams";
-        }
-    }
-}
-
-/// When anything was last read from a pooled HTTP/2 connection.
-struct ReadClock {
-    base: tokio::time::Instant,
-    /// milliseconds since `base`
-    last: std::sync::atomic::AtomicU64,
-}
-
-impl ReadClock {
-    fn new() -> Self {
-        Self {
-            base: tokio::time::Instant::now(),
-            last: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-
-    fn touch(&self) {
-        let ms = self.base.elapsed().as_millis() as u64;
-        self.last.store(ms, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn last(&self) -> u64 {
-        self.last.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn idle(&self) -> std::time::Duration {
-        self.base
-            .elapsed()
-            .saturating_sub(std::time::Duration::from_millis(self.last()))
-    }
-}
-
-/// The socket under a pooled HTTP/2 connection, stamping every read.
-struct ReadActivity<S> {
-    inner: S,
-    clock: std::sync::Arc<ReadClock>,
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for ReadActivity<S> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(res, Poll::Ready(Ok(()))) && buf.filled().len() > before {
-            self.clock.touch();
-        }
-        res
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for ReadActivity<S> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-type H2Connection = h2::client::Connection<ReadActivity<AnyStream>, Bytes>;
-
-type H2Fresh = (
-    h2::client::SendRequest<Bytes>,
-    H2Connection,
-    std::sync::Arc<ReadClock>,
-);
-
-/// HTTP/2 handshake on a fresh connection whose reads are tracked for the
-/// keep-alive.
 /// How much of a streamed body (stream-one, stream-up) goes into one DATA
 /// frame: Xray hands its HTTP client the upload in 8 KiB buffers, and Go
 /// writes each read of the body as a frame of its own, so every chunk of a
@@ -674,108 +314,6 @@ fn go_h2_request(mut req: http::Request<()>) -> http::Request<()> {
     req
 }
 
-async fn h2_handshake(stream: AnyStream) -> io::Result<H2Fresh> {
-    let clock = std::sync::Arc::new(ReadClock::new());
-    let io = ReadActivity {
-        inner: stream,
-        clock: clock.clone(),
-    };
-    let (send_request, connection) = super::h2io::client_builder()
-        // what Xray's client (Go's x/net http2) puts on the wire -- SETTINGS
-        // with push off, its windows, frame size and header list size, the
-        // preface and window update in one write, then one write per frame and
-        // a window update every 4 KiB read -- is what `client_builder` sets
-        // for every h2 transport here
-        .handshake(io)
-        .await
-        .map_err(|e| io::Error::other(format!("xhttp: h2 handshake: {e}")))?;
-    Ok((send_request, connection, clock))
-}
-
-/// Returns once the connection fails its liveness check, as Xray's
-/// `ReadIdleTimeout` does: after `period` with nothing read, send a PING and
-/// give it `ping_timeout` ([`H2_PING_TIMEOUT`]). A connection that keeps delivering frames is
-/// never pinged, and one that delivers anything while a PING is out is given
-/// another timeout, so only a peer that is silent for the whole timeout fails.
-async fn h2_keep_alive(
-    ping_pong: &mut h2::PingPong,
-    clock: &ReadClock,
-    period: std::time::Duration,
-    ping_timeout: std::time::Duration,
-) -> &'static str {
-    loop {
-        let idle = clock.idle();
-        if idle < period {
-            tokio::time::sleep(period - idle).await;
-            continue;
-        }
-        let mut seen = clock.last();
-        let ping = ping_pong.ping(h2::Ping::opaque());
-        tokio::pin!(ping);
-        loop {
-            match tokio::time::timeout(ping_timeout, ping.as_mut()).await {
-                Ok(Ok(_)) => break,
-                Ok(Err(_)) => return "ping failed",
-                Err(_) if clock.last() != seen => seen = clock.last(),
-                Err(_) => return "no PING answer",
-            }
-        }
-    }
-}
-
-/// Drives one pooled HTTP/2 connection. When it ends, stops answering PINGs or
-/// stands idle for [`H2_CONN_IDLE`] it leaves the pool; dropping it fails the
-/// streams still on it, which is why the idle arm only fires with none left.
-async fn drive_h2_connection(
-    mut connection: H2Connection,
-    clock: std::sync::Arc<ReadClock>,
-    keep_alive: Option<(std::time::Duration, std::time::Duration)>,
-    pool: std::sync::Weak<H2Pool>,
-    counter: std::sync::Arc<H2Counter>,
-    idle_limit: Option<std::time::Duration>,
-) {
-    let ping_pong = keep_alive.and_then(|times| Some((connection.ping_pong()?, times)));
-    let idle = async {
-        match idle_limit {
-            Some(limit) => h2_idle_expired(&counter, limit).await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::pin!(idle);
-    match ping_pong {
-        Some((mut ping_pong, (period, ping_timeout))) => {
-            tokio::select! {
-                res = &mut connection => {
-                    if let Err(e) = res {
-                        crate::logging::debug(format_args!("xhttp h2 connection: {e}"));
-                    }
-                }
-                why = h2_keep_alive(&mut ping_pong, &clock, period, ping_timeout) => {
-                    crate::logging::debug(format_args!("xhttp h2 connection: {why}, closing"));
-                }
-                why = &mut idle => {
-                    crate::logging::debug(format_args!("xhttp h2 connection: {why}, closing"));
-                }
-            }
-        }
-        None => {
-            tokio::select! {
-                res = &mut connection => {
-                    if let Err(e) = res {
-                        crate::logging::debug(format_args!("xhttp h2 connection: {e}"));
-                    }
-                }
-                why = &mut idle => {
-                    crate::logging::debug(format_args!("xhttp h2 connection: {why}, closing"));
-                }
-            }
-        }
-    }
-    if let Some(pool) = pool.upgrade() {
-        pool.evict(&counter).await;
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct XhttpConfig {
     host: Option<String>,
@@ -791,7 +329,7 @@ pub(crate) struct XhttpConfig {
     h2_pool: std::sync::Arc<H2Pool>,
     /// see [`HALF_CLOSE_IDLE`]
     half_close_idle: std::time::Duration,
-    /// see [`H2_CONN_IDLE`]; `None` keeps pooled connections forever
+    /// see [`super::h2io::H2_CONN_IDLE`]; `None` keeps pooled connections forever
     h2_idle: Option<std::time::Duration>,
 }
 
@@ -895,10 +433,7 @@ impl XhttpConfig {
             let stream: AnyStream = Box::new(super::h2io::H2Io {
                 h2: super::h2io::H2Stream::shared(response, send).with_write_chunk(GO_BODY_CHUNK),
             });
-            return Ok(Box::new(TrackedStream {
-                inner: stream,
-                counter: guard.into_inner(),
-            }));
+            return Ok(Box::new(TrackedStream::new(stream, guard.into_inner())));
         }
 
         let mut this = SplitConn::new(self);
@@ -982,12 +517,12 @@ impl XhttpConfig {
             }
         }
 
-        Ok(Box::new(TrackedStream {
-            inner: Box::new(XhttpConn {
+        Ok(Box::new(TrackedStream::new(
+            Box::new(XhttpConn {
                 split: Box::new(this),
             }),
-            counter: guard.into_inner(),
-        }))
+            guard.into_inner(),
+        )))
     }
 
     pub(crate) async fn connect_h2_stream(
@@ -1039,7 +574,12 @@ impl XhttpConfig {
                         if !is_h2 {
                             return Ok(Err(stream));
                         }
-                        Ok(Ok(h2_handshake(stream).await?))
+                        Ok(Ok(h2_handshake(
+                            stream,
+                            &super::h2io::client_builder(),
+                            "xhttp",
+                        )
+                        .await?))
                     }
                     .await;
 
@@ -1106,6 +646,7 @@ impl XhttpConfig {
             std::sync::Arc::downgrade(&self.h2_pool),
             counter.clone(),
             self.h2_idle,
+            "xhttp",
         ));
         counter
     }
@@ -1158,7 +699,8 @@ pub(crate) async fn connect(
     // Over HTTP/2, stream-one, stream-up, and packet-up all multiplex streams
     // over the pooled HTTP/2 connection.
     if is_h2 {
-        let (send_request, connection, clock) = h2_handshake(stream).await?;
+        let (send_request, connection, clock) =
+            h2_handshake(stream, &super::h2io::client_builder(), "xhttp").await?;
         let max_conns = cfg.pool.max_connections();
         let counter = cfg
             .register_h2(send_request.clone(), connection, clock, max_conns)
@@ -2348,6 +1890,8 @@ fn base64_url(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::h2io;
+
     #[tokio::test]
     async fn packet_worker_batches_during_the_existing_post_interval() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2462,7 +2006,7 @@ mod tests {
     async fn pooled_with_keep_alive(
         client_io: tokio::io::DuplexStream,
     ) -> (
-        std::sync::Arc<super::H2Pool>,
+        std::sync::Arc<h2io::H2Pool>,
         h2::client::SendRequest<Bytes>,
         JoinHandle<()>,
     ) {
@@ -2475,21 +2019,25 @@ mod tests {
         keep_alive: Option<(std::time::Duration, std::time::Duration)>,
         idle: Option<std::time::Duration>,
     ) -> (
-        std::sync::Arc<super::H2Pool>,
+        std::sync::Arc<h2io::H2Pool>,
         h2::client::SendRequest<Bytes>,
         JoinHandle<()>,
     ) {
-        let (client, connection, clock) = super::h2_handshake(Box::new(client_io)).await.unwrap();
-        let pool = std::sync::Arc::new(super::H2Pool::new());
+        let (client, connection, clock) =
+            h2io::h2_handshake(Box::new(client_io), &h2io::client_builder(), "xhttp")
+                .await
+                .unwrap();
+        let pool = std::sync::Arc::new(h2io::H2Pool::new());
         let counter = pool.finish_dial(Some(client.clone()), 1).await.unwrap();
-        drop(super::CounterGuard::new(counter.clone()));
-        let driver = tokio::spawn(super::drive_h2_connection(
+        drop(h2io::CounterGuard::new(counter.clone()));
+        let driver = tokio::spawn(h2io::drive_h2_connection(
             connection,
             clock,
             keep_alive,
             std::sync::Arc::downgrade(&pool),
             counter,
             idle,
+            "xhttp",
         ));
         (pool, client, driver)
     }
@@ -2510,7 +2058,7 @@ mod tests {
             "evicted before the PING timeout: {took:?}"
         );
         assert!(
-            matches!(pool.acquire(1, 0).await, super::H2Acquire::NeedDial(_)),
+            matches!(pool.acquire(1, 0).await, h2io::H2Acquire::NeedDial(_)),
             "dead connection still pooled"
         );
         assert!(
@@ -2531,7 +2079,7 @@ mod tests {
         tokio::time::sleep(5 * (TEST_PERIOD + TEST_PING_TIMEOUT)).await;
         assert!(!driver.is_finished(), "healthy idle connection dropped");
         assert!(
-            matches!(pool.acquire(1, 0).await, super::H2Acquire::Ready(..)),
+            matches!(pool.acquire(1, 0).await, h2io::H2Acquire::Ready(..)),
             "healthy idle connection left the pool"
         );
         server.abort();
@@ -2548,7 +2096,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             pool.acquire(1, 0).await,
-            super::H2Acquire::NeedDial(_)
+            h2io::H2Acquire::NeedDial(_)
         ));
     }
 
@@ -2580,7 +2128,7 @@ mod tests {
             started.elapsed()
         );
         assert!(
-            matches!(pool.acquire(1, 0).await, super::H2Acquire::NeedDial(_)),
+            matches!(pool.acquire(1, 0).await, h2io::H2Acquire::NeedDial(_)),
             "closed connection still pooled"
         );
         assert!(client.ready().await.is_err(), "closed connection usable");
@@ -2594,18 +2142,22 @@ mod tests {
             let mut connection = h2::server::handshake(server_io).await.unwrap();
             while connection.accept().await.is_some() {}
         });
-        let (client, connection, clock) = super::h2_handshake(Box::new(client_io)).await.unwrap();
-        let pool = std::sync::Arc::new(super::H2Pool::new());
+        let (client, connection, clock) =
+            h2io::h2_handshake(Box::new(client_io), &h2io::client_builder(), "xhttp")
+                .await
+                .unwrap();
+        let pool = std::sync::Arc::new(h2io::H2Pool::new());
         let counter = pool.finish_dial(Some(client), 1).await.unwrap();
         // a live stream holds the counter above zero for the whole test
-        let held = super::CounterGuard::new(counter.clone());
-        let driver = tokio::spawn(super::drive_h2_connection(
+        let held = h2io::CounterGuard::new(counter.clone());
+        let driver = tokio::spawn(h2io::drive_h2_connection(
             connection,
             clock,
             Some((TEST_PERIOD, TEST_PING_TIMEOUT)),
             std::sync::Arc::downgrade(&pool),
             counter,
             Some(TEST_H2_IDLE),
+            "xhttp",
         ));
         tokio::time::sleep(4 * TEST_H2_IDLE).await;
         assert!(!driver.is_finished(), "connection with a stream was closed");
@@ -2626,9 +2178,9 @@ mod tests {
         });
         let (client, connection) = h2::client::handshake(client_io).await.unwrap();
         let driver = tokio::spawn(connection);
-        let pool = std::sync::Arc::new(super::H2Pool::new());
+        let pool = std::sync::Arc::new(h2io::H2Pool::new());
         let count = pool.finish_dial(Some(client), 1).await.unwrap();
-        let guard = super::CounterGuard::new(count.clone());
+        let guard = h2io::CounterGuard::new(count.clone());
         let waiting_pool = pool.clone();
         let waiting = tokio::spawn(async move { waiting_pool.acquire(1, 1).await });
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -2638,14 +2190,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let super::H2Acquire::Ready(_, count) = next else {
+        let h2io::H2Acquire::Ready(_, count) = next else {
             panic!("reuse existing H2 connection")
         };
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 1);
-        drop(super::CounterGuard::new(count.clone()));
+        drop(h2io::CounterGuard::new(count.clone()));
         assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 0);
         // Cancelling a waiter must not consume capacity.
-        let guard = super::CounterGuard::new({
+        let guard = h2io::CounterGuard::new({
             count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             count.clone()
         });
@@ -2655,17 +2207,17 @@ mod tests {
         cancelled.abort();
         let _ = cancelled.await;
         drop(guard);
-        let super::H2Acquire::Ready(_, count) = pool.acquire(1, 1).await else {
+        let h2io::H2Acquire::Ready(_, count) = pool.acquire(1, 1).await else {
             panic!("capacity leaked")
         };
-        drop(super::CounterGuard::new(count));
-        let super::H2Acquire::Ready(_, count) = pool.acquire(usize::MAX, 1).await else {
+        drop(h2io::CounterGuard::new(count));
+        let h2io::H2Acquire::Ready(_, count) = pool.acquire(usize::MAX, 1).await else {
             panic!("idle connection must be reused before dialing")
         };
-        let held = super::CounterGuard::new(count);
+        let held = h2io::CounterGuard::new(count);
         let next = pool.acquire(usize::MAX, 1).await;
         assert!(
-            matches!(next, super::H2Acquire::NeedDial(_)),
+            matches!(next, h2io::H2Acquire::NeedDial(_)),
             "maxConcurrency must open a new connection when full"
         );
         drop(next);
@@ -2676,7 +2228,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_h2_dial_releases_slot_and_wakes_waiter() {
-        let pool = std::sync::Arc::new(super::H2Pool::new());
+        let pool = std::sync::Arc::new(h2io::H2Pool::new());
         let first = pool.acquire(1, 0).await;
         let waiting_pool = pool.clone();
         let waiting = tokio::spawn(async move { waiting_pool.acquire(1, 0).await });
@@ -2687,14 +2239,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(matches!(next, super::H2Acquire::NeedDial(_)));
+        assert!(matches!(next, h2io::H2Acquire::NeedDial(_)));
         drop(next);
-        assert_eq!(pool.state.lock().unwrap().active_dials, 0);
+        assert_eq!(pool.active_dials(), 0);
     }
 
     #[tokio::test]
     async fn aborted_h2_connection_dial_releases_reservation() {
-        let pool = std::sync::Arc::new(super::H2Pool::new());
+        let pool = std::sync::Arc::new(h2io::H2Pool::new());
         let worker_pool = pool.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let worker = tokio::spawn(async move {
@@ -2710,7 +2262,7 @@ mod tests {
             .await
             .unwrap();
         drop(next);
-        assert_eq!(pool.state.lock().unwrap().active_dials, 0);
+        assert_eq!(pool.active_dials(), 0);
     }
     use super::*;
     use serde_json::json;

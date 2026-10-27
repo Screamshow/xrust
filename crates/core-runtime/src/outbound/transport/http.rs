@@ -59,6 +59,29 @@ fn pick_host(hosts: &[String], default: &str) -> io::Result<String> {
     }
 }
 
+/// The request a tunnel opens on the HTTP/2 transport.
+fn h2_request(
+    hosts: &[String],
+    path: &str,
+    method: &str,
+    headers: &[(String, String)],
+) -> io::Result<http::Request<()>> {
+    // v2fly compatibility: an empty host list means www.example.com.
+    let authority = pick_host(hosts, "www.example.com")?;
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(format!("https://{authority}{path}"));
+    for (name, value) in headers {
+        if H2_SKIP.contains(&name.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder
+        .body(())
+        .map_err(|e| io::Error::other(format!("http: build request: {e}")))
+}
+
 async fn connect_h2(
     stream: AnyStream,
     hosts: &[String],
@@ -77,27 +100,28 @@ async fn connect_h2(
         .ready()
         .await
         .map_err(|e| io::Error::other(format!("http: h2 ready: {e}")))?;
-
-    // v2fly compatibility: an empty host list means www.example.com.
-    let authority = pick_host(hosts, "www.example.com")?;
-    let mut builder = http::Request::builder()
-        .method(method)
-        .uri(format!("https://{authority}{path}"));
-    for (name, value) in headers {
-        if H2_SKIP.contains(&name.to_ascii_lowercase().as_str()) {
-            continue;
-        }
-        builder = builder.header(name.as_str(), value.as_str());
-    }
-    let request = builder
-        .body(())
-        .map_err(|e| io::Error::other(format!("http: build request: {e}")))?;
     let (response, send) = send_request
-        .send_request(request, false)
+        .send_request(h2_request(hosts, path, method, headers)?, false)
         .map_err(|e| io::Error::other(format!("http: send_request: {e}")))?;
 
     Ok(Box::new(H2Io {
         h2: H2Stream::new(response, send, conn_task),
+    }))
+}
+
+/// A tunnel on a pooled connection, driven and closed by the pool.
+pub(super) fn open_pooled_h2(
+    send_req: &mut h2::client::SendRequest<bytes::Bytes>,
+    hosts: &[String],
+    path: &str,
+    method: &str,
+    headers: &[(String, String)],
+) -> io::Result<AnyStream> {
+    let (response, send) = send_req
+        .send_request(h2_request(hosts, path, method, headers)?, false)
+        .map_err(|e| io::Error::other(format!("http: send_request: {e}")))?;
+    Ok(Box::new(H2Io {
+        h2: H2Stream::shared(response, send),
     }))
 }
 

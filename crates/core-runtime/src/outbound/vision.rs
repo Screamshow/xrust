@@ -277,7 +277,7 @@ impl VisionStream {
     /// does, and at [`BLIND_SPLIT`] when there is no boundary to cut at.
     fn frame_take(buf: &[u8]) -> usize {
         const MAX_FRAME_CONTENT: usize = MAX_FRAME - FRAME_OVERHEAD;
-        debug_assert!(MAX_FRAME_CONTENT <= MAX_CONTENT);
+        const { assert!(MAX_FRAME_CONTENT <= MAX_CONTENT) };
         if buf.len() <= MAX_FRAME_CONTENT {
             return buf.len();
         }

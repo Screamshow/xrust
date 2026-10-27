@@ -35,13 +35,41 @@ const OP_CLOSE: u8 = 0x8;
 const OP_PING: u8 = 0x9;
 const OP_PONG: u8 = 0xA;
 
-#[derive(Default, Clone)]
+/// How many tunnels one pooled HTTP/2 connection carries before the pool
+/// opens another. Go's `x/net/http2` client assumes
+/// `initialMaxConcurrentStreams` (100) until the server's SETTINGS say
+/// otherwise and then opens a second connection rather than queueing, which
+/// is what Xray's HTTP/2 and gRPC transports inherit.
+const H2_POOL_CONCURRENCY: usize = 100;
+/// How many pooled connections one outbound keeps. A connection is only added
+/// once every existing one is at the concurrency above, so this is a ceiling
+/// on a router's descriptors rather than a working limit.
+const H2_POOL_CONNECTIONS: usize = 8;
+
+#[derive(Clone)]
 pub(crate) struct Transport {
     kind: Kind,
+    /// The HTTP/2 connections the tunnels of this outbound share. Xray's gRPC
+    /// dialer keeps one `ClientConn` per destination in its `globalDialerMap`
+    /// and its HTTP/2 transport multiplexes over an `http2.Transport` pool, so
+    /// a node sees one TLS handshake where a connection per tunnel showed one
+    /// each. XHTTP has had a pool of its own since it was written; this one
+    /// serves the gRPC and HTTP/2 transports.
+    h2_pool: std::sync::Arc<h2io::H2Pool>,
+    /// Pool limits, [`H2_POOL_CONCURRENCY`] and [`H2_POOL_CONNECTIONS`] unless
+    /// a test narrows them.
+    h2_limits: (usize, usize),
+    /// How long a pooled connection with no tunnel on it is kept, Go's
+    /// `net.ConnIdleTimeout` by way of `XRUST_H2_IDLE_SECS`; `None` keeps it
+    /// for as long as the process runs.
+    h2_idle: Option<std::time::Duration>,
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod pool_tests;
 
 #[cfg(test)]
 mod upgrade_tests;
@@ -154,11 +182,47 @@ fn headers_host(headers: &[(String, String)]) -> Option<&str> {
         .map(|(_, value)| value.as_str())
 }
 
+impl Default for Transport {
+    fn default() -> Self {
+        Self::with_kind(Kind::None)
+    }
+}
+
 impl Transport {
+    fn with_kind(kind: Kind) -> Self {
+        Self {
+            kind,
+            h2_pool: std::sync::Arc::new(h2io::H2Pool::new()),
+            h2_limits: (H2_POOL_CONNECTIONS, H2_POOL_CONCURRENCY),
+            h2_idle: h2io::h2_conn_idle(),
+        }
+    }
+
+    /// Narrow the pool limits, so a test can reach them without opening a
+    /// hundred tunnels.
+    #[cfg(test)]
+    pub(crate) fn with_h2_limits(mut self, max_conns: usize, max_concurrency: usize) -> Self {
+        self.h2_limits = (max_conns, max_concurrency);
+        self
+    }
+
+    /// Shorten the idle close, so a test does not wait five minutes for it.
+    #[cfg(test)]
+    pub(crate) fn with_h2_idle(mut self, idle: Option<std::time::Duration>) -> Self {
+        self.h2_idle = idle;
+        self
+    }
+
+    /// How many connections this outbound's pool holds.
+    #[cfg(test)]
+    pub(crate) fn pooled_connections(&self) -> usize {
+        self.h2_pool.pooled()
+    }
+
     /// Parse the outbound `transport` object (absent/null → no transport).
     pub(crate) fn parse(obj: &serde_json::Map<String, Value>, at: &str) -> anyhow::Result<Self> {
         let Some(transport) = obj.get("transport") else {
-            return Ok(Self { kind: Kind::None });
+            return Ok(Self::with_kind(Kind::None));
         };
         let Some(transport) = transport.as_object() else {
             anyhow::bail!("{at}: transport must be an object");
@@ -239,7 +303,7 @@ impl Transport {
             "xhttp" => Kind::Xhttp(Box::new(xhttp::XhttpConfig::parse(transport)?)),
             other => anyhow::bail!("{at}: transport type {other:?} not implemented yet"),
         };
-        Ok(Self { kind })
+        Ok(Self::with_kind(kind))
     }
 
     /// The ALPN this transport asks for when the config sets none.
@@ -340,8 +404,174 @@ impl Transport {
             }
         }
 
+        if self.pools_h2(tls.is_some()) {
+            return self.connect_pooled_h2(tls, server, port, dial).await;
+        }
+
         let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
         self.connect(tcp, tls, server, port, dial).await
+    }
+
+    /// Whether the tunnels of this transport share pooled HTTP/2 connections.
+    /// gRPC always speaks HTTP/2 -- prior knowledge without TLS, ALPN `h2`
+    /// with it -- and the HTTP/2 transport does so over TLS, plaintext there
+    /// being HTTP/1.1. XHTTP has its own pool and is handled above.
+    fn pools_h2(&self, secure: bool) -> bool {
+        match &self.kind {
+            Kind::Grpc { .. } => true,
+            Kind::Http { .. } => secure,
+            _ => false,
+        }
+    }
+
+    /// What this transport calls itself in the pool's log lines and errors.
+    fn h2_label(&self) -> &'static str {
+        match &self.kind {
+            Kind::Grpc { .. } => "grpc",
+            _ => "http",
+        }
+    }
+
+    /// A tunnel over a pooled HTTP/2 connection: one of this outbound's
+    /// existing connections when it has room, a fresh one otherwise. The
+    /// reference clients work this way -- Xray's gRPC dialer shares one
+    /// `ClientConn` per destination and its HTTP/2 transport multiplexes over
+    /// an `http2.Transport` pool -- so three tunnels to a node mean one TLS
+    /// handshake rather than three.
+    async fn connect_pooled_h2(
+        &self,
+        tls: Option<&TlsOptions>,
+        server: &str,
+        port: u16,
+        dial: &crate::outbound::dial::DialOptions,
+    ) -> io::Result<AnyStream> {
+        let (max_conns, max_concurrency) = self.h2_limits;
+        let label = self.h2_label();
+        match self.h2_pool.acquire(max_conns, max_concurrency).await {
+            h2io::H2Acquire::Ready(send_req, counter) => {
+                let guard = h2io::CounterGuard::new(counter.clone());
+                match self.open_pooled_tunnel(send_req, tls, server) {
+                    Ok(stream) => Ok(Box::new(h2io::TrackedStream::new(
+                        stream,
+                        guard.into_inner(),
+                    ))),
+                    Err(e) => {
+                        drop(guard);
+                        // A connection that will not open a stream is spent,
+                        // whatever is wrong with it; the next dial starts a
+                        // fresh one.
+                        self.h2_pool.evict(&counter).await;
+                        Err(e)
+                    }
+                }
+            }
+            h2io::H2Acquire::NeedDial(reservation) => {
+                let dialed = self.dial_pooled_h2(tls, server, port, dial, label).await;
+                let (send_request, connection, clock) = match dialed {
+                    Ok(fresh) => fresh,
+                    Err(e) => {
+                        drop(reservation);
+                        return Err(e);
+                    }
+                };
+                let counter = self
+                    .h2_pool
+                    .finish_dial(Some(send_request.clone()), max_conns)
+                    .await
+                    .expect("counter present");
+                tokio::spawn(h2io::drive_h2_connection(
+                    connection,
+                    clock,
+                    // No PINGs: Xray's gRPC dialer hands grpc-go keepalive
+                    // parameters only when the config asks for them, and its
+                    // HTTP/2 transport leaves `ReadIdleTimeout` unset. A
+                    // connection nobody can use is dropped when a stream
+                    // fails on it, and an unused one on the idle close below.
+                    None,
+                    std::sync::Arc::downgrade(&self.h2_pool),
+                    counter.clone(),
+                    self.h2_idle,
+                    label,
+                ));
+                drop(reservation);
+                let guard = h2io::CounterGuard::new(counter.clone());
+                let send_req = match send_request.ready().await {
+                    Ok(req) => req,
+                    Err(e) => {
+                        drop(guard);
+                        self.h2_pool.evict(&counter).await;
+                        return Err(io::Error::other(format!("{label}: h2 ready: {e}")));
+                    }
+                };
+                match self.open_pooled_tunnel(send_req, tls, server) {
+                    Ok(stream) => Ok(Box::new(h2io::TrackedStream::new(
+                        stream,
+                        guard.into_inner(),
+                    ))),
+                    Err(e) => {
+                        drop(guard);
+                        self.h2_pool.evict(&counter).await;
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    /// One fresh connection for the pool: the dial, the TLS this transport
+    /// asks for and the HTTP/2 handshake of the client it imitates.
+    async fn dial_pooled_h2(
+        &self,
+        tls: Option<&TlsOptions>,
+        server: &str,
+        port: u16,
+        dial: &crate::outbound::dial::DialOptions,
+        label: &'static str,
+    ) -> io::Result<h2io::H2Fresh> {
+        let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
+        let record_cap = self.record_cap().unwrap_or(core_tls::record::MAX_FRAGMENT);
+        let stream: AnyStream = match tls {
+            Some(tls) => {
+                tls.wrap_with_record_cap(tcp, self.default_alpn(true), record_cap)
+                    .await?
+            }
+            None => Box::new(tcp),
+        };
+        let builder = match &self.kind {
+            Kind::Grpc { .. } => h2io::grpc_client_builder(),
+            _ => h2io::client_builder(),
+        };
+        h2io::h2_handshake(stream, &builder, label).await
+    }
+
+    /// The request that opens one tunnel on a pooled connection.
+    fn open_pooled_tunnel(
+        &self,
+        mut send_req: h2::client::SendRequest<bytes::Bytes>,
+        tls: Option<&TlsOptions>,
+        server: &str,
+    ) -> io::Result<AnyStream> {
+        match &self.kind {
+            Kind::Grpc { service_name } => {
+                // Xray's dialer hands grpc-go the TLS server name as the
+                // authority, or the destination's domain without TLS, and
+                // never a port (`grpc/dial.go`).
+                let sni = tls
+                    .map(TlsOptions::server_name)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(server);
+                grpc::open_pooled(&mut send_req, service_name, sni)
+            }
+            Kind::Http {
+                host,
+                path,
+                method,
+                headers,
+            } => http::open_pooled_h2(&mut send_req, host, path, method, headers),
+            _ => Err(io::Error::other(
+                "transport does not pool HTTP/2 connections",
+            )),
+        }
     }
 
     pub(crate) async fn connect(

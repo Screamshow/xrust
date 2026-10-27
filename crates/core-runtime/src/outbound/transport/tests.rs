@@ -41,15 +41,13 @@ async fn ws_server(listener: tokio::net::TcpListener) -> String {
 }
 
 fn ws_transport(max_early_data: usize, header_name: &str) -> Transport {
-    Transport {
-        kind: Kind::Ws {
-            path: "/t".into(),
-            host: None,
-            headers: vec![("X-Test".into(), "1".into())],
-            max_early_data,
-            early_data_header_name: header_name.into(),
-        },
-    }
+    Transport::with_kind(Kind::Ws {
+        path: "/t".into(),
+        host: None,
+        headers: vec![("X-Test".into(), "1".into())],
+        max_early_data,
+        early_data_header_name: header_name.into(),
+    })
 }
 
 async fn connect_transport(
@@ -198,15 +196,13 @@ async fn connect_configured(header_name: &str, configured: &str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
-    let transport = Transport {
-        kind: Kind::Ws {
-            path: "/".into(),
-            host: None,
-            headers: vec![(configured.into(), "chat".into())],
-            max_early_data: 2048,
-            early_data_header_name: header_name.into(),
-        },
-    };
+    let transport = Transport::with_kind(Kind::Ws {
+        path: "/".into(),
+        host: None,
+        headers: vec![(configured.into(), "chat".into())],
+        max_early_data: 2048,
+        early_data_header_name: header_name.into(),
+    });
     connect_transport(listener, transport, b"payload").await.0
 }
 
@@ -410,15 +406,13 @@ async fn a_host_header_is_written_once() {
         .expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let server = tokio::spawn(async move { ws_server(listener).await });
-    let transport = Transport {
-        kind: Kind::Ws {
-            path: "/p".into(),
-            host: None,
-            headers: vec![("Host".into(), "cdn.example.com".into())],
-            max_early_data: 0,
-            early_data_header_name: String::new(),
-        },
-    };
+    let transport = Transport::with_kind(Kind::Ws {
+        path: "/p".into(),
+        host: None,
+        headers: vec![("Host".into(), "cdn.example.com".into())],
+        max_early_data: 0,
+        early_data_header_name: String::new(),
+    });
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .expect("connect");

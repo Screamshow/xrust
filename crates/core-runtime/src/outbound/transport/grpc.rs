@@ -57,23 +57,8 @@ fn service_path(service: &str) -> String {
     format!("/{body}/{}", path_escape(method))
 }
 
-pub(super) async fn connect(
-    stream: AnyStream,
-    service_name: &str,
-    authority: &str,
-) -> io::Result<AnyStream> {
-    let (send_request, connection) = super::h2io::grpc_client_builder()
-        .handshake(stream)
-        .await
-        .map_err(|e| io::Error::other(format!("grpc: h2 handshake: {e}")))?;
-    let conn_task = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let mut send_request = send_request
-        .ready()
-        .await
-        .map_err(|e| io::Error::other(format!("grpc: h2 ready: {e}")))?;
-
+/// The request a tunnel opens, the way grpc-go sends it.
+fn request(service_name: &str, authority: &str) -> io::Result<http::Request<()>> {
     // Escape ordinary service names as one segment, but preserve Xray's
     // explicit custom service/method path when the name starts with `/`.
     let path = service_path(service_name);
@@ -94,17 +79,56 @@ pub(super) async fn connect(
     if let Some(ua) = super::browser::profile_user_agent(None) {
         request = request.header("user-agent", ua);
     }
-    let request = request
+    request
         .header("te", "trailers")
         .body(())
-        .map_err(|e| io::Error::other(format!("grpc: build request: {e}")))?;
+        .map_err(|e| io::Error::other(format!("grpc: build request: {e}")))
+}
+
+/// A tunnel with a connection of its own: the handshake is part of the dial,
+/// and the stream owns the task that drives the connection.
+pub(super) async fn connect(
+    stream: AnyStream,
+    service_name: &str,
+    authority: &str,
+) -> io::Result<AnyStream> {
+    let (send_request, connection) = super::h2io::grpc_client_builder()
+        .handshake(stream)
+        .await
+        .map_err(|e| io::Error::other(format!("grpc: h2 handshake: {e}")))?;
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let mut send_request = send_request
+        .ready()
+        .await
+        .map_err(|e| io::Error::other(format!("grpc: h2 ready: {e}")))?;
     let (response, send) = send_request
-        .send_request(request, false)
+        .send_request(request(service_name, authority)?, false)
         .map_err(|e| io::Error::other(format!("grpc: send_request: {e}")))?;
 
     Ok(Box::new(GrpcStream {
         io: H2Io {
             h2: H2Stream::new(response, send, conn_task),
+        },
+        data_left: 0,
+        skip: 0,
+    }))
+}
+
+/// A tunnel on a pooled connection, which several tunnels share and which is
+/// driven and closed by the pool rather than by this stream.
+pub(super) fn open_pooled(
+    send_req: &mut h2::client::SendRequest<Bytes>,
+    service_name: &str,
+    authority: &str,
+) -> io::Result<AnyStream> {
+    let (response, send) = send_req
+        .send_request(request(service_name, authority)?, false)
+        .map_err(|e| io::Error::other(format!("grpc: send_request: {e}")))?;
+    Ok(Box::new(GrpcStream {
+        io: H2Io {
+            h2: H2Stream::shared(response, send),
         },
         data_left: 0,
         skip: 0,
