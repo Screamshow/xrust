@@ -526,7 +526,10 @@ impl DirectMesh {
             }
         }
         let mut packets = Vec::new();
-        let mut buffer = [0; 65536];
+        // Anything over 2048 bytes is dropped below; a longer datagram reads
+        // truncated to 2049 and is dropped the same way. Zeroing 64 KiB on
+        // every poll cost more than the receive itself.
+        let mut buffer = [0; 2049];
         let mut inbound = Vec::new();
         for index in 0..256 {
             let (length, endpoint) = match self.socket.try_recv_from(&mut buffer) {

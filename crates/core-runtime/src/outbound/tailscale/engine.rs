@@ -49,6 +49,8 @@ pub enum Cmd {
         dst: SocketAddr,
         to_caller: mpsc::Sender<Vec<u8>>,
         resp: oneshot::Sender<Result<(), String>>,
+        /// Bytes the caller may queue ahead of the stack; see `CALLER_QUEUE_BYTES`.
+        credit: Arc<tokio::sync::Semaphore>,
     },
     TcpData {
         id: u32,
@@ -182,7 +184,14 @@ impl Device for TailscaleDevice {
     }
 }
 
+/// Upload bytes one connection may queue ahead of its smoltcp socket. The
+/// caller takes permits before each `TcpData` and the stack returns them as
+/// the socket accepts the bytes, so a slow peer stalls the sender instead of
+/// growing the queue.
+pub(crate) const CALLER_QUEUE_BYTES: usize = 256 * 1024;
+
 struct TcpConn {
+    credit: Arc<tokio::sync::Semaphore>,
     handle: SocketHandle,
     #[allow(dead_code)]
     dst: SocketAddr,
@@ -191,6 +200,13 @@ struct TcpConn {
     from_caller: VecDeque<Vec<u8>>,
     created: Instant,
     caller_eof: bool,
+}
+
+impl Drop for TcpConn {
+    /// Wake a caller waiting for credit once the connection is gone.
+    fn drop(&mut self) {
+        self.credit.close();
+    }
 }
 
 pub fn spawn_tailscale_engine(
@@ -286,6 +302,10 @@ pub fn spawn_tailscale_engine_with_tun(
 
         let mut next_ephemeral_port: u16 = 40000;
         let poll_interval = Duration::from_millis(5);
+        // With no connection to pump the loop sleeps until a command, a packet
+        // or a stack timer, at most this long (mesh timers are seconds apart).
+        let idle_poll_limit = Duration::from_millis(250);
+        let mut woken_cmd: Option<Cmd> = None;
         let mut tun_read_packets = 0u64;
         let mut tun_write_errors = 0u64;
         let mut tun_send_errors = 0u64;
@@ -298,7 +318,7 @@ pub fn spawn_tailscale_engine_with_tun(
             let mut tun_read_healthy = true;
 
             // 1. Drain commands
-            while let Ok(cmd) = internal_cmd_rx.try_recv() {
+            while let Some(cmd) = woken_cmd.take().or_else(|| internal_cmd_rx.try_recv().ok()) {
                 match cmd {
                     Cmd::UpdateForwardingReady { ready } => forwarding_ready = ready,
                     Cmd::UpdateLocalAddresses { addresses, resp } => {
@@ -319,8 +339,12 @@ pub fn spawn_tailscale_engine_with_tun(
                         tcp_conns.clear();
                         udp_sessions.clear();
                         web = cfg.luci_access.then(|| {
-                            let mut bridge = super::web::WebBridge::new(cfg.ssh_access);
+                            let mut bridge = super::web::WebBridge::with_exit(
+                                cfg.ssh_access,
+                                cfg.advertise_exit_node,
+                            );
                             bridge.update_rules(lan_rules.clone());
+                            bridge.set_exit_approved(exit_approved);
                             bridge
                         });
                         sockets = SocketSet::new(vec![]);
@@ -365,6 +389,7 @@ pub fn spawn_tailscale_engine_with_tun(
                         dst,
                         to_caller,
                         resp,
+                        credit,
                     } => {
                         let rx_buf = TcpBuffer::new(vec![0; 65536]);
                         let tx_buf = TcpBuffer::new(vec![0; 65536]);
@@ -388,6 +413,7 @@ pub fn spawn_tailscale_engine_with_tun(
                                 tcp_conns.insert(
                                     id,
                                     TcpConn {
+                                        credit,
                                         handle,
                                         dst,
                                         to_caller,
@@ -399,6 +425,7 @@ pub fn spawn_tailscale_engine_with_tun(
                                 );
                             }
                             Err(e) => {
+                                credit.close();
                                 let _ = resp.send(Err(format!("smoltcp connect: {e:?}")));
                             }
                         }
@@ -494,6 +521,7 @@ pub fn spawn_tailscale_engine_with_tun(
                         match socket.send_slice(front) {
                             Ok(n) => {
                                 front.drain(..n);
+                                conn.credit.add_permits(n);
                             }
                             Err(_) => break,
                         }
@@ -666,7 +694,26 @@ pub fn spawn_tailscale_engine_with_tun(
                         std::future::pending::<()>().await;
                     }
                 };
-                tokio::select! {_=tokio::time::sleep(poll_interval)=>{},_=network=>{},_=forwarding=>{}}
+                // Connections move data between the stack and their callers
+                // without a wakeup of their own: keep polling while any exist.
+                let idle = tcp_conns.is_empty()
+                    && udp_sessions.is_empty()
+                    && web.as_ref().is_none_or(|web| !web.active(&sockets));
+                let wait = if idle {
+                    iface
+                        .poll_delay(SmolInstant::now(), &sockets)
+                        .map_or(idle_poll_limit, |delay| {
+                            Duration::from_micros(delay.total_micros()).min(idle_poll_limit)
+                        })
+                } else {
+                    poll_interval
+                };
+                tokio::select! {
+                    _=tokio::time::sleep(wait)=>{},
+                    _=network=>{},
+                    _=forwarding=>{},
+                    cmd=internal_cmd_rx.recv(), if idle => woken_cmd = cmd,
+                }
             }
         }
     });
@@ -864,6 +911,7 @@ mod mesh_tests {
                         dst: "100.64.0.2:4321".parse().unwrap(),
                         to_caller,
                         resp: result,
+                        credit: Arc::new(tokio::sync::Semaphore::new(CALLER_QUEUE_BYTES)),
                     })
                     .await
                     .unwrap();

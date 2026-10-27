@@ -472,6 +472,7 @@ impl Tailscale {
         let (to_caller_tx, mut to_caller_rx) = mpsc::channel(REPLY_QUEUE);
         let (resp_tx, resp_rx) = oneshot::channel();
 
+        let credit = Arc::new(tokio::sync::Semaphore::new(engine::CALLER_QUEUE_BYTES));
         shared
             .cmd_tx
             .send(Cmd::TcpConnect {
@@ -479,6 +480,7 @@ impl Tailscale {
                 dst,
                 to_caller: to_caller_tx,
                 resp: resp_tx,
+                credit: Arc::clone(&credit),
             })
             .await
             .map_err(|_| io::Error::other("tailscale: engine task stopped"))?;
@@ -495,6 +497,11 @@ impl Tailscale {
                         break;
                     }
                     Ok(n) => {
+                        // Closed once the stack dropped the connection.
+                        match credit.acquire_many(n as u32).await {
+                            Ok(permits) => permits.forget(),
+                            Err(_) => break,
+                        }
                         if cmd_tx
                             .send(Cmd::TcpData {
                                 id,

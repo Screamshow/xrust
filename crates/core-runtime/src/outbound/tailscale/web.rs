@@ -53,6 +53,13 @@ impl WebBridge {
     pub fn set_exit_approved(&mut self, approved: bool) {
         self.exit_approved = approved;
     }
+    /// A connection past its listener, which the stack loop has to pump.
+    pub fn active(&self, sockets: &SocketSet<'static>) -> bool {
+        self.connections.values().any(|connection| {
+            connection.task.is_some()
+                || sockets.get::<Socket>(connection.handle).state() != State::Listen
+        })
+    }
     pub fn update_rules(&mut self, rules: Vec<Rule>) {
         self.rules = rules;
     }
@@ -209,6 +216,16 @@ impl WebBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn listeners_alone_do_not_keep_the_stack_busy() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut bridge = WebBridge::with_exit(true, true);
+        assert!(!bridge.active(&sockets));
+        bridge.poll(&mut sockets);
+        assert!(!bridge.connections.is_empty());
+        assert!(!bridge.active(&sockets));
+    }
+
     #[test]
     fn ssh_listener_is_opt_in() {
         for enabled in [false, true] {
