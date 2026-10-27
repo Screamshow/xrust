@@ -3023,6 +3023,13 @@ fn validate_rule_sets(route: &Map<String, Value>) -> Result<(), String> {
                 if loaded_rule_set_file(path) {
                     continue;
                 }
+                if skipping_rule_set_payloads() {
+                    // the file must still open; its body is checked by the core
+                    std::fs::File::open(path).map_err(|err| {
+                        format!("{at_init}: {}", go_path_error("open", &absolute, &err))
+                    })?;
+                    continue;
+                }
                 let data = std::fs::read(path).map_err(|err| {
                     format!("{at_init}: {}", go_path_error("open", &absolute, &err))
                 })?;
@@ -14432,6 +14439,27 @@ pub(crate) fn with_loaded_rule_set_files<T>(
 
 fn loaded_rule_set_file(path: &str) -> bool {
     LOADED_RULE_SET_FILES.with(|slot| slot.borrow().contains(path))
+}
+
+thread_local! {
+    static SKIP_RULE_SET_PAYLOADS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `check` without decoding the payload of any local rule-set file.
+pub(crate) fn without_rule_set_payloads<T>(check: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SKIP_RULE_SET_PAYLOADS.with(|slot| slot.set(false));
+        }
+    }
+    SKIP_RULE_SET_PAYLOADS.with(|slot| slot.set(true));
+    let _reset = Reset;
+    check()
+}
+
+fn skipping_rule_set_payloads() -> bool {
+    SKIP_RULE_SET_PAYLOADS.with(std::cell::Cell::get)
 }
 
 /// Drain the warnings collected by the last `validate()` call.

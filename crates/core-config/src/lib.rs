@@ -40,6 +40,13 @@ pub fn check_str(raw: &str) -> Result<(), String> {
     check_str_warnings(raw).map(|_| ())
 }
 
+/// `check` of a parsed document without decoding local rule-set files: each
+/// one must still open, but its body is left to the core that loads it. For a
+/// planner beside a running core, which checks every changed file itself.
+pub fn check_value_without_rule_set_payloads(value: &Value) -> Result<(), String> {
+    validate::without_rule_set_payloads(|| validate::validate_with_warnings(value)).map(|_| ())
+}
+
 /// `check` of a parsed document whose local rule-set files named in `loaded`
 /// were already decoded and verified by the caller (a running instance that
 /// loaded the very same files). Their payload is not decoded again; every
@@ -80,6 +87,13 @@ mod tests {
         let mut bad = root.clone();
         bad["inbounds"] = serde_json::json!([{"type": "unknown"}]);
         assert!(check_value_with_loaded_rule_sets(&bad, &loaded).is_err());
+        // without payloads: a broken body passes, a missing file does not
+        assert!(check_value_without_rule_set_payloads(&root).is_ok());
+        assert!(check_str(&root.to_string()).is_err());
+        let mut missing = root.clone();
+        missing["route"]["rule_set"][0]["path"] = serde_json::json!(format!("{path_text}.missing"));
+        assert!(check_value_without_rule_set_payloads(&missing).is_err());
+        assert!(check_value_without_rule_set_payloads(&bad).is_err());
         let _ = std::fs::remove_file(&path);
     }
 

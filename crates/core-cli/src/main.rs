@@ -258,11 +258,18 @@ fn cmd_reload_plan(args: &[String]) -> Result<(), String> {
         .find(|pair| pair[0] == "--current")
         .map(|pair| PathBuf::from(&pair[1]))
         .ok_or("reload-plan: missing --current <path>")?;
+    // The running core decodes every changed rule-set file itself before it
+    // applies a reload and reports a refusal; a manager may leave that to it.
+    let skip_payloads = args.iter().any(|arg| arg == "--skip-rule-set-payloads");
     let raw = load_config(args)?;
-    core_config::check_str(&raw)
+    let next: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|_| "reload-plan: candidate configuration rejected".to_string())?;
-    let next: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|_| "reload-plan: invalid candidate JSON")?;
+    if skip_payloads {
+        core_config::check_value_without_rule_set_payloads(&next)
+    } else {
+        core_config::check_str(&raw)
+    }
+    .map_err(|_| "reload-plan: candidate configuration rejected".to_string())?;
     let previous: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(current)
             .map_err(|_| "reload-plan: cannot read current configuration")?,
@@ -272,6 +279,7 @@ fn cmd_reload_plan(args: &[String]) -> Result<(), String> {
         "{}",
         serde_json::json!({
             "schema": 1, "in_place": core_runtime::can_reload_in_place(&previous, &next),
+            "rule_set_payloads_checked": !skip_payloads,
             "current_sha256": core_runtime::configuration_fingerprint(&previous),
             "config_sha256": core_runtime::configuration_fingerprint(&next)
         })
