@@ -11340,21 +11340,13 @@ const KNOWN_TAILSCALE_FIELDS: &[&str] = &[
     "control_url",
     "ephemeral",
     "hostname",
-    "accept_routes",
-    "exit_node",
-    "exit_node_allow_lan_access",
     "advertise_routes",
     "advertise_exit_node",
-    "advertise_tags",
     "listen_port",
-    "relay_server_port",
-    "relay_server_static_endpoints",
     "system_interface",
-    "system_interface_name",
     "system_interface_mtu",
     "udp_timeout",
     "ssh_server",
-    "taildrop_directory",
 ];
 
 /// reference `option.OpenConnectEndpointOptions` + wrapper.
@@ -12017,33 +12009,12 @@ fn tailscale_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
             return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
         }
     }
-    for f in [
-        "state_directory",
-        "auth_key",
-        "control_url",
-        "hostname",
-        "exit_node",
-        "system_interface_name",
-        "taildrop_directory",
-    ] {
+    for f in ["state_directory", "auth_key", "control_url", "hostname"] {
         if let Some(v) = obj.get(f) {
             ep_str(v, &format!("{at}.{f}"), TS_EP, f)?;
         }
     }
-    if let Some(v) = obj.get("exit_node_allow_lan_access") {
-        ep_bool(
-            v,
-            &format!("{at}.exit_node_allow_lan_access"),
-            TS_EP,
-            "exit_node_allow_lan_access",
-        )?;
-    }
-    for f in [
-        "ephemeral",
-        "accept_routes",
-        "advertise_exit_node",
-        "system_interface",
-    ] {
+    for f in ["ephemeral", "advertise_exit_node", "system_interface"] {
         if let Some(v) = obj.get(f) {
             ep_bool(v, &format!("{at}.{f}"), TS_EP, f)?;
         }
@@ -12056,28 +12027,6 @@ fn tailscale_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
             "listen_port",
             u16::MAX as u64,
         )?;
-    }
-    if let Some(v) = obj.get("relay_server_port") {
-        match v {
-            Value::Number(_) | Value::Null => {
-                ep_unsigned(
-                    v,
-                    &format!("{at}.relay_server_port"),
-                    TS_EP,
-                    "relay_server_port",
-                    u16::MAX as u64,
-                )?;
-            }
-            other => {
-                return Err(go_field_err(
-                    &format!("{at}.relay_server_port"),
-                    other,
-                    TS_EP,
-                    "relay_server_port",
-                    "uint16",
-                ));
-            }
-        }
     }
     if let Some(v) = obj.get("system_interface_mtu") {
         ep_unsigned(
@@ -12113,21 +12062,6 @@ fn tailscale_decode(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
         } else {
             return Err(format!(
                 "{at}.advertise_routes: json: cannot unmarshal {} into Go struct field TailscaleEndpointOptions.advertise_routes of type []netip.Prefix",
-                json_kind(v)
-            ));
-        }
-    }
-    if let Some(v) = obj.get("advertise_tags") {
-        check_listable_string(v, &format!("{at}.advertise_tags"))?;
-    }
-    if let Some(v) = obj.get("relay_server_static_endpoints")
-        && !v.is_null()
-    {
-        if v.is_array() {
-            check_listable_addr_port(v, &format!("{at}.relay_server_static_endpoints"))?;
-        } else {
-            return Err(format!(
-                "{at}.relay_server_static_endpoints: json: cannot unmarshal {} into Go struct field TailscaleEndpointOptions.relay_server_static_endpoints of type []netip.AddrPort",
                 json_kind(v)
             ));
         }
@@ -12586,33 +12520,6 @@ fn check_listable_addr(value: &Value, at: &str) -> Result<(), String> {
             let kind = json_kind(other);
             Err(format!(
                 "{at}: (json: cannot unmarshal {kind} into Go value of type string | json: cannot unmarshal {kind} into Go value of type **netip.Addr)"
-            ))
-        }
-    }
-}
-
-/// `badoption.Listable[netip.AddrPort]` decode.
-fn check_listable_addr_port(value: &Value, at: &str) -> Result<(), String> {
-    match value {
-        Value::Null | Value::String(_) => Ok(()),
-        Value::Array(items) => {
-            for (i, item) in items.iter().enumerate() {
-                match item {
-                    Value::Null | Value::String(_) => {}
-                    other => {
-                        return Err(format!(
-                            "{at}: (json: cannot unmarshal array into Go value of type **netip.AddrPort | [{i}]: json: cannot unmarshal {} into Go value of type netip.AddrPort)",
-                            json_kind(other)
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        }
-        other => {
-            let kind = json_kind(other);
-            Err(format!(
-                "{at}: (json: cannot unmarshal {kind} into Go value of type string | json: cannot unmarshal {kind} into Go value of type **netip.AddrPort)"
             ))
         }
     }
@@ -13142,11 +13049,6 @@ fn tailscale_initialize(_i: usize, _tag: &str, obj: &Map<String, Value>) -> Resu
                     .to_string(),
             );
         }
-    }
-    if ep_bool_val(obj, "advertise_exit_node") && !endpoint_str(obj, "exit_node").is_empty() {
-        return Err(
-            "cannot advertise an exit node and use an exit node at the same time.".to_string(),
-        );
     }
     Ok(())
 }
@@ -14375,7 +14277,7 @@ mod endpoint_probe_parity_tests {
         let err = validate(&cfg(r#"{"log":{"level":"warn"},"outbounds":[{"type":"direct","tag":"direct"}],"endpoints":[{"type":"tailscale","tag":"ts","relay_server_static_endpoints":5}]}"#)).unwrap_err();
         assert_eq!(
             err,
-            r#"endpoints[0].relay_server_static_endpoints: json: cannot unmarshal number into Go struct field TailscaleEndpointOptions.relay_server_static_endpoints of type []netip.AddrPort"#
+            r#"endpoints[0].relay_server_static_endpoints: json: unknown field "relay_server_static_endpoints""#
         );
     }
 
