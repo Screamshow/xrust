@@ -1181,6 +1181,16 @@ pub(crate) struct WsStream {
     mask_out: bool,
 }
 
+/// The buffers of a stream that ends go back the way the parking path hands
+/// them back: a connection that stops reading still holds what it read into,
+/// and that is the last chance to keep the allocation.
+impl Drop for WsStream {
+    fn drop(&mut self) {
+        WS_READ_POOL.give(std::mem::take(&mut self.rbuf));
+        WS_WRITE_POOL.give(std::mem::take(&mut self.wbuf));
+    }
+}
+
 /// What one read asks the socket for at least.
 const WS_READ: usize = 32 * 1024;
 

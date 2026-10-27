@@ -220,6 +220,26 @@ impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
         }
     }
 
+    /// A stream dropped without a shutdown still says close_notify, as Go's
+    /// `tls.Conn.Close` does (it is what Xray's client sends when a connection
+    /// ends: a 19-byte encrypted alert record before the FIN). There is no
+    /// waiting in a drop, so this is one attempt: whatever the socket takes
+    /// now.
+    fn say_close_notify(&mut self) {
+        if !self.owes_close_notify() {
+            return;
+        }
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        if !matches!(self.poll_drain(&mut cx), Poll::Ready(Ok(()))) {
+            // a record still half way out: an alert behind it would not parse
+            return;
+        }
+        if self.queue_close_notify().is_ok() {
+            let _ = self.poll_drain(&mut cx);
+            let _ = Pin::new(&mut self.inner).poll_flush(&mut cx);
+        }
+    }
+
     /// Seal close_notify into `wbuf`, to go out with `poll_drain`.
     fn queue_close_notify(&mut self) -> io::Result<()> {
         self.close_notify_sent = true;
@@ -540,24 +560,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for FingerprintStream<S> {
     }
 }
 
-/// A stream dropped without a shutdown still says close_notify, as Go's
-/// `tls.Conn.Close` does (it is what Xray's client sends when a connection
-/// ends: a 19-byte encrypted alert record before the FIN). There is no
-/// waiting in a drop, so this is one attempt: whatever the socket takes now.
 impl<S: AsyncWrite + Unpin> Drop for FingerprintStream<S> {
     fn drop(&mut self) {
-        if !self.owes_close_notify() {
-            return;
-        }
-        let mut cx = Context::from_waker(std::task::Waker::noop());
-        if !matches!(self.poll_drain(&mut cx), Poll::Ready(Ok(()))) {
-            // a record still half way out: an alert behind it would not parse
-            return;
-        }
-        if self.queue_close_notify().is_ok() {
-            let _ = self.poll_drain(&mut cx);
-            let _ = Pin::new(&mut self.inner).poll_flush(&mut cx);
-        }
+        self.say_close_notify();
+        // `park_buffers` hands these back while a connection waits, which
+        // leaves the end of one: a stream that stopped on an end of stream or
+        // an error still holds what it was reading into, and every connection
+        // ends exactly once.
+        READ_POOL.give(std::mem::take(&mut self.raw));
+        WRITE_POOL.give(std::mem::take(&mut self.wbuf));
     }
 }
 
