@@ -40,6 +40,9 @@ pub(crate) struct Transport {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod upgrade_tests;
+
 #[derive(Clone, Default)]
 enum Kind {
     #[default]
@@ -499,16 +502,26 @@ async fn read_response_head(stream: &mut AnyStream) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&head).into_owned())
 }
 
-fn append_headers(request: &mut String, headers: &[(String, String)]) {
-    for (name, value) in headers {
-        if name.eq_ignore_ascii_case("host") {
-            continue;
-        }
-        request.push_str(name);
-        request.push_str(": ");
-        request.push_str(value);
-        request.push_str("\r\n");
-    }
+fn push_header(request: &mut String, name: &str, value: &str) {
+    request.push_str(name);
+    request.push_str(": ");
+    request.push_str(value);
+    request.push_str("\r\n");
+}
+
+/// The configured `User-Agent`, which decides whether the browser headers go
+/// on the request at all and which profile they come from.
+fn configured_ua(headers: &[(String, String)]) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.as_str())
+}
+
+fn has_header(headers: &[(String, String)], name: &str) -> bool {
+    headers
+        .iter()
+        .any(|(set, _)| set.eq_ignore_ascii_case(name))
 }
 
 /// The ws early data settings of one outbound.
@@ -556,8 +569,12 @@ async fn ws_handshake(
     } else {
         early_data.header_name
     };
+    // With no `User-Agent` configured the upgrade request is dressed as a
+    // browser making a websocket request, as Xray's dialer does
+    // (`websocket/config.go` GetRequestHeader -> `TryDefaultHeadersWith(.., "ws")`).
+    let browser = browser::defaults(configured_ua(headers), browser::Variant::Ws);
     let mut request = String::with_capacity(
-        160 + path.len() + host.len() + key.len() + headers.len() * 48 + encoded.len(),
+        560 + path.len() + host.len() + key.len() + headers.len() * 48 + encoded.len(),
     );
     request.push_str("GET ");
     request.push_str(path);
@@ -575,16 +592,26 @@ async fn ws_handshake(
         if in_header && name.eq_ignore_ascii_case(header_name) {
             continue;
         }
-        request.push_str(name);
-        request.push_str(": ");
-        request.push_str(value);
-        request.push_str("\r\n");
+        if browser.replaces(name)
+            || (browser.drop_configured_ua && name.eq_ignore_ascii_case("user-agent"))
+        {
+            continue;
+        }
+        push_header(&mut request, name, value);
+    }
+    // The reference walks its header map here, so its order varies from
+    // request to request; a fixed order is what a browser has, so the set goes
+    // out in the order the profile builds it.
+    for (name, value) in &browser.force {
+        push_header(&mut request, browser::h1_name(name), value);
+    }
+    for (name, value) in &browser.fill {
+        if !has_header(headers, name) {
+            push_header(&mut request, browser::h1_name(name), value);
+        }
     }
     if in_header {
-        request.push_str(header_name);
-        request.push_str(": ");
-        request.push_str(&encoded);
-        request.push_str("\r\n");
+        push_header(&mut request, header_name, &encoded);
     }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await?;
@@ -782,13 +809,70 @@ async fn httpupgrade_handshake(
     host: &str,
     headers: &[(String, String)],
 ) -> io::Result<AnyStream> {
-    let mut request = String::with_capacity(80 + path.len() + host.len() + headers.len() * 48);
+    // Xray's dialer writes this request through Go's `net/http`, which puts
+    // `Host` and `User-Agent` first and the rest in name order, and it adds a
+    // `Sec-WebSocket-Key` and `Sec-WebSocket-Version` of its own on top of the
+    // browser `ws` headers (`httpupgrade/dialer.go`).
+    let browser = browser::defaults(configured_ua(headers), browser::Variant::Ws);
+    let mut set: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 16);
+    for (name, value) in headers {
+        if name.eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if browser.replaces(name)
+            || (browser.drop_configured_ua && name.eq_ignore_ascii_case("user-agent"))
+        {
+            continue;
+        }
+        set.push((name, value));
+    }
+    for (name, value) in &browser.force {
+        set.push((browser::h1_name(name), value));
+    }
+    for (name, value) in &browser.fill {
+        if !has_header(headers, name) {
+            set.push((browser::h1_name(name), value));
+        }
+    }
+    set.retain(|(name, _)| {
+        !name.eq_ignore_ascii_case("connection") && !name.eq_ignore_ascii_case("upgrade")
+    });
+    set.push(("Connection", "Upgrade"));
+    set.push(("Upgrade", "websocket"));
+    let key = if has_header(headers, "sec-websocket-key") {
+        String::new()
+    } else {
+        let mut key_bytes = [0u8; 16];
+        random_bytes(&mut key_bytes)?;
+        base64_std(&key_bytes)
+    };
+    if !key.is_empty() {
+        set.push(("Sec-WebSocket-Key", &key));
+    }
+    if !has_header(headers, "sec-websocket-version") {
+        set.push(("Sec-WebSocket-Version", "13"));
+    }
+    set.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+    let mut request = String::with_capacity(620 + path.len() + host.len() + headers.len() * 48);
     request.push_str("GET ");
     request.push_str(path);
     request.push_str(" HTTP/1.1\r\nHost: ");
     request.push_str(host);
-    request.push_str("\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n");
-    append_headers(&mut request, headers);
+    request.push_str("\r\n");
+    // `User-Agent` leaves the name order and goes right behind `Host`, as
+    // `Request.write` sends it.
+    if let Some((name, value)) = set
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+    {
+        push_header(&mut request, name, value);
+    }
+    for (name, value) in &set {
+        if name.eq_ignore_ascii_case("user-agent") {
+            continue;
+        }
+        push_header(&mut request, name, value);
+    }
     request.push_str("\r\n");
     stream.write_all(request.as_bytes()).await?;
     let response = read_response_head(&mut stream).await?;
