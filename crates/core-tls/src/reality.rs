@@ -25,9 +25,18 @@ use aes_gcm::{Aes256Gcm, Nonce};
 
 use crate::tls13::{self, Hash};
 
-/// The version triple REALITY clients write. The first byte is the major version
-/// and the second the minor; the third is a build number the servers ignore.
-pub const VERSION: [u8; 3] = [26, 3, 27];
+/// The client version a REALITY hello carries, sealed inside the session id.
+///
+/// Xray writes its own build there (`core.Version_x/y/z`, used by
+/// `transport/internet/reality/reality.go`), and its releases are dated, so a
+/// current client says `26.10.21`. A server authenticates a client only if the
+/// triple falls between `minClientVer` and `maxClientVer` when those are set
+/// (`XTLS/REALITY` `tls.go`); nothing else reads it, and nothing outside the
+/// server can, since the seal covers it. `minClientVer` is what operators
+/// actually set, to push clients forward, so this follows the Xray release the
+/// handshake is verified against and moves with it. Sing-Box X stays at
+/// `26.3.27`, which is where this constant came from.
+pub const VERSION: [u8; 3] = [26, 10, 21];
 
 /// Where a field sits inside a ClientHello *record*: the 5-byte record header
 /// and the 4-byte handshake header are both counted, which is why the same

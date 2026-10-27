@@ -64,6 +64,13 @@ fn generate(rng: &mut impl RngCore) -> Template {
     shuffle(&mut suites, rng);
     profile.cipher_suites = suites.into_iter().flatten().collect();
     profile.extensions.retain(|ext| {
+        // The base is the chrome table, and a chrome-shaped ECH GREASE inside
+        // an otherwise random hello says "chrome" louder than anything the
+        // draws below can hide. uTLS's randomized profiles, which the
+        // reference hands this name to, send no ECH at all.
+        if matches!(ext, Ext::EchGrease(_)) {
+            return false;
+        }
         // These independent extensions are optional. SNI, ALPN, versions,
         // signatures, groups and shares are kept intact, including the hybrid.
         !matches!(ext, Ext::Static(0x0005 | 0x0012 | 0x001b | 0x0023, _)) || rng.next_u32() & 1 == 0
@@ -97,6 +104,30 @@ mod tests {
         fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
             self.fill_bytes(dest);
             Ok(())
+        }
+    }
+
+    /// The randomized profile carries no ECH GREASE: the reference's
+    /// randomized profiles send none, and a chrome-shaped one would name the
+    /// table this profile is built from.
+    #[test]
+    fn a_generated_profile_sends_no_ech() {
+        assert!(
+            fingerprints::chrome()
+                .extensions
+                .iter()
+                .any(|ext| matches!(ext, Ext::EchGrease(_))),
+            "the chrome table is the base and does carry it"
+        );
+        let mut rng = Draws(11);
+        for _ in 0..32 {
+            let profile = generate(&mut rng);
+            assert!(
+                !profile
+                    .extensions
+                    .iter()
+                    .any(|ext| matches!(ext, Ext::EchGrease(_)))
+            );
         }
     }
 
