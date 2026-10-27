@@ -254,7 +254,9 @@ impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
             return false;
         }
         self.direct_write = true;
-        self.wbuf = Vec::new();
+        // nothing is half way out, so the record buffer is dead from here:
+        // back to the pool, as `park_buffers` hands it back
+        WRITE_POOL.give(std::mem::take(&mut self.wbuf));
         true
     }
 
@@ -291,9 +293,13 @@ impl<S: AsyncWrite + Unpin> FingerprintStream<S> {
     }
 }
 
+/// Hand a drained read buffer back to the pool. Direct reads come off the
+/// transport into the caller's buffer, so this one is dead for the rest of the
+/// connection -- and a connection that goes Direct is exactly the one whose
+/// buffer the next connection could be using.
 fn release_drained_raw(raw: &mut Vec<u8>, rpos: &mut usize) {
     if *rpos == raw.len() {
-        *raw = Vec::new();
+        READ_POOL.give(std::mem::take(raw));
         *rpos = 0;
     }
 }
