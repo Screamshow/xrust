@@ -45,6 +45,89 @@ fn compatible() -> bool {
             .status()
             .is_ok_and(|s| s.success())
 }
+/// Identity of a file for change detection: inode, size and change times.
+type FileStamp = (u64, u64, i64, i64, i64);
+
+#[cfg(unix)]
+fn file_stamp(path: &str) -> Option<FileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+    ))
+}
+
+#[cfg(not(unix))]
+fn file_stamp(_path: &str) -> Option<FileStamp> {
+    None
+}
+
+/// Everything `compatible()` reads. The full check (three processes) runs
+/// again only when one of these files changes.
+fn compatibility_stamp() -> Vec<Option<FileStamp>> {
+    [
+        "/etc/forkop/sing-box-variant",
+        "/usr/lib/rust-x/sing-box",
+        "/usr/lib/forkop/core/constants.uc",
+        "/usr/lib/forkop/tailscale/compat.uc",
+    ]
+    .into_iter()
+    .map(file_stamp)
+    .collect()
+}
+
+/// Interface index of a device, `None` when it does not exist.
+fn ifindex(device: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{device}/ifindex"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Devices of the IPv4 and IPv6 default routes in /proc/net/route and
+/// /proc/net/ipv6_route text.
+fn default_route_devices(ipv4: &str, ipv6: &str) -> std::collections::BTreeSet<String> {
+    let mut devices = std::collections::BTreeSet::new();
+    for line in ipv4.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Iface Destination Gateway Flags RefCnt Use Metric Mask ...
+        if fields.len() > 7 && fields[1] == "00000000" && fields[7] == "00000000" {
+            devices.insert(fields[0].to_owned());
+        }
+    }
+    for line in ipv6.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // destination, prefix length, ..., device last
+        if fields.len() >= 10 && fields[1] == "00" && fields[0].bytes().all(|b| b == b'0') {
+            devices.insert(fields[9].to_owned());
+        }
+    }
+    devices
+}
+
+/// What the network helpers set up against: the default route devices with
+/// their interface indexes (a reconnected PPPoE link gets a new one), the
+/// tailnet device, and IPv4 forwarding. Read from /proc and /sys, no process.
+fn network_signature() -> String {
+    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    let devices = default_route_devices(&read("/proc/net/route"), &read("/proc/net/ipv6_route"));
+    let mut signature = String::new();
+    for device in devices.iter().map(String::as_str).chain(["forkop-tslan"]) {
+        signature.push_str(&format!("{device}:{:?} ", ifindex(device)));
+    }
+    signature.push_str(read("/proc/sys/net/ipv4/ip_forward").trim());
+    signature
+}
+
+/// The helpers also repair rules a firewall reload removed; nothing reports
+/// that reload, so they run at least this often.
+const NETWORK_RESYNC: Duration = Duration::from_secs(10);
+
 fn cleanup_network() {
     // Embedded: an old incoming Forkop package removes the newer helper files.
     let script = r#"
@@ -78,6 +161,22 @@ fi
         .args(["-c", script])
         .status();
 }
+/// Remove the procd instance so it is not respawned. An exit alone is
+/// restarted every 10 s; for a refused key that repeats the refusal against
+/// the control server and flips the LuCI status. Connect starts it again.
+fn stay_stopped() {
+    let _ = std::process::Command::new("ubus")
+        .args([
+            "call",
+            "service",
+            "delete",
+            "{\"name\":\"forkop-tailscale\"}",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
 fn status(value: serde_json::Value) -> std::io::Result<()> {
     std::fs::write(format!("{STATUS}.new"), value.to_string())?;
     std::fs::rename(format!("{STATUS}.new"), STATUS)
@@ -90,14 +189,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let result = tokio::select! {
         result = run_inner() => result,
         _ = async {
+            let mut checked = compatibility_stamp();
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
+                let now = compatibility_stamp();
+                if now == checked { continue }
+                checked = now;
                 if !compatible() { break }
             }
         } => {
             cleanup_network();
             let _ = status(serde_json::json!({"state":"disconnected", "message":"Требуются Forkop 2.3.4 или новее и совместимый Rust X"}));
-            let _ = std::process::Command::new("ubus").args(["call", "service", "delete", "{\"name\":\"forkop-tailscale\"}"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status();
+            stay_stopped();
             Ok(())
         }
     };
@@ -155,6 +258,7 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         "Ключ отклонён или требуется авторизация устройства в Tailscale."
                     }}))?;
+                    stay_stopped();
                     return Ok(());
                 }
                 status(
@@ -169,26 +273,36 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
-    loop {
-        if Path::new("/var/run/forkop/ui-state/tailscale-stopping").exists() {
-            break;
-        }
-        let udp_ready = std::process::Command::new("/usr/lib/forkop/tailscale/transport.sh")
+    let helper = |path: &str| {
+        std::process::Command::new(path)
             .arg("setup")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|s| s.success());
-        let lan_ready = if lan_config.is_some() || exit_enabled {
-            std::process::Command::new("/usr/lib/forkop/tailscale/lan.sh")
-                .arg("setup")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        } else {
-            true
-        };
+            .is_ok_and(|s| s.success())
+    };
+    let (mut udp_ready, mut lan_ready) = (false, false);
+    let mut synced: Option<(String, std::time::Instant)> = None;
+    loop {
+        if Path::new("/var/run/forkop/ui-state/tailscale-stopping").exists() {
+            break;
+        }
+        // Run the helpers (a dozen processes each) when the network they set
+        // up against changes and every NETWORK_RESYNC; a missing route or
+        // tailnet device shows up as a change once it appears.
+        let signature = network_signature();
+        let due = synced
+            .as_ref()
+            .is_none_or(|(last, at)| *last != signature || at.elapsed() >= NETWORK_RESYNC);
+        if due {
+            udp_ready = helper("/usr/lib/forkop/tailscale/transport.sh");
+            lan_ready = if lan_config.is_some() || exit_enabled {
+                helper("/usr/lib/forkop/tailscale/lan.sh")
+            } else {
+                true
+            };
+            synced = Some((signature, std::time::Instant::now()));
+        }
         if shared
             .cmd_tx
             .send(super::engine::Cmd::UpdateForwardingReady { ready: lan_ready })
@@ -216,6 +330,18 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_route_devices_come_from_both_tables() {
+        let ipv4 = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n\
+            wan\t00000000\t0101A8C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n\
+            br-lan\t0001A8C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n";
+        let ipv6 = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 pppoe-wan\n\
+            fd000000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 br-lan\n";
+        let devices: Vec<String> = default_route_devices(ipv4, ipv6).into_iter().collect();
+        assert_eq!(devices, ["pppoe-wan", "wan"]);
+        assert!(default_route_devices("", "").is_empty());
+    }
+
     #[test]
     fn retry_status_does_not_echo_server_or_transport_secrets() {
         let secret_error = std::io::Error::other("server echoed tskey-auth-test-secret");
