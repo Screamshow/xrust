@@ -134,7 +134,11 @@ async fn encoded_slash_names_support_lookup_selection_and_delay() {
         response.status, 503,
         "encoded name must reach the delay handler and report the refused target"
     );
-    assert!(response.json().get("message").is_some());
+    let message = response.json()["message"].as_str().unwrap().to_string();
+    assert!(
+        message.starts_with("could not connect:"),
+        "a refused target is named as such, not hidden behind one message: {message}"
+    );
     // a group answers with the members that responded (none here), as the
     // reference does; an unknown name would be 404
     let response = request(addr, &authed(&format!("/group/Group%2FA/delay{query}"))).await;
@@ -460,7 +464,11 @@ async fn clash_api_rest_surface() {
     )
     .await;
     assert_eq!(res.status, 503);
-    assert_eq!(res.json()["message"], "An error occurred in the delay test");
+    assert_eq!(
+        res.json()["message"],
+        "the probe url is not http or https",
+        "the probe says what was wrong with it, not just that something was"
+    );
 
     // --- keep-alive: two requests on one connection ---------------------
     let mut stream = TcpStream::connect(addr).await.expect("connect");

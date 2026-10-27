@@ -192,13 +192,23 @@ async fn manual_group_and_background_tests_authenticate_the_site() {
                 label == "trusted",
                 "background: {label}"
             );
-            let (status, _) =
+            let (status, body) =
                 api(addr, &format!("/proxies/node/delay?timeout=2000&url={url}")).await;
             assert_eq!(
                 status,
                 if label == "trusted" { 200 } else { 503 },
                 "proxy: {label}"
             );
+            if label != "trusted" {
+                // the cert is the problem, and the answer has to say so: an
+                // untrusted probe target and an unreachable node are different
+                // things to act on
+                let message = body["message"].as_str().unwrap_or_default();
+                assert!(
+                    message.starts_with("TLS handshake failed:"),
+                    "proxy: {label}: {body}"
+                );
+            }
             // `/group` lists only the members that passed.
             let (status, result) = api(
                 addr,

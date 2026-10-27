@@ -1548,7 +1548,9 @@ async fn delay_test(
         &mut order,
     );
     enum Outcome {
-        Delay(Option<u16>),
+        Delay(u16),
+        /// the probe said why, where it got far enough to know
+        Failed(Option<ProbeFail>),
         /// `/group`: member → delay
         Members(Value),
         Timeout,
@@ -1569,41 +1571,53 @@ async fn delay_test(
             let sem = sem.clone();
             tasks.spawn(async move {
                 let probe = async {
-                    let _permit = sem.acquire().await.ok()?;
+                    let _permit = sem.acquire().await.map_err(|_| ProbeFail::Closed)?;
                     probe_delay(&router, leaf, &url).await
                 };
                 let result = tokio::time::timeout_at(expires, probe).await;
-                (
-                    leaf,
-                    result.as_ref().ok().copied().flatten().filter(|ms| *ms > 0),
-                    result.is_err(),
-                )
+                let timed_out = result.is_err();
+                let (ms, fail) = match result {
+                    Ok(Ok(ms)) if ms > 0 => (Some(ms), None),
+                    Ok(Ok(_)) => (None, None),
+                    Ok(Err(fail)) => (None, Some(fail)),
+                    Err(_) => (None, None),
+                };
+                (leaf, ms, timed_out, fail)
             });
         }
         let mut results = std::collections::HashMap::new();
+        let mut fails: std::collections::HashMap<usize, ProbeFail> =
+            std::collections::HashMap::new();
         let mut timed_out = false;
         while let Some(task) = tasks.join_next().await {
-            if let Ok((leaf, ms, timeout)) = task {
+            if let Ok((leaf, ms, timeout, fail)) = task {
                 timed_out |= timeout;
                 results.insert(leaf, ms);
+                if let Some(fail) = fail {
+                    fails.insert(leaf, fail);
+                }
             }
         }
         if !Arc::ptr_eq(&inner, &router.inner()) {
             return Outcome::Timeout;
         }
         for &node in &order {
-            let ms = match &inner.outbounds[node] {
+            // a group answers with its selected member, and so does the
+            // member's reason for having no answer
+            let source = match &inner.outbounds[node] {
                 Outbound::Urltest(group) => {
                     group.apply_probe_results(router, &results);
-                    inner
-                        .index_of(group.now())
-                        .and_then(|member| results.get(&member).copied().flatten())
+                    inner.index_of(group.now())
                 }
-                Outbound::Selector(group) => inner
-                    .index_of(group.now())
-                    .and_then(|member| results.get(&member).copied().flatten()),
-                _ => results.get(&node).copied().flatten(),
+                Outbound::Selector(group) => inner.index_of(group.now()),
+                _ => Some(node),
             };
+            let ms = source.and_then(|from| results.get(&from).copied().flatten());
+            if ms.is_none()
+                && let Some(fail) = source.and_then(|from| fails.get(&from).cloned())
+            {
+                fails.insert(node, fail);
+            }
             results.insert(node, ms);
             if let Some(ms) = ms {
                 inner.record_delay(node, ms.into());
@@ -1626,9 +1640,10 @@ async fn delay_test(
                 .collect();
             return Outcome::Members(Value::Object(map));
         }
-        match results.get(&index).copied().flatten() {
+        match results.get(&index).copied().flatten().filter(|ms| *ms > 0) {
+            Some(ms) => Outcome::Delay(ms),
             None if timed_out => Outcome::Timeout,
-            ms => Outcome::Delay(ms),
+            None => Outcome::Failed(fails.remove(&index)),
         }
     };
     match test.await {
@@ -1639,19 +1654,59 @@ async fn delay_test(
             }
             respond_json(stream, 504, "Gateway Timeout", &timeout_err(), cors).await
         }
-        Outcome::Delay(None | Some(0)) => {
+        Outcome::Failed(fail) => {
             router.clear_delay(index);
-            respond_json(stream, 503, "Service Unavailable", &delay_err(), cors).await
+            respond_json(
+                stream,
+                503,
+                "Service Unavailable",
+                &delay_err(fail.as_ref()),
+                cors,
+            )
+            .await
         }
-        Outcome::Delay(Some(delay)) => {
+        Outcome::Delay(delay) => {
             router.record_delay(index, delay.into());
             respond_json(stream, 200, "OK", &json!({"delay": delay}), cors).await
         }
     }
 }
 
-async fn probe_delay(router: &Router, index: usize, url: &str) -> Option<u16> {
-    let (tls, host, port, authority, path) = parse_link(url)?;
+/// Why a delay probe came back without a number.
+///
+/// The reference answers the probe with its own error, and one message for
+/// every outcome costs the operator the difference that matters: a node that
+/// is down, a line that blocks the handshake, and a peer that answers with
+/// nonsense all look the same from the UI otherwise.
+#[derive(Clone)]
+enum ProbeFail {
+    Url,
+    Dial(String),
+    Tls(String),
+    Write(String),
+    Closed,
+    Read(String),
+    Status(String),
+    TooSlow,
+}
+
+impl ProbeFail {
+    fn message(&self) -> String {
+        match self {
+            Self::Url => "the probe url is not http or https".into(),
+            Self::Dial(e) => format!("could not connect: {e}"),
+            Self::Tls(e) => format!("TLS handshake failed: {e}"),
+            Self::Write(e) => format!("could not send the request: {e}"),
+            Self::Closed => "the peer closed before answering".into(),
+            Self::Read(e) => format!("the connection broke while reading: {e}"),
+            Self::Status(line) => format!("not an HTTP status line: {line:?}"),
+            Self::TooSlow => "the answer took longer than a delay can report".into(),
+        }
+    }
+}
+
+async fn probe_delay(router: &Router, index: usize, url: &str) -> Result<u16, ProbeFail> {
+    let (tls, host, port, authority, path) = parse_link(url).ok_or(ProbeFail::Url)?;
     let target = Target::Domain(host.clone(), port);
     let mut start = Instant::now();
     let dialled = router.connect_index(index, &target).await;
@@ -1659,7 +1714,7 @@ async fn probe_delay(router: &Router, index: usize, url: &str) -> Option<u16> {
         Ok(crate::inbound::Conn::Plain(conn)) => conn,
         Err(e) => {
             crate::logging::debug(format_args!("delay[{index}]: dial {host}:{port}: {e}"));
-            return None;
+            return Err(ProbeFail::Dial(e.to_string()));
         }
     };
     let dial_ms = start.elapsed();
@@ -1668,7 +1723,7 @@ async fn probe_delay(router: &Router, index: usize, url: &str) -> Option<u16> {
             Ok(s) => s,
             Err(e) => {
                 crate::logging::debug(format_args!("delay[{index}]: tls {host}: {e}"));
-                return None;
+                return Err(ProbeFail::Tls(e.to_string()));
             }
         }
     } else {
@@ -1678,7 +1733,10 @@ async fn probe_delay(router: &Router, index: usize, url: &str) -> Option<u16> {
         start = Instant::now();
     }
     let request = format!("HEAD {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).await.ok()?;
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(|e| ProbeFail::Write(e.to_string()))?;
     crate::logging::debug(format_args!("delay[{index}]: HEAD sent to {authority}"));
     // One read per chunk, not one per byte: the status line crosses a
     // boxed stream plus a TLS record layer, and the byte-at-a-time loop
@@ -1690,7 +1748,8 @@ async fn probe_delay(router: &Router, index: usize, url: &str) -> Option<u16> {
             break;
         }
         match stream.read(&mut buf).await {
-            Ok(0) | Err(_) => return None,
+            Ok(0) => return Err(ProbeFail::Closed),
+            Err(e) => return Err(ProbeFail::Read(e.to_string())),
             Ok(n) => status.extend_from_slice(&buf[..n]),
         }
     }
@@ -1699,8 +1758,10 @@ async fn probe_delay(router: &Router, index: usize, url: &str) -> Option<u16> {
         "delay[{index}]: dial {}ms status line {text:?}",
         dial_ms.as_millis()
     ));
-    let _ = text.split_whitespace().nth(1)?;
-    u16::try_from(start.elapsed().as_millis()).ok()
+    text.split_whitespace()
+        .nth(1)
+        .ok_or_else(|| ProbeFail::Status(text.trim_end().to_string()))?;
+    u16::try_from(start.elapsed().as_millis()).map_err(|_| ProbeFail::TooSlow)
 }
 
 /// Minimal URL split: `(tls, host, port, authority, path-with-query)`.
@@ -1977,8 +2038,13 @@ fn timeout_err() -> Value {
     json!({"message": "Timeout"})
 }
 
-fn delay_err() -> Value {
-    json!({"message": "An error occurred in the delay test"})
+/// The reference puts the probe's own error in `message`; the generic text is
+/// the fallback for a node the probe never got to run against.
+fn delay_err(fail: Option<&ProbeFail>) -> Value {
+    match fail {
+        Some(fail) => json!({"message": fail.message()}),
+        None => json!({"message": "An error occurred in the delay test"}),
+    }
 }
 
 async fn respond_json(
