@@ -175,6 +175,39 @@ async fn every_packet_sniffer_names_its_protocol() {
 }
 
 #[tokio::test]
+async fn wireguard_initiation_is_not_blocked_as_bittorrent_but_utp_still_is() {
+    for sniff in [
+        json!({"action": "sniff"}),
+        json!({"action": "sniff", "sniffer": ["bittorrent"]}),
+    ] {
+        let router = router(json!([
+            sniff,
+            {"protocol": "bittorrent", "action": "reject"}
+        ]));
+        // WireGuard initiation's fixed 148-byte layout starts with type=1
+        // and three reserved zero bytes; uTP otherwise reads this as DATA v1.
+        let mut initiation = vec![0x5au8; 148];
+        initiation[..4].copy_from_slice(&[1, 0, 0, 0]);
+        let original = initiation.clone();
+        let mut ctx = context("lan", 51820);
+        let decision = router.route_datagrams(&mut ctx, &[&initiation]).await;
+        assert!(matches!(decision, Ok(Decision::Outbound(_))));
+        assert_eq!(ctx.protocol, None);
+        assert_eq!(initiation, original, "sniffing must not rewrite the packet");
+
+        // Same-sized real uTP DATA, with a nonzero connection id, remains
+        // BitTorrent. A SYN with its extension chain remains recognized too.
+        let mut data = vec![0x5au8; 148];
+        data[..4].copy_from_slice(&[0x01, 0, 0x12, 0x34]);
+        for packet in [data, utp()] {
+            let mut ctx = context("lan", 4000);
+            assert!(router.route_datagrams(&mut ctx, &[&packet]).await.is_err());
+            assert_eq!(ctx.protocol.as_deref(), Some("bittorrent"));
+        }
+    }
+}
+
+#[tokio::test]
 async fn near_misses_are_left_alone() {
     let router = router(json!([{"action": "sniff"}]));
     let mut late_ntp = ntp();

@@ -457,12 +457,22 @@ async fn probe_once(shared: &Shared, router: &Router, member: usize, attempt: u8
         // that round trip ~200 times for every probe in the round.
         let mut head = Vec::with_capacity(256);
         let mut buf = [0u8; 1024];
-        while !head.ends_with(b"\r\n\r\n") {
+        loop {
             match stream.read(&mut buf).await {
                 Ok(0) | Err(_) => return ProbeAttempt::Retry,
                 Ok(n) => head.extend_from_slice(&buf[..n]),
             }
-            if head.len() > 16 * 1024 {
+            if let Some(end) = head.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let end = end + 4;
+                if end > 16 * 1024 {
+                    return ProbeAttempt::Fail;
+                }
+                // A read may include the start of the body. The response head
+                // is complete even when CRLF CRLF is not at the end of it.
+                head.truncate(end);
+                break;
+            }
+            if head.len() >= 16 * 1024 {
                 return ProbeAttempt::Fail;
             }
         }

@@ -964,6 +964,12 @@ impl PostWriter {
     /// Send one upload chunk as a single sequenced POST (reference
     /// `packetConn.sendPacket`).
     async fn send_packet(&mut self, chunk: &[u8]) -> io::Result<()> {
+        self.send_packet_with_body(chunk, None).await
+    }
+
+    /// `body` may share the worker's immutable buffer for H2 Body uploads.
+    /// Borrowed callers and header/cookie placements keep their existing path.
+    async fn send_packet_with_body(&mut self, chunk: &[u8], body: Option<Bytes>) -> io::Result<()> {
         let seq = self.seq;
         self.seq += 1;
         // One line per packet-up POST: which sequence number went out and how much
@@ -978,7 +984,7 @@ impl PostWriter {
             self.cfg.meta.uplink_data
         ));
         let payload = match self.cfg.meta.uplink_data {
-            UplinkPlacement::Body => Some(Bytes::copy_from_slice(chunk)),
+            UplinkPlacement::Body => Some(body.unwrap_or_else(|| Bytes::copy_from_slice(chunk))),
             UplinkPlacement::Header | UplinkPlacement::Cookie => None,
         };
         let mut req = self.cfg.build_request(
@@ -1556,6 +1562,19 @@ impl Drop for SplitConn {
     }
 }
 
+/// Recover only uniquely owned storage. An early response can leave H2 holding
+/// DATA references; fall back to copying for the rest of this session rather
+/// than accumulating full-size shared buffers on subsequent small POSTs.
+fn reclaim_upload_buffer(owner: Bytes, size: usize, reuse: &mut bool) -> BytesMut {
+    match owner.try_into_mut() {
+        Ok(buf) => buf,
+        Err(_) => {
+            *reuse = false;
+            BytesMut::zeroed(size)
+        }
+    }
+}
+
 /// Background worker reading from the write pipe and uploading sequential POST packets.
 async fn packet_upload_worker(
     mut reader: tokio::io::DuplexStream,
@@ -1566,7 +1585,9 @@ async fn packet_upload_worker(
 ) {
     let max_each = writer.cfg.meta.sc_max_each_post.rand().max(1) as usize;
     let min_interval = std::time::Duration::from_millis(writer.cfg.meta.sc_min_interval_ms.rand());
-    let mut buf = vec![0u8; max_each];
+    let mut buf = BytesMut::zeroed(max_each);
+    let mut reuse_h2_body =
+        writer.h2_client.is_some() && writer.cfg.meta.uplink_data == UplinkPlacement::Body;
     let mut last_post: Option<std::time::Instant> = None;
 
     loop {
@@ -1606,7 +1627,19 @@ async fn packet_upload_worker(
         }
         last_post = Some(std::time::Instant::now());
 
-        if let Err(e) = writer.send_packet(&buf[..n]).await {
+        let sent = if reuse_h2_body {
+            let owner = std::mem::take(&mut buf).freeze();
+            let result = writer
+                .send_packet_with_body(&owner[..n], Some(owner.slice(..n)))
+                .await;
+            if result.is_ok() {
+                buf = reclaim_upload_buffer(owner, max_each, &mut reuse_h2_body);
+            }
+            result
+        } else {
+            writer.send_packet(&buf[..n]).await
+        };
+        if let Err(e) = sent {
             crate::logging::debug(format_args!("xhttp packet upload failed: {e}"));
             failure.set(e);
             break;
@@ -1887,6 +1920,10 @@ fn base64_url(data: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "xhttp_upload_buffer_tests.rs"]
+mod upload_buffer_tests;
 
 #[cfg(test)]
 mod tests {

@@ -453,6 +453,13 @@ fn sniff_utp(p: &[u8], ctx: &mut ConnContext) -> bool {
     if p.len() < 20 || p[0] & 0x0f != 1 || p[0] >> 4 > 4 {
         return false;
     }
+    // A WireGuard initiation is exactly 148 bytes: type 1 followed by three
+    // reserved zero bytes. Those bytes also look like uTP DATA v1 with no
+    // extension and connection id 0. Leave this ambiguous shape unclassified
+    // rather than send a LAN tunnel into BitTorrent routing/blocking rules.
+    if p.len() == 148 && p[..4] == [1, 0, 0, 0] {
+        return false;
+    }
     let mut extension = p[1];
     let mut pos = 20;
     while extension != 0 {

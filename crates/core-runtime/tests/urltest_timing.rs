@@ -7,6 +7,67 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+#[tokio::test]
+async fn background_probe_accepts_headers_followed_by_body_without_waiting_for_eof() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for split in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/health", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request).await;
+                count.fetch_add(1, Ordering::SeqCst);
+                let head = b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n";
+                let mut tail = Vec::new();
+                if split {
+                    stream.write_all(&head[..head.len() - 2]).await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    tail.extend_from_slice(&head[head.len() - 2..]);
+                } else {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    tail.extend_from_slice(head);
+                }
+                tail.extend_from_slice(b"healthy!");
+                stream.write_all(&tail).await.unwrap();
+                // A complete response is enough; the probe must not wait for EOF.
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+        let instance = core_runtime::start(&json!({
+            "log": {"level": "error"},
+            "experimental": {"clash_api": {"external_controller": "127.0.0.1:0"}},
+            "outbounds": [
+                {"type": "direct", "tag": "node"},
+                {"type": "urltest", "tag": "provider", "outbounds": ["node"], "url": url, "interval": "1h"}
+            ], "route": {"final": "node"}
+        })).await.unwrap();
+        let addr = instance.clash_api_addr().unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(800), async {
+            loop {
+                let (_, node) = api(addr, "/proxies/node").await;
+                if let Some(delay) = node["history"].as_array().unwrap().last() {
+                    break delay["delay"].as_u64().unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        instance.shutdown_wait().await;
+        server.abort();
+        let delay = result.expect("a body after the headers must not turn a live node into N/A");
+        assert!((1..800).contains(&delay), "unexpected delay {delay}");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a valid response needs no retry"
+        );
+    }
+}
+
 async fn tls_server(mut pem: &[u8], setup: Duration) -> (String, tokio::task::JoinHandle<()>) {
     core_tls::install_default_provider();
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut pem)
