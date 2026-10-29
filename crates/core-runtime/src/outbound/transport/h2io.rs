@@ -1381,14 +1381,14 @@ async fn h2_idle_expired(counter: &H2Counter, limit: std::time::Duration) -> &'s
 pub(crate) struct ReadClock {
     base: tokio::time::Instant,
     /// milliseconds since `base`
-    last: std::sync::atomic::AtomicU64,
+    last: portable_atomic::AtomicU64,
 }
 
 impl ReadClock {
     pub(crate) fn new() -> Self {
         Self {
             base: tokio::time::Instant::now(),
-            last: std::sync::atomic::AtomicU64::new(0),
+            last: portable_atomic::AtomicU64::new(0),
         }
     }
 

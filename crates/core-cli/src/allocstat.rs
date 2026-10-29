@@ -1,4 +1,4 @@
-//! Feature `allocstat`: a counting allocator wrapped around mimalloc, dumping
+//! Feature `allocstat`: a counting allocator wrapped around the native allocator, dumping
 //! one line per second to `/tmp/xrust-allocstat.txt` while `XRUST_ALLOCSTAT`
 //! is set. The bench needs to know where the heap actually sits -- live bytes
 //! and objects by size class, plus allocation churn -- which no amount of
@@ -6,10 +6,16 @@
 //! Counters are plain relaxed atomics on the alloc/free path and are compiled
 //! in only under the feature, so the shipped binary pays nothing.
 
+use portable_atomic::AtomicU64;
 use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::Ordering::Relaxed;
+
+#[cfg(target_arch = "x86_64")]
+const BASE_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(not(target_arch = "x86_64"))]
+const BASE_ALLOCATOR: std::alloc::System = std::alloc::System;
 
 const BUCKETS: usize = 40;
 /// Everything at or above this is counted by its exact size: the buckets say
@@ -84,7 +90,7 @@ pub struct Counting;
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let p = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        let p = unsafe { BASE_ALLOCATOR.alloc(layout) };
         if !p.is_null() {
             add(layout.size());
         }
@@ -92,12 +98,12 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) };
+        unsafe { BASE_ALLOCATOR.dealloc(ptr, layout) };
         sub(layout.size());
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let p = unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) };
+        let p = unsafe { BASE_ALLOCATOR.realloc(ptr, layout, new_size) };
         if !p.is_null() {
             sub(layout.size());
             add(new_size);

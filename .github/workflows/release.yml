@@ -54,16 +54,31 @@ jobs:
           - name: aarch64
             target: aarch64-unknown-linux-musl
             budget: 12582912
+          - name: mipsel
+            target: mipsel-unknown-linux-musl
+            budget: 12582912
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag || github.ref }}
 
       - name: Toolchain (prebuilt std)
+        if: ${{ matrix.name != 'mipsel' }}
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+
+      - name: MIPS Rust sources and OpenWrt toolchain
+        if: ${{ matrix.name == 'mipsel' }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: rust-src
+
+      - name: Verified MIPS cross compiler
+        if: ${{ matrix.name == 'mipsel' }}
+        run: echo "MIPS_TOOLCHAIN=$(bash scripts/openwrt_mips_toolchain.sh)" >> "$GITHUB_ENV"
 
       # Link musl with rust-lld where needed. Skipped for aarch64 because .cargo/config.toml
       # already configures rustflags with ARMv8 assembly features + neon + rust-lld.
@@ -83,7 +98,19 @@ jobs:
       - name: Build
         shell: bash
         run: |
-          cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
+          if [ '${{ matrix.name }}' = mipsel ]; then
+            bash scripts/build_mips_openwrt.sh
+          else
+            cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
+          fi
+
+      - name: MIPS 24Kc executable smoke test
+        if: ${{ matrix.name == 'mipsel' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+          qemu-mipsel -cpu 24Kc -L "$MIPS_TOOLCHAIN" target/mipsel-unknown-linux-musl/release/xrust version
+          python3 scripts/test_mips_runtime.py --qemu qemu-mipsel --sysroot "$MIPS_TOOLCHAIN" --binary target/mipsel-unknown-linux-musl/release/xrust
 
       - name: Size budget
         shell: bash

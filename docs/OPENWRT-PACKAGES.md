@@ -1,5 +1,13 @@
 # Xrust OpenWrt packages
 
+For the 0.0.29 dev candidate, supported package architectures are
+`aarch64_generic`, `aarch64_cortex-a53`, `aarch64_cortex-a73`, `x86_64` and
+`mipsel_24kc`, each in APK and IPK. MIPS additionally requires the firmware's
+`libc` and `libgcc`; no foreign firmware dependencies are bundled. MIPS uses
+MIPS32r2 O32 little-endian soft-float. See
+[preparation and hardware limitations](mipsel-openwrt-preparation-2026-10-29.md).
+The following section records the initial 0.0.1 packaging baseline.
+
 Xrust 0.0.1 has APK `0.0.1-r1` for OpenWrt 25 and IPK `0.0.1-1`
 for OpenWrt 24. Architectures: `aarch64_cortex-a53` (ARM64) and `x86_64`.
 The payload uses the existing release binaries without UPX compression.

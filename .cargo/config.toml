@@ -1,4 +1,4 @@
-# Supported Rust X release targets: OpenWrt x86_64 and aarch64.
+# Supported Rust X release targets: OpenWrt x86_64, aarch64 and MIPS 24Kc.
 # ARM crypto cfgs retain runtime CPU detection; x86 uses a generic baseline.
 
 [target.aarch64-unknown-linux-musl]
@@ -33,3 +33,10 @@ rustflags = [
 [target.x86_64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = ["-C", "target-feature=+crt-static", "-C", "link-self-contained=yes", "-C", "target-cpu=x86-64", "-C", "link-arg=--icf=safe", "-C", "link-arg=-z", "-C", "link-arg=noseparate-code", "-C", "link-arg=-z", "-C", "link-arg=norelro"]
+
+# MT7628/24Kc: the Rust target already selects MIPS32r2, O32, little endian
+# and soft-float. Use the matching OpenWrt CRT/libc through its GCC driver;
+# this Tier 3 target needs std built from the toolchain's matching sources.
+# musl/libgcc are native firmware dependencies; ARM64/x86 remain static.
+[target.mipsel-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static", "-C", "link-self-contained=no", "-C", "force-unwind-tables=no"]

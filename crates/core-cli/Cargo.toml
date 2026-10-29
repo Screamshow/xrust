@@ -21,9 +21,10 @@ full = [
     "core-runtime/full",
 ]
 # counting allocator + per-second heap dump, see src/allocstat.rs
-allocstat = ["core-runtime/allocstat"]
+allocstat = ["core-runtime/allocstat", "dep:portable-atomic"]
 
 [dependencies]
+portable-atomic = { version = "1", optional = true }
 core-config = { path = "../core-config", default-features = false }
 core-runtime = { path = "../core-runtime", default-features = false }
 serde_json.workspace = true

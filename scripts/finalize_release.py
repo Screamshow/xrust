@@ -25,11 +25,12 @@ def validate(directory, version, signed=False):
     if manifest['version'] != version:
         raise ValueError('Unexpected manifest version')
     assets = manifest['assets']
-    expected = {(arch, fmt) for arch in ('x86_64', 'aarch64_cortex-a53') for fmt in ('apk', 'ipk')}
-    beam = {(arch, fmt) for arch in ('aarch64_cortex-a73',) for fmt in ('apk', 'ipk')}
-    generic = {('aarch64_generic', fmt) for fmt in ('apk', 'ipk')}
+    required = {'x86_64', 'aarch64_cortex-a53'}
+    supported = required | {'aarch64_cortex-a73', 'aarch64_generic', 'mipsel_24kc'}
     actual = {(a['architecture'], a['format']) for a in assets}
-    if actual not in (expected, expected | beam, expected | generic, expected | beam | generic) or len(assets) != len(actual):
+    architectures = {arch for arch, _ in actual}
+    complete = {(arch, fmt) for arch in architectures for fmt in ('apk', 'ipk')}
+    if not required <= architectures <= supported or actual != complete or len(assets) != len(actual):
         raise ValueError('Expected complete APK/IPK architecture pairs')
     for asset in assets:
         revision = 'r1' if asset['format'] == 'apk' else '1'

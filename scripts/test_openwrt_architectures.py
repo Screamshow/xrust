@@ -32,7 +32,10 @@ class OpenWrtArchitectures(unittest.TestCase):
         generic = [('aarch64_generic', fmt) for fmt in ('apk', 'ipk')]
         self.assertEqual(len(self.check_assets(original + beam + generic)['assets']), 8)
         self.assertEqual(len(self.check_assets(original + generic)['assets']), 6)
-        for invalid in (original + generic[:1], original + beam[:1], original + [original[0]], original + [('arm_cortex-a7', fmt) for fmt in ('apk', 'ipk')]):
+        mips = [('mipsel_24kc', fmt) for fmt in ('apk', 'ipk')]
+        self.assertEqual(len(self.check_assets(original + beam + generic + mips)['assets']), 10)
+        self.assertEqual(len(self.check_assets(original + mips)['assets']), 6)
+        for invalid in (original + mips[:1], original + generic[:1], original + beam[:1], original + [original[0]], original + [('arm_cortex-a7', fmt) for fmt in ('apk', 'ipk')]):
             with self.assertRaises(ValueError):
                 self.check_assets(invalid)
 

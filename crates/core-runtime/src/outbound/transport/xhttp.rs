@@ -495,8 +495,8 @@ impl XhttpConfig {
                     }),
                     h2_client: Some(send_req),
                 };
-                let bytes_written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-                let bytes_flushed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let bytes_written = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
+                let bytes_flushed = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
                 let flush_notify = std::sync::Arc::new(tokio::sync::Notify::new());
                 let task = tokio::spawn(packet_upload_worker(
                     worker_read,
@@ -803,8 +803,8 @@ pub(crate) async fn connect(
                 dialer,
                 h2_client: None,
             };
-            let bytes_written = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-            let bytes_flushed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let bytes_written = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
+            let bytes_flushed = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
             let flush_notify = std::sync::Arc::new(tokio::sync::Notify::new());
             let task = tokio::spawn(packet_upload_worker(
                 worker_read,
@@ -1128,8 +1128,8 @@ impl HalfClosed {
 struct PacketsUp {
     io: tokio::io::DuplexStream,
     failure: Failure,
-    bytes_written: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    bytes_flushed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    bytes_written: std::sync::Arc<portable_atomic::AtomicU64>,
+    bytes_flushed: std::sync::Arc<portable_atomic::AtomicU64>,
     flush_notify: std::sync::Arc<tokio::sync::Notify>,
     flush_wait: Option<Pin<Box<dyn std::future::Future<Output = ()> + Send>>>,
     task: tokio::task::JoinHandle<()>,
@@ -1561,7 +1561,7 @@ async fn packet_upload_worker(
     mut reader: tokio::io::DuplexStream,
     mut writer: PostWriter,
     failure: Failure,
-    bytes_flushed: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    bytes_flushed: std::sync::Arc<portable_atomic::AtomicU64>,
     flush_notify: std::sync::Arc<tokio::sync::Notify>,
 ) {
     let max_each = writer.cfg.meta.sc_max_each_post.rand().max(1) as usize;
@@ -1917,7 +1917,7 @@ mod tests {
             h2_client: None,
         };
         let (mut input, reader) = tokio::io::duplex(1024);
-        let flushed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let flushed = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
         let count = flushed.clone();
         let worker = tokio::spawn(packet_upload_worker(
             reader,
@@ -1967,14 +1967,14 @@ mod tests {
             let config = cfg(serde_json::json!({"mode":"packet-up"}));
             let mut split = SplitConn::new(&config);
             let (io, _reader) = tokio::io::duplex(1);
-            let flushed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let flushed = std::sync::Arc::new(portable_atomic::AtomicU64::new(0));
             let completion = flushed.clone();
             let failure = Failure::default();
             let error = failure.clone();
             split.up = Up::Packets(Box::new(PacketsUp {
                 io,
                 failure,
-                bytes_written: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                bytes_written: std::sync::Arc::new(portable_atomic::AtomicU64::new(1)),
                 bytes_flushed: flushed,
                 flush_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
                 // Complete between the first check and waiter registration;

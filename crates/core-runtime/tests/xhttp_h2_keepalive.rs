@@ -8,8 +8,9 @@
 //! The keep-alive period is shortened through `xmux.h_keep_alive_period`;
 //! the PING timeout is the production one.
 
+use portable_atomic::AtomicU64;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 

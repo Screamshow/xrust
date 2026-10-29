@@ -786,8 +786,9 @@ pub(crate) fn write_tsrs_if_changed(path: &std::path::Path, bytes: &[u8]) -> io:
     {
         std::fs::create_dir_all(parent)?;
     }
+    use portable_atomic::AtomicU64;
     use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::Ordering;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let tmp = path.with_extension(format!(
         "tmp-{}-{}",

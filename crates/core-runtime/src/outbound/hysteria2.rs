@@ -2,10 +2,11 @@
 //! request header with lazy-compatible response read, datagram UDP relay with
 //! fragmentation and two-socket salamander obfs (reference sing-quic client).
 
+use portable_atomic::AtomicU64;
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;

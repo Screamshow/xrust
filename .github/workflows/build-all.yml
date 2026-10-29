@@ -31,11 +31,18 @@ jobs:
           - name: aarch64-musl
             target: aarch64-unknown-linux-musl
             budget: 12582912
+          - name: mipsel-musl
+            target: mipsel-unknown-linux-musl
+            budget: 12582912
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.target != 'mipsel-unknown-linux-musl' && matrix.target || '' }}
+          components: ${{ matrix.target == 'mipsel-unknown-linux-musl' && 'rust-src' || '' }}
+      - name: Verified MIPS cross compiler
+        if: ${{ matrix.target == 'mipsel-unknown-linux-musl' }}
+        run: echo "MIPS_TOOLCHAIN=$(bash scripts/openwrt_mips_toolchain.sh)" >> "$GITHUB_ENV"
       - name: C compiler for x86_64 musl mimalloc
         if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
         run: |
@@ -43,7 +50,12 @@ jobs:
           sudo apt-get install -y musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
-        run: cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
+        run: |
+          if [ '${{ matrix.target }}' = mipsel-unknown-linux-musl ]; then
+            bash scripts/build_mips_openwrt.sh
+          else
+            cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
+          fi
       - name: Size budget (13 MiB x86_64, 12 MiB ARM64)
         run: test "$(stat -c%s target/${{ matrix.target }}/release/xrust)" -le ${{ matrix.budget }}
       - name: Architecture check

@@ -1,11 +1,12 @@
 //! DNS server transports: udp / tcp / tls (DoT) / https (DoH) / quic (DoQ) /
 //! h3 (DoH over HTTP/3) / fakeip — one exchange per query.
 
+use portable_atomic::AtomicU64;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::inbound::AnyStream;
 use std::sync::{Mutex, RwLock};
