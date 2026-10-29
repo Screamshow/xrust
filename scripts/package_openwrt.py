@@ -63,7 +63,7 @@ def main():
     a = p.parse_args(); a.output.mkdir(parents=True, exist_ok=True)
     assets = []
     requested = a.cpus.split(',')
-    for cpu, arch, machine in [('aarch64', 'aarch64_cortex-a73', 183), ('aarch64', 'aarch64_cortex-a53', 183), ('x86_64', 'x86_64', 62)]:
+    for cpu, arch, machine in [('aarch64', 'aarch64_generic', 183), ('aarch64', 'aarch64_cortex-a73', 183), ('aarch64', 'aarch64_cortex-a53', 183), ('x86_64', 'x86_64', 62)]:
         if cpu not in requested: continue
         binary = (a.binaries / f'rust-x-{cpu}-v{a.version}').read_bytes()
         if binary[:5] != b'\x7fELF\x02' or int.from_bytes(binary[18:20], 'little') != machine:
