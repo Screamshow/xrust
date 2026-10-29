@@ -1663,11 +1663,9 @@ impl XhttpConfig {
         seq: Option<&str>,
         has_body: bool,
     ) -> io::Result<http::Request<()>> {
-        // Xray's normalized path ends with a slash, and the session and seq
-        // are appended to it (`appendToPath`): `/xh/SID/7`, or `/xh/` and
-        // `/xh/7` when the session rides in a header, query or cookie. The
-        // server only routes requests under `/xh/`, so a bare `/xh` with the
-        // session placed elsewhere was refused.
+        // Xray normalizes the base path from both configured placements,
+        // even for requests that carry no seq/session. Append path metadata
+        // below; preserve an exact resource when both placements are external.
         let mut path = self.base_path();
         let mut query: Vec<(String, String)> = Vec::new();
         let mut extra_headers: Vec<(String, String)> = Vec::new();
@@ -1798,9 +1796,12 @@ impl XhttpConfig {
             .map_err(|e| io::Error::other(format!("xhttp: build request: {e}")))
     }
 
-    /// The configured path with its trailing slash, Xray's normalized path.
+    /// Add a separator only when session or seq can be appended to the path.
     fn base_path(&self) -> String {
-        if self.path.ends_with('/') {
+        if self.path.ends_with('/')
+            || (self.meta.session_placement != Placement::Path
+                && self.meta.seq_placement != Placement::Path)
+        {
             self.path.clone()
         } else {
             format!("{}/", self.path)
@@ -1924,6 +1925,10 @@ fn base64_url(data: &[u8]) -> String {
 #[cfg(test)]
 #[path = "xhttp_upload_buffer_tests.rs"]
 mod upload_buffer_tests;
+
+#[cfg(test)]
+#[path = "xhttp_path_tests.rs"]
+mod path_tests;
 
 #[cfg(test)]
 mod tests {

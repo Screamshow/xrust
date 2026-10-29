@@ -1,5 +1,7 @@
 # Client corrections and ARM verification, 2026-10-30
 
+Follow-up: [exact XHTTP paths and full stream-one REALITY checks](xhttp-path-and-reality-2026-10-30.md).
+
 Three focused changes on dev, without a release or installation:
 
 - URLTest finds the first HTTP header terminator even when the read also
