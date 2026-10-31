@@ -814,12 +814,12 @@ mod tests {
         }
     }
 
-    /// Every Initial of the first flight is shaped like a quic-go client's:
-    /// a datagram of `protocol.InitialPacketSize`, an 8-byte DCID, a
+    /// Every Initial of the first flight follows the checked Xray Chrome
+    /// profile: a 1250-byte datagram, an 8-byte DCID, a
     /// zero-length SCID and no token. The post-quantum hello spans two of
     /// them and both leave at the full size, as the reference sends them.
     #[tokio::test]
-    async fn first_initial_has_quic_go_shape() {
+    async fn first_initial_has_chrome_profile_shape() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let cfg = serde_json::json!({
             "server": "127.0.0.1", "server_port": server.local_addr().unwrap().port(),
@@ -847,11 +847,7 @@ mod tests {
             dcids.push(dg[6..6 + dcid_len].to_vec());
             assert_eq!(dg[6 + dcid_len], 0, "zero-length SCID");
             assert_eq!(dg[7 + dcid_len], 0, "no token");
-            assert_eq!(
-                n,
-                usize::from(crate::outbound::quic::QUIC_GO_INITIAL_MTU),
-                "Initial datagram {i} size"
-            );
+            assert_eq!(n, 1250, "Initial datagram {i} size");
         }
         assert_eq!(dcids[0], dcids[1], "one connection");
         dial.abort();
