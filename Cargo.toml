@@ -29,7 +29,7 @@ blake3 = { path = "vendor/blake3" }
 quinn-proto = { path = "vendor/quinn-proto" }
 
 [workspace.package]
-version = "0.0.30"
+version = "0.0.31"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Screamshow/xrust"

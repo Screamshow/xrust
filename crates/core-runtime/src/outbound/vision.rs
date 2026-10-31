@@ -75,6 +75,61 @@ const READ_CHUNK: usize = 32 * 1024;
 /// arrival is what takes the padding phase out.
 const TLS_APP_DATA: [u8; 3] = [0x17, 0x03, 0x03];
 
+/// Inner TLS record boundaries survive both TCP reads and Vision frame splits.
+/// Retain only a header and a byte count, never the application's record body.
+#[derive(Clone, Default)]
+struct WriteRecords {
+    header: [u8; 5],
+    header_len: usize,
+    remaining: usize,
+    disabled: bool,
+    saw_handshake: bool,
+}
+
+impl WriteRecords {
+    /// Stop at the first complete application record so the final padded frame
+    /// cannot carry the start of the next record past the Direct boundary.
+    fn feed(&mut self, input: &[u8]) -> (usize, bool) {
+        if self.disabled {
+            return (input.len(), false);
+        }
+        let mut at = 0;
+        while at < input.len() {
+            if self.header_len < 5 {
+                let n = (5 - self.header_len).min(input.len() - at);
+                self.header[self.header_len..self.header_len + n]
+                    .copy_from_slice(&input[at..at + n]);
+                self.header_len += n;
+                at += n;
+                if self.header_len < 5 {
+                    break;
+                }
+                self.remaining = usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                if !matches!(self.header[0], 0x14..=0x17)
+                    || self.header[1] != 3
+                    || self.header[2] > 3
+                    || self.remaining == 0
+                    || self.remaining > 18432
+                {
+                    self.disabled = true;
+                    return (input.len(), false);
+                }
+                self.saw_handshake |= self.header[0] == 0x16;
+            }
+            let n = self.remaining.min(input.len() - at);
+            self.remaining -= n;
+            at += n;
+            if self.remaining == 0 {
+                self.header_len = 0;
+                if self.header[..3] == TLS_APP_DATA {
+                    return (at, true);
+                }
+            }
+        }
+        (at, false)
+    }
+}
+
 /// Inspect only the first inner ServerHello. Both TCP and TLS handshake
 /// fragmentation are allowed; malformed or oversized input disables detection.
 #[derive(Default)]
@@ -218,6 +273,7 @@ pub struct VisionStream {
     direct_read: bool,
     direct_write_pending: bool,
     server_hello: ServerHello,
+    write_records: WriteRecords,
 }
 
 impl VisionStream {
@@ -241,6 +297,7 @@ impl VisionStream {
             direct_read: false,
             direct_write_pending: false,
             server_hello: ServerHello::default(),
+            write_records: WriteRecords::default(),
         }
     }
 
@@ -327,6 +384,7 @@ impl VisionStream {
 
     /// One complete TLS record, `IsCompleteRecord` in the reference: a partial
     /// record must not be what takes the padding phase out.
+    #[cfg(test)]
     fn is_tls_app_data(buffer: &[u8]) -> bool {
         if buffer.len() < 5 || buffer[..3] != TLS_APP_DATA {
             return false;
@@ -338,7 +396,9 @@ impl VisionStream {
     /// `VisionConn.Write`'s choice of command for the frame it is about to
     /// build, and the decision to leave the padding phase for good.
     fn next_command(&mut self, content: &[u8]) -> u8 {
-        let command = if self.saw_tls && Self::is_tls_app_data(content) {
+        let (_, application_end) = self.write_records.feed(content);
+        self.saw_tls |= self.write_records.saw_handshake;
+        let command = if self.saw_tls && application_end {
             // The negotiated inner TLS version/cipher qualifies uploads even
             // when the peer has not sent its own Direct command yet.
             if self.direct_read
@@ -584,6 +644,9 @@ impl AsyncWrite for VisionStream {
                 return std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
             }
             let take = Self::frame_take(buf);
+            // Preview the tiny parser state to limit the frame at a real inner
+            // record boundary, then commit it exactly once in next_command.
+            let (take, _) = this.write_records.clone().feed(&buf[..take]);
             this.filter(&buf[..take]);
             let command = this.next_command(&buf[..take]);
             this.build_frame(&buf[..take], command);
@@ -1047,7 +1110,7 @@ mod tests {
         direct.direct_read = true;
         assert_eq!(direct.next_command(&record[..6]), PADDING_CONTINUE);
         assert!(!direct.direct_write_pending);
-        assert_eq!(direct.next_command(&record), PADDING_DIRECT);
+        assert_eq!(direct.next_command(&record[6..]), PADDING_DIRECT);
         assert!(direct.direct_write_pending);
     }
 
@@ -1060,6 +1123,62 @@ mod tests {
             0x01, 0x00, 0x00, 0x00, 0x00, 0x01
         ]));
         assert!(!VisionStream::looks_like_tls(b"GET / HTTP/1.1"));
+    }
+
+    #[test]
+    fn large_inner_record_split_into_frames_must_reach_direct() {
+        for ccs in [false, true] {
+            let (mut stream, _) = pair();
+            stream.saw_tls = true;
+            stream.direct_read = true;
+            let mut record = if ccs {
+                vec![0x14, 3, 3, 0, 1, 1]
+            } else {
+                vec![]
+            };
+            record.extend_from_slice(&[0x17, 3, 3, 0x40, 0]);
+            record.extend_from_slice(&vec![0x77; 16384]);
+            let mut offset = 0;
+            while offset < record.len() {
+                let take = VisionStream::frame_take(&record[offset..]);
+                let command = stream.next_command(&record[offset..offset + take]);
+                offset += take;
+                assert_eq!(
+                    command,
+                    if offset == record.len() {
+                        PADDING_DIRECT
+                    } else {
+                        PADDING_CONTINUE
+                    }
+                );
+            }
+            assert!(!stream.padding);
+        }
+    }
+
+    #[test]
+    fn inner_record_boundaries_survive_every_header_split_and_reject_bad_lengths() {
+        let mut wire = vec![
+            0x16, 3, 1, 0, 1, 1, 0x14, 3, 3, 0, 1, 1, 0x17, 3, 3, 0, 2, 9, 8,
+        ];
+        let boundary = wire.len();
+        wire.extend_from_slice(&[0x17, 3, 3, 0, 1, 7]);
+        for split in 1..boundary {
+            let mut records = WriteRecords::default();
+            assert_eq!(records.feed(&wire[..split]), (split, false));
+            assert_eq!(records.feed(&wire[split..]), (boundary - split, true));
+            assert!(records.saw_handshake);
+            assert_eq!(records.feed(&wire[boundary..]), (6, true));
+        }
+        for bad in [
+            [0x17, 3, 3, 0, 0],
+            [0x17, 3, 3, 0xff, 0xff],
+            [0x17, 2, 3, 0, 1],
+        ] {
+            let mut records = WriteRecords::default();
+            assert!(!records.feed(&bad).1);
+            assert!(!records.feed(&[0x17, 3, 3, 0, 1, 7]).1);
+        }
     }
 
     #[tokio::test]

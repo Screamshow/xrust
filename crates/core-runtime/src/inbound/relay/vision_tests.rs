@@ -367,6 +367,27 @@ async fn run(
     down: Vec<u8>,
     close: Close,
 ) -> (u8, bool) {
+    run_with_flight(
+        version,
+        direct,
+        up,
+        down,
+        close,
+        client_app_data(),
+        usize::MAX,
+    )
+    .await
+}
+
+async fn run_with_flight(
+    version: [u8; 2],
+    direct: bool,
+    up: Vec<u8>,
+    down: Vec<u8>,
+    close: Close,
+    flight: Vec<u8>,
+    fragment: usize,
+) -> (u8, bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let server = tokio::spawn({
@@ -411,7 +432,10 @@ async fn run(
         .expect("first answer in time")
         .expect("first answer");
     assert_eq!(first, want_first);
-    lan_w.write_all(&client_app_data()).await.expect("app data");
+    for part in flight.chunks(fragment) {
+        lan_w.write_all(part).await.expect("app data");
+        tokio::task::yield_now().await;
+    }
 
     // The upload half-closes as soon as it is sent, in both modes: the
     // download, through outer TLS or Direct, must still arrive in full.
@@ -435,7 +459,7 @@ async fn run(
         .await
         .expect("server in time")
         .expect("server task");
-    let mut want_up = client_app_data();
+    let mut want_up = flight;
     want_up.extend_from_slice(&up);
     let mut want_down = tail();
     want_down.extend_from_slice(&down);
@@ -458,6 +482,26 @@ async fn run(
     let want_down = want_first.len() + want_down.len();
     assert_eq!(counted, (want_up as u64, want_down as u64), "counters");
     (command, spliced)
+}
+
+#[tokio::test]
+async fn large_fragmented_inner_record_switches_only_after_the_final_outer_frame() {
+    for fragment in [3, 8192, usize::MAX] {
+        let mut flight = record(0x14, &[1]);
+        flight.extend(record(0x17, &pattern(16384, 17)));
+        let (command, spliced) = run_with_flight(
+            [3, 4],
+            true,
+            pattern(1024 * 1024 + 7, 18),
+            pattern(1024 * 1024 + 9, 19),
+            Close::Fin,
+            flight,
+            fragment,
+        )
+        .await;
+        assert_eq!(command, DIRECT, "inner fragment size {fragment}");
+        assert!(spliced);
+    }
 }
 
 #[tokio::test]

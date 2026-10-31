@@ -76,6 +76,63 @@ fn client_conn_window() -> u32 {
 /// 48 KiB also stays below musl's large-allocation threshold.
 pub(super) const WRITE_CHUNK: usize = 48 * 1024;
 
+static SMALL_UPLOAD_POOL: crate::bufpool::Pool = crate::bufpool::Pool::new();
+static LARGE_UPLOAD_POOL: crate::bufpool::Pool = crate::bufpool::Pool::new();
+
+/// Reuse upload storage without changing frame sizes or flow control. Bytes
+/// owns the buffer until H2 drops its last slice/reference. Set
+/// XRUST_H2_UPLOAD_POOL=0 to disable reuse for diagnostics.
+pub(super) fn upload_pool_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| crate::env_var("H2_UPLOAD_POOL").is_none_or(|v| v != "0"))
+}
+
+struct UploadOwner {
+    bytes: Vec<u8>,
+    pool: &'static crate::bufpool::Pool,
+}
+
+impl AsRef<[u8]> for UploadOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for UploadOwner {
+    fn drop(&mut self) {
+        self.pool.give(std::mem::take(&mut self.bytes));
+    }
+}
+
+pub(super) fn upload_buffer(size: usize) -> Vec<u8> {
+    let pool = if size <= 8192 {
+        &SMALL_UPLOAD_POOL
+    } else {
+        &LARGE_UPLOAD_POOL
+    };
+    let mut bytes = pool.take();
+    bytes.reserve(if size <= 8192 { 8192 } else { WRITE_CHUNK });
+    bytes
+}
+
+pub(super) fn own_upload_buffer(bytes: Vec<u8>, size: usize) -> Bytes {
+    let pool = if size <= 8192 {
+        &SMALL_UPLOAD_POOL
+    } else {
+        &LARGE_UPLOAD_POOL
+    };
+    Bytes::from_owner(UploadOwner { bytes, pool })
+}
+
+fn copy_upload(data: &[u8]) -> Bytes {
+    if !upload_pool_enabled() {
+        return Bytes::copy_from_slice(data);
+    }
+    let mut bytes = upload_buffer(data.len());
+    bytes.extend_from_slice(data);
+    own_upload_buffer(bytes, data.len())
+}
+
 /// The client handshake the h2-based transports share: the SETTINGS set Go
 /// sends, the preface and window update in one write, a window update per
 /// 4 KiB read, and the request pseudo-headers in Go's order -- what the
@@ -545,8 +602,7 @@ impl AsyncWrite for H2Io {
                 return Poll::Ready(Ok(0));
             }
             let take = buf.len().min(self.h2.write_chunk);
-            self.h2
-                .stage_bytes(Bytes::copy_from_slice(&buf[..take]), take);
+            self.h2.stage_bytes(copy_upload(&buf[..take]), take);
         }
         ready!(self.h2.poll_flush_out(cx))?;
         Poll::Ready(Ok(self.h2.take_report()))
@@ -570,6 +626,60 @@ impl AsyncWrite for H2Io {
 #[cfg(test)]
 mod backpressure_tests {
     use super::*;
+
+    #[test]
+    fn concurrent_upload_owners_preserve_live_slices_across_pool_reuse() {
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for worker in 0..16u8 {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    for round in 0..64u8 {
+                        let size = if round % 2 == 0 { 8192 } else { WRITE_CHUNK };
+                        let marker = worker.wrapping_mul(17).wrapping_add(round);
+                        let mut buffer = upload_buffer(size);
+                        buffer.resize(size, marker);
+                        let bytes = own_upload_buffer(buffer, size);
+                        let slice = bytes.slice(1..size - 1);
+                        drop(bytes);
+                        barrier.wait();
+                        // Reusing other storage must not overwrite a live H2 slice.
+                        let mut other = upload_buffer(size);
+                        other.resize(size, !marker);
+                        let other = own_upload_buffer(other, size);
+                        assert!(slice.iter().all(|byte| *byte == marker));
+                        assert!(other.iter().all(|byte| *byte == !marker));
+                        drop(other);
+                        drop(slice);
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn upload_owner_returns_storage_only_after_the_last_h2_slice() {
+        let pool = Box::leak(Box::new(crate::bufpool::Pool::new()));
+        let storage = vec![0x5a; 8192];
+        let pointer = storage.as_ptr();
+        let bytes = Bytes::from_owner(UploadOwner {
+            bytes: storage,
+            pool,
+        });
+        let slice = bytes.slice(100..300);
+        let clone = slice.clone();
+        drop(bytes);
+        drop(slice);
+        assert!(pool.take().is_empty());
+        assert!(clone.iter().all(|b| *b == 0x5a));
+        assert_eq!(pool.take().capacity(), 0);
+        drop(clone);
+        let returned = pool.take();
+        assert!(returned.is_empty());
+        assert_eq!(returned.as_ptr(), pointer);
+        assert!(returned.capacity() >= 8192);
+    }
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},

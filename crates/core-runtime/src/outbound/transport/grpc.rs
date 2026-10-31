@@ -161,16 +161,20 @@ pub(crate) fn server(recv: h2::RecvStream, send: h2::SendStream<Bytes>) -> AnySt
 
 impl GrpcStream {
     fn encode_frame(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + data.len());
+        Self::encode_frame_into(data, &mut out);
+        out
+    }
+
+    fn encode_frame_into(data: &[u8], out: &mut Vec<u8>) {
         let mut varint = [0u8; 10];
         let vl = write_varint(data.len() as u64, &mut varint);
         let inner_len = 1 + vl + data.len();
-        let mut out = Vec::with_capacity(5 + inner_len);
         out.push(0);
         out.extend_from_slice(&(inner_len as u32).to_be_bytes());
         out.push(0x0A);
         out.extend_from_slice(&varint[..vl]);
         out.extend_from_slice(data);
-        out
     }
 }
 
@@ -235,8 +239,17 @@ impl AsyncWrite for GrpcStream {
             // there is not even a variant of this that copies less)
             // Leave room for the gRPC prefix, protobuf tag and length varint.
             let take = buf.len().min(super::h2io::WRITE_CHUNK - 16);
-            let frame = Self::encode_frame(&buf[..take]);
-            self.io.h2.stage(frame, take);
+            if super::h2io::upload_pool_enabled() {
+                let mut frame = super::h2io::upload_buffer(super::h2io::WRITE_CHUNK);
+                Self::encode_frame_into(&buf[..take], &mut frame);
+                self.io.h2.stage_bytes(
+                    super::h2io::own_upload_buffer(frame, super::h2io::WRITE_CHUNK),
+                    take,
+                );
+            } else {
+                let frame = Self::encode_frame(&buf[..take]);
+                self.io.h2.stage(frame, take);
+            }
         }
         ready!(self.io.h2.poll_flush_out(cx))?;
         Poll::Ready(Ok(self.io.h2.take_report()))
@@ -372,6 +385,25 @@ fn parse_hunk_head(raw: &[u8]) -> io::Result<Option<(usize, usize, usize)>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pooled_encoding_preserves_every_grpc_and_protobuf_byte() {
+        for len in [
+            0,
+            1,
+            127,
+            128,
+            16383,
+            16384,
+            super::super::h2io::WRITE_CHUNK - 16,
+        ] {
+            let data = vec![0x5a; len];
+            let mut frame = super::super::h2io::upload_buffer(super::super::h2io::WRITE_CHUNK);
+            super::GrpcStream::encode_frame_into(&data, &mut frame);
+            let owned =
+                super::super::h2io::own_upload_buffer(frame, super::super::h2io::WRITE_CHUNK);
+            assert_eq!(owned.as_ref(), super::GrpcStream::encode_frame(&data));
+        }
+    }
     use super::*;
 
     /// The request a gRPC node gets, the way Xray's dialer sends it: `:scheme`

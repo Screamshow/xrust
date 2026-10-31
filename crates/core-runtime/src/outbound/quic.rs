@@ -338,10 +338,10 @@ pub(crate) struct QuicTunnelDefaults {
 }
 
 impl QuicTunnelDefaults {
-    /// Outbound ChromeParrot profile; servers retain the ordinary HY2 defaults.
+    /// Outbound ChromeParrot profile; retain HY2's 10 s keepalive so idle
+    /// proxied TCP sessions survive. Servers keep the ordinary HY2 defaults.
     pub fn hysteria2_chrome_client() -> Self {
         Self {
-            keep_alive_period: Duration::ZERO,
             stream_receive_window: Some(6 * 1024 * 1024),
             connection_receive_window: Some(15 * 1024 * 1024),
             initial_packet_size: Some(1250),
@@ -1266,6 +1266,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn hy2_client_defaults_to_keepalive_and_honors_explicit_interval() {
+        let defaults = QuicTunnelDefaults::hysteria2_chrome_client();
+        let options = QuicTunnelOptions::parse(&serde_json::Map::new(), "hy2", defaults).unwrap();
+        assert_eq!(options.keep_alive_period, Some(Duration::from_secs(10)));
+        assert_eq!(options.stream_receive_window, Some(6 * 1024 * 1024));
+        assert_eq!(options.connection_receive_window, Some(15 * 1024 * 1024));
+
+        let explicit = json!({"keep_alive_period": "25s"});
+        let options = QuicTunnelOptions::parse(
+            explicit.as_object().unwrap(),
+            "hy2",
+            QuicTunnelDefaults::hysteria2_chrome_client(),
+        )
+        .unwrap();
+        assert_eq!(options.keep_alive_period, Some(Duration::from_secs(25)));
+    }
     #[test]
     fn varint_roundtrip() {
         for v in [0u64, 63, 64, 16_383, 16_384, 1_073_741_823, 1 << 40] {
