@@ -160,6 +160,40 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// Strip hybrid groups only for a REALITY handshake that did not opt into PQ.
+fn compact_reality_template(template: &mut core_tls::hello::Template) -> io::Result<()> {
+    use core_tls::hello::Ext;
+    let hybrid = |group: u16| matches!(group, 0x11ec | 0x6399 | 0x45ac);
+    for extension in &mut template.extensions {
+        match extension {
+            Ext::KeyShare(body) => {
+                let mut entries = Vec::new();
+                for (group, key) in core_tls::keyshare::entries(body)? {
+                    if !hybrid(group) {
+                        entries.extend_from_slice(&group.to_be_bytes());
+                        entries.extend_from_slice(&(key.len() as u16).to_be_bytes());
+                        entries.extend_from_slice(key);
+                    }
+                }
+                *body = (entries.len() as u16).to_be_bytes().to_vec();
+                body.extend_from_slice(&entries);
+            }
+            Ext::Static(10, body) => {
+                let mut groups = Vec::new();
+                for pair in body.get(2..).unwrap_or_default().as_chunks::<2>().0 {
+                    if !hybrid(u16::from_be_bytes([pair[0], pair[1]])) {
+                        groups.extend_from_slice(pair);
+                    }
+                }
+                *body = (groups.len() as u16).to_be_bytes().to_vec();
+                body.extend_from_slice(&groups);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// REALITY: the server's public key and the short id that opens the session id
 /// seal. A server that fails the REALITY check is refused, see
 /// [`TlsOptions::establish`].
@@ -168,6 +202,7 @@ pub struct Reality {
     pub public_key: [u8; 32],
     pub short_id: Vec<u8>,
     pub fingerprint: Option<Fingerprint>,
+    pub support_x25519mlkem768: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -321,6 +356,14 @@ impl TlsOptions {
                     public_key,
                     short_id,
                     fingerprint,
+                    support_x25519mlkem768: match r.get("support_x25519mlkem768") {
+                        None => false,
+                        Some(value) => value.as_bool().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "{at}: tls.reality.support_x25519mlkem768 must be a boolean"
+                            )
+                        })?,
+                    },
                 })
             }
             _ => None,
@@ -773,11 +816,14 @@ impl TlsOptions {
         }
         // With no fingerprint named, present chrome: ours always writes its own
         // hello, so there is a template to pick either way.
-        let (name, template) = match self.fingerprint() {
+        let (name, mut template) = match self.fingerprint() {
             Some(f) => (f.name.clone(), f.template.clone()),
             None => ("chrome".to_string(), core_tls::fingerprints::chrome()),
         };
         let reality = self.reality.as_ref();
+        if reality.is_some_and(|r| !r.support_x25519mlkem768) {
+            compact_reality_template(&mut template)?;
+        }
         let seal = reality.map(|r| core_tls::client::RealitySeal {
             public_key: &r.public_key,
             short_id: &r.short_id,

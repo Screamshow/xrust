@@ -241,7 +241,7 @@ pub enum Outbound {
     Trojan(Trojan),
     Hysteria2(Hysteria2),
     Masque(Masque),
-    WireGuard(WireGuard),
+    WireGuard(Arc<WireGuard>),
     Urltest(Urltest),
     Selector(Selector),
     Chain(Chain),
@@ -776,6 +776,8 @@ pub struct RouterInner {
     setup_timeouts: Vec<std::time::Duration>,
     /// Lease files for the neighbour resolver, when anything reads it.
     neighbor_lease_files: Option<Vec<String>>,
+    // Exact endpoint identity, kept private: these values contain keys.
+    wireguard_configs: HashMap<String, (Value, Arc<WireGuard>)>,
 }
 
 pub struct Router {
@@ -881,7 +883,7 @@ impl RouterInner {
     /// once this inner is the one that serves traffic.
     pub(crate) fn build_reusing(
         root: &Value,
-        previous: Option<&rule_set::RuleSetRegistry>,
+        previous: Option<&RouterInner>,
     ) -> anyhow::Result<Self> {
         let defaults = RouteDefaults::parse(root.get("route"))?;
         let bind_iface = defaults.bind_interface();
@@ -892,6 +894,7 @@ impl RouterInner {
             .unwrap_or(&empty);
         let mut outbounds = Vec::with_capacity(outbounds_list.len());
         let mut tags = HashMap::new();
+        let mut wireguard_configs = HashMap::new();
         for (i, obj) in outbounds_list.iter().enumerate() {
             let tag = obj
                 .get("tag")
@@ -919,7 +922,26 @@ impl RouterInner {
                 .as_object()
                 .ok_or_else(|| anyhow::anyhow!("{at}: must be an object"))?;
             let outbound = match ty {
-                "wireguard" => Outbound::WireGuard(WireGuard::build(map, &at)?),
+                "wireguard" => {
+                    let tag = map.get("tag").and_then(Value::as_str).unwrap_or_default();
+                    let identity = if tag.is_empty() {
+                        at.clone()
+                    } else {
+                        format!("tag:{tag}")
+                    };
+                    let reused = previous.and_then(|old| {
+                        old.wireguard_configs
+                            .get(&identity)
+                            .filter(|(config, _)| config == obj)
+                            .map(|(_, wg)| Arc::clone(wg))
+                    });
+                    let wg = match reused {
+                        Some(wg) => wg,
+                        None => Arc::new(WireGuard::build(map, &at)?),
+                    };
+                    wireguard_configs.insert(identity, (obj.clone(), Arc::clone(&wg)));
+                    Outbound::WireGuard(wg)
+                }
                 "openconnect" => anyhow::bail!(
                     "{at}: openconnect client is not implemented yet (config check parity only)"
                 ),
@@ -961,7 +983,7 @@ impl RouterInner {
             registry = build_rule_sets_reusing(
                 map,
                 &crate::http_client::Registry::from_config(root)?,
-                previous,
+                previous.and_then(|old| old.rule_sets.as_deref()),
             )?;
             if let Some(list) = map.get("rules").and_then(Value::as_array) {
                 for (i, obj) in list.iter().enumerate() {
@@ -1031,6 +1053,7 @@ impl RouterInner {
             delay_history,
             setup_timeouts,
             neighbor_lease_files,
+            wireguard_configs,
         })
     }
 
@@ -1194,7 +1217,7 @@ impl Router {
     /// sharing its unchanged inline and local rule sets.
     pub(crate) fn prepare(root: &Value, previous: &Router) -> anyhow::Result<Arc<Self>> {
         let previous = previous.inner();
-        let inner = RouterInner::build_reusing(root, previous.rule_sets.as_deref())?;
+        let inner = RouterInner::build_reusing(root, Some(&previous))?;
         Ok(Arc::new(Self {
             inner: std::sync::RwLock::new(Arc::new(inner)),
             connection_scope: Arc::new(()),
@@ -1556,7 +1579,7 @@ impl Router {
     }
 
     pub async fn reload(self: &Arc<Self>, root: &Value) -> anyhow::Result<()> {
-        let new_inner = RouterInner::build(root)?;
+        let new_inner = RouterInner::build_reusing(root, Some(&self.inner()))?;
         self.apply_inner(new_inner).await
     }
 }

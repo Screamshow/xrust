@@ -1,0 +1,15 @@
+# REALITY PQ and WG/AWG reload fixes — 2026-10-31
+
+Implemented locally on existing Xrust dev, based on d20dd97. No release, main integration or router installation.
+
+REALITY now reads and type-checks tls.reality.support_x25519mlkem768. Absent/false removes hybrid ML-KEM groups from that handshake's key shares and supported groups. True preserves the selected fingerprint's hybrid support. This does not add hybrid support to fingerprints that never offered it. Non-REALITY TLS/QUIC profiles, certificate verification and per-session key generation are unchanged. Captured first records are below 1400 bytes for default/false Chrome REALITY, while explicit true and ordinary Chrome TLS retain hybrid key shares. Random ECH sizes vary, so record length is not a fixed constant or a promise about TCP segmentation/DPI behavior.
+
+Router preparation now reuses the same Arc<WireGuard> only for exactly equal endpoint configuration, preserving its lazy shared engine, socket and active sessions. Tagged endpoints match by tag even after reorder; untagged endpoints match by position. Both BoxInstance reload and Router::reload use this path. Changed endpoints are built separately; same-port conflicts reject reload without modifying the previous live endpoint. Seamless live changes to keys/MTU/listen settings are not implemented by this fix. Rule-set reuse remains intact; WG route defaults that were previously ignored are not newly applied.
+
+Regression tests: crates/core-runtime/tests/reality_wg_reload.rs covers default/false/true REALITY first-flight key shares, compact size, unchanged ordinary Chrome TLS, repeated unchanged reload for WG/AWG with/without tags, and a live TCP stream through an independent responder across four client reloads plus a rejected same-port MTU change. Payload is checked byte-for-byte (four 64 KiB blocks plus final marker). SING_BOX_REF is required for the live test; absent reference prints an explicit skip message. Local reference: Sing-Box Extended 1.14.2-lx.11, revision 3d3d3db3a2ccef3b1a8eb71b831ed2461c54b94d, with_wireguard/with_awg. Plain WG and AWG h1..h4 both pass. This is an isolated WSL correctness fixture, not an ARM benchmark or full camouflage proof.
+
+Fixture corrections: our WG responder does not forward arbitrary incoming TCP to host services. The initially selected Sing-Box X binary has no with_wireguard build tag. Extended's gVisor rejects loopback destinations (Martian packets), so the final responder forwards to the discovered WSL IPv4 address instead. These initial fixture failures are retained in the chat history; they are not attributed to the reload change.
+
+Validation logs: Forkop tmp/fix-027-check.log (13 hot_reload, 6 REALITY auth, 75 core-tls tests passed; an initial Clippy style diagnostic was corrected); tmp/fix-027-final.log contains final regression tests, TLS client tests and strict rust-x Clippy. No all-platform CI claim.
+
+Final results: 3 regression tests passed (including live WG and AWG), 12 TLS client tests passed, strict Clippy for core-runtime rust-x passed. git diff --check passed. Changes remain local on dev; no commit/push was requested.
