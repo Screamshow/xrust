@@ -2384,10 +2384,24 @@ fn validate_tls_reality_container(value: &Value, at: &str) -> Result<(), String>
                     ep_str(v, &format!("{at}.{f}"), GS, &format!("tls.reality.{f}"))?;
                 }
             }
+            if let Some(v) = m.get("support_x25519mlkem768") {
+                ep_bool(
+                    v,
+                    &format!("{at}.support_x25519mlkem768"),
+                    GS,
+                    "tls.reality.support_x25519mlkem768",
+                )?;
+            }
             reject_unknown_fields_deep(
                 value,
                 at,
-                &["enabled", "public_key", "short_id", "key_share"],
+                &[
+                    "enabled",
+                    "public_key",
+                    "short_id",
+                    "key_share",
+                    "support_x25519mlkem768",
+                ],
             )?;
             Ok(())
         }

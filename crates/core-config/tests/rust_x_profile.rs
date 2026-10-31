@@ -1,6 +1,22 @@
 use core_config::check_str;
 
 #[test]
+fn reality_pq_preference_passes_the_full_config_check() {
+    let mut config = serde_json::json!({"outbounds":[{"type":"vless","tag":"node",
+        "server":"127.0.0.1","server_port":443,"uuid":"00000000-0000-0000-0000-000000000001",
+        "flow":"xtls-rprx-vision","tls":{"enabled":true,"server_name":"example.test",
+        "utls":{"enabled":true,"fingerprint":"chrome"},"reality":{"enabled":true,
+        "public_key":"IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI","short_id":"1234abcd"}}}]});
+    check_str(&config.to_string()).unwrap();
+    for value in [serde_json::json!(false), serde_json::json!(true)] {
+        config["outbounds"][0]["tls"]["reality"]["support_x25519mlkem768"] = value;
+        check_str(&config.to_string()).unwrap();
+    }
+    config["outbounds"][0]["tls"]["reality"]["support_x25519mlkem768"] = serde_json::json!("false");
+    assert!(check_str(&config.to_string()).is_err());
+}
+
+#[test]
 fn rust_x_rejects_removed_protocols_at_check_time() {
     for protocol in [
         "naive",
