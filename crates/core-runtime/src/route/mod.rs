@@ -9,6 +9,7 @@ pub mod rule_set;
 pub mod rule_set_index;
 pub mod rule_set_remote;
 pub mod sniff;
+mod sniff_bittorrent;
 mod sniff_quic;
 
 use std::collections::HashMap;

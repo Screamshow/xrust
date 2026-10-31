@@ -29,6 +29,7 @@ fn sniffer_by_name(name: &str) -> Option<SnifferFn> {
         "http" => Some(sniff_http),
         "dns" => Some(sniff_dns_stream),
         "bittorrent" => Some(sniff_bittorrent),
+        "bittorrent-extended" => Some(sniff_bittorrent_extended),
         "ssh" => Some(sniff_ssh),
         "rdp" => Some(sniff_rdp),
         _ => None,
@@ -77,7 +78,11 @@ pub(crate) fn action_sniff_packet(
     let Some(first) = datagrams.first() else {
         return;
     };
-    let enabled = |name: &str| configured.is_empty() || configured.iter().any(|n| n == name);
+    let extended = configured.iter().any(|n| n == "bittorrent-extended");
+    let enabled = |name: &str| {
+        (name != "bittorrent" || !extended)
+            && (configured.is_empty() || configured.iter().any(|n| n == name))
+    };
     ctx.sniffer_names = configured.to_vec();
     ctx.sniff_error = None;
     let (dns, rest) = PACKET_SNIFFERS.split_at(1);
@@ -88,6 +93,11 @@ pub(crate) fn action_sniff_packet(
         || rest
             .iter()
             .any(|(name, sniffer)| enabled(name) && sniffer(first, ctx));
+    let matched = matched
+        || (extended
+            && (sniff_utp_extended(first, ctx)
+                || sniff_udp_tracker(first, ctx)
+                || sniff_dht(first, ctx)));
     if matched {
         logging::debug(format_args!(
             "sniffed packet protocol: {:?}, domain: {:?}",
@@ -144,7 +154,13 @@ pub(crate) async fn action_sniff<S>(
     } else {
         configured
             .iter()
-            .filter_map(|n| sniffer_by_name(n))
+            .filter_map(|n| {
+                if n == "http" && configured.iter().any(|n| n == "bittorrent-extended") {
+                    Some(sniff_bittorrent_extended as SnifferFn)
+                } else {
+                    sniffer_by_name(n)
+                }
+            })
             .collect()
     };
     if sniffers.is_empty() {
@@ -316,6 +332,10 @@ fn http_method_prefix(buf: &[u8]) -> bool {
 }
 
 fn sniff_http(buf: &[u8], ctx: &mut ConnContext) -> Outcome {
+    sniff_http_impl(buf, ctx, false)
+}
+
+fn sniff_http_impl(buf: &[u8], ctx: &mut ConnContext, extended: bool) -> Outcome {
     if !http_method_prefix(buf) {
         return Outcome::NoMatch;
     }
@@ -347,6 +367,9 @@ fn sniff_http(buf: &[u8], ctx: &mut ConnContext) -> Outcome {
     }
 
     ctx.protocol = Some("http".into());
+    if extended && super::sniff_bittorrent::http(method, request_target, &text) {
+        ctx.protocol = Some("bittorrent".into());
+    }
     if let Some(raw) = host {
         let fqdn = strip_authority_port(&raw);
         if !fqdn.is_empty() {
@@ -523,6 +546,30 @@ fn sniff_bittorrent(buf: &[u8], ctx: &mut ConnContext) -> Outcome {
     }
     ctx.protocol = Some("bittorrent".into());
     Outcome::Matched
+}
+
+fn sniff_dht(buf: &[u8], ctx: &mut ConnContext) -> bool {
+    if !super::sniff_bittorrent::dht(buf) {
+        return false;
+    }
+    ctx.protocol = Some("bittorrent".into());
+    true
+}
+
+fn sniff_utp_extended(buf: &[u8], ctx: &mut ConnContext) -> bool {
+    if !super::sniff_bittorrent::utp_syn(buf) {
+        return false;
+    }
+    ctx.protocol = Some("bittorrent".into());
+    true
+}
+
+fn sniff_bittorrent_extended(buf: &[u8], ctx: &mut ConnContext) -> Outcome {
+    let bt = sniff_bittorrent(buf, ctx);
+    if bt != Outcome::NoMatch {
+        return bt;
+    }
+    sniff_http_impl(buf, ctx, true)
 }
 
 fn sniff_ssh(buf: &[u8], ctx: &mut ConnContext) -> Outcome {

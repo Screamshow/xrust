@@ -1393,7 +1393,17 @@ fn parse_override_address(raw: &str, at: &str) -> anyhow::Result<TargetOverride>
 pub fn is_known_sniffer(name: &str) -> bool {
     matches!(
         name,
-        "tls" | "http" | "quic" | "dns" | "stun" | "bittorrent" | "dtls" | "ssh" | "rdp" | "ntp"
+        "tls"
+            | "http"
+            | "quic"
+            | "dns"
+            | "stun"
+            | "bittorrent"
+            | "bittorrent-extended"
+            | "dtls"
+            | "ssh"
+            | "rdp"
+            | "ntp"
     )
 }
 
