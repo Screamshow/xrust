@@ -178,7 +178,8 @@ impl Hysteria2 {
 
         let tls = TlsOptions::from_outbound(obj, &server, at)?
             .ok_or_else(|| anyhow::anyhow!("{at}: TLS is required for hysteria2"))?;
-        let quic = QuicTunnelOptions::parse(obj, at, QuicTunnelDefaults::hysteria2())?;
+        let quic =
+            QuicTunnelOptions::parse(obj, at, QuicTunnelDefaults::hysteria2_chrome_client())?;
         let connect_timeout = parse_duration(
             obj.get("connect_timeout"),
             DEFAULT_CONNECT,
@@ -262,10 +263,8 @@ impl Hysteria2 {
         } else {
             bind_udp(addr)?
         };
-        let (mut ep_config, transport) =
-            self.quic
-                .build_configs(self.congestion(), None, self.want_udp);
-        let quic_tls = self.tls.quic_config(&[b"h3"])?;
+        let (mut ep_config, transport) = self.quic.build_hy2_configs(self.congestion());
+        let quic_tls = self.tls.quic_config(&[b"h3"])?.with_hy2_chrome()?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
         client_config.transport_config(Arc::new(transport));
         quic_go_client_shape(&mut ep_config, &mut client_config);

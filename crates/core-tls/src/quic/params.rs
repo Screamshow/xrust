@@ -145,6 +145,62 @@ pub(crate) fn in_quic_go_order(quinn: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Xray 26.10.21 ChromeParrot profile. Limits come from the actual transport
+/// configuration, never from a decorative replacement of flow-control values.
+pub(crate) fn in_chrome_order(quinn: &[u8], seed: &[u8; 64]) -> Vec<u8> {
+    let parsed = parse(quinn);
+    let mut fields: Vec<(u64, Vec<u8>)> = parsed
+        .iter()
+        .filter(|(id, _)| {
+            is_grease(*id)
+                || matches!(
+                    *id,
+                    MAX_IDLE_TIMEOUT
+                        | MAX_UDP_PAYLOAD_SIZE
+                        | MAX_DATA
+                        | STREAM_DATA_BIDI_LOCAL
+                        | STREAM_DATA_BIDI_REMOTE
+                        | STREAM_DATA_UNI
+                        | STREAMS_BIDI
+                        | STREAMS_UNI
+                        | INITIAL_SOURCE_CONNECTION_ID
+                )
+        })
+        .map(|(id, value)| (*id, value.to_vec()))
+        .collect();
+    if parsed.iter().any(|(id, _)| *id == MAX_DATAGRAM_FRAME_SIZE) {
+        let mut value = Vec::new();
+        // The peer's packet is bounded by our real max_udp_payload_size (1472),
+        // so this Chrome frame limit cannot exceed our packet/buffer capacity.
+        write_varint(&mut value, 65_536);
+        fields.push((MAX_DATAGRAM_FRAME_SIZE, value));
+    }
+    fields.push((0x3128, b"ORIG".to_vec()));
+    let grease_version = u32::from_be_bytes(seed[60..64].try_into().expect("four bytes"))
+        & 0xf0f0_f0f0
+        | 0x0a0a_0a0a;
+    let mut versions = 1u32.to_be_bytes().to_vec();
+    let available = if seed[59] & 1 == 0 {
+        [grease_version, 1]
+    } else {
+        [1, grease_version]
+    };
+    for version in available {
+        versions.extend_from_slice(&version.to_be_bytes());
+    }
+    fields.push((0x11, versions));
+    for i in (1..fields.len()).rev() {
+        let at = (fields.len() - 1 - i) * 4;
+        let draw = u32::from_le_bytes(seed[at..at + 4].try_into().expect("four bytes"));
+        fields.swap(i, draw as usize % (i + 1));
+    }
+    let mut out = Vec::new();
+    for (id, value) in fields {
+        write_param(&mut out, id, &value);
+    }
+    out
+}
+
 /// Split a parameter blob into `(id, value)` pairs. A malformed tail is
 /// dropped: the blob comes from quinn's own writer, so this cannot happen,
 /// and a panic here would take a connection down.
@@ -213,6 +269,56 @@ fn write_varint_param(out: &mut Vec<u8>, id: u64, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chrome_parameters_preserve_real_limits_and_shuffle() {
+        let input = quinn_blob();
+        let a = in_chrome_order(&input, &[0x12; 64]);
+        let b = in_chrome_order(&input, &[0x34; 64]);
+        assert_ne!(a, b);
+        assert_eq!(value(&a, MAX_DATA), Some(20 * 1024 * 1024));
+        assert_eq!(value(&a, STREAM_DATA_BIDI_LOCAL), Some(8 * 1024 * 1024));
+        assert_eq!(value(&a, MAX_DATAGRAM_FRAME_SIZE), Some(65_536));
+        assert!(
+            parse(&a)
+                .iter()
+                .any(|(id, v)| *id == 0x3128 && *v == b"ORIG")
+        );
+        assert_eq!(
+            parse(&a)
+                .iter()
+                .find(|(id, _)| *id == 0x11)
+                .unwrap()
+                .1
+                .len(),
+            12
+        );
+        assert!(
+            parse(&a)
+                .iter()
+                .all(|(id, _)| !matches!(*id, 0x2ab2 | 0xff04de1b | MAX_ACK_DELAY))
+        );
+    }
+
+    #[test]
+    fn chrome_version_grease_can_precede_or_follow_v1() {
+        for position in [0, 1] {
+            let mut seed = [0x12; 64];
+            seed[59] = position;
+            let encoded = in_chrome_order(&quinn_blob(), &seed);
+            let parsed = parse(&encoded);
+            let versions = parsed.iter().find(|(id, _)| *id == 0x11).unwrap().1;
+            assert_eq!(&versions[..4], &1u32.to_be_bytes());
+            let available: Vec<_> = versions[4..]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| u32::from_be_bytes(*v))
+                .collect();
+            assert_eq!(available[1 - position as usize], 1);
+            assert_eq!(available[position as usize] & 0x0f0f_0f0f, 0x0a0a_0a0a);
+        }
+    }
 
     /// A blob in quinn's shape: shuffled order, a greased parameter in the
     /// middle of it, `grease_quic_bit` and `min_ack_delay` present, an

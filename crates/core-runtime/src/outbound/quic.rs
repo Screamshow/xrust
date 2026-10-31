@@ -172,6 +172,19 @@ pub(crate) struct QuicTunnelOptions {
 }
 
 impl QuicTunnelOptions {
+    /// Chrome QUIC profile used only by HY2. Explicit window/MTU settings survive.
+    pub fn build_hy2_configs(
+        &self,
+        congestion: CongestionKind,
+    ) -> (quinn::EndpointConfig, quinn::TransportConfig) {
+        // ChromeParrot always offers QUIC DATAGRAM, including for TCP-only
+        // outbounds. HY2's application-level network permission stays separate.
+        let (mut endpoint, mut transport) = self.build_configs(congestion, Some(103), true);
+        let _ = endpoint.max_udp_payload_size(self.initial_packet_size.unwrap_or(1250).max(1472));
+        transport.ack_frequency_config(None);
+        transport.chrome_initial(true);
+        (endpoint, transport)
+    }
     pub fn parse(
         obj: &serde_json::Map<String, Value>,
         at: &str,
@@ -325,7 +338,18 @@ pub(crate) struct QuicTunnelDefaults {
 }
 
 impl QuicTunnelDefaults {
-    /// hysteria2: idle 30s, keepalive 10s, stream 8 MiB, conn 20 MiB, BBR.
+    /// Outbound ChromeParrot profile; servers retain the ordinary HY2 defaults.
+    pub fn hysteria2_chrome_client() -> Self {
+        Self {
+            keep_alive_period: Duration::ZERO,
+            stream_receive_window: Some(6 * 1024 * 1024),
+            connection_receive_window: Some(15 * 1024 * 1024),
+            initial_packet_size: Some(1250),
+            ..Self::hysteria2()
+        }
+    }
+
+    /// Ordinary HY2 server defaults, independent of client camouflage.
     pub fn hysteria2() -> Self {
         Self {
             idle_timeout: Duration::from_secs(30),
@@ -454,7 +478,8 @@ pub(crate) fn random_padding(min: usize, max: usize) -> String {
     out
 }
 
-pub(crate) fn blake2b256(data: &[u8]) -> [u8; 32] {
+#[cfg(test)]
+fn blake2b256(data: &[u8]) -> [u8; 32] {
     use blake2::Blake2bVar;
     use blake2::digest::{Update, VariableOutput};
     let mut h = Blake2bVar::new(32).expect("blake2b-32");
@@ -466,17 +491,48 @@ pub(crate) fn blake2b256(data: &[u8]) -> [u8; 32] {
 
 /// Salamander outbound seal: `salt8 || xor(payload, blake2b256(password||salt))`.
 pub(crate) fn salamander_seal(password: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    salamander_seal_into(password, payload, &mut out);
+    out
+}
+
+fn salamander_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
+    use blake2::Blake2bVar;
+    use blake2::digest::{Update, VariableOutput};
+    let mut hash = Blake2bVar::new(32).expect("blake2b-32");
+    hash.update(password);
+    hash.update(salt);
+    let mut key = [0u8; 32];
+    hash.finalize_variable(&mut key).expect("blake2b-32 output");
+    key
+}
+
+fn salamander_seal_into(password: &[u8], payload: &[u8], out: &mut Vec<u8>) {
     let mut salt = [0u8; 8];
     let _ = random_bytes(&mut salt);
-    let mut key_input = password.to_vec();
-    key_input.extend_from_slice(&salt);
-    let key = blake2b256(&key_input);
-    let mut out = Vec::with_capacity(8 + payload.len());
+    let key = salamander_key(password, &salt);
+    out.clear();
+    out.reserve(8 + payload.len());
     out.extend_from_slice(&salt);
-    for (i, &b) in payload.iter().enumerate() {
-        out.push(b ^ key[i % 32]);
+    out.extend_from_slice(payload);
+    salamander_xor(&mut out[8..], &key);
+}
+
+/// XOR full key blocks a machine word at a time, without a Vec capacity check
+/// for every byte. Native-endian reads/writes preserve the byte-wise XOR and
+/// need no aligned pointers or architecture-specific code.
+fn salamander_xor(payload: &mut [u8], key: &[u8; 32]) {
+    let (blocks, remainder) = payload.as_chunks_mut::<32>();
+    let (key_words, _) = key.as_chunks::<8>();
+    for block in blocks {
+        let (words, _) = block.as_chunks_mut::<8>();
+        for (word, mask) in words.iter_mut().zip(key_words) {
+            *word = (u64::from_ne_bytes(*word) ^ u64::from_ne_bytes(*mask)).to_ne_bytes();
+        }
     }
-    out
+    for (byte, mask) in remainder.iter_mut().zip(key) {
+        *byte ^= mask;
+    }
 }
 
 /// Salamander inbound open; `None` when the packet is too short.
@@ -484,14 +540,19 @@ pub(crate) fn salamander_open(password: &[u8], packet: &[u8]) -> Option<Vec<u8>>
     if packet.len() <= 8 {
         return None;
     }
-    let mut key_input = password.to_vec();
-    key_input.extend_from_slice(&packet[..8]);
-    let key = blake2b256(&key_input);
-    let mut out = Vec::with_capacity(packet.len() - 8);
-    for (i, &b) in packet[8..].iter().enumerate() {
-        out.push(b ^ key[i % 32]);
-    }
+    let key = salamander_key(password, &packet[..8]);
+    let mut out = packet[8..].to_vec();
+    salamander_xor(&mut out, &key);
     Some(out)
+}
+
+fn salamander_open_in_place<'a>(password: &[u8], packet: &'a mut [u8]) -> Option<&'a [u8]> {
+    if packet.len() <= 8 {
+        return None;
+    }
+    let key = salamander_key(password, &packet[..8]);
+    salamander_xor(&mut packet[8..], &key);
+    Some(&packet[8..])
 }
 
 /// Gecko obfuscation: the salamander framing plus a fragmentation layer, from
@@ -782,6 +843,7 @@ pub(crate) async fn spawn_hop_relay(
     let target_up = Arc::clone(&current_target);
     let up = tokio::spawn(async move {
         let mut buf = vec![0u8; 65_535];
+        let mut sealed = Vec::with_capacity(2048);
         let mut message_id = 0u8;
         loop {
             let Ok(n) = sock_ep_up.recv(&mut buf).await else {
@@ -811,7 +873,7 @@ pub(crate) async fn spawn_hop_relay(
                     }
                 }
             } else if let Some(ref pw) = pw_up {
-                let sealed = salamander_seal(pw, &buf[..n]);
+                salamander_seal_into(pw, &buf[..n], &mut sealed);
                 if sock_srv_up.send_to(&sealed, dst).await.is_err() {
                     break;
                 }
@@ -851,10 +913,10 @@ pub(crate) async fn spawn_hop_relay(
                     break;
                 }
             } else if let Some(ref pw) = pw_down {
-                let Some(plain) = salamander_open(pw, &buf[..n]) else {
+                let Some(plain) = salamander_open_in_place(pw, &mut buf[..n]) else {
                     continue;
                 };
-                if sock_ep_down.send(&plain).await.is_err() {
+                if sock_ep_down.send(plain).await.is_err() {
                     break;
                 }
             } else if sock_ep_down.send(&buf[..n]).await.is_err() {
@@ -1300,6 +1362,38 @@ mod tests {
         assert_eq!(opened, payload);
         assert!(salamander_open(pw, &sealed[..4]).is_none());
         assert!(salamander_open(b"wrong", &sealed).unwrap() != payload);
+    }
+
+    #[test]
+    fn salamander_reuse_preserves_wire_bytes_and_in_place_open() {
+        let password = b"test-password";
+        let mut sealed = Vec::with_capacity(65_543);
+        let allocation = sealed.as_ptr();
+        for length in [1, 8, 31, 32, 33, 63, 64, 65, 1200, 1452, 65_535, 9] {
+            let payload: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
+            salamander_seal_into(password, &payload, &mut sealed);
+            assert_eq!(sealed.as_ptr(), allocation);
+            assert_eq!(sealed.len(), length + 8);
+            // Independent old framing: hash the concatenated password/salt,
+            // then XOR the payload. No transport parameter or padding changes.
+            let mut input = password.to_vec();
+            input.extend_from_slice(&sealed[..8]);
+            let key = blake2b256(&input);
+            let expected: Vec<u8> = payload
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ key[i % 32])
+                .collect();
+            assert_eq!(&sealed[8..], expected);
+            assert_eq!(
+                salamander_open_in_place(password, &mut sealed),
+                Some(payload.as_slice())
+            );
+        }
+        for length in 0..=8 {
+            let mut short = vec![0; length];
+            assert!(salamander_open_in_place(password, &mut short).is_none());
+        }
     }
 
     #[test]

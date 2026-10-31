@@ -370,6 +370,7 @@ pub struct HandshakeData {
 pub struct QuicClientConfig {
     pub(crate) inner: Arc<rustls::ClientConfig>,
     initial: Suite,
+    chrome_seed: Option<[u8; 64]>,
 }
 
 impl QuicClientConfig {
@@ -379,6 +380,7 @@ impl QuicClientConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .ok_or(NoInitialCipherSuite { specific: false })?,
             inner,
+            chrome_seed: None,
         })
     }
 
@@ -390,6 +392,7 @@ impl QuicClientConfig {
             initial: initial_suite_from_provider(inner.crypto_provider())
                 .expect("core-crypto provides TLS13_AES_128_GCM_SHA256"),
             inner: Arc::new(inner),
+            chrome_seed: None,
         }
     }
 
@@ -399,7 +402,11 @@ impl QuicClientConfig {
         initial: Suite,
     ) -> Result<Self, NoInitialCipherSuite> {
         match initial.suite.common.suite {
-            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self { inner, initial }),
+            CipherSuite::TLS13_AES_128_GCM_SHA256 => Ok(Self {
+                inner,
+                initial,
+                chrome_seed: None,
+            }),
             _ => Err(NoInitialCipherSuite { specific: true }),
         }
     }
@@ -414,6 +421,94 @@ impl QuicClientConfig {
 
         config.enable_early_data = true;
         config
+    }
+
+    /// HY2's Xray 26.10.21 Chrome QUIC profile, not an override for other QUIC clients.
+    pub fn with_hy2_chrome(mut self) -> io::Result<Self> {
+        let mut seed = [0; 64];
+        getrandom::fill(&mut seed).map_err(|e| io::Error::other(e.to_string()))?;
+        let mut config = (*self.inner).clone();
+        config.quic_chrome_ech_grease = Some(crate::hello::EchGrease::CHROME.body()?);
+        config.cert_decompressors = vec![&ChromeBrotli];
+        config.resumption = rustls::client::Resumption::disabled();
+        self.inner = Arc::new(config);
+        self.chrome_seed = Some(seed);
+        Ok(self)
+    }
+}
+
+#[derive(Debug)]
+struct ChromeBrotli;
+impl rustls::compress::CertDecompressor for ChromeBrotli {
+    fn algorithm(&self) -> rustls::CertificateCompressionAlgorithm {
+        rustls::CertificateCompressionAlgorithm::Brotli
+    }
+    fn decompress(
+        &self,
+        input: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), rustls::compress::DecompressionFailed> {
+        use brotli::{BrotliDecompressStream, BrotliResult, BrotliState, enc::StandardAlloc};
+        if output.is_empty() || output.len() > 1024 * 1024 {
+            return Err(rustls::compress::DecompressionFailed);
+        }
+        let mut state = BrotliState::new_strict(
+            StandardAlloc::default(),
+            StandardAlloc::default(),
+            StandardAlloc::default(),
+        );
+        let (mut available_in, mut input_offset) = (input.len(), 0);
+        let (mut available_out, mut output_offset, mut total_out) = (output.len(), 0, 0);
+        match BrotliDecompressStream(
+            &mut available_in,
+            &mut input_offset,
+            input,
+            &mut available_out,
+            &mut output_offset,
+            output,
+            &mut total_out,
+            &mut state,
+        ) {
+            BrotliResult::ResultSuccess if available_in == 0 && available_out == 0 => Ok(()),
+            _ => Err(rustls::compress::DecompressionFailed),
+        }
+    }
+}
+
+#[cfg(test)]
+mod chrome_compression_tests {
+    use super::*;
+    use rustls::compress::CertDecompressor;
+    use std::io::Write;
+
+    #[test]
+    fn advertised_brotli_is_strictly_decoded() {
+        let data = b"bounded synthetic certificate payload";
+        let mut encoded = Vec::new();
+        {
+            let mut writer = brotli::CompressorWriter::new(&mut encoded, 4096, 4, 22);
+            writer.write_all(data).unwrap();
+        }
+        let mut out = vec![0; data.len()];
+        ChromeBrotli.decompress(&encoded, &mut out).unwrap();
+        assert_eq!(out, data);
+        assert!(
+            ChromeBrotli
+                .decompress(&encoded, &mut vec![0; data.len() - 1])
+                .is_err()
+        );
+        assert!(
+            ChromeBrotli
+                .decompress(&encoded, &mut vec![0; data.len() + 1])
+                .is_err()
+        );
+        assert!(
+            ChromeBrotli
+                .decompress(&encoded[..encoded.len() - 1], &mut out)
+                .is_err()
+        );
+        encoded.push(0);
+        assert!(ChromeBrotli.decompress(&encoded, &mut out).is_err());
     }
 }
 
@@ -436,7 +531,10 @@ impl crypto::ClientConfig for QuicClientConfig {
                     ServerName::try_from(server_name)
                         .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?
                         .to_owned(),
-                    client_params(params),
+                    match &self.chrome_seed {
+                        Some(seed) => super::params::in_chrome_order(&to_vec(params), seed),
+                        None => client_params(params),
+                    },
                 )
                 .map_err(|_| ConnectError::InvalidServerName(server_name.into()))?,
             ),

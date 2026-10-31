@@ -43,6 +43,7 @@ pub struct TransportConfig {
     /// xrust: pad every client Initial datagram to the send size, as quic-go
     /// does, instead of to RFC 9000's 1200-byte minimum.
     pub(crate) pad_initial_to_mtu: bool,
+    pub(crate) chrome_initial: bool,
     pub(crate) ack_frequency_config: Option<AckFrequencyConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -253,6 +254,12 @@ impl TransportConfig {
         self
     }
 
+    /// Xrust: Chrome client handshake layout, including Initial CRYPTO/PING/padding.
+    pub fn chrome_initial(&mut self, value: bool) -> &mut Self {
+        self.chrome_initial = value;
+        self
+    }
+
     /// Specifies the ACK frequency config (see [`AckFrequencyConfig`] for details)
     ///
     /// The provided configuration will be ignored if the peer does not support the acknowledgement
@@ -403,6 +410,7 @@ impl Default for TransportConfig {
             mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
             pad_to_mtu: false,
             pad_initial_to_mtu: false,
+            chrome_initial: false,
             ack_frequency_config: None,
 
             persistent_congestion_threshold: 3,
@@ -441,6 +449,7 @@ impl fmt::Debug for TransportConfig {
             mtu_discovery_config,
             pad_to_mtu,
             pad_initial_to_mtu,
+            chrome_initial,
             ack_frequency_config,
             persistent_congestion_threshold,
             keep_alive_interval,
@@ -471,6 +480,7 @@ impl fmt::Debug for TransportConfig {
             .field("mtu_discovery_config", mtu_discovery_config)
             .field("pad_to_mtu", pad_to_mtu)
             .field("pad_initial_to_mtu", pad_initial_to_mtu)
+            .field("chrome_initial", chrome_initial)
             .field("ack_frequency_config", ack_frequency_config)
             .field(
                 "persistent_congestion_threshold",

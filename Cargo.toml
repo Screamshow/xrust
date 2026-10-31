@@ -16,6 +16,8 @@ members = [
 # reference; at window/32 the stream stays fed and tput_1 reaches parity
 # (2.63 vs 2.74 Gbit/s). Vendored: upstream h2 has no knob for this ratio.
 [patch.crates-io]
+# A QUIC-only Chrome ClientHello preset; ordinary TLS and verification are unchanged.
+rustls = { path = "vendor/rustls" }
 h2 = { path = "vendor/h2" }
 # Library API extension for binary VLESS contexts; hash implementation unchanged.
 blake3 = { path = "vendor/blake3" }

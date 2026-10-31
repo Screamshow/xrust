@@ -48,7 +48,7 @@ impl EchGrease {
 
     /// The extension body (RFC 9849 §5, outer variant): type 0, cipher suite,
     /// config_id, enc, payload (u_ech.go:177-200).
-    fn body(&self) -> io::Result<Vec<u8>> {
+    pub(crate) fn body(&self) -> io::Result<Vec<u8>> {
         let mut draw = [0u8; 32 + 1];
         getrandom::fill(&mut draw).map_err(|e| err(&format!("no entropy: {e}")))?;
         let (kdf, aead) = self.cipher_suites[pick(self.cipher_suites.len())?];

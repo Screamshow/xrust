@@ -38,6 +38,7 @@ use crate::{
 };
 
 mod ack_frequency;
+mod chrome_initial;
 use ack_frequency::AckFrequencyState;
 
 mod assembler;
@@ -552,6 +553,16 @@ impl Connection {
             let mut ack_eliciting = !self.spaces[space_id].pending.is_empty(&self.streams)
                 || self.spaces[space_id].ping_pending
                 || self.spaces[space_id].immediate_ack_pending;
+            if self.config.chrome_initial
+                && self.side.is_client()
+                && space_id == SpaceId::Handshake
+                && self.spaces[space_id].pending_acks.can_send()
+                && !self.spaces[space_id].pending.crypto.is_empty()
+                && !self.spaces[space_id].ping_pending
+                && !self.spaces[space_id].immediate_ack_pending
+            {
+                ack_eliciting = false;
+            }
             if space_id == SpaceId::Data {
                 ack_eliciting |= self.can_send_1rtt(frame_space_1rtt);
             }
@@ -789,7 +800,9 @@ impl Connection {
                 ack_eliciting,
                 self,
             )?);
-            coalesce = coalesce && !builder.short_header;
+            coalesce = coalesce
+                && !builder.short_header
+                && !(self.config.chrome_initial && self.side.is_client());
 
             // https://tools.ietf.org/html/draft-ietf-quic-transport-34#section-14.1
             pad_datagram |=
@@ -810,6 +823,7 @@ impl Connection {
                         buf,
                         &mut self.stats,
                         buf_capacity,
+                        self.config.chrome_initial && self.side.is_client() && space_id != SpaceId::Data,
                     );
                 }
 
@@ -894,6 +908,14 @@ impl Connection {
 
             let sent =
                 self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let chrome_handshake_ack = self.config.chrome_initial
+                && self.side.is_client()
+                && space_id == SpaceId::Handshake
+                && sent.largest_acked.is_some()
+                && !self.spaces[space_id].pending.crypto.is_empty();
+            if chrome_handshake_ack {
+                builder.ack_eliciting = !sent.is_ack_only(&self.streams);
+            }
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -903,6 +925,7 @@ impl Connection {
             // writing ACKs.
             debug_assert!(
                 !(sent.is_ack_only(&self.streams)
+                    && !chrome_handshake_ack
                     && !can_send.acks
                     && can_send.other
                     && (buf_capacity - builder.datagram_start) == self.path.current_mtu() as usize
@@ -919,6 +942,16 @@ impl Connection {
 
             // Keep information about the packet around until it gets finalized
             sent_frames = Some(sent);
+
+            // Keep both the Handshake ACK and Finished in their own batches.
+            // Neither tiny packet may set the GSO segment size for the queued
+            // CRYPTO / application data, which must retain the normal MTU.
+            if self.config.chrome_initial
+                && self.side.is_client()
+                && space_id == SpaceId::Handshake
+            {
+                break;
+            }
 
             // Don't increment space_idx.
             // We stay in the current space and check if there is more data to send.
@@ -3177,6 +3210,9 @@ impl Connection {
         pn: u64,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
+        let chrome_handshake = self.config.chrome_initial
+            && self.side.is_client()
+            && space_id != SpaceId::Data;
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();
@@ -3218,7 +3254,17 @@ impl Connection {
                 buf,
                 &mut self.stats,
                 max_size,
+                chrome_handshake,
             );
+        }
+
+        if self.config.chrome_initial
+            && self.side.is_client()
+            && space_id == SpaceId::Handshake
+            && sent.largest_acked.is_some()
+            && !space.pending.crypto.is_empty()
+        {
+            return sent;
         }
 
         // ACK_FREQUENCY
@@ -3279,7 +3325,17 @@ impl Connection {
         }
 
         // CRYPTO
-        while buf.len() + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
+        let chrome = self.config.chrome_initial
+            && self.side.is_client()
+            && space_id == SpaceId::Initial;
+        if chrome && !space.pending.crypto.is_empty() {
+            let (frames, pings) =
+                chrome_initial::write(&mut space.pending.crypto, buf, max_size, &mut self.rng);
+            self.stats.frame_tx.crypto += frames.len() as u64;
+            self.stats.frame_tx.ping += pings as u64;
+            sent.retransmits.get_or_create().crypto.extend(frames);
+        }
+        while !chrome && buf.len() + frame::Crypto::SIZE_BOUND < max_size && !is_0rtt {
             let mut frame = match space.pending.crypto.pop_front() {
                 Some(x) => x,
                 None => break,
@@ -3447,6 +3503,7 @@ impl Connection {
                 buf,
                 &mut self.stats,
                 max_size,
+                chrome_handshake,
             );
         }
 
@@ -3468,6 +3525,7 @@ impl Connection {
         buf: &mut Vec<u8>,
         stats: &mut ConnectionStats,
         max_size: usize,
+        zero_delay: bool,
     ) {
         debug_assert!(!space.pending_acks.ranges().is_empty());
 
@@ -3479,7 +3537,14 @@ impl Connection {
             None
         };
 
-        let delay_micros = space.pending_acks.ack_delay(now).as_micros() as u64;
+        // quic-go leaves ACK delay zero outside application data. Such delay
+        // is ignored by RFC 9002, and encoding measured CPU time here also
+        // changes the visible Handshake ACK packet length.
+        let delay_micros = if zero_delay {
+            0
+        } else {
+            space.pending_acks.ack_delay(now).as_micros() as u64
+        };
 
         // TODO: This should come from `TransportConfig` if that gets configurable.
         let ack_delay_exp = TransportParameters::default().ack_delay_exponent;

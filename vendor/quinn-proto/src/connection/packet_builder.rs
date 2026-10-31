@@ -86,7 +86,16 @@ impl PacketBuilder {
 
         let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
 
-        let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
+        let number = if conn.config.chrome_initial
+            && conn.side.is_client()
+            && space_id == SpaceId::Initial
+            && exact_number > 0
+            && exact_number <= u16::MAX as u64
+        {
+            PacketNumber::U16(exact_number as u16)
+        } else {
+            PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0))
+        };
         let header = match space_id {
             SpaceId::Data if space.crypto.is_some() => Header::Short {
                 dst_cid,

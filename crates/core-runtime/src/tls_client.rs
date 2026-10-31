@@ -1366,13 +1366,15 @@ tKRtIBbVNqzAuojxmi55s2+rAP2MkmRaA4dJ5cDEEsVBbwnQkkEKHOPK
         let key_pin = core_tls::verify::spki_sha256(cert.as_ref()).unwrap();
         let endpoint_config =
             || quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(&[9; 32])));
-        let serve = |key_holder: bool| {
-            let mut cfg = server_config(
-                cert.clone(),
-                key_holder,
-                core_tls::quic::configured_provider(),
-            );
-            cfg.alpn_protocols = vec![b"pin-test".to_vec()];
+        let serve = |key_holder: bool, classical_only: bool| {
+            let mut provider = (*core_tls::quic::configured_provider()).clone();
+            if classical_only {
+                provider
+                    .kx_groups
+                    .retain(|g| g.name() == rustls::NamedGroup::X25519);
+            }
+            let mut cfg = server_config(cert.clone(), key_holder, Arc::new(provider));
+            cfg.alpn_protocols = vec![b"h3".to_vec()];
             let server_config = quinn::ServerConfig::new(
                 Arc::new(core_tls::quic::QuicServerConfig::try_from(cfg).unwrap()),
                 Arc::new(core_tls::quic::HandshakeTokenKeyRustCrypto::new([7; 64])),
@@ -1396,58 +1398,75 @@ tKRtIBbVNqzAuojxmi55s2+rAP2MkmRaA4dJ5cDEEsVBbwnQkkEKHOPK
             });
             (addr, task)
         };
-        let (genuine, genuine_task) = serve(true);
+        let (genuine, genuine_task) = serve(true, false);
+        let (classical, classical_task) = serve(true, true);
         // the pinned certificate, signed for with a key that is not its own
-        let (stolen, stolen_task) = serve(false);
-        for (addr, cert_pins, key_pins, insecure, expected) in [
-            (genuine, vec![cert_pin], vec![key_pin], false, true),
-            (genuine, vec![[0; 32]], vec![], false, false),
-            (genuine, vec![], vec![[0; 32]], false, false),
-            // insecure does not switch the pins off
-            (genuine, vec![cert_pin], vec![key_pin], true, true),
-            (genuine, vec![cert_pin], vec![], true, true),
-            (genuine, vec![[0; 32]], vec![], true, false),
-            (genuine, vec![], vec![[0; 32]], true, false),
-            (genuine, vec![[0; 32]], vec![[0; 32]], true, false),
-            // and without a pin it still accepts anything
-            (genuine, vec![], vec![], true, true),
-            (stolen, vec![], vec![], true, true),
-            // a pin is only as good as the handshake signature behind it
-            (stolen, vec![cert_pin], vec![key_pin], true, false),
-            (stolen, vec![cert_pin], vec![key_pin], false, false),
-        ] {
-            let mut tls = options(json!({"tls":{"enabled":true,"server_name":"localhost"}}))
-                .unwrap()
+        let (stolen, stolen_task) = serve(false, false);
+        for chrome in [false, true] {
+            for (addr, cert_pins, key_pins, insecure, expected) in [
+                (genuine, vec![cert_pin], vec![key_pin], false, true),
+                // Both offered shares must retain the matching private key.
+                (classical, vec![cert_pin], vec![key_pin], false, true),
+                (classical, vec![[0; 32]], vec![], false, false),
+                (genuine, vec![[0; 32]], vec![], false, false),
+                (genuine, vec![], vec![[0; 32]], false, false),
+                // insecure does not switch the pins off
+                (genuine, vec![cert_pin], vec![key_pin], true, true),
+                (genuine, vec![cert_pin], vec![], true, true),
+                (genuine, vec![[0; 32]], vec![], true, false),
+                (genuine, vec![], vec![[0; 32]], true, false),
+                (genuine, vec![[0; 32]], vec![[0; 32]], true, false),
+                // and without a pin it still accepts anything
+                (genuine, vec![], vec![], true, true),
+                (stolen, vec![], vec![], true, true),
+                // a pin is only as good as the handshake signature behind it
+                (stolen, vec![cert_pin], vec![key_pin], true, false),
+                (stolen, vec![cert_pin], vec![key_pin], false, false),
+            ] {
+                let mut tls = options(json!({"tls":{"enabled":true,"server_name":"localhost"}}))
+                    .unwrap()
+                    .unwrap();
+                tls.ca_certs = vec![ca.clone()];
+                tls.certificate_sha256 = cert_pins;
+                tls.certificate_public_key_sha256 = key_pins;
+                tls.insecure = insecure;
+                let mut client = quinn::Endpoint::new(
+                    endpoint_config(),
+                    None,
+                    std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                    quinn::default_runtime().unwrap(),
+                )
                 .unwrap();
-            tls.ca_certs = vec![ca.clone()];
-            tls.certificate_sha256 = cert_pins;
-            tls.certificate_public_key_sha256 = key_pins;
-            tls.insecure = insecure;
-            let mut client = quinn::Endpoint::new(
-                endpoint_config(),
-                None,
-                std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
-                quinn::default_runtime().unwrap(),
-            )
-            .unwrap();
-            client.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-                tls.quic_config(&[b"pin-test"]).unwrap(),
-            )));
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                client.connect(addr, "localhost").unwrap(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                result.is_ok(),
-                expected,
-                "QUIC pin policy: insecure={insecure} {:?}",
-                result.err()
-            );
-            client.close(0u32.into(), b"test complete");
+                let crypto = tls.quic_config(&[b"h3"]).unwrap();
+                let crypto = if chrome {
+                    crypto.with_hy2_chrome().unwrap()
+                } else {
+                    crypto
+                };
+                let mut config = quinn::ClientConfig::new(Arc::new(crypto));
+                if chrome {
+                    let mut transport = quinn::TransportConfig::default();
+                    transport.chrome_initial(true);
+                    config.transport_config(Arc::new(transport));
+                }
+                client.set_default_client_config(config);
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    client.connect(addr, "localhost").unwrap(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "QUIC pin policy: insecure={insecure} {:?}",
+                    result.err()
+                );
+                client.close(0u32.into(), b"test complete");
+            }
         }
         genuine_task.abort();
+        classical_task.abort();
         stolen_task.abort();
     }
 
