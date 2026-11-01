@@ -5238,19 +5238,33 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
                 "{at}.session_table: required when session_length is set"
             ));
         }
-        let lo = length
-            .split('-')
-            .next()
-            .unwrap_or("0")
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| format!("{at}.session_length: invalid range \"{length}\""))?;
+        let (lo, hi) = length.split_once('-').unwrap_or((&length, &length));
+        let parse = |value: &str| {
+            value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| format!("{at}.session_length: invalid range \"{length}\""))
+        };
+        let (lo, hi) = (parse(lo)?, parse(hi)?);
         if lo == 0 {
             return Err(format!("{at}.session_length: must be above 0"));
         }
-        // id space: len(table)^min >= 2^31
-        let space = (crate::xhttp_session_table(&table).chars().count() as u64)
-            .saturating_pow(lo.min(63) as u32);
+        // Xray roomSize and sing-box X sessionIDRoom count all lengths,
+        // not just the shortest one. Stop once the validation threshold is met.
+        let base = crate::xhttp_session_table(&table).chars().count() as u64;
+        let mut space = 0u64;
+        if base == 1 {
+            space = hi - lo + 1;
+        } else if base > 1 {
+            let mut term = base.saturating_pow(lo.min(63) as u32);
+            for _ in lo..=hi {
+                space = space.saturating_add(term);
+                if space >= (1u64 << 31) {
+                    break;
+                }
+                term = term.saturating_mul(base);
+            }
+        }
         if space < (1u64 << 31) {
             return Err(format!(
                 "{at}.session_length: session id space {space} is too small (want >= 2^31)"
