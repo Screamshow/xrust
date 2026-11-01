@@ -196,6 +196,52 @@ pub(super) fn dht(data: &[u8]) -> bool {
     check(data).is_some()
 }
 
+// Match a decoded 20-byte info hash without allocating or accepting malformed
+// percent escapes. BEP 17 uses the binary hash, not a hex string in the URL.
+fn binary_info_hash(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut pos = 0;
+    let mut decoded = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'%' {
+            if !bytes.get(pos + 1).is_some_and(u8::is_ascii_hexdigit)
+                || !bytes.get(pos + 2).is_some_and(u8::is_ascii_hexdigit)
+            {
+                return false;
+            }
+            pos += 3;
+        } else {
+            pos += 1;
+        }
+        decoded += 1;
+        if decoded > 20 {
+            return false;
+        }
+    }
+    decoded == 20
+}
+
+fn http_seed(query: &str) -> bool {
+    let mut hash = None;
+    let mut piece = None;
+    for (key, value) in query.split('&').filter_map(|p| p.split_once('=')) {
+        let slot = match key {
+            "info_hash" => &mut hash,
+            "piece" => &mut piece,
+            _ => continue,
+        };
+        if slot.replace(value).is_some() {
+            return false;
+        }
+    }
+    hash.is_some_and(binary_info_hash)
+        && piece.is_some_and(|value| {
+            !value.is_empty()
+                && value.bytes().all(|b| b.is_ascii_digit())
+                && value.parse::<u32>().is_ok()
+        })
+}
+
 pub(super) fn http(method: &str, target: &str, headers: &str) -> bool {
     // Require tracker parameters together, rather than matching arbitrary text
     // containing "torrent", magnet links, or a generic /announce endpoint.
@@ -208,7 +254,7 @@ pub(super) fn http(method: &str, target: &str, headers: &str) -> bool {
                     .is_some_and(|(k, v)| k == name && !v.is_empty())
             })
         };
-        if has("info_hash") && has("peer_id") && has("port") {
+        if (has("info_hash") && has("peer_id") && has("port")) || http_seed(query) {
             return true;
         }
     }
@@ -224,6 +270,33 @@ pub(super) fn http(method: &str, target: &str, headers: &str) -> bool {
                     "libtorrent",
                     "utorrent",
                     "rtorrent",
+                    "libretorrent",
+                    "bitcomet",
+                    "btwebclient",
+                    "azureus",
+                    "biglybt",
+                    "tixati",
+                    "ktorrent",
+                    "vuze",
+                    "frostwire",
+                    "bitlord",
+                    "bitspirit",
+                    "bittornado",
+                    "mldonkey",
+                    "monotorrent",
+                    "picotorrent",
+                    "tribler",
+                    "webtorrent",
+                    "ctorrent",
+                    "mediaget",
+                    "zona",
+                    "torrserver",
+                    "atorrent",
+                    "ttorrent",
+                    "flud",
+                    "torrdroid",
+                    "torrent-stream",
+                    "peerflix",
                 ]
                 .iter()
                 .any(|client| {
@@ -291,6 +364,71 @@ mod tests {
             "/?info_hash=x&peer_id=y&port=1",
             "Host: example.com"
         ));
+    }
+
+    #[test]
+    fn seed_requires_binary_hash_and_unsigned_piece() {
+        let hash = "%01".repeat(20);
+        for query in [
+            format!("info_hash={hash}&piece=0"),
+            format!("piece=4294967295&info_hash={hash}&ranges=0-1023"),
+            "info_hash=abcdefghijklmnopqrst&piece=3".into(),
+        ] {
+            assert!(http("GET", &format!("/seed?{query}"), "Host: seed"));
+        }
+        for query in [
+            "info_hash=short&piece=0".into(),
+            format!("info_hash={hash}&piece=-1"),
+            format!("info_hash={hash}&piece=+1"),
+            format!("info_hash={hash}&piece="),
+            format!("info_hash={hash}&piece=1x"),
+            format!("info_hash={hash}&piece=4294967296"),
+            format!("info_hash={hash}&piece=1&piece=2"),
+            format!("info_hash={hash}&piece=1&info_hash={hash}"),
+            format!("info_hash={hash}%&piece=0"),
+            format!("info_hash={hash}&other_piece=0"),
+            format!("info_hash={hash}"),
+        ] {
+            assert!(
+                !http("GET", &format!("/seed?{query}"), "Host: seed"),
+                "{query}"
+            );
+        }
+        assert!(!http(
+            "POST",
+            &format!("/seed?info_hash={hash}&piece=0"),
+            "Host: seed"
+        ));
+        for value in ["%", "%0", "%xx", &"%01".repeat(19), &"%01".repeat(21)] {
+            assert!(!binary_info_hash(value));
+        }
+    }
+
+    #[test]
+    fn additional_clients_require_name_boundaries() {
+        for client in [
+            "BiglyBT",
+            "TorrServer",
+            "Flud",
+            "BitComet",
+            "LibreTorrent",
+            "WebTorrent",
+        ] {
+            for suffix in ["", "/1.0", " 1.0"] {
+                assert!(http(
+                    "GET",
+                    "/file",
+                    &format!("User-Agent: {client}{suffix}")
+                ));
+            }
+            for value in [
+                format!("Mozilla/5.0 {client}/1"),
+                format!("{client}-docs/1"),
+                format!("{client}Index/1"),
+            ] {
+                assert!(!http("GET", "/file", &format!("User-Agent: {value}")));
+            }
+        }
     }
 
     #[test]

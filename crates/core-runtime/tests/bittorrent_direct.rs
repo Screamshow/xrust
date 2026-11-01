@@ -41,6 +41,8 @@ async fn split_tcp_is_classified_and_preserved_before_direct() {
             b"\x13BitTorrent protocol".as_slice(),
             b"GET /announce?info_hash=x&peer_id=y&port=6881 HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
             b"GET /seed HTTP/1.1\r\nHost: seed.test\r\nUser-Agent: qBittorrent/5\r\n\r\n",
+            b"GET /seed?info_hash=abcdefghijklmnopqrst&piece=0 HTTP/1.1\r\nHost: seed.test\r\n\r\n",
+            b"GET /file HTTP/1.0\r\nHost: seed.test\r\nUser-Agent: BiglyBT/3.8\r\n\r\n",
         ] {
             for split in [1, payload.len() / 2, payload.len() - 1] {
                 let (mut tx, mut rx) = duplex(4096);
@@ -93,6 +95,15 @@ async fn ordinary_http_and_disabled_extension_keep_normal_routing() {
     for (extended, payload) in [
         (
             false,
+            b"GET /seed?info_hash=abcdefghijklmnopqrst&piece=0 HTTP/1.1\r\nHost: seed.test\r\n\r\n"
+                .as_slice(),
+        ),
+        (
+            false,
+            b"GET /file HTTP/1.1\r\nHost: seed.test\r\nUser-Agent: BiglyBT/1\r\n\r\n",
+        ),
+        (
+            false,
             b"GET /?info_hash=x&peer_id=y&port=1 HTTP/1.1\r\nHost: tracker.test\r\n\r\n".as_slice(),
         ),
         (
@@ -114,5 +125,33 @@ async fn ordinary_http_and_disabled_extension_keep_normal_routing() {
         );
         assert_eq!(ctx.protocol.as_deref(), Some("http"));
         assert_eq!(ctx.sniff_prefix, payload);
+    }
+}
+
+#[tokio::test]
+async fn invalid_http_and_lookalikes_do_not_get_direct_exception() {
+    let router = router(true);
+    for payload in [
+        b"GET / NOTHTTP\r\nUser-Agent: qBittorrent/5\r\n\r\n".as_slice(),
+        b"GET / HTTP/2.0\r\nUser-Agent: BiglyBT/1\r\n\r\n",
+        b"GET / HTTP/1.1 extra\r\nUser-Agent: Flud/1\r\n\r\n",
+        b"GET  / HTTP/1.1\r\nUser-Agent: qBittorrent/5\r\n\r\n",
+        b"GET\t/ HTTP/1.1\r\nUser-Agent: qBittorrent/5\r\n\r\n",
+        b"GET / HTTP/1.1\r\nUser-Agent: TorrServerIndex/1\r\n\r\n",
+        b"GET / HTTP/1.1\r\nUser-Agent: Mozilla/5.0 BiglyBT/1\r\n\r\n",
+        b"GET /search?info_hash=document123&piece=0 HTTP/1.1\r\nHost: example.test\r\n\r\n",
+    ] {
+        for ipv6 in [false, true] {
+            let (mut tx, mut rx) = duplex(4096);
+            tx.write_all(payload).await.unwrap();
+            tx.shutdown().await.unwrap();
+            let mut ctx = context("tcp", ipv6);
+            assert_eq!(
+                router.route(&mut rx, &mut ctx).await.unwrap(),
+                Decision::Outbound(1)
+            );
+            assert_ne!(ctx.protocol.as_deref(), Some("bittorrent"));
+            assert_eq!(ctx.sniff_prefix, payload);
+        }
     }
 }

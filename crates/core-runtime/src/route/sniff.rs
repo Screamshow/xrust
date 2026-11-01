@@ -352,6 +352,20 @@ fn sniff_http_impl(buf: &[u8], ctx: &mut ConnContext, extended: bool) -> Outcome
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let request_target = parts.next().unwrap_or_default();
+    // Keep ordinary HTTP sniffing compatible; optional BitTorrent routing must
+    // not turn a malformed request line into a DIRECT exception via its UA.
+    if extended {
+        let mut request = request_line.split(' ');
+        let valid = request.next() == Some(method)
+            && request.next() == Some(request_target)
+            && !request_target.is_empty()
+            && !request_target.bytes().any(|b| b <= b' ' || b == 0x7f)
+            && matches!(request.next(), Some("HTTP/1.0" | "HTTP/1.1"))
+            && request.next().is_none();
+        if !valid {
+            return Outcome::NoMatch;
+        }
+    }
 
     let mut host: Option<String> = None;
     for line in lines {
