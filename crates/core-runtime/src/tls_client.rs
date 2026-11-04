@@ -358,7 +358,10 @@ impl TlsOptions {
                     short_id,
                     fingerprint,
                     support_x25519mlkem768: match r.get("support_x25519mlkem768") {
-                        None => false,
+                        // Preserve the browser profile by default. Removing its
+                        // hybrid share can make a REALITY server reject an
+                        // otherwise valid client; compact hellos are opt-in.
+                        None => true,
                         Some(value) => value.as_bool().ok_or_else(|| {
                             anyhow::anyhow!(
                                 "{at}: tls.reality.support_x25519mlkem768 must be a boolean"

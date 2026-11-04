@@ -29,66 +29,68 @@ async fn unchanged_wg_and_awg_reload_probe() {
 }
 #[tokio::test]
 async fn reality_pq_preference_wire_probe() {
-    for (reality, preference) in [
-        (true, None),
-        (true, Some(false)),
-        (true, Some(true)),
-        (false, None),
-    ] {
-        let mut out = json!({"tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI"}}});
-        if let Some(p) = preference {
-            out["tls"]["reality"]["support_x25519mlkem768"] = json!(p);
-        }
-        if !reality {
-            out["tls"].as_object_mut().unwrap().remove("reality");
-            out["tls"]["utls"] = json!({"enabled":true,"fingerprint":"chrome"});
-        }
-        let opts = core_runtime::tls_client::TlsOptions::from_outbound(
-            out.as_object().unwrap(),
-            "example.com",
-            "probe",
-        )
-        .unwrap()
-        .unwrap();
-        let (a, mut b) = tokio::io::duplex(8192);
-        let t = tokio::spawn(async move {
-            let _ = opts.establish(a, &[]).await;
-        });
-        let mut head = [0; 5];
-        b.read_exact(&mut head).await.unwrap();
-        let mut payload = vec![0; u16::from_be_bytes([head[3], head[4]]) as usize];
-        b.read_exact(&mut payload).await.unwrap();
-        let mut pos = 4 + 2 + 32;
-        pos += 1 + payload[pos] as usize;
-        let n = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
-        pos += 2 + n;
-        pos += 1 + payload[pos] as usize;
-        pos += 2;
-        let mut hybrid = false;
-        while pos + 4 <= payload.len() {
-            let id = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
-            let n = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
-            pos += 4;
-            if id == 51 {
-                let mut k = pos + 2;
-                while k < pos + n {
-                    let g = u16::from_be_bytes([payload[k], payload[k + 1]]);
-                    let sz = u16::from_be_bytes([payload[k + 2], payload[k + 3]]) as usize;
-                    hybrid |= g == 0x11ec;
-                    k += 4 + sz;
-                }
+    for fingerprint in ["chrome", "firefox", "safari"] {
+        for (reality, preference) in [
+            (true, None),
+            (true, Some(false)),
+            (true, Some(true)),
+            (false, None),
+        ] {
+            let mut out = json!({"tls":{"enabled":true,"server_name":"example.com","reality":{"enabled":true,"public_key":"IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI"}}});
+            out["tls"]["utls"] = json!({"enabled":true,"fingerprint":fingerprint});
+            if let Some(p) = preference {
+                out["tls"]["reality"]["support_x25519mlkem768"] = json!(p);
             }
-            pos += n;
+            if !reality {
+                out["tls"].as_object_mut().unwrap().remove("reality");
+            }
+            let opts = core_runtime::tls_client::TlsOptions::from_outbound(
+                out.as_object().unwrap(),
+                "example.com",
+                "probe",
+            )
+            .unwrap()
+            .unwrap();
+            let (a, mut b) = tokio::io::duplex(8192);
+            let t = tokio::spawn(async move {
+                let _ = opts.establish(a, &[]).await;
+            });
+            let mut head = [0; 5];
+            b.read_exact(&mut head).await.unwrap();
+            let mut payload = vec![0; u16::from_be_bytes([head[3], head[4]]) as usize];
+            b.read_exact(&mut payload).await.unwrap();
+            let mut pos = 4 + 2 + 32;
+            pos += 1 + payload[pos] as usize;
+            let n = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
+            pos += 2 + n;
+            pos += 1 + payload[pos] as usize;
+            pos += 2;
+            let mut hybrid = false;
+            while pos + 4 <= payload.len() {
+                let id = u16::from_be_bytes([payload[pos], payload[pos + 1]]);
+                let n = u16::from_be_bytes([payload[pos + 2], payload[pos + 3]]) as usize;
+                pos += 4;
+                if id == 51 {
+                    let mut k = pos + 2;
+                    while k < pos + n {
+                        let g = u16::from_be_bytes([payload[k], payload[k + 1]]);
+                        let sz = u16::from_be_bytes([payload[k + 2], payload[k + 3]]) as usize;
+                        hybrid |= g == 0x11ec;
+                        k += 4 + sz;
+                    }
+                }
+                pos += n;
+            }
+            println!(
+                "fingerprint={fingerprint} PQ preference={preference:?} record_bytes={} hybrid={hybrid}",
+                payload.len() + 5
+            );
+            assert_eq!(hybrid, !reality || preference != Some(false));
+            if reality && preference == Some(false) {
+                assert!(payload.len() + 5 < 1400);
+            }
+            t.abort();
         }
-        println!(
-            "PQ preference={preference:?} record_bytes={} hybrid={hybrid}",
-            payload.len() + 5
-        );
-        assert_eq!(hybrid, !reality || preference == Some(true));
-        if reality && preference != Some(true) {
-            assert!(payload.len() + 5 < 1400);
-        }
-        t.abort();
     }
 }
 
