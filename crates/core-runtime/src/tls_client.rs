@@ -82,7 +82,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAny {
 #[derive(Clone, Debug)]
 pub struct Fingerprint {
     pub name: String,
-    pub template: core_tls::hello::Template,
+    pub template: Arc<core_tls::hello::Template>,
 }
 
 /// Read a pin field: one base64 SHA-256, or a list of them, as the reference
@@ -321,7 +321,7 @@ impl TlsOptions {
                     .and_then(Value::as_str)
                     .unwrap_or("chrome")
                     .to_string();
-                let template = core_tls::fingerprints::by_name(&name).ok_or_else(|| {
+                let template = core_tls::fingerprints::shared_by_name(&name).ok_or_else(|| {
                     anyhow::anyhow!("{at}: tls.utls.fingerprint: {name:?} is not a known browser")
                 })?;
                 Some(Fingerprint { name, template })
@@ -340,11 +340,12 @@ impl TlsOptions {
                         .map_err(|e| anyhow::anyhow!("{at}: tls.reality.short_id: {e}"))?;
                 let fingerprint = match r.get("fingerprint").and_then(Value::as_str) {
                     Some(name) => {
-                        let template = core_tls::fingerprints::by_name(name).ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "{at}: tls.reality.fingerprint: {name:?} is not a known browser"
-                            )
-                        })?;
+                        let template =
+                            core_tls::fingerprints::shared_by_name(name).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "{at}: tls.reality.fingerprint: {name:?} is not a known browser"
+                                )
+                            })?;
                         Some(Fingerprint {
                             name: name.to_string(),
                             template,
@@ -699,6 +700,24 @@ impl TlsOptions {
         self.reality.as_ref()
     }
 
+    fn handshake_template(&self) -> io::Result<Arc<core_tls::hello::Template>> {
+        let mut template = match self.fingerprint() {
+            Some(fingerprint) => Arc::clone(&fingerprint.template),
+            None => core_tls::fingerprints::shared_by_name("chrome")
+                .expect("the default Chrome template exists"),
+        };
+        if self
+            .reality
+            .as_ref()
+            .is_some_and(|r| !r.support_x25519mlkem768)
+        {
+            // Only this handshake's copy is customized; other outbounds keep
+            // the full immutable browser table, including hybrid groups.
+            compact_reality_template(Arc::make_mut(&mut template))?;
+        }
+        Ok(template)
+    }
+
     /// Whose TLS does the handshake and the record layer.
     ///
     /// A fingerprint or REALITY settles it: neither can be presented through
@@ -816,14 +835,9 @@ impl TlsOptions {
         }
         // With no fingerprint named, present chrome: ours always writes its own
         // hello, so there is a template to pick either way.
-        let (name, mut template) = match self.fingerprint() {
-            Some(f) => (f.name.clone(), f.template.clone()),
-            None => ("chrome".to_string(), core_tls::fingerprints::chrome()),
-        };
+        let name = self.fingerprint().map_or("chrome", |f| f.name.as_str());
+        let template = self.handshake_template()?;
         let reality = self.reality.as_ref();
-        if reality.is_some_and(|r| !r.support_x25519mlkem768) {
-            compact_reality_template(&mut template)?;
-        }
         let seal = reality.map(|r| core_tls::client::RealitySeal {
             public_key: &r.public_key,
             short_id: &r.short_id,
@@ -1582,6 +1596,49 @@ tKRtIBbVNqzAuojxmi55s2+rAP2MkmRaA4dJ5cDEEsVBbwnQkkEKHOPK
                 .any(|e| matches!(e, core_tls::hello::Ext::KeyShare(_)))
         );
         assert!(tls.reality().is_none());
+    }
+
+    #[test]
+    fn outbounds_share_templates_but_reality_customization_is_private() {
+        for name in core_tls::fingerprints::NAMES {
+            let make = || {
+                options(json!({
+                    "server": "example.com",
+                    "tls": {"enabled": true, "utls": {"enabled": true, "fingerprint": name}}
+                }))
+                .unwrap()
+                .unwrap()
+            };
+            let tls = make();
+            let other = make();
+            let base = &tls.fingerprint().unwrap().template;
+            assert!(Arc::ptr_eq(base, &other.fingerprint().unwrap().template));
+            assert!(Arc::ptr_eq(
+                base,
+                &tls.clone().fingerprint().unwrap().template
+            ));
+            assert!(Arc::ptr_eq(base, &tls.handshake_template().unwrap()));
+            let before = format!("{base:?}");
+            let mut reality = tls.clone();
+            reality.reality = Some(Reality {
+                public_key: [1; 32],
+                short_id: vec![2],
+                fingerprint: None,
+                support_x25519mlkem768: false,
+            });
+            let compact = reality.handshake_template().unwrap();
+            assert!(!Arc::ptr_eq(base, &compact));
+            assert_eq!(format!("{:?}", other.handshake_template().unwrap()), before);
+            reality.reality.as_mut().unwrap().support_x25519mlkem768 = true;
+            assert!(Arc::ptr_eq(base, &reality.handshake_template().unwrap()));
+        }
+        let tls = options(json!({"server": "example.com", "tls": {"enabled": true}}))
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &tls.handshake_template().unwrap(),
+            &core_tls::fingerprints::shared_by_name("chrome").unwrap()
+        ));
     }
 
     #[test]

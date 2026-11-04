@@ -47,6 +47,32 @@ pub fn by_name(name: &str) -> Option<Template> {
     })
 }
 
+/// Immutable process-wide tables. The fixed slots cannot grow with config
+/// input; aliases share the same table and randomized retains its existing
+/// once-per-process policy. Callers that customize a table must copy it first.
+pub fn shared_by_name(name: &str) -> Option<std::sync::Arc<Template>> {
+    use std::sync::{Arc, OnceLock};
+    static TABLES: [OnceLock<Arc<Template>>; 6] = [const { OnceLock::new() }; 6];
+    let (slot, canonical) = match name {
+        ""
+        | "chrome"
+        | "chrome_psk"
+        | "chrome_psk_shuffle"
+        | "chrome_padding_psk_shuffle"
+        | "chrome_pq"
+        | "chrome_pq_psk" => (0, "chrome"),
+        "firefox" | "random" => (1, "firefox"),
+        "edge" => (2, "edge"),
+        "safari" => (3, "safari"),
+        "ios" => (4, "ios"),
+        "randomized" => (5, "randomized"),
+        _ => return None,
+    };
+    Some(Arc::clone(TABLES[slot].get_or_init(|| {
+        Arc::new(by_name(canonical).expect("known canonical fingerprint"))
+    })))
+}
+
 /// The names the reference maps to a table, for `check` and for the docs.
 pub const NAMES: &[&str] = &[
     "chrome_psk",
@@ -1323,5 +1349,40 @@ pub fn safari() -> Template {
             Ext::Static(0x4a4a, vec![0x00]),
         ],
         shuffle_extensions: false,
+    }
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn shared_tables_preserve_all_names_and_aliases() {
+        for name in NAMES.iter().copied().chain([""]) {
+            let shared = shared_by_name(name).unwrap();
+            assert!(Arc::ptr_eq(&shared, &shared_by_name(name).unwrap()));
+            assert_eq!(
+                format!("{shared:?}"),
+                format!("{:?}", by_name(name).unwrap())
+            );
+        }
+        let chrome = shared_by_name("chrome").unwrap();
+        for alias in [
+            "",
+            "chrome_psk",
+            "chrome_psk_shuffle",
+            "chrome_padding_psk_shuffle",
+            "chrome_pq",
+            "chrome_pq_psk",
+        ] {
+            assert!(Arc::ptr_eq(&chrome, &shared_by_name(alias).unwrap()));
+        }
+        assert!(Arc::ptr_eq(
+            &shared_by_name("random").unwrap(),
+            &shared_by_name("firefox").unwrap()
+        ));
+        assert!(!Arc::ptr_eq(&chrome, &shared_by_name("firefox").unwrap()));
+        assert!(shared_by_name("unknown").is_none());
     }
 }
