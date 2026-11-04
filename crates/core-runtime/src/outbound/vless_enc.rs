@@ -464,6 +464,7 @@ impl ClientInstance {
                     xor_in_ctr: None,
                     out_skip: 0,
                     in_skip: 0,
+                    direct: VisionDirect::default(),
                 }));
             }
         }
@@ -614,6 +615,7 @@ impl ClientInstance {
             xor_in_ctr,
             out_skip: 0,
             in_skip,
+            direct: VisionDirect::default(),
         }))
     }
 }
@@ -705,11 +707,40 @@ pub struct EncryptedConn {
     xor_in_ctr: Option<Aes128Ctr>,
     out_skip: usize,
     in_skip: usize,
+    direct: VisionDirect,
 }
 
 const RECORD_MAX: usize = 8192;
 
+#[derive(Default)]
+struct VisionDirect {
+    read: bool,
+    write: bool,
+    read_header: Vec<u8>,
+    write_header: Vec<u8>,
+    read_skip: usize,
+    write_skip: usize,
+}
+
 impl EncryptedConn {
+    // Xray unwraps CommonConn once: Direct skips the encryption AEAD, but
+    // retains the outer transport and the random appearance's header XOR.
+    pub(crate) fn enable_vision_direct_read(&mut self) -> bool {
+        if self.rec.is_some() || !self.stage.is_empty() || self.peer_padding.is_some() {
+            return false;
+        }
+        self.direct.read = true;
+        true
+    }
+
+    pub(crate) fn enable_vision_direct_write(&mut self) -> bool {
+        if self.out_pos < self.out_buf.len() || self.out_flush || self.out_claimed != 0 {
+            return false;
+        }
+        self.direct.write = true;
+        true
+    }
+
     /// Append one encrypted record for `chunk` (capped at `RECORD_MAX`)
     /// directly onto `out`, which may already hold the pre_write bytes.
     fn poll_build_record_into(&mut self, buf: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
@@ -750,6 +781,38 @@ fn xor_stream(ctr: &mut Aes128Ctr, skip: &mut usize, buf: &mut [u8]) {
     ctr.apply_keystream(&mut buf[start..end]);
 }
 
+/// XorConn's header-only transform, including split headers and multiple TLS
+/// records in one I/O call. Decode the plaintext length before masking writes.
+fn xor_direct(
+    ctr: &mut Aes128Ctr,
+    skip: &mut usize,
+    header: &mut Vec<u8>,
+    mut buf: &mut [u8],
+    reading: bool,
+) {
+    while !buf.is_empty() {
+        let n = (*skip).min(buf.len());
+        *skip -= n;
+        buf = &mut buf[n..];
+        if buf.is_empty() {
+            break;
+        }
+        let n = (RECORD_HEADER - header.len()).min(buf.len());
+        if reading {
+            ctr.apply_keystream(&mut buf[..n]);
+        }
+        header.extend_from_slice(&buf[..n]);
+        if !reading {
+            ctr.apply_keystream(&mut buf[..n]);
+        }
+        buf = &mut buf[n..];
+        if header.len() == RECORD_HEADER {
+            *skip = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            header.clear();
+        }
+    }
+}
+
 impl AsyncWrite for EncryptedConn {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -760,6 +823,37 @@ impl AsyncWrite for EncryptedConn {
             return Poll::Ready(Ok(0));
         }
         let this = &mut *self;
+        if this.direct.write {
+            if this.xor_out_ctr.is_none() {
+                return Pin::new(&mut this.inner).poll_write(cx, buf);
+            }
+            if this.out_pos >= this.out_buf.len() {
+                this.out_buf.clear();
+                this.out_buf
+                    .extend_from_slice(&buf[..buf.len().min(RECORD_MAX)]);
+                xor_direct(
+                    this.xor_out_ctr.as_mut().expect("checked"),
+                    &mut this.direct.write_skip,
+                    &mut this.direct.write_header,
+                    &mut this.out_buf,
+                    false,
+                );
+                this.out_pos = 0;
+                this.out_claimed = this.out_buf.len();
+            }
+            while this.out_pos < this.out_buf.len() {
+                let n = ready!(
+                    Pin::new(&mut this.inner).poll_write(cx, &this.out_buf[this.out_pos..])
+                )?;
+                if n == 0 {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                this.out_pos += n;
+            }
+            this.out_buf.clear();
+            this.out_pos = 0;
+            return Poll::Ready(Ok(std::mem::take(&mut this.out_claimed)));
+        }
         // an interrupted flush is answered before anything new is built —
         // rebuilding here would put a duplicate record on the wire
         if this.out_flush {
@@ -805,8 +899,8 @@ impl AsyncWrite for EncryptedConn {
         Poll::Ready(Ok(std::mem::take(&mut this.out_claimed)))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -821,6 +915,25 @@ impl AsyncRead for EncryptedConn {
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        if this.direct.read {
+            if !this.raw.is_empty() {
+                let n = out.remaining().min(this.raw.len());
+                out.put_slice(&this.raw.split_to(n));
+                return Poll::Ready(Ok(()));
+            }
+            let before = out.filled().len();
+            ready!(Pin::new(&mut this.inner).poll_read(cx, out))?;
+            if let Some(ctr) = &mut this.xor_in_ctr {
+                xor_direct(
+                    ctr,
+                    &mut this.direct.read_skip,
+                    &mut this.direct.read_header,
+                    &mut out.filled_mut()[before..],
+                    true,
+                );
+            }
+            return Poll::Ready(Ok(()));
+        }
         // 0-RTT: the first read carries the 16-byte server random, which
         // seeds the downlink AEAD (and the XOR stream for `random`).
         if this.is_0rtt && this.peer_aead.is_none() {
@@ -953,6 +1066,42 @@ impl VlessEncryption {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn vision_direct_random_masks_only_headers_across_fragmented_io() {
+        let key = [0x42; 96];
+        let iv = [0x17; 16];
+        let mut plain = Vec::new();
+        for n in [17, 4096, 12000] {
+            let mut h = [0; RECORD_HEADER];
+            encode_header(&mut h, n);
+            plain.extend_from_slice(&h);
+            plain.extend(std::iter::repeat_n(0x55, n));
+        }
+        let mut oracle = plain.clone();
+        let mut ctr = new_ctr(&key, &iv);
+        let mut at = 0;
+        while at < oracle.len() {
+            let n = usize::from(u16::from_be_bytes([oracle[at + 3], oracle[at + 4]]));
+            ctr.apply_keystream(&mut oracle[at..at + RECORD_HEADER]);
+            at += RECORD_HEADER + n;
+        }
+        for chunk in [1, 2, 4, 5, 7, 4096, 65536] {
+            let mut masked = plain.clone();
+            let mut ctr = new_ctr(&key, &iv);
+            let (mut skip, mut header) = (0, Vec::new());
+            for part in masked.chunks_mut(chunk) {
+                xor_direct(&mut ctr, &mut skip, &mut header, part, false);
+            }
+            assert_eq!(masked, oracle);
+            let mut ctr = new_ctr(&key, &iv);
+            let (mut skip, mut header) = (0, Vec::new());
+            for part in masked.chunks_mut(chunk) {
+                xor_direct(&mut ctr, &mut skip, &mut header, part, true);
+            }
+            assert_eq!(masked, plain);
+        }
+    }
+
     #[test]
     fn aes_records_use_the_full_derived_key() {
         use aes_gcm::aead::AeadInPlace;
@@ -1297,6 +1446,7 @@ mod tests {
                 xor_in_ctr: None,
                 out_skip: 0,
                 in_skip: 0,
+                direct: VisionDirect::default(),
             };
             let first =
                 std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll_write(cx, b"abc")))

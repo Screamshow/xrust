@@ -139,6 +139,9 @@ pub(crate) fn enable_vision_direct_read(stream: &mut AnyStream) -> bool {
     if let Some(vless) = stream.downcast_mut::<crate::outbound::secure::VlessStream>() {
         return vless.enable_vision_direct_read();
     }
+    if let Some(encrypted) = stream.downcast_mut::<crate::outbound::vless_enc::EncryptedConn>() {
+        return encrypted.enable_vision_direct_read();
+    }
     if let Some(tls) = stream.downcast_mut::<crate::tls_utls::FingerprintStream<TcpStream>>() {
         tls.enable_direct_read();
         return true;
@@ -177,6 +180,7 @@ pub(crate) fn supports_vision_direct(stream: &mut AnyStream) -> bool {
         return vless.supports_vision_direct();
     }
     stream.is::<crate::tls_utls::FingerprintStream<TcpStream>>()
+        || stream.is::<crate::outbound::vless_enc::EncryptedConn>()
 }
 
 /// Enter raw writes only after the last encrypted Vision frame was drained.
@@ -187,6 +191,9 @@ pub(crate) fn enable_vision_direct_write(stream: &mut AnyStream) -> bool {
     }
     if let Some(vless) = stream.downcast_mut::<crate::outbound::secure::VlessStream>() {
         return vless.enable_vision_direct_write();
+    }
+    if let Some(encrypted) = stream.downcast_mut::<crate::outbound::vless_enc::EncryptedConn>() {
+        return encrypted.enable_vision_direct_write();
     }
     if let Some(tls) = stream.downcast_mut::<crate::tls_utls::FingerprintStream<TcpStream>>() {
         return tls.enable_direct_write();

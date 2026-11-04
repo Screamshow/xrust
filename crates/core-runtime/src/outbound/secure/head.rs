@@ -17,7 +17,7 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll, Waker, ready};
 use std::time::Duration;
 
 use tokio::io::AsyncWrite;
@@ -44,6 +44,7 @@ pub(crate) struct PendingHead {
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     /// the head went out from the read side and still needs a flush
     flush_head: bool,
+    waiting_reader: Option<Waker>,
 }
 
 impl PendingHead {
@@ -54,6 +55,7 @@ impl PendingHead {
             first_write,
             deadline: Some(Box::pin(tokio::time::sleep(wait))),
             flush_head: false,
+            waiting_reader: None,
         }
     }
 
@@ -88,6 +90,9 @@ impl PendingHead {
         let claimed = *claimed;
         self.state = State::Done;
         self.deadline = None;
+        if let Some(reader) = self.waiting_reader.take() {
+            reader.wake();
+        }
         Poll::Ready(Ok(claimed))
     }
 
@@ -109,6 +114,9 @@ impl PendingHead {
         if matches!(self.state, State::Waiting(_)) {
             self.state = State::Done;
             self.deadline = None;
+            if let Some(reader) = self.waiting_reader.take() {
+                reader.wake();
+            }
         }
     }
 
@@ -126,6 +134,10 @@ impl PendingHead {
             match &self.state {
                 // nothing can come back before the server has the head
                 State::Waiting(_) => {
+                    // UDP bridges split reads and writes into separate tasks.
+                    // A first write cancels the deadline: wake the reader that
+                    // was waiting on it so it can register for server data.
+                    self.waiting_reader = Some(cx.waker().clone());
                     if let Some(deadline) = self.deadline.as_mut() {
                         ready!(deadline.as_mut().poll(cx));
                     }
@@ -216,5 +228,40 @@ impl PendingHead {
             ready!(self.poll_head(inner, cx))?;
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::task::Wake;
+
+    struct WakeCount(AtomicUsize);
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_write_wakes_reader_whose_deadline_it_cancels() {
+        let (mut io, _peer) = tokio::io::duplex(1024);
+        let mut head = PendingHead::new(b"head".to_vec(), Duration::from_secs(60), 1024);
+        let reader = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let rw = Waker::from(Arc::clone(&reader));
+        let mut rcx = Context::from_waker(&rw);
+        assert!(head.poll_before_read(&mut io, &mut rcx).is_pending());
+        let ww = Waker::noop();
+        let mut wcx = Context::from_waker(ww);
+        assert!(matches!(
+            head.poll_write(&mut io, &mut wcx, b"first"),
+            Poll::Ready(Ok(5))
+        ));
+        assert_eq!(reader.0.load(Ordering::SeqCst), 1);
+        assert!(head.poll_before_read(&mut io, &mut rcx).is_ready());
     }
 }

@@ -6,7 +6,7 @@ use tokio::io::AsyncWriteExt;
 
 use crate::inbound::{AnyStream, Target};
 use crate::outbound::mux;
-use crate::outbound::packet::{CMD_MUX, CMD_TCP, PacketEncoding, spawn_packet_bridge};
+use crate::outbound::packet::{CMD_MUX, CMD_TCP, CMD_UDP, PacketEncoding, spawn_packet_bridge};
 use crate::outbound::proxy::server_endpoint;
 use crate::outbound::transport::Transport;
 use crate::tls_client::TlsOptions;
@@ -163,14 +163,17 @@ impl Vless {
     }
 
     async fn dial(&self, command: u8, target: &Target) -> io::Result<AnyStream> {
-        let header = request_head(&self.uuid, command, target, self.vision)?;
+        // Plain VLESS UDP is accepted without flow even on a Vision account.
+        // XUDP uses Mux and keeps Vision framing; the UDP command must not.
+        let vision = self.vision && command != CMD_UDP;
+        let header = request_head(&self.uuid, command, target, vision)?;
         // a ws transport with early data sends its upgrade request with the
         // first write below, so the head and first payload ride in it
         let mut stream = self
             .transport
             .connect_or_dial(self.tls.as_ref(), &self.server, self.port, &self.dial)
             .await?;
-        if self.vision {
+        if vision {
             // the transport is still bare here, which is all this needs; it
             // walks a wrapped stream just as well (see the function)
             crate::inbound::disable_tls_read_batching(&mut stream);
@@ -209,7 +212,7 @@ impl Vless {
             need: 2,
             buf: Vec::new(),
         });
-        if self.vision {
+        if vision {
             // Vision frames the payload that follows the request header
             Ok(Box::new(crate::outbound::vision::VisionStream::new(
                 framed, self.uuid,
