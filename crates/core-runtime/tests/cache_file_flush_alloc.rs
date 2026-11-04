@@ -1,6 +1,6 @@
-//! A flush must not copy the stored keys and values before writing them: the
-//! only large allocation is the file image itself. One test per binary, so
-//! the counting allocator sees nothing else.
+//! A flush borrows stored bytes and streams its image. Index allocations may
+//! scale with entry count, but a large value must not require an image copy.
+//! One test per binary isolates the counting allocator.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,7 +45,7 @@ unsafe impl GlobalAlloc for CountAlloc {
 static ALLOC: CountAlloc = CountAlloc;
 
 #[test]
-fn flush_allocates_about_one_file_image() {
+fn flush_streams_large_values_without_allocating_a_file_image() {
     let dir = std::env::temp_dir().join(format!("rust-x-flush-alloc-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -77,10 +77,44 @@ fn flush_allocates_about_one_file_image() {
     drop(store);
     std::fs::remove_dir_all(&dir).unwrap();
 
-    // The image Vec grows by doubling, so up to twice the file; copies of the
-    // stored data would add at least one more file's worth per copy.
+    println!("mixed_flush_extra={extra} database_bytes={file}");
     assert!(
-        extra < 2 * file + file / 2,
+        extra < file,
         "flush allocated {extra} bytes for a {file}-byte file"
     );
+
+    use core_experimental::bbolt::{self, EntryRef, NodeRef};
+    let value = vec![0x5a; 8 * 1024 * 1024];
+    let tree = || NodeRef {
+        entries: vec![EntryRef::Bucket {
+            name: b"rule_set",
+            seq: 0,
+            node: NodeRef {
+                entries: vec![EntryRef::Kv(b"large", &value)],
+            },
+        }],
+    };
+    let before = LIVE.load(Ordering::Relaxed);
+    PEAK.store(before, Ordering::Relaxed);
+    let image = bbolt::encode_ref(tree()).unwrap();
+    let image_peak = PEAK.load(Ordering::Relaxed) - before;
+
+    // Recreate the owned temporary directory after the mixed-cache check.
+    std::fs::create_dir_all(&dir).unwrap();
+    let output = std::fs::File::create(&path).unwrap();
+    let before = LIVE.load(Ordering::Relaxed);
+    PEAK.store(before, Ordering::Relaxed);
+    bbolt::write_to(std::io::BufWriter::with_capacity(32 * 1024, output), tree()).unwrap();
+    let stream_peak = PEAK.load(Ordering::Relaxed) - before;
+    assert!(image_peak >= value.len());
+    assert!(
+        stream_peak < 128 * 1024,
+        "payload-sized allocation: {stream_peak}"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), image);
+    println!(
+        "large_value_bytes={} image_peak={image_peak} stream_peak={stream_peak}",
+        value.len()
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
 }

@@ -321,8 +321,12 @@ impl CacheFile {
             return Ok(());
         }
         let tmp = self.path.with_extension("db.tmp");
-        let image = core_experimental::bbolt::encode_ref(build_tree(&self.buckets))?;
-        replace_synced(&tmp, &self.path, &image)?;
+        replace_synced(&tmp, &self.path, |file| {
+            core_experimental::bbolt::write_to(
+                std::io::BufWriter::with_capacity(32 * 1024, file),
+                build_tree(&self.buckets),
+            )
+        })?;
         self.dirty = false;
         self.pending = 0;
         self.last_flush = Instant::now();
@@ -330,16 +334,19 @@ impl CacheFile {
     }
 }
 
-/// Write `image` to `tmp`, sync it, rename it over `path`, then sync the
+/// Stream the new image to `tmp`, sync it, rename it over `path`, then sync the
 /// directory so the rename itself survives a power loss.
 ///
 /// Before the rename an error leaves `path` untouched and removes `tmp`.
 /// After the rename `path` already holds the new image; a failed directory
 /// sync is returned as such and nothing is rolled back.
-fn replace_synced(tmp: &Path, path: &Path, image: &[u8]) -> io::Result<()> {
-    use std::io::Write;
+fn replace_synced(
+    tmp: &Path,
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<()> {
     let written = std::fs::File::create(tmp).and_then(|mut file| {
-        file.write_all(image)?;
+        write(&mut file)?;
         file.sync_all()
     });
     if let Err(error) = written.and_then(|()| std::fs::rename(tmp, path)) {
@@ -637,6 +644,30 @@ mod durable_flush_tests {
         assert_eq!(sync_hook::take_seen(), vec![dir.clone()]);
         assert!(!cache.dirty);
         assert!(!path.with_extension("db.tmp").exists());
+        drop(cache);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn partial_stream_error_keeps_old_file_and_removes_temporary_file() {
+        use std::io::Write;
+        let dir = temp_dir("partial");
+        let path = dir.join("cache.db");
+        let tmp = path.with_extension("db.tmp");
+        let mut cache = open(&path);
+        cache.put("test", b"k", b"old".to_vec());
+        cache.flush().unwrap();
+        let error = replace_synced(&tmp, &path, |file| {
+            file.write_all(b"partial image")?;
+            Err(io::Error::other("injected mid-stream error"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("mid-stream"));
+        assert!(!tmp.exists());
+        assert_eq!(stored(&path, b"k").as_deref(), Some(&b"old"[..]));
+        cache.put("test", b"k", b"new".to_vec());
+        cache.flush().unwrap();
+        assert_eq!(stored(&path, b"k").as_deref(), Some(&b"new"[..]));
         drop(cache);
         std::fs::remove_dir_all(dir).unwrap();
     }

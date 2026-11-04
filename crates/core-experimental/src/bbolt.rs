@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub const MAGIC: u32 = 0xED0CDAED;
@@ -551,29 +551,53 @@ impl Inode<'_> {
 /// A bbolt writer: builds the tree bottom-up, spilling large nodes across
 /// overflow pages and splitting wide nodes behind branch pages, so the file is
 /// byte-compatible with go.etcd.io/bbolt readers.
-struct Writer {
+struct Writer<W> {
     page_size: usize,
     next_pgid: u64,
-    file: Vec<u8>,
+    file: W,
 }
 
-impl Writer {
-    fn new(page_size: usize) -> Self {
-        Self {
+impl<W: Write + Seek> Writer<W> {
+    fn new(mut file: W, page_size: usize) -> io::Result<Self> {
+        file.seek(SeekFrom::Start(0))?;
+        let mut writer = Self {
             page_size,
             next_pgid: 2,
-            file: vec![0u8; 2 * page_size],
-        }
+            file,
+        };
+        writer.zeros(2 * page_size)?;
+        Ok(writer)
     }
 
     fn alloc(&mut self, npages: usize) -> u64 {
         let pgid = self.next_pgid;
         self.next_pgid += npages as u64;
-        let end = (pgid as usize + npages) * self.page_size;
-        if self.file.len() < end {
-            self.file.resize(end, 0);
-        }
         pgid
+    }
+
+    fn zeros(&mut self, mut bytes: usize) -> io::Result<()> {
+        let zeroes = [0u8; 4096];
+        while bytes > 0 {
+            let chunk = bytes.min(zeroes.len());
+            self.file.write_all(&zeroes[..chunk])?;
+            bytes -= chunk;
+        }
+        Ok(())
+    }
+
+    fn page_header(
+        &mut self,
+        pgid: u64,
+        flags: u16,
+        count: usize,
+        overflow: usize,
+    ) -> io::Result<()> {
+        // Data pages are allocated and emitted consecutively. Only metadata
+        // needs a seek, so buffered disk writes stay sequential here.
+        self.file.write_all(&pgid.to_le_bytes())?;
+        self.file.write_all(&flags.to_le_bytes())?;
+        self.file.write_all(&(count as u16).to_le_bytes())?;
+        self.file.write_all(&(overflow as u32).to_le_bytes())
     }
 
     /// Materialize a node and everything under it; returns its root pgid.
@@ -601,10 +625,10 @@ impl Writer {
                 }
             }
         }
-        Ok(self.spill(&inodes))
+        self.spill(&inodes)
     }
 
-    fn spill(&mut self, inodes: &[Inode<'_>]) -> u64 {
+    fn spill(&mut self, inodes: &[Inode<'_>]) -> io::Result<u64> {
         if inodes.is_empty() {
             return self.write_leaf(&[]);
         }
@@ -616,7 +640,7 @@ impl Writer {
         let mut refs = Vec::with_capacity(leaves.len());
         for range in leaves {
             let leaf = &inodes[range];
-            let pgid = self.write_leaf(leaf);
+            let pgid = self.write_leaf(leaf)?;
             refs.push((leaf[0].key, pgid));
         }
         self.build_branch(refs)
@@ -643,7 +667,7 @@ impl Writer {
         leaves
     }
 
-    fn write_leaf(&mut self, inodes: &[Inode<'_>]) -> u64 {
+    fn write_leaf(&mut self, inodes: &[Inode<'_>]) -> io::Result<u64> {
         let total = PAGE_HEADER
             + LEAF_ELEM * inodes.len()
             + inodes
@@ -652,30 +676,29 @@ impl Writer {
                 .sum::<usize>();
         let npages = total.div_ceil(self.page_size).max(1);
         let pgid = self.alloc(npages);
-        let base = pgid as usize * self.page_size;
-        self.file[base..base + 8].copy_from_slice(&pgid.to_le_bytes());
-        self.file[base + 8..base + 10].copy_from_slice(&LEAF_FLAG.to_le_bytes());
-        self.file[base + 10..base + 12].copy_from_slice(&(inodes.len() as u16).to_le_bytes());
-        self.file[base + 12..base + 16].copy_from_slice(&((npages - 1) as u32).to_le_bytes());
-        let mut data_off = base + PAGE_HEADER + LEAF_ELEM * inodes.len();
+        self.page_header(pgid, LEAF_FLAG, inodes.len(), npages - 1)?;
+        let mut data_off = PAGE_HEADER + LEAF_ELEM * inodes.len();
         for (i, inode) in inodes.iter().enumerate() {
             let value = inode.value();
-            let elem = base + PAGE_HEADER + i * LEAF_ELEM;
+            let elem = PAGE_HEADER + i * LEAF_ELEM;
             let pos = (data_off - elem) as u32;
-            self.file[elem..elem + 4].copy_from_slice(&inode.flags.to_le_bytes());
-            self.file[elem + 4..elem + 8].copy_from_slice(&pos.to_le_bytes());
-            self.file[elem + 8..elem + 12].copy_from_slice(&(inode.key.len() as u32).to_le_bytes());
-            self.file[elem + 12..elem + 16].copy_from_slice(&(value.len() as u32).to_le_bytes());
-            self.file[data_off..data_off + inode.key.len()].copy_from_slice(inode.key);
-            data_off += inode.key.len();
-            self.file[data_off..data_off + value.len()].copy_from_slice(value);
-            data_off += value.len();
+            self.file.write_all(&inode.flags.to_le_bytes())?;
+            self.file.write_all(&pos.to_le_bytes())?;
+            self.file
+                .write_all(&(inode.key.len() as u32).to_le_bytes())?;
+            self.file.write_all(&(value.len() as u32).to_le_bytes())?;
+            data_off += inode.key.len() + value.len();
         }
-        pgid
+        for inode in inodes {
+            self.file.write_all(inode.key)?;
+            self.file.write_all(inode.value())?;
+        }
+        self.zeros(npages * self.page_size - total)?;
+        Ok(pgid)
     }
 
     /// Branch pages, recursing into branch-of-branches when the index is wide.
-    fn build_branch(&mut self, refs: Vec<(&[u8], u64)>) -> u64 {
+    fn build_branch(&mut self, refs: Vec<(&[u8], u64)>) -> io::Result<u64> {
         if branch_size(&refs) <= self.page_size {
             return self.write_branch_page(&refs);
         }
@@ -697,32 +720,32 @@ impl Writer {
         let mut child_refs = Vec::with_capacity(groups.len());
         for group in groups {
             let first = group[0].0;
-            let pgid = self.write_branch_page(&group);
+            let pgid = self.write_branch_page(&group)?;
             child_refs.push((first, pgid));
         }
         self.build_branch(child_refs)
     }
 
-    fn write_branch_page(&mut self, refs: &[(&[u8], u64)]) -> u64 {
+    fn write_branch_page(&mut self, refs: &[(&[u8], u64)]) -> io::Result<u64> {
         let pgid = self.alloc(1);
-        let base = pgid as usize * self.page_size;
-        self.file[base..base + 8].copy_from_slice(&pgid.to_le_bytes());
-        self.file[base + 8..base + 10].copy_from_slice(&BRANCH_FLAG.to_le_bytes());
-        self.file[base + 10..base + 12].copy_from_slice(&(refs.len() as u16).to_le_bytes());
-        let mut data_off = base + PAGE_HEADER + BRANCH_ELEM * refs.len();
+        self.page_header(pgid, BRANCH_FLAG, refs.len(), 0)?;
+        let mut data_off = PAGE_HEADER + BRANCH_ELEM * refs.len();
         for (i, (key, child)) in refs.iter().enumerate() {
-            let elem = base + PAGE_HEADER + i * BRANCH_ELEM;
+            let elem = PAGE_HEADER + i * BRANCH_ELEM;
             let pos = (data_off - elem) as u32;
-            self.file[elem..elem + 4].copy_from_slice(&pos.to_le_bytes());
-            self.file[elem + 4..elem + 8].copy_from_slice(&(key.len() as u32).to_le_bytes());
-            self.file[elem + 8..elem + 16].copy_from_slice(&child.to_le_bytes());
-            self.file[data_off..data_off + key.len()].copy_from_slice(key);
+            self.file.write_all(&pos.to_le_bytes())?;
+            self.file.write_all(&(key.len() as u32).to_le_bytes())?;
+            self.file.write_all(&child.to_le_bytes())?;
             data_off += key.len();
         }
-        pgid
+        for (key, _) in refs {
+            self.file.write_all(key)?;
+        }
+        self.zeros(self.page_size - data_off)?;
+        Ok(pgid)
     }
 
-    fn write_meta(&mut self, root_pgid: u64) {
+    fn write_meta(&mut self, root_pgid: u64) -> io::Result<()> {
         let high_water = self.next_pgid;
         for (id, txid) in [(0u64, 0u64), (1u64, 1u64)] {
             let mut page = vec![0u8; self.page_size];
@@ -740,9 +763,11 @@ impl Writer {
             let sum = fnv1a64(&meta[0..56]);
             meta[56..64].copy_from_slice(&sum.to_le_bytes());
             page[PAGE_HEADER..PAGE_HEADER + META_BODY].copy_from_slice(&meta);
-            let off = id as usize * self.page_size;
-            self.file[off..off + self.page_size].copy_from_slice(&page);
+            self.file
+                .seek(SeekFrom::Start(id * self.page_size as u64))?;
+            self.file.write_all(&page)?;
         }
+        Ok(())
     }
 }
 
@@ -757,21 +782,90 @@ pub fn write(path: &Path, root: &NodeSpec) -> io::Result<()> {
 /// Write a borrowed tree; the output is the same as `write` for the same
 /// content.
 pub fn write_ref(path: &Path, root: NodeRef<'_>) -> io::Result<()> {
-    fs::write(path, encode_ref(root)?)
+    let file = fs::File::create(path)?;
+    write_to(io::BufWriter::with_capacity(32 * 1024, file), root)
 }
 
 /// The file image `write_ref` would write, for callers that do their own
 /// file handling (for example a synced replace).
 pub fn encode_ref(root: NodeRef<'_>) -> io::Result<Vec<u8>> {
-    let mut writer = Writer::new(4096);
+    let mut output = io::Cursor::new(Vec::new());
+    write_to(&mut output, root)?;
+    Ok(output.into_inner())
+}
+
+/// Serialize directly into an initially empty/truncated seekable destination.
+/// The destination is flushed on success; durability and atomic replacement
+/// remain the caller's responsibility. Large values are written by reference.
+pub fn write_to<W: Write + Seek>(output: W, root: NodeRef<'_>) -> io::Result<()> {
+    let mut writer = Writer::new(output, 4096)?;
     let root_pgid = writer.materialize(root)?;
-    writer.write_meta(root_pgid);
-    Ok(writer.file)
+    writer.write_meta(root_pgid)?;
+    writer.file.flush()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_propagates_partial_write_metadata_seek_and_flush_errors() {
+        struct Faulty {
+            inner: io::Cursor<Vec<u8>>,
+            bytes_left: usize,
+            seeks: usize,
+            fail_seek: bool,
+            fail_flush: bool,
+        }
+        impl Write for Faulty {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.bytes_left == 0 {
+                    return Err(io::Error::other("injected partial write"));
+                }
+                let count = bytes.len().min(self.bytes_left).min(113);
+                self.bytes_left -= count;
+                self.inner.write(&bytes[..count])
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                if self.fail_flush {
+                    Err(io::Error::other("injected flush"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl Seek for Faulty {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.seeks += 1;
+                if self.fail_seek && self.seeks == 2 {
+                    return Err(io::Error::other("injected metadata seek"));
+                }
+                self.inner.seek(position)
+            }
+        }
+        let value = vec![1; 10000];
+        for (bytes_left, fail_seek, fail_flush, expected) in [
+            (9000, false, false, "partial write"),
+            (usize::MAX, true, false, "metadata seek"),
+            (usize::MAX, false, true, "flush"),
+        ] {
+            let output = Faulty {
+                inner: io::Cursor::new(Vec::new()),
+                bytes_left,
+                seeks: 0,
+                fail_seek,
+                fail_flush,
+            };
+            let error = write_to(
+                output,
+                NodeRef {
+                    entries: vec![EntryRef::Kv(b"k", &value)],
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
 
     #[test]
     fn borrowed_tree_writes_the_same_bytes() {
