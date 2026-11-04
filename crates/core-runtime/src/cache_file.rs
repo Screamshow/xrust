@@ -431,6 +431,15 @@ pub mod saved_binary {
         pub url_hash: [u8; 32],
     }
 
+    /// Borrow the downloaded payload while encoding the persistent record.
+    /// The returned record owns its bytes; no input references escape.
+    pub struct SavedBinaryRef<'a> {
+        pub last_updated: u64,
+        pub content: &'a [u8],
+        pub last_etag: &'a str,
+        pub url_hash: [u8; 32],
+    }
+
     fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
         while value >= 0x80 {
             out.push((value as u8) | 0x80);
@@ -464,10 +473,20 @@ pub mod saved_binary {
     }
 
     pub fn marshal(saved: &SavedBinary) -> Vec<u8> {
-        let mut out = Vec::with_capacity(saved.content.len() + 64);
+        marshal_ref(&SavedBinaryRef {
+            last_updated: saved.last_updated,
+            content: &saved.content,
+            last_etag: &saved.last_etag,
+            url_hash: saved.url_hash,
+        })
+    }
+
+    pub fn marshal_ref(saved: &SavedBinaryRef<'_>) -> Vec<u8> {
+        // Two u64 varints take at most ten bytes each; metadata adds 41.
+        let mut out = Vec::with_capacity(saved.content.len() + saved.last_etag.len() + 61);
         out.push(VERSION);
         put_uvarint(&mut out, saved.content.len() as u64);
-        out.extend_from_slice(&saved.content);
+        out.extend_from_slice(saved.content);
         out.extend_from_slice(&saved.last_updated.to_be_bytes());
         put_uvarint(&mut out, saved.last_etag.len() as u64);
         out.extend_from_slice(saved.last_etag.as_bytes());

@@ -375,22 +375,19 @@ impl RemoteRuleSet {
     }
 
     fn save_to_cache(&self, cache: &SharedCacheFile, content: &[u8]) {
-        let saved = saved_binary::SavedBinary {
+        let saved = saved_binary::SavedBinaryRef {
             last_updated: self
                 .last_updated
                 .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or_else(saved_binary::now_unix),
-            content: content.to_vec(),
-            last_etag: self.etag.clone().unwrap_or_default(),
+            content,
+            last_etag: self.etag.as_deref().unwrap_or_default(),
             url_hash: url_hash(&self.spec.url),
         };
+        let record = saved_binary::marshal_ref(&saved);
         let mut guard = cache.lock().expect("cache file");
-        guard.put(
-            BUCKET_RULE_SET,
-            self.tag().as_bytes(),
-            saved_binary::marshal(&saved),
-        );
+        guard.put(BUCKET_RULE_SET, self.tag().as_bytes(), record);
         if let Err(error) = guard.flush() {
             logging::error(format_args!("save rule-set cache: {error}"));
         }
