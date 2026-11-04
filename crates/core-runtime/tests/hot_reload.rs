@@ -827,3 +827,68 @@ async fn reload_check_skips_only_files_the_router_loaded_unchanged() {
     instance.shutdown_wait().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
+#[tokio::test]
+async fn direct_proxy_toggle_keeps_existing_tcp_and_releases_listener() {
+    let echo = spawn_echo().await;
+    let root = json!({"inbounds":[{"type":"mixed","tag":"main","listen":"127.0.0.1","listen_port":0}],
+        "outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}});
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    let address = instance.inbound_addrs()[0].1;
+    let mut client = TcpStream::connect(address).await.unwrap();
+    socks5_handshake(&mut client, echo).await;
+    let mut next = root.clone();
+    next["inbounds"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"mixed","tag":"direct-proxy-in","listen":"127.0.0.1","listen_port":0}));
+    for _ in 0..3 {
+        assert!(core_runtime::can_reload_in_place(&root, &next));
+        instance.reload_in_place(&next).await.unwrap();
+        let proxy = instance
+            .inbound_addrs()
+            .iter()
+            .find(|(tag, _)| tag == "direct-proxy-in")
+            .unwrap()
+            .1;
+        let mut direct = TcpStream::connect(proxy).await.unwrap();
+        socks5_handshake(&mut direct, echo).await;
+        direct.write_all(b"direct").await.unwrap();
+        let mut bytes = [0; 6];
+        timeout(T, direct.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes, b"direct");
+        instance.reload_in_place(&root).await.unwrap();
+        assert!(TcpStream::connect(proxy).await.is_err());
+        assert_eq!(instance.inbound_addrs(), &[("main".into(), address)]);
+        client.write_all(b"alive!").await.unwrap();
+        timeout(T, client.read_exact(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes, b"alive!");
+    }
+    instance.shutdown_wait().await;
+}
+
+#[tokio::test]
+async fn direct_proxy_bind_failure_preserves_generation_and_existing_listener() {
+    let root = json!({"inbounds":[{"type":"mixed","tag":"main","listen":"127.0.0.1","listen_port":0}],
+        "outbounds":[{"type":"direct","tag":"direct"}],"route":{"final":"direct"}});
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    let existing = instance.inbound_addrs()[0].1;
+    let busy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut next = root.clone();
+    next["inbounds"].as_array_mut().unwrap().push(json!({"type":"mixed","tag":"direct-proxy-in","listen":"127.0.0.1","listen_port":busy.local_addr().unwrap().port()}));
+    assert!(instance.reload_in_place(&next).await.is_err());
+    assert_eq!(instance.inbound_addrs().len(), 1);
+    assert!(TcpStream::connect(existing).await.is_ok());
+    drop(busy);
+    instance.reload_in_place(&next).await.unwrap();
+    let mut changed = next.clone();
+    changed["inbounds"][1]["listen_port"] = json!(1);
+    assert!(!core_runtime::can_reload_in_place(&next, &changed));
+    instance.reload_in_place(&root).await.unwrap();
+    instance.shutdown_wait().await;
+}

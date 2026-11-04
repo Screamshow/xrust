@@ -37,6 +37,7 @@ use crate::route::Router;
 pub struct BoxInstance {
     router: Arc<Router>,
     reload_boundary: Value,
+    direct_proxy_task: Option<tokio::task::AbortHandle>,
     tasks: Vec<JoinHandle<()>>,
     inbounds: Vec<(String, SocketAddr)>,
     dns: Option<Arc<dns::DnsService>>,
@@ -131,6 +132,16 @@ impl BoxInstance {
             can_reload_in_place(&self.reload_boundary, new_root),
             "configuration changes listeners or other restart-only settings"
         );
+        // Bind a newly enabled Direct Proxy before publishing any new routing.
+        // Other listeners remain immutable; a bind failure leaves the live core alone.
+        let previous_direct = direct_proxy_inbound(&self.reload_boundary);
+        let next_direct = direct_proxy_inbound(new_root);
+        let staged_direct = match (previous_direct, next_direct) {
+            (None, Some(config)) => {
+                Some(inbound::mixed::Mixed::bind(config, Arc::clone(&self.router)).await?)
+            }
+            _ => None,
+        };
         warn_unhonored_options(new_root);
 
         // 1. Build and validate new router inner BEFORE mutating anything running
@@ -184,6 +195,24 @@ impl BoxInstance {
             logging::set_level(lvl);
         }
         logging::set_enabled(!disabled);
+        if previous_direct.is_some() && next_direct.is_none() {
+            if let Some(handle) = self.direct_proxy_task.take()
+                && let Some(index) = self.tasks.iter().position(|task| task.id() == handle.id())
+            {
+                let task = self.tasks.remove(index);
+                task.abort();
+                let _ = task.await;
+            }
+            self.inbounds.retain(|(tag, _)| tag != "direct-proxy-in");
+        }
+        if let Some(listener) = staged_direct {
+            let address = listener.local_addr()?;
+            let task = tokio::spawn(listener.serve());
+            self.direct_proxy_task = Some(task.abort_handle());
+            self.tasks.push(task);
+            self.inbounds.push(("direct-proxy-in".into(), address));
+        }
+        self.reload_boundary = reload_boundary(new_root);
         self.router.record_applied_config(new_root);
 
         Ok(())
@@ -306,6 +335,7 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
         tasks.push(ntp.spawn());
     }
     let mut inbounds = Vec::new();
+    let mut direct_proxy_task = None;
     let empty = Vec::new();
     let list = root
         .get("inbounds")
@@ -332,7 +362,11 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
                     .with_context(|| format!("inbounds[{i}]: {ty}"))?;
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
-                tasks.push(tokio::spawn(inbound.serve()));
+                let task = tokio::spawn(inbound.serve());
+                if tag == "direct-proxy-in" && ty == "mixed" {
+                    direct_proxy_task = Some(task.abort_handle());
+                }
+                tasks.push(task);
             }
             "direct" => {
                 let inbound = inbound::direct::Direct::bind(obj, Arc::clone(&router))
@@ -400,6 +434,7 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
     Ok(BoxInstance {
         router,
         reload_boundary: reload_boundary(root),
+        direct_proxy_task,
         tasks: std::mem::take(tasks),
         inbounds,
         dns: dns_service,
@@ -493,8 +528,27 @@ pub fn configuration_fingerprint(root: &Value) -> String {
     )
 }
 
+fn direct_proxy_inbound(root: &Value) -> Option<&Value> {
+    root.get("inbounds")?.as_array()?.iter().find(|value| {
+        value.get("tag").and_then(Value::as_str) == Some("direct-proxy-in")
+            && value.get("type").and_then(Value::as_str) == Some("mixed")
+    })
+}
+
+fn stable_inbounds(root: &Value) -> Vec<&Value> {
+    root.get("inbounds")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|value| Some(*value) != direct_proxy_inbound(root))
+        .collect()
+}
+
 pub fn can_reload_in_place(old_root: &Value, new_root: &Value) -> bool {
-    if old_root.get("inbounds") != new_root.get("inbounds") {
+    if stable_inbounds(old_root) != stable_inbounds(new_root)
+        || matches!((direct_proxy_inbound(old_root), direct_proxy_inbound(new_root)),
+            (Some(old), Some(new)) if old != new)
+    {
         return false;
     }
     let old_clash = old_root
