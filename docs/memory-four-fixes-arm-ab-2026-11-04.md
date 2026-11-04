@@ -116,6 +116,11 @@ LAN firewall rules could not be changed with the current process privileges.
 The successful series is adequate for the reported controlled process-memory
 comparison and traffic correctness, not a substitute for that direct fixture.
 
+Subsequent follow-up: after the user disabled Windows LAN firewall profiles,
+the direct-LAN series completed. See
+`memory-four-fixes-direct-arm-ab-2026-11-04.md` for independent direct results;
+the tunnel measurements above remain unchanged and separately identified.
+
 ## Restoration
 
 Owned supervisor/core/monitor processes terminated normally; SSH tunnels and
