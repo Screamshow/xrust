@@ -23,7 +23,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use aes::cipher::{KeyIvInit, StreamCipher};
@@ -129,8 +129,7 @@ impl RecordAead {
     fn new(ctx: &[u8], key: &[u8], use_aes: bool) -> Self {
         let k = derive_key_aead(ctx, key);
         if use_aes {
-            // AES-128-GCM: the first 16 bytes of the 32-byte derived key.
-            RecordAead::Aes(Gcm::new(&k[..16]))
+            RecordAead::Aes(Gcm::new(&k))
         } else {
             RecordAead::Cha(Box::new(ChaCha20Poly1305::new_from_slice(&k).expect("key")))
         }
@@ -257,7 +256,7 @@ fn decode_header(h: &[u8; RECORD_HEADER]) -> Result<usize, ()> {
     if h[0] != 23 || h[1] != 3 || h[2] != 3 {
         return Err(());
     }
-    (17..=17000).contains(&l).then_some(l).ok_or(())
+    (17..=16640).contains(&l).then_some(l).ok_or(())
 }
 
 fn encode_length(l: usize) -> [u8; 2] {
@@ -286,7 +285,7 @@ pub struct ClientInstance {
     seconds: u32,
     padding_lens: Vec<[i64; 3]>,
     padding_gaps: Vec<[i64; 3]>,
-    ticket: Mutex<Option<TicketState>>,
+    ticket: Arc<Mutex<Option<TicketState>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -332,7 +331,7 @@ impl ClientInstance {
             seconds: spec.seconds,
             padding_lens,
             padding_gaps,
-            ticket: Mutex::new(None),
+            ticket: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -356,9 +355,8 @@ impl ClientInstance {
     /// Perform the handshake over a dialed stream; returns the encrypted conn
     /// that carries the inner VLESS flow.
     pub async fn handshake(&self, mut conn: AnyStream) -> io::Result<AnyStream> {
-        // The reference picks AES-GCM when the CPU accelerates it (hasAESGCM
-        // Hardware on every supported path); both sides probe their own CPU
-        // and every realistic peer has AES.
+        // Use AES-256-GCM; Xray detects the client's cipher from the first
+        // authenticated handshake record. Gcm retains its software fallback.
         let use_aes = true;
 
         let iv_and_relays_len = 16 + self.relays_length;
@@ -378,8 +376,7 @@ impl ClientInstance {
             let mut last_ctr: Option<Aes128Ctr> = None;
             let count = self.nfs_p_keys.len();
             for (j, key) in self.nfs_p_keys.iter().enumerate() {
-                let index;
-                match key {
+                let index = match key {
                     NfsPublicKey::X25519(server_pub) => {
                         let mut sk_bytes = [0u8; 32];
                         rand_fill(&mut sk_bytes);
@@ -387,7 +384,10 @@ impl ClientInstance {
                         let pk = x25519_dalek::PublicKey::from(&sk);
                         relays[..32].copy_from_slice(pk.as_bytes());
                         nfs_key = sk.diffie_hellman(server_pub).to_bytes();
-                        index = 32;
+                        if nfs_key == [0; 32] {
+                            return Err(io::Error::other("vless-enc: invalid server X25519 key"));
+                        }
+                        32
                     }
                     NfsPublicKey::Mlkem(ek) => {
                         let (ciphertext, shared) = ek
@@ -395,9 +395,9 @@ impl ClientInstance {
                             .map_err(|()| io::Error::other("mlkem encapsulate failed"))?;
                         nfs_key.copy_from_slice(&shared.0);
                         relays[..MLKEM_CT_LEN].copy_from_slice(&ciphertext.0);
-                        index = MLKEM_CT_LEN;
+                        MLKEM_CT_LEN
                     }
-                }
+                };
                 if self.xor_mode > 0 {
                     let mut ctr = new_ctr(&self.nfs_p_keys_bytes[j], &iv);
                     ctr.apply_keystream(&mut relays[..index]);
@@ -434,16 +434,18 @@ impl ClientInstance {
                 let sealed_len = nfs_aead.seal(&nfs_nonce, &encode_length(32), &[]);
                 client_hello[iv_and_relays_len..iv_and_relays_len + 18]
                     .copy_from_slice(&sealed_len);
+                increase_nonce(&mut nfs_nonce);
                 let sealed_ticket = nfs_aead.seal(&nfs_nonce, &t.ticket, &[]);
                 let ticket_end = iv_and_relays_len + 18 + sealed_ticket.len();
                 client_hello[iv_and_relays_len + 18..ticket_end].copy_from_slice(&sealed_ticket);
                 let pre_write_len = ticket_end;
                 let aead_ctx = client_hello[iv_and_relays_len + 18..ticket_end].to_vec();
+                let aead = RecordAead::new(&aead_ctx, &united, use_aes);
                 let xor_out = (self.xor_mode == 2).then(|| new_ctr(&united, &iv));
                 return Ok(Box::new(EncryptedConn {
                     inner: conn,
                     united_key: united,
-                    aead: Some((aead_ctx, None)),
+                    aead: Some((aead_ctx, Some(aead))),
                     peer_aead: None,
                     peer_padding: None,
                     pre_write: Some(client_hello[..pre_write_len].to_vec()),
@@ -453,13 +455,15 @@ impl ClientInstance {
                     out_buf: Vec::new(),
                     out_pos: 0,
                     out_flush: false,
+                    out_claimed: 0,
                     out_nonce: [0u8; 12],
                     in_nonce: [0u8; 12],
                     is_0rtt: true,
+                    ticket_cache: Some(self.ticket.clone()),
                     xor_out_ctr: xor_out,
                     xor_in_ctr: None,
-                    out_skip: pre_write_len,
-                    in_skip: 16,
+                    out_skip: 0,
+                    in_skip: 0,
                 }));
             }
         }
@@ -469,7 +473,7 @@ impl ClientInstance {
         let (dk, x_sk) = {
             let pfs =
                 &mut client_hello[iv_and_relays_len..iv_and_relays_len + pfs_key_exchange_len];
-            let sealed_len = nfs_aead.seal(&nfs_nonce, &encode_length(MLKEM_EK_LEN + 32), &[]);
+            let sealed_len = nfs_aead.seal(&nfs_nonce, &encode_length(MLKEM_EK_LEN + 32 + 16), &[]);
             increase_nonce(&mut nfs_nonce);
             pfs[..18].copy_from_slice(&sealed_len);
             let (dk, ek) = MlKem768::generate(&mut OsRngCore);
@@ -513,6 +517,7 @@ impl ClientInstance {
         if sent < client_hello.len() {
             conn.write_all(&client_hello[sent..]).await?;
         }
+        conn.flush().await?;
 
         // Server Hello: pfs public key under the max nonce.
         let mut encrypted_pfs_public_key = vec![0u8; MLKEM_CT_LEN + 32 + 16];
@@ -531,6 +536,9 @@ impl ClientInstance {
         x_peer.copy_from_slice(&pfs_server[MLKEM_CT_LEN..MLKEM_CT_LEN + 32]);
         let x_peer = x25519_dalek::PublicKey::from(x_peer);
         let x_shared = x_sk.diffie_hellman(&x_peer).to_bytes();
+        if x_shared == [0; 32] {
+            return Err(io::Error::other("vless-enc: invalid ephemeral X25519 key"));
+        }
 
         let mut pfs_key = Vec::with_capacity(64 + nfs_key.len());
         pfs_key.extend_from_slice(&shared.0);
@@ -555,7 +563,7 @@ impl ClientInstance {
 
         if self.seconds > 0 && seconds > 0 {
             let mut t = [0u8; 16];
-            t.copy_from_slice(&ticket_record[..16]);
+            t.copy_from_slice(&ticket[..16]);
             *self.ticket.lock().unwrap() = Some(TicketState {
                 pfs_key,
                 ticket: t,
@@ -575,8 +583,8 @@ impl ClientInstance {
         let (xor_out_ctr, xor_in_ctr, in_skip) = if self.xor_mode == 2 {
             (
                 Some(new_ctr(&united_key, &iv)),
-                Some(new_ctr(&united_key, &ticket_record[..16])),
-                peer_padding_len,
+                Some(new_ctr(&united_key, &ticket[..16])),
+                0,
             )
         } else {
             (None, None, 0)
@@ -597,9 +605,11 @@ impl ClientInstance {
             out_buf: Vec::new(),
             out_pos: 0,
             out_flush: false,
+            out_claimed: 0,
             out_nonce: [0u8; 12],
             in_nonce,
             is_0rtt: false,
+            ticket_cache: None,
             xor_out_ctr,
             xor_in_ctr,
             out_skip: 0,
@@ -684,9 +694,13 @@ pub struct EncryptedConn {
     out_buf: Vec<u8>,
     out_pos: usize,
     out_flush: bool,
+    /// Plaintext represented by the staged record, even if the caller grows
+    /// its buffer while our write/flush is Pending (the pooled relay does).
+    out_claimed: usize,
     out_nonce: [u8; 12],
     in_nonce: [u8; 12],
     is_0rtt: bool,
+    ticket_cache: Option<Arc<Mutex<Option<TicketState>>>>,
     xor_out_ctr: Option<Aes128Ctr>,
     xor_in_ctr: Option<Aes128Ctr>,
     out_skip: usize,
@@ -746,13 +760,12 @@ impl AsyncWrite for EncryptedConn {
             return Poll::Ready(Ok(0));
         }
         let this = &mut *self;
-        let consumed = buf.len().min(RECORD_MAX);
         // an interrupted flush is answered before anything new is built —
         // rebuilding here would put a duplicate record on the wire
         if this.out_flush {
             ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
             this.out_flush = false;
-            return Poll::Ready(Ok(consumed));
+            return Poll::Ready(Ok(std::mem::take(&mut this.out_claimed)));
         }
         if this.out_pos >= this.out_buf.len() {
             // nothing staged: pre_write (0-RTT client hello) leads, then the
@@ -774,6 +787,7 @@ impl AsyncWrite for EncryptedConn {
             }
             this.out_buf = staged;
             this.out_pos = 0;
+            this.out_claimed = buf.len().min(RECORD_MAX);
         }
         while this.out_pos < this.out_buf.len() {
             match Pin::new(&mut this.inner).poll_write(cx, &this.out_buf[this.out_pos..]) {
@@ -788,7 +802,7 @@ impl AsyncWrite for EncryptedConn {
         this.out_flush = true;
         ready!(Pin::new(&mut this.inner).poll_flush(cx))?;
         this.out_flush = false;
-        Poll::Ready(Ok(consumed))
+        Poll::Ready(Ok(std::mem::take(&mut this.out_claimed)))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -815,7 +829,7 @@ impl AsyncRead for EncryptedConn {
             server_random.copy_from_slice(&this.stage[..16]);
             this.stage.clear();
             this.peer_aead = Some(RecordAead::new(&server_random, &this.united_key, true));
-            if this.xor_in_ctr.is_none() {
+            if this.xor_out_ctr.is_some() && this.xor_in_ctr.is_none() {
                 this.xor_in_ctr = Some(new_ctr(&this.united_key, &server_random));
             }
             this.is_0rtt = false;
@@ -839,8 +853,22 @@ impl AsyncRead for EncryptedConn {
                 if let Some(ctr) = &mut this.xor_in_ctr {
                     xor_stream(ctr, &mut this.in_skip, &mut header);
                 }
-                let l = decode_header(&header)
-                    .map_err(|_| io::Error::other("vless-enc: invalid record header"))?;
+                let l = decode_header(&header).map_err(|_| {
+                    // Xray responds to an expired ticket with noise. Drop only
+                    // the matching cached session; a concurrent new handshake
+                    // may already have replaced it. The next dial starts fresh.
+                    if let Some(cache) = this.ticket_cache.take() {
+                        let mut cached = cache.lock().unwrap();
+                        if cached
+                            .as_ref()
+                            .is_some_and(|t| this.united_key.starts_with(&t.pfs_key))
+                        {
+                            *cached = None;
+                        }
+                    }
+                    io::Error::other("vless-enc: invalid record header; new handshake needed")
+                })?;
+                this.ticket_cache = None;
                 this.rec = Some((header, l));
                 // the header now lives in `rec`; the stage is free to hold
                 // the body, which may arrive over several polls
@@ -925,6 +953,26 @@ impl VlessEncryption {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn aes_records_use_the_full_derived_key() {
+        use aes_gcm::aead::AeadInPlace;
+        use aes_gcm::{Aes256Gcm, KeyInit};
+        let context = b"independent AES-256 record check";
+        let key = [0x42; 96];
+        let derived = super::derive_key_aead(context, &key);
+        let oracle = Aes256Gcm::new_from_slice(&derived).unwrap();
+        let nonce = [0x17; 12];
+        let aad = [23, 3, 3, 0, 20];
+        let mut expected = b"ping".to_vec();
+        oracle
+            .encrypt_in_place((&nonce).into(), &aad, &mut expected)
+            .unwrap();
+        assert_eq!(
+            super::RecordAead::new(context, &key, true).seal(&nonce, b"ping", &aad),
+            expected
+        );
+    }
+
     #[test]
     fn binary_derive_context_matches_reference_vector() {
         let context = [0xff, 0, 0xc3, 0x28, 0x80, 0xf0, 0x9f, 0x92];
@@ -1012,7 +1060,7 @@ mod tests {
             .open(&nfs_nonce, &encrypted_length, &[])
             .expect("len decrypt");
         increase_nonce(&mut nfs_nonce);
-        assert_eq!(decode_length(&dec), MLKEM_EK_LEN + 32);
+        assert_eq!(decode_length(&dec), MLKEM_EK_LEN + 32 + 16);
 
         // encryptedPfsPublicKey
         let mut encrypted_pfs = vec![0u8; MLKEM_EK_LEN + 32 + 16];
@@ -1130,6 +1178,7 @@ mod tests {
         per: usize,
         r_ok: bool,
         w_ok: bool,
+        f_ok: bool,
     }
 
     impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Chunked<S> {
@@ -1174,10 +1223,15 @@ mod tests {
             std::pin::Pin::new(&mut this.inner).poll_write(cx, &buf[..n])
         }
         fn poll_flush(
-            self: std::pin::Pin<&mut Self>,
+            mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<io::Result<()>> {
-            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+            if !self.f_ok {
+                self.f_ok = true;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
         }
         fn poll_shutdown(
             self: std::pin::Pin<&mut Self>,
@@ -1195,13 +1249,76 @@ mod tests {
             per: 7,
             r_ok: true,
             w_ok: true,
+            f_ok: true,
         });
         let server_io = Box::new(Chunked {
             inner: b,
             per: 5,
             r_ok: true,
             w_ok: true,
+            f_ok: true,
         });
         echo_roundtrip(client_io, server_io).await;
+    }
+
+    #[tokio::test]
+    async fn pending_record_claims_only_the_original_plaintext() {
+        for pending_flush in [false, true] {
+            let (a, mut b) = tokio::io::duplex(4096);
+            let inner = Box::new(Chunked {
+                inner: a,
+                per: 4096,
+                r_ok: true,
+                w_ok: pending_flush,
+                f_ok: !pending_flush,
+            });
+            let mut conn = EncryptedConn {
+                inner,
+                united_key: vec![0x42; 96],
+                aead: Some((
+                    b"test".to_vec(),
+                    Some(RecordAead::new(b"test", &[0x42; 96], true)),
+                )),
+                peer_aead: None,
+                peer_padding: None,
+                pre_write: None,
+                raw: BytesMut::new(),
+                stage: Vec::new(),
+                rec: None,
+                out_buf: Vec::new(),
+                out_pos: 0,
+                out_flush: false,
+                out_claimed: 0,
+                out_nonce: [0; 12],
+                in_nonce: [0; 12],
+                is_0rtt: false,
+                ticket_cache: None,
+                xor_out_ctr: None,
+                xor_in_ctr: None,
+                out_skip: 0,
+                in_skip: 0,
+            };
+            let first =
+                std::future::poll_fn(|cx| Poll::Ready(Pin::new(&mut conn).poll_write(cx, b"abc")))
+                    .await;
+            assert!(first.is_pending());
+            // The relay can append new client bytes during Pending. They
+            // must remain unclaimed until a subsequent encrypted record.
+            let n = std::future::poll_fn(|cx| Pin::new(&mut conn).poll_write(cx, b"abcdef"))
+                .await
+                .unwrap();
+            assert_eq!(n, 3);
+            conn.write_all(b"def").await.unwrap();
+            let aead = RecordAead::new(b"test", &[0x42; 96], true);
+            for (nonce, expected) in [(1, b"abc"), (2, b"def")] {
+                let mut header = [0; 5];
+                b.read_exact(&mut header).await.unwrap();
+                let mut record = vec![0; decode_header(&header).unwrap()];
+                b.read_exact(&mut record).await.unwrap();
+                let mut counter = [0; 12];
+                counter[11] = nonce;
+                assert_eq!(aead.open(&counter, &record, &header).unwrap(), expected);
+            }
+        }
     }
 }

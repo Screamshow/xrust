@@ -70,6 +70,7 @@ pub struct Vless {
     uuid: [u8; 16],
     transport: Transport,
     tls: Option<TlsOptions>,
+    encryption: Option<Arc<crate::outbound::vless_enc::VlessEncryption>>,
     /// `flow: xtls-rprx-vision` — the payload is framed, see `vision`.
     vision: bool,
     /// how datagrams are framed on the stream, see `packet`
@@ -95,6 +96,8 @@ impl Vless {
         };
         let transport = Transport::parse(obj, at)?;
         let tls = TlsOptions::from_outbound(obj, &server, at)?;
+        let encryption =
+            crate::outbound::vless_enc::VlessEncryption::from_config(obj, at)?.map(Arc::new);
         let multiplex = match obj.get("multiplex") {
             Some(value) if !value.is_null() => {
                 mux::MuxOptions::parse(value, &format!("{at}.multiplex"))?
@@ -109,6 +112,7 @@ impl Vless {
             uuid,
             transport,
             tls,
+            encryption,
             vision,
             packet_encoding,
             mux: if multiplex.min_streams > 0
@@ -170,6 +174,9 @@ impl Vless {
             // the transport is still bare here, which is all this needs; it
             // walks a wrapped stream just as well (see the function)
             crate::inbound::disable_tls_read_batching(&mut stream);
+        }
+        if let Some(encryption) = &self.encryption {
+            stream = encryption.wrap(stream).await?;
         }
         // The head waits for the first payload and both go in one write, as
         // Xray's client sends them (`proxy/vless/outbound`: the head goes into

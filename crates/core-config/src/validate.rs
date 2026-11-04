@@ -5347,9 +5347,7 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
     Ok(())
 }
 
-/// VLESS `encryption`: only the plain protocol is supported. The encryption
-/// layer is not wired into the outbound, so any other value would connect as
-/// plain VLESS and send the UUID in the clear; refuse it at check time.
+/// Validate the encryption specification before the outbound is constructed.
 fn validate_vless_encryption(i: usize, obj: &Map<String, Value>) -> Result<(), String> {
     let Some(enc) = obj.get("encryption").and_then(Value::as_str) else {
         return Ok(());
@@ -5357,10 +5355,9 @@ fn validate_vless_encryption(i: usize, obj: &Map<String, Value>) -> Result<(), S
     if enc.is_empty() || enc == "none" {
         return Ok(());
     }
-    let scheme = enc.split('.').next().unwrap_or(enc);
-    Err(format!(
-        "outbounds[{i}].encryption: VLESS encryption ({scheme}) is not supported; use \"none\""
-    ))
+    crate::vless_enc::parse_client_encryption(enc)
+        .map(|_| ())
+        .map_err(|err| format!("outbounds[{i}].encryption: {err}"))
 }
 
 /// What the trojan client builds with: TLS on, and no `multiplex`. The
@@ -9181,10 +9178,8 @@ mod tests {
         );
     }
 
-    // VLESS-ENC-01: the encryption layer is not wired in; a configured
-    // encryption must fail at check time instead of running as plain VLESS.
     #[test]
-    fn vless_encryption_other_than_none_is_refused() {
+    fn vless_encryption_spec_is_validated() {
         let vless = |encryption: Option<&str>| {
             let mut out = json!({"type": "vless", "tag": "v", "server": "192.0.2.1",
                 "server_port": 443, "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811"});
@@ -9197,14 +9192,19 @@ mod tests {
             assert!(validate(&vless(accepted)).is_ok(), "{accepted:?}");
         }
         let key = "a".repeat(43);
-        for refused in [
+        for accepted in [
             format!("mlkem768x25519plus.native.0rtt.{key}"),
             format!("mlkem768x25519plus.xorpub.1rtt.{key}"),
+        ] {
+            assert!(validate(&vless(Some(&accepted))).is_ok(), "{accepted}");
+        }
+        for refused in [
+            format!("mlkem768x25519plus.native.2rtt.{key}"),
+            "mlkem768x25519plus.native.0rtt.bad-key".to_string(),
             "aes-128-gcm".to_string(),
         ] {
             let err = validate(&vless(Some(&refused))).unwrap_err();
             assert!(err.contains("outbounds[0].encryption"), "{err}");
-            assert!(err.contains("not supported"), "{err}");
         }
     }
 

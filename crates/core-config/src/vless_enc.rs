@@ -97,11 +97,13 @@ pub fn parse_client_encryption(raw: &str) -> Result<ClientEncryptionSpec, String
     if keys.is_empty() {
         return Err("no encryption keys in encryption string".to_string());
     }
+    let padding = padding_parts.join(".");
+    parse_padding(&padding)?;
     Ok(ClientEncryptionSpec {
         keys,
         xor_mode,
         seconds,
-        padding: padding_parts.join("."),
+        padding,
     })
 }
 
