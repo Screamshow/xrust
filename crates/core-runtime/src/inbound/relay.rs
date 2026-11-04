@@ -237,17 +237,18 @@ async fn one_way_buffered(
 pub(crate) async fn relay(
     client: &TcpStream,
     upstream: &TcpStream,
-    prefix: &[u8],
+    prefix: Vec<u8>,
     tracker: Option<&ConnHandle>,
     vless_head: bool,
     half: &HalfOpen,
 ) -> io::Result<()> {
     if !prefix.is_empty() {
-        write_all(upstream, prefix).await?;
+        write_all(upstream, &prefix).await?;
         if let Some(tracker) = tracker {
             tracker.add_upload(prefix.len() as u64);
         }
     }
+    drop(prefix);
     let both = async {
         tokio::try_join!(
             async {

@@ -8,8 +8,8 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::inbound::udp::{DEFAULT_UDP_TIMEOUT, DatagramFrame, Reply, UdpHub};
 use crate::inbound::{
-    ClientConn, Target, network_includes_udp, pump_conn_tracked, require_u16, socks_failure_reply,
-    socks_success_reply,
+    ClientConn, Target, network_includes_udp, pump_conn_tracked_owned, require_u16,
+    socks_failure_reply, socks_success_reply,
 };
 use crate::logging;
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
@@ -226,7 +226,13 @@ async fn socks4(
                 Ok((conn, tracker)) => {
                     client.write_all(&granted).await?;
                     logging::info(format_args!("socks[{tag}] {peer} CONNECT {dest}"));
-                    pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
+                    pump_conn_tracked_owned(
+                        client,
+                        conn,
+                        std::mem::take(&mut ctx.sniff_prefix),
+                        Some(&tracker),
+                    )
+                    .await
                 }
                 Err(err) => {
                     let _ = client
@@ -400,7 +406,13 @@ async fn socks5(
                     // a reply that only its own first packet can trigger.
                     client.established().await?;
                     logging::info(format_args!("mixed[{tag}] {peer} CONNECT {dest}"));
-                    pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
+                    pump_conn_tracked_owned(
+                        client,
+                        conn,
+                        std::mem::take(&mut ctx.sniff_prefix),
+                        Some(&tracker),
+                    )
+                    .await
                 }
                 Err(err) => {
                     let _ = client.fail(&err).await;
@@ -647,7 +659,13 @@ async fn http_connect(
             let dest = ctx.destination.clone();
             let (conn, tracker) = super::connect_tracked(router, idx, &ctx).await?;
             logging::info(format_args!("mixed[{tag}] {peer} CONNECT {dest}"));
-            pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
+            pump_conn_tracked_owned(
+                client,
+                conn,
+                std::mem::take(&mut ctx.sniff_prefix),
+                Some(&tracker),
+            )
+            .await
         }
     }
 }

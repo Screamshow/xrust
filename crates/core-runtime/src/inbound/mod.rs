@@ -625,6 +625,20 @@ pub async fn pump_conn_tracked<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any,
 {
+    pump_conn_tracked_owned(client, conn, prefix.to_vec(), tracker).await
+}
+
+/// Consume sniffed bytes so their allocation can be released as soon as they
+/// reach the upstream, rather than keeping it for the lifetime of the relay.
+pub async fn pump_conn_tracked_owned<S>(
+    client: S,
+    conn: Conn,
+    prefix: Vec<u8>,
+    tracker: Option<&clash_state::ConnHandle>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any,
+{
     let half = HalfOpen::default();
     let relay = end_half_open(
         pump_conn_tracked_inner(client, conn, prefix, tracker, &half),
@@ -646,7 +660,7 @@ where
 async fn pump_conn_tracked_inner<S>(
     mut client: S,
     conn: Conn,
-    prefix: &[u8],
+    prefix: Vec<u8>,
     tracker: Option<&clash_state::ConnHandle>,
     half: &HalfOpen,
 ) -> io::Result<()>
@@ -674,7 +688,7 @@ where
                     let sent = if prefix.is_empty() {
                         vless.send_head_from(client_tcp).await?
                     } else {
-                        vless.write_all(prefix).await?;
+                        vless.write_all(&prefix).await?;
                         vless.flush().await?;
                         std::mem::take(&mut prefix).len()
                     };
@@ -702,22 +716,24 @@ where
             #[cfg(target_os = "linux")]
             if client_raw_tcp(&client).is_some() && vision_splice_candidate(&mut upstream) {
                 if !prefix.is_empty() {
-                    upstream.write_all(prefix).await?;
+                    upstream.write_all(&prefix).await?;
                     if let Some(tracker) = tracker {
                         tracker.add_upload(prefix.len() as u64);
                     }
                 }
+                drop(prefix);
                 return relay::relay_vision(&mut client, &mut upstream, tracker, half)
                     .await
                     .map(|_| ());
             }
 
             if !prefix.is_empty() {
-                upstream.write_all(prefix).await?;
+                upstream.write_all(&prefix).await?;
                 if let Some(tracker) = tracker {
                     tracker.add_upload(prefix.len() as u64);
                 }
             }
+            drop(prefix);
             match tracker {
                 Some(tracker) => {
                     relay_tracked(&mut client, &mut upstream, tracker, half).await?;
@@ -1459,7 +1475,13 @@ pub(crate) async fn drive_framed(
             let (conn, tracker) = connect_tracked(router, idx, &ctx).await?;
             logging::info(format_args!("inbound {tag} {peer} CONNECT {dest}"));
 
-            pump_conn_tracked(client, conn, &ctx.sniff_prefix, Some(&tracker)).await
+            pump_conn_tracked_owned(
+                client,
+                conn,
+                std::mem::take(&mut ctx.sniff_prefix),
+                Some(&tracker),
+            )
+            .await
         }
     }
 }
