@@ -195,6 +195,42 @@ pub struct DirectMesh {
     network_endpoints: Vec<SocketAddr>,
 }
 
+// Linux reports twice the requested SO_RCVBUF (including kernel accounting).
+// Bound the per-socket queue; never change router-wide sysctls or the send queue.
+const RECEIVE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+
+fn configure_receive_buffer(socket: &socket2::SockRef<'_>) -> io::Result<usize> {
+    let before = socket.recv_buffer_size()?;
+    if before >= RECEIVE_BUFFER_BYTES {
+        return Ok(before);
+    }
+    let requested = if cfg!(target_os = "linux") {
+        RECEIVE_BUFFER_BYTES / 2
+    } else {
+        RECEIVE_BUFFER_BYTES
+    };
+    // The ordinary operation may be capped by rmem_max. Retain the existing
+    // queue if that operation fails, and still try the privileged Linux option.
+    let _ = socket.set_recv_buffer_size(requested);
+    #[cfg(target_os = "linux")]
+    if socket.recv_buffer_size()? < RECEIVE_BUFFER_BYTES {
+        use std::os::fd::AsRawFd;
+        let value = requested as libc::c_int;
+        // Only this socket is affected. EPERM (unprivileged operation) leaves
+        // the ordinary, kernel-capped buffer usable; startup must still work.
+        unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUFFORCE,
+                (&value as *const libc::c_int).cast(),
+                std::mem::size_of_val(&value) as libc::socklen_t,
+            );
+        }
+    }
+    socket.recv_buffer_size()
+}
+
 impl DirectMesh {
     pub fn set_local_routes(&mut self, routes: Vec<smoltcp::wire::IpCidr>) {
         self.local_routes = routes;
@@ -203,9 +239,19 @@ impl DirectMesh {
         let mut disco = [0; 32];
         getrandom::fill(&mut disco)
             .map_err(|_| io::Error::other("tailscale: entropy unavailable"))?;
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
+        match configure_receive_buffer(&socket2::SockRef::from(&socket)) {
+            Ok(actual) if actual >= RECEIVE_BUFFER_BYTES => {}
+            Ok(actual) => crate::logging::warn(format_args!(
+                "tailscale: UDP receive buffer limited to {actual} bytes (target {RECEIVE_BUFFER_BYTES}); burst traffic may drop"
+            )),
+            Err(error) => crate::logging::warn(format_args!(
+                "tailscale: cannot verify UDP receive buffer: {error}"
+            )),
+        }
         Ok(Self {
             disco: StaticSecret::from(disco),
-            socket: UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).await?,
+            socket,
             public: PublicKey::from(&private).to_bytes(),
             private,
             local,
@@ -1141,5 +1187,42 @@ mod tests {
         let mut invalid = packet([100, 64, 0, 1], [100, 64, 0, 2], 0);
         invalid[2..4].copy_from_slice(&100u16.to_be_bytes());
         assert!(packet_ips(&invalid).is_none());
+    }
+}
+
+#[cfg(test)]
+mod receive_buffer_tests {
+    use super::*;
+    #[test]
+    fn receive_queue_tuning_preserves_send_queue_and_datagrams() {
+        let a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let socket = socket2::SockRef::from(&a);
+        let send_before = socket.send_buffer_size().unwrap();
+        let receive_before = socket.recv_buffer_size().unwrap();
+        let actual = configure_receive_buffer(&socket).unwrap();
+        assert!(actual >= receive_before);
+        assert_eq!(socket.send_buffer_size().unwrap(), send_before);
+        b.send_to(b"queue-test", a.local_addr().unwrap()).unwrap();
+        let mut bytes = [0; 32];
+        let (n, _) = a.recv_from(&mut bytes).unwrap();
+        assert_eq!(&bytes[..n], b"queue-test");
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN to exceed rmem_max"]
+    fn privileged_receive_queue_reaches_target() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let reference = socket2::SockRef::from(&socket);
+        assert!(configure_receive_buffer(&reference).unwrap() >= RECEIVE_BUFFER_BYTES);
+    }
+
+    #[test]
+    fn tuning_is_idempotent_under_kernel_limits() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let reference = socket2::SockRef::from(&socket);
+        let first = configure_receive_buffer(&reference).unwrap();
+        assert_eq!(configure_receive_buffer(&reference).unwrap(), first);
     }
 }
