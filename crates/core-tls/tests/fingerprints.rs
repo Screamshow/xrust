@@ -1,6 +1,6 @@
 //! Every vendored fingerprint rebuilds its own capture byte-for-byte, apart
 //! from GREASE values and the GREASE ECH body, which is checked by structure,
-//! and, for the Chrome tables that shuffle per hello, the extension order.
+//! ephemeral key material and, for Chrome, the shuffled extension order.
 //!
 //! The captures are what the reference sent as a uTLS client
 //! (tests/spikes/clienthello/captures, taken on sing-box-lx 1.14.2-lx.3). A
@@ -14,7 +14,9 @@ use core_tls::hello::{EchGrease, build, parse_record};
 
 fn capture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join(if matches!(name, "chrome" | "firefox" | "safari") {
+        .join(if name == "chrome" {
+            "../../tests/spikes/clienthello/captures-xray-26.11.9"
+        } else if matches!(name, "firefox" | "safari") {
             "../../tests/spikes/clienthello/captures-sing-box-x"
         } else {
             "../../tests/spikes/clienthello/captures"
@@ -210,10 +212,10 @@ fn is_grease(value: u16) -> bool {
 /// only in them compare equal.
 fn mask_body(id: u16, body: &[u8]) -> Vec<u8> {
     let mut out = body.to_vec();
-    // a list of u16 values: supported_groups, key_share group ids, and
+    // Lists of u16 values, including groups and signature schemes, and
     // supported_versions after its one-byte length
     let skip = if id == 0x002b { 1 } else { 0 };
-    let u16_list = matches!(id, 0x000a | 0x0023 | 0x0033 | 0x001d | 0x002b);
+    let u16_list = matches!(id, 0x000a | 0x000d | 0x0023 | 0x001d | 0x002b);
     if u16_list {
         let start = skip.min(out.len());
         for pair in out[start..].chunks_mut(2) {
@@ -319,7 +321,22 @@ fn same_extension(
                 || (id_a == id_b && mask_body(*id_a, body_a) == mask_body(*id_b, body_b))
         }
         (Ext::Sni, Ext::Sni) | (Ext::Alpn, Ext::Alpn) => true,
-        (Ext::KeyShare(a), Ext::KeyShare(b)) => mask_body(0x0033, a) == mask_body(0x0033, b),
+        (Ext::KeyShare(a), Ext::KeyShare(b)) => {
+            use core_tls::keyshare::entries;
+            let (Ok(a), Ok(b)) = (entries(a), entries(b)) else {
+                return false;
+            };
+            a.len() == b.len()
+                && a.iter()
+                    .zip(&b)
+                    .all(|((group_a, share_a), (group_b, share_b))| {
+                        if is_grease(*group_a) && is_grease(*group_b) {
+                            share_a == share_b
+                        } else {
+                            group_a == group_b && share_a.len() == share_b.len()
+                        }
+                    })
+        }
         _ => false,
     }
 }

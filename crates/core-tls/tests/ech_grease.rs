@@ -140,7 +140,7 @@ fn hello(template: &Template, shares: Option<&Shares>) -> Vec<u8> {
 fn ungrease(id: u16, body: &[u8]) -> (u16, Vec<u8>) {
     let mut body = body.to_vec();
     let skip = match id {
-        0x000a => 2,
+        0x000a | 0x000d => 2,
         0x002b => 1,
         _ => body.len(),
     };

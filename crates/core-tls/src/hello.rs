@@ -265,6 +265,7 @@ pub fn build(
                 grease_exts += 1;
                 (grease.extension(grease_exts)?, body.clone())
             }
+            Ext::Static(id @ 0x000d, body) => (*id, grease.u16_list(body, 2, grease.signature)),
             Ext::Static(id @ 0x000a, body) => (*id, grease.u16_list(body, 2, grease.group)),
             Ext::Static(id @ 0x002b, body) => (*id, grease.u16_list(body, 1, grease.version)),
             Ext::Static(id, body) => (*id, body.clone()),
@@ -312,7 +313,7 @@ pub fn build(
 /// `greaseSeed` per handshake (utls aa6edf4b11af, u_parrots.go:3049-3061 and
 /// GetBoringGREASEValue in u_tls_extensions.go:983): one value each for the
 /// cipher list, the groups (supported_groups and key_share alike), the two
-/// GREASE extensions and supported_versions. They are independent of one
+/// GREASE extensions, supported_versions and signature_algorithms. They are independent of one
 /// another -- the cipher value may equal the group value -- except that the
 /// two extension ids differ, since a repeated id is a duplicate extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -322,17 +323,18 @@ struct Grease {
     ext1: u16,
     ext2: u16,
     version: u16,
+    signature: u16,
 }
 
 impl Grease {
     fn draw() -> io::Result<Self> {
-        let mut seed = [0u8; 5];
+        let mut seed = [0u8; 6];
         getrandom::fill(&mut seed).map_err(|e| err(&format!("no entropy: {e}")))?;
         Ok(Self::from_seed(seed))
     }
 
     /// 0xωaωa from the high nibble of each seed byte.
-    fn from_seed(seed: [u8; 5]) -> Self {
+    fn from_seed(seed: [u8; 6]) -> Self {
         let value = |byte: u8| {
             let v = (byte & 0xf0) as u16 | 0x0a;
             v << 8 | v
@@ -348,6 +350,7 @@ impl Grease {
             ext1,
             ext2,
             version: value(seed[4]),
+            signature: value(seed[5]),
         }
     }
 
@@ -462,16 +465,17 @@ mod tests {
         for byte in 0..=255u8 {
             let hi = (byte >> 4) as u16;
             let want = (hi << 12) | 0x0a00 | (hi << 4) | 0x0a;
-            let g = Grease::from_seed([byte, byte, byte, 0x00, byte]);
+            let g = Grease::from_seed([byte, byte, byte, 0x00, byte, byte]);
             assert_eq!(g.cipher, want);
             assert_eq!(g.group, want);
             assert_eq!(g.version, want);
+            assert_eq!(g.signature, want);
             assert_eq!(g.ext1, want);
-            let same = Grease::from_seed([0, 0, byte, byte, 0]);
+            let same = Grease::from_seed([0, 0, byte, byte, 0, 0]);
             assert_eq!(same.ext2, want ^ 0x1010);
             assert!(keyshare::is_grease(same.ext2));
         }
-        assert!(Grease::from_seed([0; 5]).extension(3).is_err());
+        assert!(Grease::from_seed([0; 6]).extension(3).is_err());
     }
 
     /// The sniffers hand this parser whatever a client sent. It may refuse,

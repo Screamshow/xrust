@@ -10,6 +10,9 @@ use self::rsa::{
 
 pub static ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
     all: &[
+        &ml_dsa::MlDsa44,
+        &ml_dsa::MlDsa65,
+        &ml_dsa::MlDsa87,
         ECDSA_P256_SHA256,
         ECDSA_P256_SHA384,
         ECDSA_P384_SHA256,
@@ -23,6 +26,9 @@ pub static ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
         RSA_PSS_SHA512,
     ],
     mapping: &[
+        (SignatureScheme::ML_DSA_44, &[&ml_dsa::MlDsa44]),
+        (SignatureScheme::ML_DSA_65, &[&ml_dsa::MlDsa65]),
+        (SignatureScheme::ML_DSA_87, &[&ml_dsa::MlDsa87]),
         (
             SignatureScheme::ECDSA_NISTP384_SHA384,
             &[ECDSA_P384_SHA384, ECDSA_P256_SHA384],
@@ -43,4 +49,5 @@ pub static ALGORITHMS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
 
 pub mod ecdsa;
 pub mod eddsa;
+mod ml_dsa;
 pub mod rsa;

@@ -47,7 +47,7 @@ fn shuffle<T>(values: &mut [T], rng: &mut impl RngCore) {
 }
 
 fn generate(rng: &mut impl RngCore) -> Template {
-    let mut profile = fingerprints::chrome();
+    let mut profile = fingerprints::chrome_base();
     let mut suites: Vec<[u8; 2]> = profile
         .cipher_suites
         .as_chunks::<2>()
@@ -129,7 +129,7 @@ mod tests {
 
     #[test]
     fn generated_profiles_vary_but_keep_negotiation_essentials() {
-        let chrome = fingerprints::chrome();
+        let chrome = fingerprints::chrome_base();
         let required: Vec<_> = chrome
             .extensions
             .iter()
