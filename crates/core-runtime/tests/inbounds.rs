@@ -349,6 +349,7 @@ async fn redirect_inbound_without_nat_closes_connection() {
         eprintln!("SKIP redirect inbound: needs CAP_NET_ADMIN for the NAT table");
         return;
     }
+    let echo = spawn_echo().await;
     let cfg = base_cfg(
         json!([
             {
@@ -359,21 +360,36 @@ async fn redirect_inbound_without_nat_closes_connection() {
             }
         ]),
         json!([{"type": "direct", "tag": "out"}]),
-        json!({"final": "out"}),
+        json!({
+            "rules": [{
+                "inbound": ["redir-in"],
+                "action": "route",
+                "outbound": "out",
+                "override_address": "127.0.0.1",
+                "override_port": echo.port()
+            }],
+            "final": "out"
+        }),
     );
     let instance = start_box(cfg).await;
     let addr = inbound_addr(&instance, "redir-in");
 
-    // Without iptables REDIRECT there is no original destination: on Linux
-    // SO_ORIGINAL_DST fails with ENOENT, elsewhere unsupported — either way
-    // the connection is accepted then closed before route.
+    // Without REDIRECT, SO_ORIGINAL_DST can fail with ENOENT or return the
+    // accepted socket's local address when conntrack tracks this connection.
+    // Both cases must close before route instead of dialing the listener.
+    // An override to echo exposes accidental routing without opening a
+    // recursive chain of connections that can exhaust file descriptors.
     let mut stream = TcpStream::connect(addr).await.expect("connect redirect");
+    let _ = stream.write_all(b"hello-redirect").await;
     let mut buf = [0u8; 16];
-    let n = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
         .await
-        .expect("close timeout")
-        .expect("read after accept");
-    assert_eq!(n, 0, "expected connection close without NAT entry");
+        .expect("close timeout");
+    match result {
+        Ok(0) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("expected connection close without NAT entry, got {other:?}"),
+    }
     instance.shutdown();
 }
 

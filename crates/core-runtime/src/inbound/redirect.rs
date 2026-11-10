@@ -84,7 +84,17 @@ impl Redirect {
 /// Reference `redir.GetOriginalDestination`.
 async fn original_destination(stream: &TcpStream) -> io::Result<Target> {
     // getsockopt is non-blocking and O(μs); run inline.
-    original_destination_blocking(stream)
+    let destination = original_destination_blocking(stream)?;
+    // A conntrack entry can exist without NAT. In that case SO_ORIGINAL_DST
+    // returns this accepted socket's local address, which would dial the
+    // redirect listener again instead of reaching an intercepted destination.
+    if destination == Target::Ip(stream.local_addr()?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "redirect original destination is the listener itself",
+        ));
+    }
+    Ok(destination)
 }
 
 #[cfg(target_os = "linux")]
