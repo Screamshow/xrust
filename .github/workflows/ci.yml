@@ -34,9 +34,11 @@ jobs:
       # covers what the unprivileged `cargo test` above can only skip.
       - name: Exit gate (privileged)
         run: |
-          sudo -E env "PATH=$PATH" XRUST_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --lib outbound::dial::tests::the_options_reach_the_socket -- --exact
-          sudo -E env "PATH=$PATH" cargo test -p core-runtime --test exit_gate -- --nocapture
-          sudo -E env "PATH=$PATH" cargo test -p core-runtime --test inbounds -- --nocapture
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          sudo env "PATH=$PATH" "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_HOME=$CARGO_HOME" XRUST_TEST_REQUIRE_SO_MARK=1 cargo test -p core-runtime --lib outbound::dial::tests::the_options_reach_the_socket -- --exact
+          sudo env "PATH=$PATH" "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_HOME=$CARGO_HOME" cargo test -p core-runtime --test exit_gate -- --nocapture
+          sudo env "PATH=$PATH" "RUSTUP_HOME=$RUSTUP_HOME" "CARGO_HOME=$CARGO_HOME" cargo test -p core-runtime --test inbounds -- --nocapture
 
   differential:
     name: check vs sing-box-lx
