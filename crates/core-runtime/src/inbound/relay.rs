@@ -291,7 +291,7 @@ pub(crate) async fn relay(
 /// kernel can take over. Xray splices this direction only, and so do we.
 enum Down {
     /// userspace, until the upstream reports its reads raw and drained
-    Watch(PooledBuffer, bool),
+    Watch(PooledBuffer, bool, Option<io::Error>),
     /// userspace for good: no pipe could be had
     Copy(PooledBuffer),
     /// the kernel, with how much of the last chunk is still in the pipe
@@ -306,6 +306,7 @@ enum Down {
 struct UntilRaw<'a> {
     inner: &'a mut AnyStream,
     switch: &'a mut bool,
+    error: &'a mut Option<io::Error>,
 }
 
 impl AsyncRead for UntilRaw<'_> {
@@ -315,11 +316,30 @@ impl AsyncRead for UntilRaw<'_> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if *this.switch || super::vision_direct_socket((**this.inner).as_any()).is_some() {
-            *this.switch = true;
+        if this.error.is_some() {
             return Poll::Ready(Ok(()));
         }
-        Pin::new(&mut *this.inner).poll_read(cx, buf)
+        let start = buf.filled().len();
+        loop {
+            if *this.switch || super::vision_direct_socket((**this.inner).as_any()).is_some() {
+                *this.switch = true;
+                return Poll::Ready(Ok(()));
+            }
+            let before = buf.filled().len();
+            match Pin::new(&mut *this.inner).poll_read(cx, buf) {
+                // Vision still checks each TLS record for Direct. Collect
+                // available records here so the relay can write them together.
+                Poll::Ready(Ok(())) if buf.filled().len() > before && buf.remaining() > 0 => {}
+                Poll::Pending if buf.filled().len() > start => return Poll::Ready(Ok(())),
+                Poll::Ready(Err(error)) => {
+                    // Finish writing the bytes already in the relay buffer
+                    // before surfacing the read error.
+                    *this.error = Some(error);
+                    return Poll::Ready(Ok(()));
+                }
+                result => return result,
+            }
+        }
     }
 }
 
@@ -375,16 +395,20 @@ where
 {
     loop {
         match state {
-            Down::Watch(buf, switch) => {
+            Down::Watch(buf, switch, error) => {
                 let mut reader = UntilRaw {
                     inner: &mut *upstream,
                     switch: &mut *switch,
+                    error,
                 };
                 let mut writer = Counted {
                     inner: &mut *client,
                     tracker,
                 };
                 ready!(buf.poll_copy(cx, Pin::new(&mut reader), Pin::new(&mut writer)))?;
+                if let Some(error) = error.take() {
+                    return Poll::Ready(Err(error));
+                }
                 // the buffer is empty and flushed: everything read so far is
                 // with the client
                 let switched = *switch;
@@ -463,7 +487,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + std::any::Any,
 {
     let mut up = TransferState::Running(PooledBuffer::new(take_buf()));
-    let mut down = Down::Watch(PooledBuffer::new(take_buf()), false);
+    let mut down = Down::Watch(PooledBuffer::new(take_buf()), false, None);
     let mut spliced = false;
     std::future::poll_fn(|cx| {
         let res_up = {

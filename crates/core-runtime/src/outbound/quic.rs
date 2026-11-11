@@ -555,6 +555,142 @@ fn salamander_open_in_place<'a>(password: &[u8], packet: &'a mut [u8]) -> Option
     Some(&packet[8..])
 }
 
+fn open_salamander_datagrams(password: &[u8], buf: &mut [u8], stride: usize) -> usize {
+    let mut plain_len = 0;
+    for start in (0..buf.len()).step_by(stride) {
+        let end = (start + stride).min(buf.len());
+        if let Some(plain) = salamander_open_in_place(password, &mut buf[start..end]) {
+            let len = plain.len();
+            buf.copy_within(start + 8..end, plain_len);
+            plain_len += len;
+        }
+    }
+    plain_len
+}
+
+/// Plain Salamander over Quinn's network socket, without a loopback UDP relay.
+/// The wrapper uses Quinn's receive batching and applies the salt to each
+/// individual datagram, including when the kernel coalesces receives.
+pub(crate) struct SalamanderSocket {
+    socket: Arc<dyn quinn::AsyncUdpSocket>,
+    peer: SocketAddr,
+    password: Vec<u8>,
+    sealed: std::sync::Mutex<Vec<u8>>,
+}
+
+impl SalamanderSocket {
+    pub(crate) fn bind(
+        runtime: &dyn quinn::Runtime,
+        peer: SocketAddr,
+        password: Vec<u8>,
+    ) -> io::Result<Self> {
+        let udp = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
+        udp.set_nonblocking(true)?;
+        // Keep the network queue limits of the relay socket.
+        let sock_ref = socket2::SockRef::from(&udp);
+        let _ = sock_ref.set_recv_buffer_size(UDP_SOCKET_BUFFER);
+        let _ = sock_ref.set_send_buffer_size(UDP_SOCKET_BUFFER);
+        #[cfg(target_os = "linux")]
+        let options = udp.try_clone()?;
+        let socket = runtime.wrap_udp_socket(udp)?;
+        // The old network-facing relay socket allowed IPv4 fragmentation.
+        // Restore its default after Quinn configures its receive backend.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mode: libc::c_int = libc::IP_PMTUDISC_WANT;
+            // SAFETY: the duplicate refers to the same live IPv4 UDP socket.
+            let result = unsafe {
+                libc::setsockopt(
+                    options.as_raw_fd(),
+                    libc::IPPROTO_IP,
+                    libc::IP_MTU_DISCOVER,
+                    (&raw const mode).cast(),
+                    size_of_val(&mode) as libc::socklen_t,
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self {
+            socket,
+            peer,
+            password,
+            sealed: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl std::fmt::Debug for SalamanderSocket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SalamanderSocket")
+            .field("peer", &self.peer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl quinn::AsyncUdpSocket for SalamanderSocket {
+    fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+        Arc::clone(&self.socket).create_io_poller()
+    }
+
+    fn try_send(&self, tx: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+        // Advertise the default limit of one segment: each datagram needs
+        // its own salt. The relay did not propagate ECN to the network.
+        debug_assert!(tx.segment_size.is_none());
+        let mut sealed = self.sealed.lock().unwrap();
+        salamander_seal_into(&self.password, tx.contents, &mut sealed);
+        self.socket.try_send(&quinn::udp::Transmit {
+            destination: tx.destination,
+            ecn: None,
+            contents: &sealed,
+            segment_size: None,
+            src_ip: None,
+        })
+    }
+
+    fn poll_recv(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [io::IoSliceMut<'_>],
+        meta: &mut [quinn::udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        let count = std::task::ready!(self.socket.poll_recv(cx, bufs, meta))?;
+        for (buf, meta) in bufs.iter_mut().zip(&mut meta[..count]) {
+            if meta.addr.ip() != self.peer.ip() || meta.stride <= 8 {
+                meta.len = 0;
+                continue;
+            }
+            meta.len = open_salamander_datagrams(&self.password, &mut buf[..meta.len], meta.stride);
+            meta.stride -= 8;
+            // As with the relay, accept replies from the configured IP and
+            // present a stable peer address, without relaying ECN markings.
+            meta.addr = self.peer;
+            meta.ecn = None;
+            meta.dst_ip = None;
+        }
+        Poll::Ready(Ok(count))
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    fn max_receive_segments(&self) -> usize {
+        // Quinn sizes each receive buffer for the advertised plaintext
+        // datagrams. Leave room for their eight-byte wire prefixes.
+        let segments = self.socket.max_receive_segments();
+        segments + (segments * 8).div_ceil(1200)
+    }
+
+    fn may_fragment(&self) -> bool {
+        // From QUIC's perspective this replaces the plaintext loopback
+        // socket, whose PMTU discovery behaviour stays in effect.
+        self.socket.may_fragment()
+    }
+}
+
 /// Gecko obfuscation: the salamander framing plus a fragmentation layer, from
 /// `sing-quic/hysteria2/gecko.go`.
 ///
@@ -1379,6 +1515,23 @@ mod tests {
         assert_eq!(opened, payload);
         assert!(salamander_open(pw, &sealed[..4]).is_none());
         assert!(salamander_open(b"wrong", &sealed).unwrap() != payload);
+    }
+
+    #[test]
+    fn coalesced_salamander_datagrams_keep_their_boundaries() {
+        let password = b"test";
+        let mut batch = salamander_seal(password, b"first");
+        let stride = batch.len();
+        batch.extend(salamander_seal(password, b"other"));
+        let full_batch = batch.clone();
+        batch.extend(salamander_seal(password, b"end"));
+        let n = open_salamander_datagrams(password, &mut batch, stride);
+        assert_eq!(&batch[..n], b"firstotherend");
+
+        let mut batch = full_batch;
+        batch.extend([0; 8]);
+        let n = open_salamander_datagrams(password, &mut batch, stride);
+        assert_eq!(&batch[..n], b"firstother");
     }
 
     #[test]

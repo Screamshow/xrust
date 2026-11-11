@@ -1,6 +1,6 @@
 //! hysteria2 outbound: shared lazy QUIC dial, HTTP/3 password auth, eager TCP
 //! request header with lazy-compatible response read, datagram UDP relay with
-//! fragmentation and two-socket salamander obfs (reference sing-quic client).
+//! fragmentation and Salamander obfuscation.
 
 use portable_atomic::AtomicU64;
 use std::collections::HashMap;
@@ -16,10 +16,10 @@ use crate::logging;
 use crate::outbound::proxy::{server_endpoint, server_host};
 use crate::outbound::quic::{
     CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN,
-    PoolLease, QuicStream, QuicTunnelDefaults, QuicTunnelOptions, SalamanderRelay, VarintReader,
-    bind_udp, bind_udp_loopback, dest_string, io_from_datagram, io_from_quinn,
-    pick_port_from_ranges, put_varint, quic_go_client_shape, random_padding, read_varint,
-    resolve_host, spawn_hop_relay, udp_loopback_pair,
+    PoolLease, QuicStream, QuicTunnelDefaults, QuicTunnelOptions, SalamanderRelay,
+    SalamanderSocket, VarintReader, bind_udp, bind_udp_loopback, dest_string, io_from_datagram,
+    io_from_quinn, pick_port_from_ranges, put_varint, quic_go_client_shape, random_padding,
+    read_varint, resolve_host, spawn_hop_relay, udp_loopback_pair,
 };
 use crate::outbound::urltest::parse_duration;
 use crate::tls_client::TlsOptions;
@@ -257,28 +257,45 @@ impl Hysteria2 {
     async fn dial(&self) -> io::Result<Arc<Hy2Shared>> {
         let port = self.pick_port();
         let addr = resolve_host(&self.server, port).await?;
-        let need_relay = !self.server_port_ranges.is_empty() || self.obfs_password.is_some();
-        let sock = if need_relay {
-            bind_udp_loopback(addr.is_ipv4())?
-        } else {
-            bind_udp(addr)?
-        };
         let (mut ep_config, transport) = self.quic.build_hy2_configs(self.congestion());
         let quic_tls = self.tls.quic_config(&[b"h3"])?.with_hy2_chrome()?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
         client_config.transport_config(Arc::new(transport));
         quic_go_client_shape(&mut ep_config, &mut client_config);
-        let mut endpoint = quinn::Endpoint::new(
-            ep_config,
-            None,
-            sock,
-            quinn::default_runtime()
-                .ok_or_else(|| io::Error::other("hysteria2: no quinn runtime"))?,
-        )?;
+        let runtime = quinn::default_runtime()
+            .ok_or_else(|| io::Error::other("hysteria2: no quinn runtime"))?;
+        let hopping = !self.server_port_ranges.is_empty();
+        let direct_obfs =
+            if cfg!(target_os = "linux") && addr.is_ipv4() && !hopping && self.gecko.is_none() {
+                self.obfs_password.as_ref().and_then(|password| {
+                    match SalamanderSocket::bind(&*runtime, addr, password.clone()) {
+                        Ok(socket) => Some(socket),
+                        Err(e) => {
+                            logging::debug(format_args!(
+                                "hysteria2: direct Salamander socket: {e}"
+                            ));
+                            None
+                        }
+                    }
+                })
+            } else {
+                None
+            };
+        let need_relay = hopping || (self.obfs_password.is_some() && direct_obfs.is_none());
+        let mut endpoint = if let Some(socket) = direct_obfs {
+            quinn::Endpoint::new_with_abstract_socket(ep_config, None, Arc::new(socket), runtime)?
+        } else {
+            let sock = if need_relay {
+                bind_udp_loopback(addr.is_ipv4())?
+            } else {
+                bind_udp(addr)?
+            };
+            quinn::Endpoint::new(ep_config, None, sock, runtime)?
+        };
         endpoint.set_default_client_config(client_config);
 
         let relay = if need_relay {
-            let hop_interval = (!self.server_port_ranges.is_empty()).then_some(self.hop_interval);
+            let hop_interval = hopping.then_some(self.hop_interval);
             let relay = spawn_hop_relay(
                 addr.ip(),
                 self.server_port_ranges.clone(),
@@ -820,11 +837,24 @@ mod tests {
     /// them and both leave at the full size, as the reference sends them.
     #[tokio::test]
     async fn first_initial_has_chrome_profile_shape() {
+        check_first_initial_chrome_profile(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn salamander_first_initial_has_chrome_profile_shape() {
+        check_first_initial_chrome_profile(true).await;
+    }
+
+    async fn check_first_initial_chrome_profile(salamander: bool) {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let cfg = serde_json::json!({
+        let mut cfg = serde_json::json!({
             "server": "127.0.0.1", "server_port": server.local_addr().unwrap().port(),
             "password": "test", "tls": {"enabled": true, "insecure": true}
         });
+        if salamander {
+            cfg["obfs"] = serde_json::json!({"type": "salamander", "password": "test"});
+        }
         let outbound = Arc::new(Hysteria2::build(cfg.as_object().unwrap(), "test").unwrap());
         let dial = tokio::spawn({
             let outbound = Arc::clone(&outbound);
@@ -839,7 +869,14 @@ mod tests {
                 .await
                 .expect("Initial datagram")
                 .unwrap();
-            let dg = &buf[..n];
+            let plain;
+            let dg = if salamander {
+                assert_eq!(n, 1258, "salt plus the Initial datagram");
+                plain = crate::outbound::quic::salamander_open(b"test", &buf[..n]).unwrap();
+                &plain
+            } else {
+                &buf[..n]
+            };
             assert_eq!(dg[0] & 0xf0, 0xc0, "long header Initial");
             assert_eq!(&dg[1..5], &[0, 0, 0, 1], "QUIC v1");
             let dcid_len = dg[5] as usize;
@@ -847,7 +884,7 @@ mod tests {
             dcids.push(dg[6..6 + dcid_len].to_vec());
             assert_eq!(dg[6 + dcid_len], 0, "zero-length SCID");
             assert_eq!(dg[7 + dcid_len], 0, "no token");
-            assert_eq!(n, 1250, "Initial datagram {i} size");
+            assert_eq!(dg.len(), 1250, "Initial datagram {i} size");
         }
         assert_eq!(dcids[0], dcids[1], "one connection");
         dial.abort();

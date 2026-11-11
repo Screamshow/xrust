@@ -556,31 +556,41 @@ impl Session {
     /// Seal one inner packet into a transport message (pads to 16 bytes).
     pub fn seal(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
         let pad = (16 - (packet.len() % 16)) % 16;
-        self.seal_raw(packet, packet.len() + pad)
+        let mut msg = Vec::new();
+        self.seal_into(packet, packet.len() + pad, 0, &mut msg)
+            .then_some(msg)
     }
 
-    /// Seal with an explicit final plaintext length (AWG 3.x content
-    /// padding / trailers replace the multiple-of-16 alignment).
-    pub fn seal_raw(&mut self, packet: &[u8], padded_len: usize) -> Option<Vec<u8>> {
+    /// Seal in a reusable wire buffer, leaving room for the AWG prefix.
+    pub fn seal_into(
+        &mut self,
+        packet: &[u8],
+        padded_len: usize,
+        prefix_len: usize,
+        msg: &mut Vec<u8>,
+    ) -> bool {
         if self.send_counter > REJECT_AFTER_MESSAGES {
-            return None;
+            return false;
         }
         debug_assert!(padded_len >= packet.len());
         let counter = self.send_counter;
         self.send_counter += 1;
-        let mut msg = Vec::with_capacity(TRANSPORT_HEADER_LEN + padded_len + 16);
+        let payload_start = prefix_len + TRANSPORT_HEADER_LEN;
+        msg.clear();
+        msg.reserve(payload_start + padded_len + 16);
+        msg.resize(prefix_len, 0);
         msg.extend_from_slice(&gen_type(self.awg_transport).to_le_bytes());
         msg.extend_from_slice(&self.remote_index.to_le_bytes());
         msg.extend_from_slice(&counter.to_le_bytes());
         msg.extend_from_slice(packet);
-        msg.resize(TRANSPORT_HEADER_LEN + padded_len, 0);
+        msg.resize(payload_start + padded_len, 0);
         let mut nonce = [0u8; 12];
         nonce[4..].copy_from_slice(&counter.to_le_bytes());
         let tag = self
             .send_cipher
-            .seal(&nonce, &[], &mut msg[TRANSPORT_HEADER_LEN..]);
+            .seal(&nonce, &[], &mut msg[payload_start..]);
         msg.extend_from_slice(&tag);
-        Some(msg)
+        true
     }
 
     /// Open a transport message addressed to us; enforces the replay window.

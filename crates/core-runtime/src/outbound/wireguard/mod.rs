@@ -817,9 +817,9 @@ struct Stack {
     tcp: HashMap<u32, TcpConn>,
     udp: HashMap<u16, UdpSess>,
     next_port: u16,
-    scratch: Vec<u8>,
     /// Transport datagrams sealed during one device flush, sent together.
     outbox: Vec<(SocketAddr, Vec<u8>)>,
+    wire_buffers: Vec<Vec<u8>>,
 }
 
 impl Stack {
@@ -937,35 +937,28 @@ impl Stack {
     /// a random trailer inside the AEAD, the s4 random prefix in front, and
     /// the header masked by the header-protection keystream.
     fn seal_transport(&mut self, pi: usize, pkt: &[u8]) -> Option<Vec<u8>> {
-        let params = self.cfg.awg.clone();
-        let pad_len = params.as_ref().map(|a| {
-            awg::transport_padding(
-                a,
-                self.peers[pi].udp_window,
-                pkt.len(),
-                a.padding(awg::TRANSPORT),
-            )
-        });
-        let session = self.peers[pi].session.as_mut()?;
-        let msg = match (&params, pad_len) {
-            (None, _) => session.seal(pkt)?,
-            (Some(_), Some(pad_len)) => session.seal_raw(pkt, pkt.len() + pad_len)?,
-            (Some(_), None) => return None,
-        };
-        let mut out = msg;
-        if let Some(a) = params.as_ref() {
-            let s4 = a.padding(awg::TRANSPORT);
+        let peer = &mut self.peers[pi];
+        let session = peer.session.as_mut()?;
+        let params = self.cfg.awg.as_deref();
+        let s4 = params.map_or(0, |a| a.padding(awg::TRANSPORT));
+        let pad_len = params.map_or_else(
+            || (16 - pkt.len() % 16) % 16,
+            |a| awg::transport_padding(a, peer.udp_window, pkt.len(), s4),
+        );
+        let mut out = self.wire_buffers.pop().unwrap_or_default();
+        if !session.seal_into(pkt, pkt.len() + pad_len, s4, &mut out) {
+            self.wire_buffers.push(out);
+            return None;
+        }
+        if let Some(a) = params {
             if s4 > 0 {
-                let mut dressed = vec![0u8; s4 + out.len()];
-                awg::fill_random(&mut dressed[..s4]);
-                dressed[s4..].copy_from_slice(&out);
-                out = dressed;
+                awg::fill_random(&mut out[..s4]);
             }
             if let Some(key) = &a.header_protection {
-                let nonce = out[..12].to_vec();
-                awg::mask_header(key, &nonce, &mut out[s4..s4 + 16]);
+                let (prefix, message) = out.split_at_mut(s4);
+                awg::mask_header(key, prefix, &mut message[..16]);
             }
-            self.peers[pi].udp_window = self.peers[pi].udp_window.max(out.len() as u32);
+            peer.udp_window = peer.udp_window.max(out.len() as u32);
         }
         Some(out)
     }
@@ -990,7 +983,10 @@ impl Stack {
             Some(msg) => {
                 match (outbox, self.peers[pi].resolved) {
                     (Some(outbox), Some(addr)) => outbox.push((addr, msg)),
-                    _ => self.send_raw(pi, &msg),
+                    _ => {
+                        self.send_raw(pi, &msg);
+                        self.wire_buffers.push(msg);
+                    }
                 }
                 self.peers[pi].last_sent = Some(Instant::now());
                 Some(pkt)
@@ -1516,7 +1512,7 @@ impl Stack {
     }
 
     /// Send and empty `outbox`, in order, one socket family run at a time.
-    fn send_outbox(&self, outbox: &mut Vec<(SocketAddr, Vec<u8>)>) {
+    fn send_outbox(&mut self, outbox: &mut Vec<(SocketAddr, Vec<u8>)>) {
         let mut start = 0;
         while start < outbox.len() {
             let v6 = outbox[start].0.is_ipv6();
@@ -1538,16 +1534,17 @@ impl Stack {
             }
             start = end;
         }
-        outbox.clear();
+        self.wire_buffers
+            .extend(outbox.drain(..).map(|(_, msg)| msg));
     }
 
-    fn maintain_tcp(&mut self) {
+    fn maintain_tcp(&mut self) -> bool {
+        let mut drained_receive_window = false;
         let ids: Vec<u32> = self.tcp.keys().copied().collect();
         for id in ids {
             let Some(mut conn) = self.tcp.remove(&id) else {
                 continue;
             };
-            let mut rbuf = std::mem::take(&mut self.scratch);
             let mut remote_closed = false;
             let mut caller_gone = false;
             let state = {
@@ -1574,23 +1571,30 @@ impl Stack {
 
                 if conn.stash.is_none() {
                     loop {
-                        match sock.recv_slice(&mut rbuf) {
-                            Ok(0) => break,
-                            Ok(n) => match conn.to_caller.try_send(rbuf[..n].to_vec()) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(v)) => {
-                                    // Flag first, then the retry below: either
-                                    // the retry finds room, or the pump sees
-                                    // the flag after it makes room and wakes us.
-                                    conn.stalled.store(true, Ordering::SeqCst);
-                                    conn.stash = Some(v);
-                                    break;
+                        // Copy directly from the TCP ring to the message.
+                        // At a wrap, recv exposes the second span next time.
+                        match sock.recv(|buf| {
+                            let len = buf.len().min(SCRATCH_BUF);
+                            (len, buf[..len].to_vec())
+                        }) {
+                            Ok(data) if data.is_empty() => break,
+                            Ok(data) => {
+                                drained_receive_window = true;
+                                match conn.to_caller.try_send(data) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(v)) => {
+                                        // Flag first, then retry: either the retry
+                                        // finds room or the pump wakes us.
+                                        conn.stalled.store(true, Ordering::SeqCst);
+                                        conn.stash = Some(v);
+                                        break;
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        caller_gone = true;
+                                        break;
+                                    }
                                 }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    caller_gone = true;
-                                    break;
-                                }
-                            },
+                            }
                             Err(TcpRecvError::InvalidState) => break,
                             Err(TcpRecvError::Finished) => {
                                 remote_closed = true;
@@ -1608,8 +1612,6 @@ impl Stack {
                 }
                 sock.state()
             };
-            self.scratch = rbuf;
-
             if let Some(stash) = conn.stash.take() {
                 match conn.to_caller.try_send(stash) {
                     Ok(()) => {}
@@ -1654,6 +1656,7 @@ impl Stack {
                 self.tcp.insert(id, conn);
             }
         }
+        drained_receive_window
     }
 
     async fn maintain_peers(&mut self) {
@@ -1752,6 +1755,7 @@ impl Stack {
                     let confirm = self.seal_transport(pi, &[]);
                     if let Some(msg) = confirm {
                         self.send_raw(pi, &msg);
+                        self.wire_buffers.push(msg);
                         self.peers[pi].last_sent = Some(Instant::now());
                     }
                 }
@@ -1763,6 +1767,7 @@ impl Stack {
                 let confirm = self.seal_transport(pi, &[]);
                 if let Some(msg) = confirm {
                     self.send_raw(pi, &msg);
+                    self.wire_buffers.push(msg);
                     self.peers[pi].last_sent = Some(Instant::now());
                 }
                 let pending: Vec<Vec<u8>> = std::mem::take(&mut self.peers[pi].pending)
@@ -1879,8 +1884,8 @@ async fn run(
         tcp: HashMap::new(),
         udp: HashMap::new(),
         next_port: EPHEMERAL_BASE,
-        scratch: vec![0u8; SCRATCH_BUF],
         outbox: Vec::new(),
+        wire_buffers: Vec::new(),
     };
     // Peer configs live in cfg (Arc) — materialize runtime state.
     let peer_cfgs = stack.cfg.peers.clone();
@@ -1918,7 +1923,14 @@ async fn run(
         stack.poll_stack();
         // Deliver bytes processed by this poll now, rather than waiting for
         // another UDP packet or a delayed-ACK timer to wake the task.
-        stack.maintain_tcp();
+        if stack.maintain_tcp() {
+            // If draining the receive ring reopened a full window, smoltcp
+            // can acknowledge it now, in this batch, instead of waiting for
+            // the 1 ms timer or for the sender to probe its closed window.
+            stack
+                .iface
+                .poll_egress(SmolInstant::now(), &mut stack.device, &mut stack.sockets);
+        }
         stack.flush_device_tx().await;
         stack.maintain_peers().await;
         let deadline = stack.next_deadline();
