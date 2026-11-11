@@ -820,6 +820,7 @@ struct Stack {
     /// Transport datagrams sealed during one device flush, sent together.
     outbox: Vec<(SocketAddr, Vec<u8>)>,
     wire_buffers: Vec<Vec<u8>>,
+    udp_gso: bool,
 }
 
 impl Stack {
@@ -1526,7 +1527,9 @@ impl Stack {
                 Some(&*self.sock)
             };
             match sock {
-                Some(sock) => send_datagrams(sock, &outbox[start..end], &self.cfg.tag),
+                Some(sock) => {
+                    send_datagrams(sock, &outbox[start..end], &self.cfg.tag, &mut self.udp_gso)
+                }
                 None => logging::debug(format_args!(
                     "wireguard[{}]: no ipv6 socket for {}",
                     self.cfg.tag, outbox[start].0
@@ -1886,6 +1889,7 @@ async fn run(
         next_port: EPHEMERAL_BASE,
         outbox: Vec::new(),
         wire_buffers: Vec::new(),
+        udp_gso: true,
     };
     // Peer configs live in cfg (Arc) — materialize runtime state.
     let peer_cfgs = stack.cfg.peers.clone();
@@ -1970,11 +1974,11 @@ const SEND_BATCH: usize = 64;
 /// never wait here, because it is also the one reading the sockets, and a
 /// wait leaves incoming datagrams to overflow the receive buffer. Any other
 /// error skips just that datagram.
-fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str) {
+fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str, gso: &mut bool) {
     let mut sent = 0;
     while sent < items.len() {
         let chunk = &items[sent..items.len().min(sent + SEND_BATCH)];
-        match send_some(sock, chunk) {
+        match send_some(sock, chunk, gso) {
             Ok(n) => sent += n.max(1),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
             Err(e) => {
@@ -1987,10 +1991,46 @@ fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str) 
 
 /// One `sendmmsg(2)`: how many of `chunk` (1..=SEND_BATCH) the kernel took.
 #[cfg(target_os = "linux")]
-fn send_some(sock: &UdpSocket, chunk: &[(SocketAddr, Vec<u8>)]) -> io::Result<usize> {
+fn send_some(
+    sock: &UdpSocket,
+    chunk: &[(SocketAddr, Vec<u8>)],
+    gso: &mut bool,
+) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
     if chunk.len() == 1 {
         return sock.try_send_to(&chunk[0].1, chunk[0].0).map(|_| 1);
+    }
+    if *gso {
+        let (addr, first) = &chunk[0];
+        let len = first.len();
+        let count = chunk
+            .iter()
+            .take_while(|(to, data)| to == addr && data.len() == len)
+            .count()
+            .min(65_535 / len.max(1));
+        if count > 1 && len > 0 {
+            match send_segmented(sock, &chunk[..count], len as u16) {
+                Ok(()) => return Ok(count),
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(
+                            libc::EINVAL
+                                | libc::EIO
+                                | libc::ENOPROTOOPT
+                                | libc::EOPNOTSUPP
+                                | libc::EMSGSIZE
+                        )
+                    ) =>
+                {
+                    // Some kernels and interfaces lack UDP segmentation.
+                    // Retry these unsent datagrams through sendmmsg and keep
+                    // using that path for the rest of this endpoint's life.
+                    *gso = false;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
     let addrs: Vec<socket2::SockAddr> = chunk
         .iter()
@@ -2028,8 +2068,57 @@ fn send_some(sock: &UdpSocket, chunk: &[(SocketAddr, Vec<u8>)]) -> io::Result<us
     })
 }
 
+/// Scatter/gather avoids joining the encrypted packets in another buffer.
+/// UDP_SEGMENT makes the kernel emit each iovec as its original datagram.
+#[cfg(target_os = "linux")]
+fn send_segmented(
+    sock: &UdpSocket,
+    chunk: &[(SocketAddr, Vec<u8>)],
+    segment_size: u16,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let addr = socket2::SockAddr::from(chunk[0].0);
+    let mut iovs: Vec<libc::iovec> = chunk
+        .iter()
+        .map(|(_, data)| libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: data.len(),
+        })
+        .collect();
+    // usize gives cmsghdr its native alignment, including on 32-bit targets.
+    let mut control = [0usize; 8];
+    // SAFETY: zero is a valid empty msghdr. All referenced storage outlives
+    // sendmsg, and the kernel only reads these payloads and socket address.
+    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+    message.msg_name = addr.as_ptr() as *mut libc::c_void;
+    message.msg_namelen = addr.len();
+    message.msg_iov = iovs.as_mut_ptr();
+    message.msg_iovlen = iovs.len() as _;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = unsafe { libc::CMSG_SPACE(2) } as _;
+    unsafe {
+        let cmsg = libc::CMSG_FIRSTHDR(&message);
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(2) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<u16>(), segment_size);
+    }
+    sock.try_io(tokio::io::Interest::WRITABLE, || {
+        let rc = unsafe { libc::sendmsg(sock.as_raw_fd(), &message, 0) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+}
+
 #[cfg(not(target_os = "linux"))]
-fn send_some(sock: &UdpSocket, chunk: &[(SocketAddr, Vec<u8>)]) -> io::Result<usize> {
+fn send_some(
+    sock: &UdpSocket,
+    chunk: &[(SocketAddr, Vec<u8>)],
+    _gso: &mut bool,
+) -> io::Result<usize> {
     sock.try_send_to(&chunk[0].1, chunk[0].0).map(|_| 1)
 }
 
@@ -2532,6 +2621,34 @@ mod tests {
 mod batch_send_tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn segmented_datagrams_keep_boundaries_and_order_for_both_families() {
+        for host in ["127.0.0.1:0", "[::1]:0"] {
+            for enabled in [true, false] {
+                let rx = UdpSocket::bind(host).await.unwrap();
+                let tx = UdpSocket::bind(host).await.unwrap();
+                let to = rx.local_addr().unwrap();
+                let items: Vec<_> = (0..70u8)
+                    .map(|i| (to, vec![i; if i == 69 { 173 } else { 1400 }]))
+                    .collect();
+                tx.writable().await.unwrap();
+                let mut gso = enabled;
+                send_datagrams(&tx, &items, "test", &mut gso);
+                let mut buf = [0; 2048];
+                for (_, want) in &items {
+                    let (n, from) =
+                        tokio::time::timeout(Duration::from_secs(3), rx.recv_from(&mut buf))
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    assert_eq!(from, tx.local_addr().unwrap());
+                    assert_eq!(&buf[..n], want);
+                }
+            }
+        }
+    }
+
     /// A run of datagrams longer than one batch goes out through the
     /// batched path and arrives whole, once each and in order.
     #[tokio::test]
@@ -2549,7 +2666,7 @@ mod batch_send_tests {
             .collect();
         // a fresh socket learns it is writable from the reactor first
         tx.writable().await.unwrap();
-        send_datagrams(&tx, &items, "test");
+        send_datagrams(&tx, &items, "test", &mut true);
         let mut buf = vec![0u8; 2048];
         for (i, (_, want)) in items.iter().enumerate() {
             let (n, from) =
@@ -2569,7 +2686,7 @@ mod batch_send_tests {
         let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let to = rx.local_addr().unwrap();
         tx.writable().await.unwrap();
-        assert_eq!(send_some(&tx, &[(to, vec![7; 100])]).unwrap(), 1);
+        assert_eq!(send_some(&tx, &[(to, vec![7; 100])], &mut true).unwrap(), 1);
         let mut buf = [0u8; 256];
         let (n, _) = rx.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], &[7; 100][..]);
