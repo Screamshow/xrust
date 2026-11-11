@@ -109,11 +109,12 @@ async fn f1_exit_gate_starts_and_answers_fakeip_dns() {
         "fixture has experimental.clash_api; controller must bind"
     );
 
-    // UDP DNS through the direct inbound → hijack-dns → FakeIP pool
-    // (domain_suffix google.com routes to fakeip-server; no upstream needed).
+    // UDP DNS through the direct inbound → hijack-dns → FakeIP pool.
+    // Use the explicit FakeIP rule before `evaluate`: google.com is routed
+    // after that action in the full fixture and would require external DNS.
     let dns_addr = inbound_addr(&instance, "dns-in");
     let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
-    let query = codec::build_query(0xF1F1, "www.google.com", hickory_proto::rr::RecordType::A)
+    let query = codec::build_query(0xF1F1, "fakeip.podkop.fyi", hickory_proto::rr::RecordType::A)
         .expect("query");
     client.send_to(&query, dns_addr).await.expect("send query");
     let mut buf = [0u8; 512];

@@ -15,7 +15,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -55,9 +55,55 @@ const DEFAULT_PORT: u16 = 51820;
 const EPHEMERAL_BASE: u16 = 49152;
 
 const SOCKET_BUF: usize = 65_536;
-// Allow more than one receive burst in flight while the stack drains TCP
-// into the caller. A 64 KiB window limited ARM downloads between ACKs.
+// Keep the small buffers as a fallback when the shared WAN allowance is full.
 const TCP_RECV_BUF: usize = 128 * 1024;
+// Bytes must remain queued until ACKed. Small TX and RX rings otherwise cap
+// throughput at roughly their capacity divided by the path RTT.
+const TCP_WAN_RECV_BUF: usize = 2 * 1024 * 1024;
+const TCP_WAN_SEND_BUF: usize = 2 * 1024 * 1024;
+const TCP_WINDOW_EXTRA: usize = TCP_WAN_RECV_BUF + TCP_WAN_SEND_BUF - TCP_RECV_BUF - SOCKET_BUF;
+// Shared across endpoints: a subscription with many WG endpoints must not
+// multiply the extra window allowance. Existing small buffers remain available
+// when the allowance is exhausted; this is not a total process memory cap.
+// The supported 32-bit OpenWrt target is MIPS 24Kc, commonly RAM-limited.
+// Keep two large connections there instead of consuming a 32 MiB allowance.
+#[cfg(target_pointer_width = "32")]
+const TCP_WINDOW_BUDGET: usize = 8 * 1024 * 1024;
+#[cfg(not(target_pointer_width = "32"))]
+const TCP_WINDOW_BUDGET: usize = 32 * 1024 * 1024;
+static TCP_WINDOW_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn tcp_buffer_sizes(reserved: bool) -> (usize, usize) {
+    if reserved {
+        (TCP_WAN_RECV_BUF, TCP_WAN_SEND_BUF)
+    } else {
+        (TCP_RECV_BUF, SOCKET_BUF)
+    }
+}
+
+struct TcpWindowReservation<'a>(&'a AtomicUsize);
+
+impl<'a> TcpWindowReservation<'a> {
+    fn acquire(bytes: &'a AtomicUsize) -> Option<Self> {
+        let mut used = bytes.load(Ordering::Relaxed);
+        loop {
+            let next = used.checked_add(TCP_WINDOW_EXTRA)?;
+            if next > TCP_WINDOW_BUDGET {
+                return None;
+            }
+            match bytes.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return Some(Self(bytes)),
+                Err(actual) => used = actual,
+            }
+        }
+    }
+}
+
+impl Drop for TcpWindowReservation<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(TCP_WINDOW_EXTRA, Ordering::Relaxed);
+    }
+}
 const SCRATCH_BUF: usize = 16_384;
 const CALLER_BUF: usize = 65_536;
 const CMD_QUEUE: usize = 256;
@@ -606,6 +652,7 @@ impl WireGuard {
 }
 
 struct TcpConn {
+    _window_reservation: Option<TcpWindowReservation<'static>>,
     handle: SocketHandle,
     #[allow(dead_code)]
     dst: SocketAddr,
@@ -1094,9 +1141,11 @@ impl Stack {
                     return;
                 };
                 let port = self.alloc_port();
+                let window_reservation = TcpWindowReservation::acquire(&TCP_WINDOW_BYTES);
+                let (recv_size, send_size) = tcp_buffer_sizes(window_reservation.is_some());
                 let mut socket = TcpSock::new(
-                    TcpBuffer::new(vec![0; TCP_RECV_BUF]),
-                    TcpBuffer::new(vec![0; SOCKET_BUF]),
+                    TcpBuffer::new(vec![0; recv_size]),
+                    TcpBuffer::new(vec![0; send_size]),
                 );
                 socket.set_nagle_enabled(false);
                 socket.set_timeout(Some(SmolDuration::from_millis(
@@ -1115,6 +1164,7 @@ impl Stack {
                 self.tcp.insert(
                     id,
                     TcpConn {
+                        _window_reservation: window_reservation,
                         handle,
                         dst,
                         to_caller,
@@ -2307,6 +2357,59 @@ fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tcp_window_budget_survives_concurrent_acquire_and_drop() {
+        let bytes = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                let bytes = &bytes;
+                scope.spawn(move || {
+                    for _ in 0..500 {
+                        let reservation = super::TcpWindowReservation::acquire(bytes);
+                        assert!(
+                            bytes.load(std::sync::atomic::Ordering::Relaxed)
+                                <= super::TCP_WINDOW_BUDGET
+                        );
+                        std::thread::yield_now();
+                        drop(reservation);
+                    }
+                });
+            }
+        });
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn tcp_window_budget_is_bounded_and_reusable() {
+        let bytes = std::sync::atomic::AtomicUsize::new(0);
+        let mut reservations = Vec::new();
+        while let Some(reservation) = super::TcpWindowReservation::acquire(&bytes) {
+            reservations.push(reservation);
+        }
+        assert_eq!(
+            reservations.len(),
+            if cfg!(target_pointer_width = "32") {
+                2
+            } else {
+                8
+            }
+        );
+        assert_eq!(
+            super::tcp_buffer_sizes(true),
+            (2 * 1024 * 1024, 2 * 1024 * 1024)
+        );
+        assert_eq!(super::tcp_buffer_sizes(false), (128 * 1024, 64 * 1024));
+        let used = bytes.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(used <= super::TCP_WINDOW_BUDGET);
+        assert!(used + super::TCP_WINDOW_EXTRA > super::TCP_WINDOW_BUDGET);
+        drop(reservations.pop());
+        let reused = super::TcpWindowReservation::acquire(&bytes).unwrap();
+        assert!(super::TcpWindowReservation::acquire(&bytes).is_none());
+        drop(reused);
+        drop(reservations);
+        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
     use super::*;
 
     #[test]
