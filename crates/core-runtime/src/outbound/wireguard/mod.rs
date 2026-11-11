@@ -118,7 +118,6 @@ const IGNORED_FIELDS: &[&str] = &[
     "udp_filtering",
     "udp_nat_max",
     "workers",
-    "routing_mark",
     "network_strategy",
     "reserved",
     "bind_interface",
@@ -194,6 +193,7 @@ struct PeerConfig {
 #[derive(Clone, Debug)]
 struct WgConfig {
     tag: String,
+    routing_mark: Option<u32>,
     private_key: [u8; 32],
     public_key: [u8; 32],
     listen_port: u16,
@@ -260,6 +260,17 @@ impl WireGuard {
             anyhow::bail!("{at}: system wireguard is not implemented yet");
         }
         let awg = awg::AwgParams::from_obj(obj, at)?.map(Arc::new);
+        let routing_mark = match obj.get("routing_mark").filter(|v| !v.is_null()) {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("{at}.routing_mark: expected an unsigned 32-bit integer")
+                    })?,
+            ),
+        };
         for f in IGNORED_FIELDS {
             if obj.get(*f).is_some_and(|v| !v.is_null()) {
                 logging::warn(format_args!(
@@ -429,6 +440,7 @@ impl WireGuard {
         Ok(Self {
             cfg: WgConfig {
                 tag: at.to_string(),
+                routing_mark,
                 private_key,
                 public_key,
                 listen_port,
@@ -449,9 +461,8 @@ impl WireGuard {
         if let Some(shared) = guard.as_ref() {
             return Ok(Arc::clone(shared));
         }
-        let sock = UdpSocket::bind(("0.0.0.0", self.cfg.listen_port))
-            .await
-            .map_err(|e| {
+        let sock =
+            bind_network_udp(false, self.cfg.listen_port, self.cfg.routing_mark).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -461,12 +472,13 @@ impl WireGuard {
                 )
             })?;
         crate::outbound::quic::size_network_udp_buffers(socket2::SockRef::from(&sock));
-        let sock_v6 = match UdpSocket::bind(("[::]", self.cfg.listen_port)).await {
+        let sock_v6 = match bind_network_udp(true, self.cfg.listen_port, self.cfg.routing_mark) {
             Ok(s) => {
                 crate::outbound::quic::size_network_udp_buffers(socket2::SockRef::from(&s));
                 Some(Arc::new(s))
             }
-            Err(_) => None,
+            Err(error) if network_family_unavailable(&error) => None,
+            Err(error) => return Err(error),
         };
         if self.cfg.listen_port > 0 {
             logging::info(format_args!(
@@ -649,6 +661,51 @@ impl WireGuard {
 
         Ok(local)
     }
+}
+
+// Apply before starting the stack or emitting a handshake/junk packet. An
+// unsuccessful SO_MARK is fatal: silently using an unprotected socket would
+// allow an external NFQUEUE processor to modify the transport.
+fn network_family_unavailable(error: &io::Error) -> bool {
+    #[cfg(unix)]
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT | libc::EADDRNOTAVAIL)
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(10047 | 10043 | 10049)) {
+        return true;
+    }
+    matches!(
+        error.kind(),
+        io::ErrorKind::Unsupported | io::ErrorKind::AddrNotAvailable
+    )
+}
+
+fn bind_network_udp(ipv6: bool, port: u16, mark: Option<u32>) -> io::Result<UdpSocket> {
+    let socket = socket2::Socket::new(
+        if ipv6 {
+            socket2::Domain::IPV6
+        } else {
+            socket2::Domain::IPV4
+        },
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    if ipv6 {
+        socket.set_only_v6(true)?;
+    }
+    crate::outbound::dial::apply_transport_mark(socket2::SockRef::from(&socket), mark)?;
+    socket.set_nonblocking(true)?;
+    let address = if ipv6 {
+        SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), port)
+    } else {
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port)
+    };
+    socket.bind(&address.into())?;
+    UdpSocket::from_std(socket.into())
 }
 
 struct TcpConn {
@@ -2466,6 +2523,45 @@ mod tests {
         assert_eq!(wg.cfg.peers[0].keepalive, Some((25, 25)));
         assert_eq!(wg.cfg.peers[0].allowed_ips_v4, vec![(0, 0)]);
         assert!(wg.cfg.peers[0].allowed_ips_v6.is_empty());
+    }
+
+    #[test]
+    fn routing_mark_is_validated_for_wireguard_and_awg() {
+        for extra in [
+            json!({"routing_mark": 0x0a000000}),
+            json!({"routing_mark": 0x0a000000,"jc":4}),
+        ] {
+            let wg = WireGuard::build(&wg_obj(extra), "endpoints[0]").unwrap();
+            assert_eq!(wg.cfg.routing_mark, Some(0x0a000000));
+        }
+        for value in [json!(-1), json!(4294967296u64), json!(true), json!("bad")] {
+            assert!(
+                WireGuard::build(&wg_obj(json!({"routing_mark":value})), "endpoints[0]").is_err()
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn routing_mark_reaches_both_network_socket_families() {
+        let mut sockets = Vec::new();
+        let mut port = 0;
+        for ipv6 in [false, true] {
+            let socket = match bind_network_udp(ipv6, port, Some(0x0a000000)) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        && std::env::var("XRUST_TEST_REQUIRE_SO_MARK").as_deref() != Ok("1")
+                    {
+                        continue;
+                    }
+                    panic!("required socket protection failed: {error}");
+                }
+            };
+            assert_eq!(socket2::SockRef::from(&socket).mark().unwrap(), 0x0a000000);
+            port = socket.local_addr().unwrap().port();
+            sockets.push(socket);
+        }
     }
 
     #[test]

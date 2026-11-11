@@ -78,7 +78,7 @@ fn version_line() -> String {
         format!(
             "sing-box version {CONFIG_BASELINE}-rust-x.{version}\n\
              Xrust: {version}; configuration compatibility baseline: {CONFIG_BASELINE}\n\
-             Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended\n\
+             Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended,outbound.transport-mark\n\
              Tags: with_utls,with_clash_api,with_tailscale\n"
         )
     } else {

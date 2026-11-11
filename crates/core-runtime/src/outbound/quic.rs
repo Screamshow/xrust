@@ -583,8 +583,10 @@ impl SalamanderSocket {
         runtime: &dyn quinn::Runtime,
         peer: SocketAddr,
         password: Vec<u8>,
+        routing_mark: Option<u32>,
     ) -> io::Result<Self> {
         let udp = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?;
+        crate::outbound::dial::apply_transport_mark(socket2::SockRef::from(&udp), routing_mark)?;
         udp.set_nonblocking(true)?;
         // Keep the network queue limits of the relay socket.
         let sock_ref = socket2::SockRef::from(&udp);
@@ -913,6 +915,7 @@ pub(crate) async fn spawn_hop_relay(
     obfs_password: Option<Vec<u8>>,
     gecko: Option<(usize, usize)>,
     endpoint_local: SocketAddr,
+    routing_mark: Option<u32>,
 ) -> io::Result<SalamanderRelay> {
     let ep_bind = if server_ip.is_ipv4() {
         "127.0.0.1:0"
@@ -931,6 +934,7 @@ pub(crate) async fn spawn_hop_relay(
         "[::]:0"
     };
     let sock_srv = Arc::new(tokio::net::UdpSocket::bind(srv_bind).await?);
+    crate::outbound::dial::apply_transport_mark(socket2::SockRef::from(&*sock_srv), routing_mark)?;
     let _ = socket2::SockRef::from(&*sock_srv).set_recv_buffer_size(UDP_SOCKET_BUFFER);
     let _ = socket2::SockRef::from(&*sock_srv).set_send_buffer_size(UDP_SOCKET_BUFFER);
 
@@ -1084,6 +1088,7 @@ pub(crate) async fn spawn_gecko_relay(
         Some(password),
         Some((min_packet_size, max_packet_size)),
         endpoint_local,
+        None,
     )
     .await
 }
@@ -1103,6 +1108,7 @@ pub(crate) async fn spawn_salamander_relay(
         Some(password),
         None,
         endpoint_local,
+        None,
     )
     .await
 }

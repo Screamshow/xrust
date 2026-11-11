@@ -99,10 +99,12 @@ impl H3Conn {
         server: SocketAddr,
         keep_alive: Option<Duration>,
         handshake_budget: Option<Duration>,
+        routing_mark: Option<u32>,
     ) -> io::Result<H3Conn> {
         let request = parse_connect_uri(uri)?;
 
         let sock = bind_udp(server)?;
+        crate::outbound::dial::apply_transport_mark(socket2::SockRef::from(&sock), routing_mark)?;
         let mut reset = [0u8; 32];
         crate::util::random_bytes(&mut reset)?;
         let endpoint_config = quinn::EndpointConfig::new(Arc::new(

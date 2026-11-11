@@ -67,7 +67,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const IGNORED_FIELDS: &[&str] = &[
     "detour",
     "bind_interface",
-    "routing_mark",
     "domain_resolver",
     "connect_timeout",
     "tcp_keep_alive",
@@ -79,6 +78,7 @@ const IGNORED_FIELDS: &[&str] = &[
 /// Runtime-side config (reference `NewOutbound` after `resolveLegacyOptions`).
 #[derive(Debug)]
 pub(crate) struct MasqueCfg {
+    pub routing_mark: Option<u32>,
     pub tag: String,
     pub server: (String, u16),
     pub uri: String,
@@ -410,6 +410,7 @@ impl Masque {
 
         Ok(Self {
             cfg: Arc::new(MasqueCfg {
+                routing_mark: crate::outbound::dial::transport_routing_mark(&obj)?,
                 tag: at.to_string(),
                 server,
                 uri,
@@ -452,12 +453,21 @@ impl Masque {
         budget: Option<Duration>,
     ) -> io::Result<h3::H3Conn> {
         let tls = Self::make_tls(&cfg)?;
-        h3::H3Conn::connect(&tls, &cfg.profile, &cfg.uri, server, cfg.keep_alive, budget).await
+        h3::H3Conn::connect(
+            &tls,
+            &cfg.profile,
+            &cfg.uri,
+            server,
+            cfg.keep_alive,
+            budget,
+            cfg.routing_mark,
+        )
+        .await
     }
 
     async fn dial_h2(cfg: Arc<MasqueCfg>, server: SocketAddr) -> io::Result<h2::H2Conn> {
         let tls = Self::make_tls(&cfg)?;
-        h2::H2Conn::connect(&tls, &cfg.profile, &cfg.uri, server).await
+        h2::H2Conn::connect(&tls, &cfg.profile, &cfg.uri, server, cfg.routing_mark).await
     }
 
     fn remember(&self, network: u8) {

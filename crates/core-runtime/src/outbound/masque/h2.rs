@@ -14,7 +14,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use super::h3::take_capsule;
@@ -44,12 +43,19 @@ impl H2Conn {
         profile: &Profile,
         uri: &str,
         server: SocketAddr,
+        routing_mark: Option<u32>,
     ) -> io::Result<H2Conn> {
         let request = parse_connect_uri(uri)?;
 
-        let tcp = TcpStream::connect(server)
-            .await
-            .map_err(|e| io::Error::other(format!("masque h2: dial tcp: {e}")))?;
+        let tcp = crate::outbound::dial::connect_tcp_addr(
+            server,
+            &crate::outbound::dial::DialOptions {
+                routing_mark,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|e| io::Error::other(format!("masque h2: dial tcp: {e}")))?;
         tcp.set_nodelay(true).ok();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(
             tls.tcp_config()

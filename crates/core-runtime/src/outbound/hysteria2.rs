@@ -35,6 +35,7 @@ const DEFAULT_CONNECT: Duration = Duration::from_secs(5);
 type H3SendRequest = h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>;
 
 pub struct Hysteria2 {
+    routing_mark: Option<u32>,
     server: String,
     port: u16,
     server_port_ranges: Vec<(u16, u16)>,
@@ -187,6 +188,7 @@ impl Hysteria2 {
         )?;
 
         Ok(Self {
+            routing_mark: crate::outbound::dial::transport_routing_mark(obj)?,
             server,
             port,
             server_port_ranges,
@@ -265,22 +267,23 @@ impl Hysteria2 {
         let runtime = quinn::default_runtime()
             .ok_or_else(|| io::Error::other("hysteria2: no quinn runtime"))?;
         let hopping = !self.server_port_ranges.is_empty();
-        let direct_obfs =
-            if cfg!(target_os = "linux") && addr.is_ipv4() && !hopping && self.gecko.is_none() {
-                self.obfs_password.as_ref().and_then(|password| {
-                    match SalamanderSocket::bind(&*runtime, addr, password.clone()) {
-                        Ok(socket) => Some(socket),
-                        Err(e) => {
-                            logging::debug(format_args!(
-                                "hysteria2: direct Salamander socket: {e}"
-                            ));
-                            None
-                        }
+        let direct_obfs = if cfg!(target_os = "linux")
+            && addr.is_ipv4()
+            && !hopping
+            && self.gecko.is_none()
+        {
+            self.obfs_password.as_ref().and_then(|password| {
+                match SalamanderSocket::bind(&*runtime, addr, password.clone(), self.routing_mark) {
+                    Ok(socket) => Some(socket),
+                    Err(e) => {
+                        logging::debug(format_args!("hysteria2: direct Salamander socket: {e}"));
+                        None
                     }
-                })
-            } else {
-                None
-            };
+                }
+            })
+        } else {
+            None
+        };
         let need_relay = hopping || (self.obfs_password.is_some() && direct_obfs.is_none());
         let mut endpoint = if let Some(socket) = direct_obfs {
             quinn::Endpoint::new_with_abstract_socket(ep_config, None, Arc::new(socket), runtime)?
@@ -290,6 +293,12 @@ impl Hysteria2 {
             } else {
                 bind_udp(addr)?
             };
+            if !need_relay {
+                crate::outbound::dial::apply_transport_mark(
+                    socket2::SockRef::from(&sock),
+                    self.routing_mark,
+                )?;
+            }
             quinn::Endpoint::new(ep_config, None, sock, runtime)?
         };
         endpoint.set_default_client_config(client_config);
@@ -305,6 +314,7 @@ impl Hysteria2 {
                 self.obfs_password.clone(),
                 self.gecko,
                 endpoint.local_addr()?,
+                self.routing_mark,
             )
             .await
             .map_err(|e| io::Error::other(format!("hysteria2: relay: {e}")))?;

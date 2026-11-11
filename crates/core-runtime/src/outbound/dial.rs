@@ -520,6 +520,35 @@ fn connect_socket(fd: RawFd, addr: &SocketAddr) -> io::Result<()> {
 
 /// Resolve a name the way the reference's dialer does, then connect with every
 /// option this outbound asked for.
+pub(crate) fn transport_routing_mark(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> anyhow::Result<Option<u32>> {
+    let mut fields = serde_json::Map::new();
+    if let Some(value) = obj.get("routing_mark") {
+        fields.insert("routing_mark".into(), value.clone());
+    }
+    Ok(DialOptions::parse(&fields)?.routing_mark)
+}
+
+pub(crate) fn apply_transport_mark(
+    socket: socket2::SockRef<'_>,
+    mark: Option<u32>,
+) -> io::Result<()> {
+    if let Some(mark) = mark {
+        #[cfg(target_os = "linux")]
+        socket.set_mark(mark)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (socket, mark);
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "routing_mark requires Linux",
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub async fn connect_tcp(host: &str, port: u16, options: &DialOptions) -> io::Result<TcpStream> {
     // resolution always goes through the dns service when one is installed,
     // options or not: that is the whole point of `route.default_domain_resolver`
