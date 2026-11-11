@@ -46,8 +46,7 @@ jobs:
       - name: C compiler for x86_64 musl mimalloc
         if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo bash scripts/install_ci_tools.sh musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
         run: |

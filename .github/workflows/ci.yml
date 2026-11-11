@@ -89,8 +89,7 @@ jobs:
       - name: C compiler for x86_64 musl mimalloc
         if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo bash scripts/install_ci_tools.sh musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
       - name: Build
         run: |
@@ -102,8 +101,7 @@ jobs:
       - name: MIPS 24Kc runtime smoke
         if: ${{ matrix.target == 'mipsel-unknown-linux-musl' }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-user
+          sudo bash scripts/install_ci_tools.sh qemu-user
           python3 scripts/test_mips_runtime.py --qemu qemu-mipsel --sysroot "$MIPS_TOOLCHAIN" --binary target/mipsel-unknown-linux-musl/release/xrust
       - name: Size budget (13 MiB x86_64, 12 MiB ARM64)
         run: |
