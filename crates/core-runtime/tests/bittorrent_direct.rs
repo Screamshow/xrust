@@ -40,9 +40,7 @@ async fn split_tcp_is_classified_and_preserved_before_direct() {
         for payload in [
             b"\x13BitTorrent protocol".as_slice(),
             b"GET /announce?info_hash=x&peer_id=y&port=6881 HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
-            b"GET /seed HTTP/1.1\r\nHost: seed.test\r\nUser-Agent: qBittorrent/5\r\n\r\n",
             b"GET /seed?info_hash=abcdefghijklmnopqrst&piece=0 HTTP/1.1\r\nHost: seed.test\r\n\r\n",
-            b"GET /file HTTP/1.0\r\nHost: seed.test\r\nUser-Agent: BiglyBT/3.8\r\n\r\n",
         ] {
             for split in [1, payload.len() / 2, payload.len() - 1] {
                 let (mut tx, mut rx) = duplex(4096);
@@ -132,6 +130,8 @@ async fn ordinary_http_and_disabled_extension_keep_normal_routing() {
 async fn invalid_http_and_lookalikes_do_not_get_direct_exception() {
     let router = router(true);
     for payload in [
+        b"GET /updates HTTP/1.1\r\nHost: updates.test\r\nUser-Agent: qBittorrent/5\r\n\r\n"
+            .as_slice(),
         b"GET / NOTHTTP\r\nUser-Agent: qBittorrent/5\r\n\r\n".as_slice(),
         b"GET / HTTP/2.0\r\nUser-Agent: BiglyBT/1\r\n\r\n",
         b"GET / HTTP/1.1 extra\r\nUser-Agent: Flud/1\r\n\r\n",
@@ -152,6 +152,34 @@ async fn invalid_http_and_lookalikes_do_not_get_direct_exception() {
             );
             assert_ne!(ctx.protocol.as_deref(), Some("bittorrent"));
             assert_eq!(ctx.sniff_prefix, payload);
+        }
+    }
+}
+
+#[tokio::test]
+async fn turn_and_truncated_utp_extensions_keep_normal_route() {
+    let mut turn = vec![0u8; 20];
+    turn[..4].copy_from_slice(&[0x41, 0, 0, 16]);
+    turn[17] = 1;
+    let mut truncated = vec![0u8; 22];
+    truncated[0] = 0x41;
+    truncated[1] = 1;
+    truncated[21] = 4; // Final extension body is missing.
+    let mut syn = vec![0u8; 20];
+    syn[0] = 0x41;
+    syn[3] = 42;
+    syn[17] = 7; // Do not require sequence number 1.
+    for ipv6 in [false, true] {
+        for extended in [false, true] {
+            let router = router(extended);
+            for (packet, outbound) in [(&turn, 1), (&truncated, 1), (&syn, 0)] {
+                let mut ctx = context("udp", ipv6);
+                assert_eq!(
+                    router.route_datagrams(&mut ctx, &[packet]).await.unwrap(),
+                    Decision::Outbound(outbound)
+                );
+                assert_eq!(ctx.protocol.as_deref() == Some("bittorrent"), outbound == 0);
+            }
         }
     }
 }

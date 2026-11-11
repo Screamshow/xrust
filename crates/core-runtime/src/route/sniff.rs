@@ -485,29 +485,10 @@ fn sniff_stun(p: &[u8], ctx: &mut ConnContext) -> bool {
     true
 }
 
-/// BEP 29 uTP: version 1, a known type, and an extension chain that ends.
+/// Only an opening uTP SYN establishes a new BitTorrent flow. Established
+/// DATA/STATE/FIN/RESET shapes also occur in unrelated UDP protocols.
 fn sniff_utp(p: &[u8], ctx: &mut ConnContext) -> bool {
-    if p.len() < 20 || p[0] & 0x0f != 1 || p[0] >> 4 > 4 {
-        return false;
-    }
-    // A WireGuard initiation is exactly 148 bytes: type 1 followed by three
-    // reserved zero bytes. Those bytes also look like uTP DATA v1 with no
-    // extension and connection id 0. Leave this ambiguous shape unclassified
-    // rather than send a LAN tunnel into BitTorrent routing/blocking rules.
-    if p.len() == 148 && p[..4] == [1, 0, 0, 0] {
-        return false;
-    }
-    let mut extension = p[1];
-    let mut pos = 20;
-    while extension != 0 {
-        let (Some(&next), Some(&len)) = (p.get(pos), p.get(pos + 1)) else {
-            return false;
-        };
-        extension = next;
-        pos += 2 + usize::from(len);
-    }
-    ctx.protocol = Some("bittorrent".into());
-    true
+    sniff_utp_extended(p, ctx)
 }
 
 /// BEP 15 connect request: the protocol id and action 0.

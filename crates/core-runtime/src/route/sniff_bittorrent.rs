@@ -7,6 +7,14 @@ const DHT_ITEMS: usize = 256;
 const DHT_DEPTH: usize = 8;
 
 pub(super) fn utp_syn(p: &[u8]) -> bool {
+    // TURN ChannelData can share 0x4100 with uTP SYN. Prefer a complete
+    // ChannelData frame; this is a framing heuristic, not authentication.
+    if p.len() >= 4
+        && (0x4000..=0x7fff).contains(&u16::from_be_bytes([p[0], p[1]]))
+        && usize::from(u16::from_be_bytes([p[2], p[3]])) == p.len() - 4
+    {
+        return false;
+    }
     if p.len() < 20 || p[0] != 0x41 || p[8..12] != [0; 4] {
         return false;
     }
@@ -147,6 +155,20 @@ fn string_value(data: &[u8]) -> Option<&[u8]> {
     (p.pos == data.len()).then_some(value)
 }
 
+// Read a canonical nonnegative bencoded integer without allocation.
+fn integer_value(data: &[u8]) -> Option<u64> {
+    let digits = data.strip_prefix(b"i")?.strip_suffix(b"e")?;
+    if digits.is_empty() || (digits.len() > 1 && digits[0] == b'0') {
+        return None;
+    }
+    digits.iter().try_fold(0u64, |value, &digit| {
+        if !digit.is_ascii_digit() {
+            return None;
+        }
+        value.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+    })
+}
+
 pub(super) fn dht(data: &[u8]) -> bool {
     fn check(data: &[u8]) -> Option<()> {
         if data.len() > DHT_BYTES {
@@ -187,7 +209,20 @@ pub(super) fn dht(data: &[u8]) -> bool {
             match string_value(get(b"q")?)? {
                 b"ping" => (),
                 b"find_node" | b"sample_infohashes" if arg(b"target")?.len() == 20 => (),
-                b"get_peers" | b"announce_peer" if arg(b"info_hash")?.len() == 20 => (),
+                b"get_peers" if arg(b"info_hash")?.len() == 20 => (),
+                b"announce_peer" if arg(b"info_hash")?.len() == 20 => {
+                    if arg(b"token")?.is_empty() {
+                        return None;
+                    }
+                    let port = integer_value(field(&args, b"port")?)?;
+                    let implied = match field(&args, b"implied_port") {
+                        Some(value) => integer_value(value)?,
+                        None => 0,
+                    };
+                    if port > 65535 || (port == 0 && implied == 0) {
+                        return None;
+                    }
+                }
                 _ => return None,
             }
         }
@@ -242,7 +277,7 @@ fn http_seed(query: &str) -> bool {
         })
 }
 
-pub(super) fn http(method: &str, target: &str, headers: &str) -> bool {
+pub(super) fn http(method: &str, target: &str, _headers: &str) -> bool {
     // Require tracker parameters together, rather than matching arbitrary text
     // containing "torrent", magnet links, or a generic /announce endpoint.
     if method == "GET"
@@ -258,58 +293,7 @@ pub(super) fn http(method: &str, target: &str, headers: &str) -> bool {
             return true;
         }
     }
-    headers
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .any(|(name, value)| {
-            name.eq_ignore_ascii_case("user-agent")
-                && [
-                    "qbittorrent",
-                    "transmission",
-                    "deluge",
-                    "libtorrent",
-                    "utorrent",
-                    "rtorrent",
-                    "libretorrent",
-                    "bitcomet",
-                    "btwebclient",
-                    "azureus",
-                    "biglybt",
-                    "tixati",
-                    "ktorrent",
-                    "vuze",
-                    "frostwire",
-                    "bitlord",
-                    "bitspirit",
-                    "bittornado",
-                    "mldonkey",
-                    "monotorrent",
-                    "picotorrent",
-                    "tribler",
-                    "webtorrent",
-                    "ctorrent",
-                    "mediaget",
-                    "zona",
-                    "torrserver",
-                    "atorrent",
-                    "ttorrent",
-                    "flud",
-                    "torrdroid",
-                    "torrent-stream",
-                    "peerflix",
-                ]
-                .iter()
-                .any(|client| {
-                    let value = value.trim();
-                    value
-                        .get(..client.len())
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(client))
-                        && value
-                            .as_bytes()
-                            .get(client.len())
-                            .is_none_or(|c| matches!(c, b'/' | b' '))
-                })
-        })
+    false
 }
 
 #[cfg(test)]
@@ -345,7 +329,7 @@ mod tests {
             "/announce?info_hash=x&peer_id=y&port=6881",
             "Host: tracker"
         ));
-        assert!(http(
+        assert!(!http(
             "GET",
             "/file",
             "User-Agent: qBittorrent/5.0\r\nHost: seed"
@@ -405,7 +389,7 @@ mod tests {
     }
 
     #[test]
-    fn additional_clients_require_name_boundaries() {
+    fn user_agent_alone_never_establishes_bittorrent() {
         for client in [
             "BiglyBT",
             "TorrServer",
@@ -415,7 +399,7 @@ mod tests {
             "WebTorrent",
         ] {
             for suffix in ["", "/1.0", " 1.0"] {
-                assert!(http(
+                assert!(!http(
                     "GET",
                     "/file",
                     &format!("User-Agent: {client}{suffix}")
@@ -448,6 +432,39 @@ mod tests {
         p[8] = 1;
         assert!(!utp_syn(&p));
         assert!(!utp_syn(&[0; 148]));
+    }
+
+    #[test]
+    fn complete_turn_frame_is_not_utp_syn() {
+        let mut packet = [0u8; 20];
+        packet[..4].copy_from_slice(&[0x41, 0, 0, 16]);
+        packet[16] = 1;
+        assert!(!utp_syn(&packet));
+        // Same SYN fields without the TURN length coincidence still match.
+        packet[3] = 17;
+        assert!(utp_syn(&packet));
+    }
+
+    #[test]
+    fn announce_requires_token_and_valid_port_state() {
+        for (extra, expected) in [
+            ("4:porti6881e5:token2:aa", true),
+            ("4:porti0e12:implied_porti1e5:token2:aa", true),
+            ("4:porti6881e", false),
+            ("4:porti6881e5:token0:", false),
+            ("5:token2:aa12:implied_porti1e", false),
+            ("4:porti0e5:token2:aa", false),
+            ("4:porti65536e5:token2:aa", false),
+            ("4:porti-1e5:token2:aa", false),
+            ("4:port4:68815:token2:aa", false),
+            ("4:porti0e12:implied_porti2e5:token2:aa", true),
+            ("4:porti6881e12:implied_port1:x5:token2:aa", false),
+        ] {
+            let packet = format!(
+                "d1:ad2:id20:abcdefghijklmnopqrst9:info_hash20:abcdefghijklmnopqrst{extra}e1:q13:announce_peer1:t2:aa1:y1:qe"
+            );
+            assert_eq!(dht(packet.as_bytes()), expected, "{extra}");
+        }
     }
 
     #[test]

@@ -175,7 +175,7 @@ async fn every_packet_sniffer_names_its_protocol() {
 }
 
 #[tokio::test]
-async fn wireguard_initiation_is_not_blocked_as_bittorrent_but_utp_still_is() {
+async fn ambiguous_udp_is_not_blocked_but_utp_syn_still_is() {
     for sniff in [
         json!({"action": "sniff"}),
         json!({"action": "sniff", "sniffer": ["bittorrent"]}),
@@ -195,15 +195,16 @@ async fn wireguard_initiation_is_not_blocked_as_bittorrent_but_utp_still_is() {
         assert_eq!(ctx.protocol, None);
         assert_eq!(initiation, original, "sniffing must not rewrite the packet");
 
-        // Same-sized real uTP DATA, with a nonzero connection id, remains
-        // BitTorrent. A SYN with its extension chain remains recognized too.
+        // Standalone DATA is ambiguous; SYN with extensions remains recognized.
         let mut data = vec![0x5au8; 148];
         data[..4].copy_from_slice(&[0x01, 0, 0x12, 0x34]);
-        for packet in [data, utp()] {
-            let mut ctx = context("lan", 4000);
-            assert!(router.route_datagrams(&mut ctx, &[&packet]).await.is_err());
-            assert_eq!(ctx.protocol.as_deref(), Some("bittorrent"));
-        }
+        let mut ctx = context("lan", 4000);
+        assert!(router.route_datagrams(&mut ctx, &[&data]).await.is_ok());
+        assert_ne!(ctx.protocol.as_deref(), Some("bittorrent"));
+        let packet = utp();
+        let mut ctx = context("lan", 4000);
+        assert!(router.route_datagrams(&mut ctx, &[&packet]).await.is_err());
+        assert_eq!(ctx.protocol.as_deref(), Some("bittorrent"));
     }
 }
 
