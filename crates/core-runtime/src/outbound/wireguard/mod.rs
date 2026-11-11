@@ -55,6 +55,9 @@ const DEFAULT_PORT: u16 = 51820;
 const EPHEMERAL_BASE: u16 = 49152;
 
 const SOCKET_BUF: usize = 65_536;
+// Allow more than one receive burst in flight while the stack drains TCP
+// into the caller. A 64 KiB window limited ARM downloads between ACKs.
+const TCP_RECV_BUF: usize = 128 * 1024;
 const SCRATCH_BUF: usize = 16_384;
 const CALLER_BUF: usize = 65_536;
 const CMD_QUEUE: usize = 256;
@@ -1092,7 +1095,7 @@ impl Stack {
                 };
                 let port = self.alloc_port();
                 let mut socket = TcpSock::new(
-                    TcpBuffer::new(vec![0; SOCKET_BUF]),
+                    TcpBuffer::new(vec![0; TCP_RECV_BUF]),
                     TcpBuffer::new(vec![0; SOCKET_BUF]),
                 );
                 socket.set_nagle_enabled(false);
