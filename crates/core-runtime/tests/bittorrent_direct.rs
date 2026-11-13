@@ -39,7 +39,7 @@ async fn split_tcp_is_classified_and_preserved_before_direct() {
     for ipv6 in [false, true] {
         for payload in [
             b"\x13BitTorrent protocol".as_slice(),
-            b"GET /announce?info_hash=x&peer_id=y&port=6881 HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
+            b"GET /announce?info_hash=abcdefghijklmnopqrst&peer_id=-qB5000-abcdefghijkl&port=6881 HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
             b"GET /seed?info_hash=abcdefghijklmnopqrst&piece=0 HTTP/1.1\r\nHost: seed.test\r\n\r\n",
         ] {
             for split in [1, payload.len() / 2, payload.len() - 1] {
@@ -140,6 +140,8 @@ async fn invalid_http_and_lookalikes_do_not_get_direct_exception() {
         b"GET / HTTP/1.1\r\nUser-Agent: TorrServerIndex/1\r\n\r\n",
         b"GET / HTTP/1.1\r\nUser-Agent: Mozilla/5.0 BiglyBT/1\r\n\r\n",
         b"GET /search?info_hash=document123&piece=0 HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        b"GET /search?info_hash=document&peer_id=browser&port=banana HTTP/1.1\r\nHost: example.test\r\n\r\n",
+        b"GET /announce?info_hash=abcdefghijklmnopqrst&peer_id=-qB5000-abcdefghijkl&port=65536&piece=0 HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
     ] {
         for ipv6 in [false, true] {
             let (mut tx, mut rx) = duplex(4096);
@@ -152,6 +154,44 @@ async fn invalid_http_and_lookalikes_do_not_get_direct_exception() {
             );
             assert_ne!(ctx.protocol.as_deref(), Some("bittorrent"));
             assert_eq!(ctx.sniff_prefix, payload);
+        }
+    }
+}
+
+#[tokio::test]
+async fn bep44_dht_routes_only_when_extended_and_structurally_valid() {
+    for ipv6 in [false, true] {
+        for extended in [false, true] {
+            let router = router(extended);
+            for (packet, valid) in [
+                (
+                    "d1:ad2:id20:abcdefghijklmnopqrst6:target20:abcdefghijklmnopqrste1:q3:get1:t2:aa1:y1:qe",
+                    true,
+                ),
+                (
+                    "d1:ad2:id20:abcdefghijklmnopqrst5:token2:aa1:v4:spame1:q3:put1:t2:aa1:y1:qe",
+                    true,
+                ),
+                (
+                    "d1:ad2:id20:abcdefghijklmnopqrst1:v4:spame1:q3:put1:t2:aa1:y1:qe",
+                    false,
+                ),
+                (
+                    "d1:ad2:id20:abcdefghijklmnopqrst3:seqi-1e6:target20:abcdefghijklmnopqrste1:q3:get1:t2:aa1:y1:qe",
+                    false,
+                ),
+            ] {
+                let mut ctx = context("udp", ipv6);
+                let classified = extended && valid;
+                assert_eq!(
+                    router
+                        .route_datagrams(&mut ctx, &[packet.as_bytes()])
+                        .await
+                        .unwrap(),
+                    Decision::Outbound(if classified { 0 } else { 1 })
+                );
+                assert_eq!(ctx.protocol.as_deref() == Some("bittorrent"), classified);
+            }
         }
     }
 }

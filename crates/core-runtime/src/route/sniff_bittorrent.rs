@@ -169,6 +169,36 @@ fn integer_value(data: &[u8]) -> Option<u64> {
     })
 }
 
+fn bep44_sequence(data: &[u8]) -> bool {
+    integer_value(data).is_some_and(|value| value <= i64::MAX as u64)
+}
+
+fn bep44_put(args: &Fields<'_>) -> bool {
+    if !field(args, b"token")
+        .and_then(string_value)
+        .is_some_and(|token| !token.is_empty())
+        || !field(args, b"v").is_some_and(|value| value.len() <= 1000)
+    {
+        return false;
+    }
+    // BEP 44 shares Mainline DHT with peer discovery; this checks wire
+    // structure, not the signature or whether the value describes a torrent.
+    let mutable = [b"k".as_slice(), b"seq", b"sig", b"salt", b"cas"]
+        .iter()
+        .any(|key| field(args, key).is_some());
+    !mutable
+        || (field(args, b"k")
+            .and_then(string_value)
+            .is_some_and(|v| v.len() == 32)
+            && field(args, b"sig")
+                .and_then(string_value)
+                .is_some_and(|v| v.len() == 64)
+            && field(args, b"seq").is_some_and(bep44_sequence)
+            && field(args, b"cas").is_none_or(bep44_sequence)
+            && field(args, b"salt")
+                .is_none_or(|v| string_value(v).is_some_and(|salt| salt.len() <= 64)))
+}
+
 pub(super) fn dht(data: &[u8]) -> bool {
     fn check(data: &[u8]) -> Option<()> {
         if data.len() > DHT_BYTES {
@@ -209,6 +239,12 @@ pub(super) fn dht(data: &[u8]) -> bool {
             match string_value(get(b"q")?)? {
                 b"ping" => (),
                 b"find_node" | b"sample_infohashes" if arg(b"target")?.len() == 20 => (),
+                b"get" if arg(b"target")?.len() == 20 => {
+                    if !field(&args, b"seq").is_none_or(bep44_sequence) {
+                        return None;
+                    }
+                }
+                b"put" if bep44_put(&args) => (),
                 b"get_peers" if arg(b"info_hash")?.len() == 20 => (),
                 b"announce_peer" if arg(b"info_hash")?.len() == 20 => {
                     if arg(b"token")?.is_empty() {
@@ -256,12 +292,17 @@ fn binary_info_hash(value: &str) -> bool {
     decoded == 20
 }
 
-fn http_seed(query: &str) -> bool {
+fn http_query(query: &str) -> bool {
     let mut hash = None;
+    let mut peer = None;
+    let mut port = None;
     let mut piece = None;
-    for (key, value) in query.split('&').filter_map(|p| p.split_once('=')) {
+    for parameter in query.split('&') {
+        let (key, value) = parameter.split_once('=').unwrap_or((parameter, ""));
         let slot = match key {
             "info_hash" => &mut hash,
+            "peer_id" => &mut peer,
+            "port" => &mut port,
             "piece" => &mut piece,
             _ => continue,
         };
@@ -269,12 +310,23 @@ fn http_seed(query: &str) -> bool {
             return false;
         }
     }
-    hash.is_some_and(binary_info_hash)
-        && piece.is_some_and(|value| {
-            !value.is_empty()
-                && value.bytes().all(|b| b.is_ascii_digit())
-                && value.parse::<u32>().is_ok()
-        })
+    if !hash.is_some_and(binary_info_hash) {
+        return false;
+    }
+    if peer.is_some() || port.is_some() {
+        // Port zero is used by clients without an incoming listener.
+        return peer.is_some_and(binary_info_hash)
+            && port.is_some_and(|value| {
+                !value.is_empty()
+                    && value.bytes().all(|b| b.is_ascii_digit())
+                    && value.parse::<u16>().is_ok()
+            });
+    }
+    piece.is_some_and(|value| {
+        !value.is_empty()
+            && value.bytes().all(|b| b.is_ascii_digit())
+            && value.parse::<u32>().is_ok()
+    })
 }
 
 pub(super) fn http(method: &str, target: &str, _headers: &str) -> bool {
@@ -283,15 +335,7 @@ pub(super) fn http(method: &str, target: &str, _headers: &str) -> bool {
     if method == "GET"
         && let Some((_, query)) = target.split_once('?')
     {
-        let has = |name: &str| {
-            query.split('&').any(|p| {
-                p.split_once('=')
-                    .is_some_and(|(k, v)| k == name && !v.is_empty())
-            })
-        };
-        if (has("info_hash") && has("peer_id") && has("port")) || http_seed(query) {
-            return true;
-        }
+        return http_query(query);
     }
     false
 }
@@ -326,7 +370,7 @@ mod tests {
     fn http_requires_specific_signals() {
         assert!(http(
             "GET",
-            "/announce?info_hash=x&peer_id=y&port=6881",
+            "/announce?info_hash=abcdefghijklmnopqrst&peer_id=-qB5000-abcdefghijkl&port=6881",
             "Host: tracker"
         ));
         assert!(!http(
@@ -348,6 +392,123 @@ mod tests {
             "/?info_hash=x&peer_id=y&port=1",
             "Host: example.com"
         ));
+    }
+
+    #[test]
+    fn tracker_requires_binary_ids_and_unambiguous_numeric_port() {
+        let hash = "%aF".repeat(20);
+        let peer = "-qB5000-abcdefghijkl";
+        for port in ["0", "1", "6881", "65535"] {
+            assert!(http(
+                "GET",
+                &format!("/custom?info_hash={hash}&peer_id={peer}&port={port}"),
+                ""
+            ));
+        }
+        for query in [
+            "info_hash=document&peer_id=browser&port=banana".into(),
+            format!("info_hash={hash}&peer_id={peer}&port=65536"),
+            format!("info_hash={hash}&peer_id={peer}&port=-1"),
+            format!("info_hash={hash}&peer_id={peer}&port=+1"),
+            format!("info_hash={hash}&peer_id={peer}&port=1x"),
+            format!("info_hash={hash}&peer_id={peer}&port="),
+            format!("info_hash={hash}&peer_id={peer}&port"),
+            format!("info_hash={hash}&peer_id={peer}&port=1&port=2"),
+            format!("info_hash={hash}&peer_id={peer}&port=1&info_hash={hash}"),
+            format!("info_hash={hash}&peer_id={peer}&port=1&peer_id={peer}"),
+            format!("info_hash={hash}&peer_id=short&port=1"),
+            format!("info_hash={hash}&peer_id={}%zz&port=1", "a".repeat(19)),
+            format!("info_hash={}%xx&peer_id={peer}&port=1", "%01".repeat(19)),
+            // A seed-shaped suffix must not rescue invalid tracker fields.
+            format!("info_hash={hash}&peer_id=short&port=banana&piece=0"),
+        ] {
+            assert!(!http("GET", &format!("/custom?{query}"), ""), "{query}");
+        }
+    }
+
+    fn query_packet(query: &str, arguments: &str) -> String {
+        format!(
+            "d1:ad2:id20:abcdefghijklmnopqrst{arguments}e1:q{}:{query}1:t2:aa1:y1:qe",
+            query.len()
+        )
+    }
+
+    #[test]
+    fn bep44_get_checks_target_and_optional_sequence() {
+        for (arguments, expected) in [
+            ("6:target20:abcdefghijklmnopqrst", true),
+            ("3:seqi0e6:target20:abcdefghijklmnopqrst", true),
+            (
+                "3:seqi9223372036854775807e6:target20:abcdefghijklmnopqrst",
+                true,
+            ),
+            (
+                "3:seqi9223372036854775808e6:target20:abcdefghijklmnopqrst",
+                false,
+            ),
+            ("3:seqi-1e6:target20:abcdefghijklmnopqrst", false),
+            ("3:seq1:x6:target20:abcdefghijklmnopqrst", false),
+            ("6:target3:abc", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                dht(query_packet("get", arguments).as_bytes()),
+                expected,
+                "{arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn bep44_put_checks_immutable_and_mutable_shapes() {
+        let mutable = format!("1:k32:{}3:seqi7e3:sig64:{}", "k".repeat(32), "s".repeat(64));
+        for (arguments, expected) in [
+            ("5:token2:aa1:v4:spam".into(), true),
+            ("5:token2:aa1:vd3:bari42ee".into(), true),
+            ("5:token2:aa1:v0:".into(), true),
+            (format!("{mutable}5:token2:aa1:v4:spam"), true),
+            (
+                format!(
+                    "3:casi0e{mutable}4:salt64:{}5:token2:aa1:v4:spam",
+                    "a".repeat(64)
+                ),
+                true,
+            ),
+            (format!("3:casi-1e{mutable}5:token2:aa1:v4:spam"), false),
+            (
+                format!("{mutable}4:salt65:{}5:token2:aa1:v4:spam", "a".repeat(65)),
+                false,
+            ),
+            (format!("{mutable}4:salti1e5:token2:aa1:v4:spam"), false),
+            ("3:seqi7e5:token2:aa1:v4:spam".into(), false),
+            (
+                format!("1:k32:{}3:seqi7e5:token2:aa1:v4:spam", "k".repeat(32)),
+                false,
+            ),
+            (
+                format!(
+                    "1:k31:{}3:seqi7e3:sig64:{}5:token2:aa1:v4:spam",
+                    "k".repeat(31),
+                    "s".repeat(64)
+                ),
+                false,
+            ),
+            (format!("{mutable}3:seqi8e5:token2:aa1:v4:spam"), false),
+            ("5:token0:1:v4:spam".into(), false),
+            ("1:v4:spam".into(), false),
+            ("5:token2:aa".into(), false),
+            (format!("5:token2:aa1:v996:{}", "a".repeat(996)), true),
+            (format!("5:token2:aa1:v997:{}", "a".repeat(997)), false),
+        ] {
+            let packet = query_packet("put", &arguments);
+            assert_eq!(dht(packet.as_bytes()), expected, "{arguments}");
+            if expected {
+                for len in 0..packet.len() {
+                    assert!(!dht(&packet.as_bytes()[..len]));
+                }
+                assert!(!dht(format!("{packet}x").as_bytes()));
+            }
+        }
     }
 
     #[test]
