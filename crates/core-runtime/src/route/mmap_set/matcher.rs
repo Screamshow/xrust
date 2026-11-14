@@ -124,11 +124,7 @@ impl<'a> MmapView<'a> {
 
         // 3. Match destination Port
         let port = ctx.destination.port();
-        if port != 0 && self.matches_port(port) {
-            return true;
-        }
-
-        false
+        port != 0 && self.matches_port(port)
     }
 
     /// Match exact domain, suffix, or keyword.
@@ -224,9 +220,6 @@ impl<'a> MmapView<'a> {
         }
         // partition_point gives first range where start > port
         let idx = self.dest_ports.partition_point(|range| range.start <= port);
-        if idx > 0 && port <= self.dest_ports[idx - 1].end {
-            return true;
-        }
-        false
+        idx > 0 && port <= self.dest_ports[idx - 1].end
     }
 }

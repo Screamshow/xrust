@@ -457,15 +457,10 @@ fn match_default(rule: &serde_json::Map<String, Value>, ctx: &ConnContext) -> bo
     }
 
     // 5. Network criteria
-    if rule.contains_key("network")
-        && !list(rule.get("network"))
+    !rule.contains_key("network")
+        || list(rule.get("network"))
             .iter()
             .any(|entry| *entry == ctx.network)
-    {
-        return false;
-    }
-
-    true
 }
 
 /// `badoption.Listable[uint16]`: the SRS container stores numbers.
