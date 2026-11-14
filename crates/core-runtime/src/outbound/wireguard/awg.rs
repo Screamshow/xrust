@@ -70,6 +70,7 @@ const HEADER_NONCE_LEN: usize = 12;
 pub enum Obf {
     Bytes(Vec<u8>),
     Timestamp,
+    Counter,
     Rand(usize),
     RandChar(usize),
     RandDigit(usize),
@@ -82,7 +83,7 @@ impl Obf {
     fn obfuscated_len(&self, src_len: usize) -> usize {
         match self {
             Obf::Bytes(b) => b.len(),
-            Obf::Timestamp => 4,
+            Obf::Timestamp | Obf::Counter => 4,
             Obf::Rand(n) | Obf::RandChar(n) | Obf::RandDigit(n) | Obf::DataSize(n) => *n,
             Obf::Data => src_len,
             // base64.RawStdEncoding.EncodedLen
@@ -90,9 +91,10 @@ impl Obf {
         }
     }
 
-    fn obfuscate(&self, dst: &mut [u8], src: &[u8]) {
+    fn obfuscate(&self, dst: &mut [u8], src: &[u8], counter: u32) {
         match self {
             Obf::Bytes(b) => dst[..b.len()].copy_from_slice(b),
+            Obf::Counter => dst[..4].copy_from_slice(&counter.to_be_bytes()),
             Obf::Timestamp => {
                 let secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -149,6 +151,7 @@ pub fn compile_chain(spec: &str, at: &str) -> anyhow::Result<JunkChain> {
         let built: Result<Obf, String> = match key {
             "b" => decode_hex(val).map(Obf::Bytes),
             "t" => Ok(Obf::Timestamp),
+            "c" if val.is_empty() => Ok(Obf::Counter),
             "r" => parse_len(val).map(Obf::Rand),
             "rc" => parse_len(val).map(Obf::RandChar),
             "rd" => parse_len(val).map(Obf::RandDigit),
@@ -176,12 +179,17 @@ pub fn chain_len(chain: &[Obf]) -> usize {
     chain.iter().map(|o| o.obfuscated_len(0)).sum()
 }
 
+#[cfg(test)]
 pub fn render_chain(chain: &[Obf]) -> Vec<u8> {
+    render_chain_with_counter(chain, 0)
+}
+
+pub fn render_chain_with_counter(chain: &[Obf], counter: u32) -> Vec<u8> {
     let mut out = vec![0u8; chain_len(chain)];
     let mut written = 0;
     for o in chain {
         let l = o.obfuscated_len(0);
-        o.obfuscate(&mut out[written..written + l], &[]);
+        o.obfuscate(&mut out[written..written + l], &[], counter);
         written += l;
     }
     out
@@ -216,7 +224,7 @@ pub struct AwgParams {
     /// AWG 3.1: random tail on handshake datagrams (and the data-packet
     /// padding when content padding is unset).
     pub random_trailers: bool,
-    /// AWG 3.1: never send or honor cookie replies.
+    /// AWG 3.1: disable outgoing cookie challenges, not incoming replies.
     pub disable_cookies: bool,
 }
 
@@ -550,7 +558,8 @@ pub fn trailer_len(udp_window: u32, datagram_size: usize) -> usize {
 /// when trailers are on, else the WireGuard multiple-of-16 pad. Clamped by
 /// the peer's UDP window exactly like the reference.
 pub fn transport_padding(a: &AwgParams, udp_window: u32, pkt_len: usize, s4: usize) -> usize {
-    let datagram_size = s4 + 16 + pkt_len;
+    // Include both the transport header and the AEAD authentication tag.
+    let datagram_size = s4 + 32 + pkt_len;
     let addition = match a.content_padding {
         Some(r) => Some(pick_range(r) as usize),
         None if a.random_trailers => Some(trailer_len(udp_window, datagram_size)),
@@ -573,7 +582,8 @@ pub fn mask_header(key: &[u8; 32], nonce12: &[u8], data: &mut [u8]) -> bool {
     if data.len() < HEADER_NONCE_LEN || nonce12.len() < HEADER_NONCE_LEN {
         return false;
     }
-    let nonce: [u8; HEADER_NONCE_LEN] = nonce12.try_into().expect("len checked");
+    let nonce: [u8; HEADER_NONCE_LEN] =
+        nonce12[..HEADER_NONCE_LEN].try_into().expect("len checked");
     core_crypto::fastchacha::chacha20_xor(key, &nonce, data);
     true
 }
@@ -699,6 +709,53 @@ mod tests {
     }
 
     const NO_INDEX: &dyn Fn(u32) -> bool = &|_| false;
+
+    #[test]
+    fn header_mask_accepts_larger_prefix_and_uses_first_twelve_bytes() {
+        for len in [12, 13, 16, 64] {
+            let nonce = vec![3u8; len];
+            let mut expected = vec![7u8; 148];
+            let mut actual = expected.clone();
+            core_crypto::fastchacha::chacha20_xor(&[9; 32], &[3; 12], &mut expected);
+            assert!(mask_header(&[9; 32], &nonce, &mut actual));
+            assert_eq!(actual, expected);
+            assert!(mask_header(&[9; 32], &nonce, &mut actual));
+            assert_eq!(actual, vec![7u8; 148]);
+        }
+        assert!(!mask_header(&[9; 32], &[3; 11], &mut [0; 16]));
+    }
+
+    #[test]
+    fn content_padding_bounds_include_authentication_tag() {
+        let a = AwgParams::from_obj(&obj(&[("content_padding_addition", json!(100))]), "test")
+            .unwrap()
+            .unwrap();
+        for window in [0, 400, 448, 500, 548, 600] {
+            let padding = transport_padding(&a, window, 400, 16);
+            assert_eq!(padding, 100usize.min((window as usize).saturating_sub(448)));
+        }
+        let legacy = AwgParams::from_obj(&obj(&[("jc", json!(1))]), "test")
+            .unwrap()
+            .unwrap();
+        for size in [0, 1, 15, 16, 400, 1408] {
+            assert_eq!(
+                transport_padding(&legacy, 500, size, 16),
+                (16 - size % 16) % 16
+            );
+        }
+    }
+
+    #[test]
+    fn cps_counter_is_big_endian_and_shared_within_packet() {
+        let c = compile_chain("<b 0xaa><c><c><r 2>", "test").unwrap();
+        assert_eq!(chain_len(&c), 11);
+        let out = render_chain_with_counter(&c, 0x12345678);
+        assert_eq!(
+            &out[..9],
+            &[0xaa, 0x12, 0x34, 0x56, 0x78, 0x12, 0x34, 0x56, 0x78]
+        );
+        assert!(compile_chain("<c 1>", "test").is_err());
+    }
 
     #[test]
     fn chain_parse_and_render() {
@@ -947,16 +1004,16 @@ mod tests {
             let n = transport_padding(&a, 500, 40, 12);
             assert!((10..=100).contains(&n));
         }
-        // window clamp: datagram 12+16+40=68, window 80 → max 12 bytes
+        // Header, tag and prefix total 12+32+40=84: no room below 80.
         let n = transport_padding(&a, 80, 40, 12);
-        assert!(n <= 12);
+        assert_eq!(n, 0);
 
         // trailers without content padding: random below the window budget
         let o = obj(&[("random_trailers", json!(true))]);
         let a = AwgParams::from_obj(&o, "x").expect("awg").expect("set");
         for _ in 0..50 {
             let n = transport_padding(&a, 500, 40, 0);
-            assert!(n < 500 - 56);
+            assert!(n < 500 - 72);
         }
     }
 
