@@ -17,6 +17,8 @@ pub mod noise;
 pub mod peer_dns;
 pub mod service;
 pub mod session;
+#[cfg(test)]
+mod session_tests;
 pub mod web;
 
 use std::io;
@@ -511,6 +513,7 @@ impl Tailscale {
                 }
                 let _ = write.flush().await;
             }
+            let _ = write.shutdown().await;
         });
 
         match tokio::time::timeout(CONNECT_TIMEOUT, resp_rx).await {
@@ -552,35 +555,22 @@ impl Tailscale {
             }
         };
 
-        let peer = Arc::new(peer);
         let cmd_tx = shared.cmd_tx.clone();
         let udp_timeout = self.cfg.udp_timeout;
-
-        // replies: engine → loopback peer socket
-        {
-            let peer = Arc::clone(&peer);
-            tokio::spawn(async move {
-                while let Some(bytes) = replies.recv().await {
-                    if peer.send(&bytes).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-
-        // sends: loopback peer socket → engine
+        // Reset one idle timer for either direction of this UDP session.
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65_535];
-            while let Ok(Ok(n)) = tokio::time::timeout(udp_timeout, peer.recv(&mut buf)).await {
-                if cmd_tx
-                    .send(Cmd::UdpSend {
-                        port,
-                        bytes: buf[..n].to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
+            loop {
+                tokio::select! {
+                    reply = replies.recv() => {
+                        let Some(bytes) = reply else { break; };
+                        if peer.send(&bytes).await.is_err() { break; }
+                    }
+                    incoming = peer.recv(&mut buf) => {
+                        let Ok(n) = incoming else { break; };
+                        if cmd_tx.send(Cmd::UdpSend { port, bytes: buf[..n].to_vec() }).await.is_err() { break; }
+                    }
+                    _ = tokio::time::sleep(udp_timeout) => break,
                 }
             }
             let _ = cmd_tx.send(Cmd::UdpClose { port }).await;

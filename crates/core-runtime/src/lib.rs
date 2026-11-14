@@ -17,6 +17,8 @@ pub mod protect;
 pub mod route;
 pub mod tls_client;
 pub mod tls_utls;
+#[cfg(test)]
+mod tunnel_session_tests;
 pub mod util;
 pub mod ws;
 #[cfg(feature = "clash-api")]

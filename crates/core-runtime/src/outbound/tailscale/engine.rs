@@ -195,7 +195,7 @@ struct TcpConn {
     handle: SocketHandle,
     #[allow(dead_code)]
     dst: SocketAddr,
-    to_caller: mpsc::Sender<Vec<u8>>,
+    to_caller: Option<mpsc::Sender<Vec<u8>>>,
     resp: Option<oneshot::Sender<Result<(), String>>>,
     from_caller: VecDeque<Vec<u8>>,
     created: Instant,
@@ -415,7 +415,7 @@ pub fn spawn_tailscale_engine_with_tun(
                                         credit,
                                         handle,
                                         dst,
-                                        to_caller,
+                                        to_caller: Some(to_caller),
                                         resp: Some(resp),
                                         from_caller: VecDeque::new(),
                                         created: Instant::now(),
@@ -503,7 +503,7 @@ pub fn spawn_tailscale_engine_with_tun(
             // 2. Pump TCP data from caller to smoltcp sockets
             for conn in tcp_conns.values_mut() {
                 let socket = sockets.get_mut::<TcpSock>(conn.handle);
-                if socket.state() == TcpState::Established {
+                if matches!(socket.state(), TcpState::Established | TcpState::CloseWait) {
                     #[allow(clippy::collapsible_if)]
                     if let Some(resp) = conn.resp.take() {
                         let _ = resp.send(Ok(()));
@@ -601,22 +601,30 @@ pub fn spawn_tailscale_engine_with_tun(
             let mut closed_ids = Vec::new();
             for (id, conn) in tcp_conns.iter_mut() {
                 let socket = sockets.get_mut::<TcpSock>(conn.handle);
-                while socket.can_recv() {
-                    let accepted = socket.recv(|data| {
-                        let size = data.len().min(8192);
-                        if conn.to_caller.try_send(data[..size].to_vec()).is_ok() {
-                            (size, true)
-                        } else {
-                            (0, false)
+                if let Some(to_caller) = &conn.to_caller {
+                    while socket.can_recv() {
+                        let accepted = socket.recv(|data| {
+                            let size = data.len().min(8192);
+                            if to_caller.try_send(data[..size].to_vec()).is_ok() {
+                                (size, true)
+                            } else {
+                                (0, false)
+                            }
+                        });
+                        if !matches!(accepted, Ok(true)) {
+                            break;
                         }
-                    });
-                    if !matches!(accepted, Ok(true)) {
-                        break;
                     }
                 }
 
+                // Closing the receive channel delivers EOF after queued data
+                // without closing the caller's still-writable TCP direction.
+                if conn.resp.is_none() && !socket.may_recv() {
+                    conn.to_caller.take();
+                }
+
                 match socket.state() {
-                    TcpState::Closed | TcpState::TimeWait => {
+                    TcpState::Closed | TcpState::TimeWait if !socket.can_recv() => {
                         closed_ids.push(*id);
                     }
                     TcpState::SynSent if conn.created.elapsed() > CONNECT_TIMEOUT => {

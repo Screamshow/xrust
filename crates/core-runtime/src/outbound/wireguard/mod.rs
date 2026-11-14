@@ -9,6 +9,8 @@ pub mod awg;
 pub(crate) mod awg_masque;
 pub(crate) mod awg_quic;
 pub mod noise;
+#[cfg(test)]
+mod session_tests;
 mod tcp_window;
 
 use std::cell::RefCell;
@@ -539,6 +541,7 @@ impl WireGuard {
                 }
                 let _ = write.flush().await;
             }
+            let _ = write.shutdown().await;
         });
 
         match tokio::time::timeout(CONNECT_TIMEOUT, resp_rx).await {
@@ -578,33 +581,22 @@ impl WireGuard {
             }
         };
 
-        let peer = Arc::new(peer);
         let cmd_tx = shared.cmd_tx.clone();
         let udp_timeout = self.cfg.udp_timeout;
-
-        // replies: stack → session channel → loopback peer socket.
-        {
-            let peer = Arc::clone(&peer);
-            tokio::spawn(async move {
-                while let Some(bytes) = replies.recv().await {
-                    if peer.send(&bytes).await.is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-
-        // sends: loopback peer socket → stack (mirrors the hysteria2 bridge).
+        // A single bridge owns the idle timer: traffic in either direction
+        // keeps the session alive, including a receive-only media stream.
         tokio::spawn(async move {
-            // read through the per-thread scratch; only the datagram is copied
-            while let Ok(Ok(bytes)) = tokio::time::timeout(
-                udp_timeout,
-                crate::inbound::udp::recv_with(&peer, <[u8]>::to_vec),
-            )
-            .await
-            {
-                if cmd_tx.send(Cmd::UdpSend { port, bytes }).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    reply = replies.recv() => {
+                        let Some(bytes) = reply else { break; };
+                        if peer.send(&bytes).await.is_err() { break; }
+                    }
+                    incoming = crate::inbound::udp::recv_with(&peer, <[u8]>::to_vec) => {
+                        let Ok(bytes) = incoming else { break; };
+                        if cmd_tx.send(Cmd::UdpSend { port, bytes }).await.is_err() { break; }
+                    }
+                    _ = tokio::time::sleep(udp_timeout) => break,
                 }
             }
             let _ = cmd_tx.send(Cmd::UdpClose { port }).await;
@@ -695,7 +687,7 @@ struct TcpConn {
     handle: SocketHandle,
     #[allow(dead_code)]
     dst: SocketAddr,
-    to_caller: mpsc::Sender<Vec<u8>>,
+    to_caller: Option<mpsc::Sender<Vec<u8>>>,
     /// set when data is held back because `to_caller` is full; the caller's
     /// pump clears it and wakes the stack once it has made room
     stalled: Arc<AtomicBool>,
@@ -1267,7 +1259,7 @@ impl Stack {
                         send_window: tcp_window::SendWindow::default(),
                         handle,
                         dst,
-                        to_caller,
+                        to_caller: Some(to_caller),
                         stalled,
                         resp: Some(resp),
                         from_caller: VecDeque::new(),
@@ -1562,6 +1554,7 @@ impl Stack {
             self.recycle(plain);
             return; // keepalive
         }
+        plain.truncate(noise::trim_ip_padding(&plain).len());
         let Some((src_ip, dst, proto, hdr_len)) = ip_info(&plain) else {
             self.recycle(plain);
             return;
@@ -1616,6 +1609,11 @@ impl Stack {
             return;
         }
         if proto == 17 && plain.len() >= hdr_len + 8 {
+            let udp_len = u16::from_be_bytes([plain[hdr_len + 4], plain[hdr_len + 5]]) as usize;
+            if udp_len < 8 || udp_len > plain.len() - hdr_len {
+                self.recycle(plain);
+                return;
+            }
             let sport = u16::from_be_bytes([plain[hdr_len], plain[hdr_len + 1]]);
             let dport = u16::from_be_bytes([plain[hdr_len + 2], plain[hdr_len + 3]]);
             let sender = match self.udp.get(&dport) {
@@ -1628,7 +1626,7 @@ impl Stack {
                 _ => None,
             };
             if let Some(sender) = sender {
-                let out = plain[hdr_len + 8..].to_vec();
+                let out = plain[hdr_len + 8..hdr_len + udp_len].to_vec();
                 self.recycle(plain);
                 let _ = sender.try_send(out);
                 return;
@@ -1704,7 +1702,7 @@ impl Stack {
             let Some(mut conn) = self.tcp.remove(&id) else {
                 continue;
             };
-            let mut remote_closed = false;
+            let mut remote_closed = conn.to_caller.is_none();
             let mut caller_gone = false;
             let state = {
                 let sock = self.sockets.get_mut::<TcpSock<'static>>(conn.handle);
@@ -1731,7 +1729,9 @@ impl Stack {
                     }
                 }
 
-                if conn.stash.is_none() {
+                if conn.stash.is_none()
+                    && let Some(to_caller) = &conn.to_caller
+                {
                     loop {
                         // Copy directly from the TCP ring to the message.
                         // At a wrap, recv exposes the second span next time.
@@ -1743,7 +1743,7 @@ impl Stack {
                             Ok(data) => {
                                 received += data.len();
                                 drained_receive_window = true;
-                                match conn.to_caller.try_send(data) {
+                                match to_caller.try_send(data) {
                                     Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(v)) => {
                                         // Flag first, then retry: either the retry
@@ -1771,13 +1771,15 @@ impl Stack {
                 // a remote FIN that can never arrive (we never sent one) and
                 // the socket leaks in the set forever — three cancelled LuCI
                 // pings used to be three leaked sockets and ports.
-                if conn.caller_eof && conn.from_caller.is_empty() && !remote_closed {
+                if conn.caller_eof && conn.from_caller.is_empty() {
                     sock.close();
                 }
                 sock.state()
             };
-            if let Some(stash) = conn.stash.take() {
-                match conn.to_caller.try_send(stash) {
+            if let Some(stash) = conn.stash.take()
+                && let Some(to_caller) = &conn.to_caller
+            {
+                match to_caller.try_send(stash) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(v)) => {
                         conn.stalled.store(true, Ordering::SeqCst);
@@ -1786,11 +1788,11 @@ impl Stack {
                     Err(mpsc::error::TrySendError::Closed(_)) => caller_gone = true,
                 }
             }
-            if conn.to_caller.is_closed() {
+            if conn.to_caller.as_ref().is_some_and(mpsc::Sender::is_closed) {
                 caller_gone = true;
             }
 
-            if state == TcpState::Established
+            if matches!(state, TcpState::Established | TcpState::CloseWait)
                 && let Some(resp) = conn.resp.take()
             {
                 let _ = resp.send(Ok(()));
@@ -1801,9 +1803,16 @@ impl Stack {
 
             let connect_failed = conn.resp.is_some()
                 && (state == TcpState::Closed || conn.created.elapsed() >= CONNECT_TIMEOUT);
-            let finished = state == TcpState::Closed
-                || caller_gone
-                || (conn.caller_eof && remote_closed && conn.stash.is_none());
+            // Drop only the receive sender after every byte (including the
+            // held-back chunk) was queued. The caller can still write after
+            // receiving EOF; retain the TCP socket until its FIN is acked.
+            if remote_closed && conn.stash.is_none() {
+                conn.to_caller.take();
+            }
+            let finished = caller_gone
+                || (matches!(state, TcpState::Closed | TcpState::TimeWait)
+                    && conn.stash.is_none()
+                    && !self.sockets.get::<TcpSock<'static>>(conn.handle).can_recv());
 
             if connect_failed && let Some(resp) = conn.resp.take() {
                 let _ = resp.send(Err(match state {
@@ -2564,6 +2573,102 @@ mod tests {
         stack.on_response(&response, index, stack.peers[0].resolved.unwrap());
         assert!(stack.peers[0].session.is_some());
         session
+    }
+
+    #[tokio::test]
+    async fn udp_transport_padding_is_removed_for_ipv4_ipv6_and_protected_awg() {
+        use base64::Engine;
+        for protected in [false, true] {
+            let extra = if protected {
+                json!({"s1":16,"s2":16,"s3":16,"s4":16,"header_protection_key":base64::engine::general_purpose::STANDARD.encode([3;32])})
+            } else {
+                json!({})
+            };
+            let (mut stack, _sink) = compat_stack(extra).await;
+            let mut server = compat_session(&mut stack);
+            Arc::make_mut(&mut stack.cfg).local_addr_v6 = Some("fd00::2".parse().unwrap());
+            stack.peers[0].endpoint.allowed_ips_v6.push((0, 0));
+            let source = stack.peers[0].resolved.unwrap();
+            for ipv6 in [false, true] {
+                let target = if ipv6 {
+                    "[fd00::1]:1234"
+                } else {
+                    "10.66.66.1:1234"
+                };
+                let (resp, wait) = oneshot::channel();
+                stack.process_cmd(Cmd::UdpOpen {
+                    target: target.parse().unwrap(),
+                    resp,
+                });
+                let (port, mut replies) = wait.await.unwrap().unwrap();
+                for size in [0, 1, 4, 8, 15, 16, 17, 20, 64, 1232] {
+                    let payload: Vec<_> = (0..size).map(|n| (n % 251) as u8).collect();
+                    let packet = if ipv6 {
+                        build_ipv6_udp(
+                            "fd00::1".parse().unwrap(),
+                            "fd00::2".parse().unwrap(),
+                            1234,
+                            port,
+                            &payload,
+                        )
+                    } else {
+                        build_ipv4_udp(
+                            Ipv4Addr::new(10, 66, 66, 1),
+                            Ipv4Addr::new(10, 66, 66, 2),
+                            1234,
+                            port,
+                            &payload,
+                        )
+                    };
+                    for extra in [0, 7, 64] {
+                        let prefix = if protected { 16 } else { 0 };
+                        let padded = packet.len().next_multiple_of(16) + extra;
+                        let mut wire = Vec::new();
+                        assert!(server.seal_into(&packet, padded, prefix, &mut wire));
+                        if protected {
+                            let (nonce, msg) = wire.split_at_mut(prefix);
+                            awg::fill_random(nonce);
+                            awg::mask_header(&[3; 32], nonce, &mut msg[..16]);
+                        }
+                        stack.process_inbound(&wire, source);
+                        assert_eq!(
+                            replies.try_recv().unwrap(),
+                            payload,
+                            "v6={ipv6}, protected={protected}, size={size}, padding={extra}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_length_cannot_expose_bytes_outside_the_ip_packet() {
+        let (mut stack, _sink) = compat_stack(json!({})).await;
+        let mut server = compat_session(&mut stack);
+        let source = stack.peers[0].resolved.unwrap();
+        let (resp, wait) = oneshot::channel();
+        stack.process_cmd(Cmd::UdpOpen {
+            target: "10.66.66.1:1234".parse().unwrap(),
+            resp,
+        });
+        let (port, mut replies) = wait.await.unwrap().unwrap();
+        for bad_length in [0u16, 7, 17, 65535] {
+            let mut packet = build_ipv4_udp(
+                Ipv4Addr::new(10, 66, 66, 1),
+                Ipv4Addr::new(10, 66, 66, 2),
+                1234,
+                port,
+                &[1; 8],
+            );
+            packet[24..26].copy_from_slice(&bad_length.to_be_bytes());
+            let wire = server.seal(&packet).unwrap();
+            stack.process_inbound(&wire, source);
+            assert!(matches!(
+                replies.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
     }
 
     #[tokio::test]
