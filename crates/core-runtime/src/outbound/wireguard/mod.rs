@@ -9,13 +9,14 @@ pub mod awg;
 pub(crate) mod awg_masque;
 pub(crate) mod awg_quic;
 pub mod noise;
+mod tcp_window;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -54,56 +55,6 @@ const DEFAULT_MTU: usize = 1408;
 const DEFAULT_PORT: u16 = 51820;
 const EPHEMERAL_BASE: u16 = 49152;
 
-const SOCKET_BUF: usize = 65_536;
-// Keep the small buffers as a fallback when the shared WAN allowance is full.
-const TCP_RECV_BUF: usize = 128 * 1024;
-// Bytes must remain queued until ACKed. Small TX and RX rings otherwise cap
-// throughput at roughly their capacity divided by the path RTT.
-const TCP_WAN_RECV_BUF: usize = 2 * 1024 * 1024;
-const TCP_WAN_SEND_BUF: usize = 2 * 1024 * 1024;
-const TCP_WINDOW_EXTRA: usize = TCP_WAN_RECV_BUF + TCP_WAN_SEND_BUF - TCP_RECV_BUF - SOCKET_BUF;
-// Shared across endpoints: a subscription with many WG endpoints must not
-// multiply the extra window allowance. Existing small buffers remain available
-// when the allowance is exhausted; this is not a total process memory cap.
-// The supported 32-bit OpenWrt target is MIPS 24Kc, commonly RAM-limited.
-// Keep two large connections there instead of consuming a 32 MiB allowance.
-#[cfg(target_pointer_width = "32")]
-const TCP_WINDOW_BUDGET: usize = 8 * 1024 * 1024;
-#[cfg(not(target_pointer_width = "32"))]
-const TCP_WINDOW_BUDGET: usize = 32 * 1024 * 1024;
-static TCP_WINDOW_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-fn tcp_buffer_sizes(reserved: bool) -> (usize, usize) {
-    if reserved {
-        (TCP_WAN_RECV_BUF, TCP_WAN_SEND_BUF)
-    } else {
-        (TCP_RECV_BUF, SOCKET_BUF)
-    }
-}
-
-struct TcpWindowReservation<'a>(&'a AtomicUsize);
-
-impl<'a> TcpWindowReservation<'a> {
-    fn acquire(bytes: &'a AtomicUsize) -> Option<Self> {
-        let mut used = bytes.load(Ordering::Relaxed);
-        loop {
-            let next = used.checked_add(TCP_WINDOW_EXTRA)?;
-            if next > TCP_WINDOW_BUDGET {
-                return None;
-            }
-            match bytes.compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => return Some(Self(bytes)),
-                Err(actual) => used = actual,
-            }
-        }
-    }
-}
-
-impl Drop for TcpWindowReservation<'_> {
-    fn drop(&mut self) {
-        self.0.fetch_sub(TCP_WINDOW_EXTRA, Ordering::Relaxed);
-    }
-}
 const SCRATCH_BUF: usize = 16_384;
 const CALLER_BUF: usize = 65_536;
 const CMD_QUEUE: usize = 256;
@@ -709,7 +660,8 @@ fn bind_network_udp(ipv6: bool, port: u16, mark: Option<u32>) -> io::Result<UdpS
 }
 
 struct TcpConn {
-    _window_reservation: Option<TcpWindowReservation<'static>>,
+    receive_window: tcp_window::ReceiveWindow<'static>,
+    send_window: tcp_window::SendWindow<'static>,
     handle: SocketHandle,
     #[allow(dead_code)]
     dst: SocketAddr,
@@ -1198,12 +1150,17 @@ impl Stack {
                     return;
                 };
                 let port = self.alloc_port();
-                let window_reservation = TcpWindowReservation::acquire(&TCP_WINDOW_BYTES);
-                let (recv_size, send_size) = tcp_buffer_sizes(window_reservation.is_some());
+                let recv_size = tcp_window::SMALL_RECV;
+                let send_size = tcp_window::SMALL_SEND;
                 let mut socket = TcpSock::new(
                     TcpBuffer::new(vec![0; recv_size]),
                     TcpBuffer::new(vec![0; send_size]),
                 );
+                // Negotiate future RX growth before SYN, while advertising
+                // only the memory actually supplied to the socket.
+                socket
+                    .set_receive_capacity_limit(tcp_window::LARGE)
+                    .expect("bounded receive capacity on a new TCP socket");
                 socket.set_nagle_enabled(false);
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
@@ -1221,7 +1178,8 @@ impl Stack {
                 self.tcp.insert(
                     id,
                     TcpConn {
-                        _window_reservation: window_reservation,
+                        receive_window: tcp_window::ReceiveWindow::default(),
+                        send_window: tcp_window::SendWindow::default(),
                         handle,
                         dst,
                         to_caller,
@@ -1653,6 +1611,7 @@ impl Stack {
 
     fn maintain_tcp(&mut self) -> bool {
         let mut drained_receive_window = false;
+        let now = Instant::now();
         let ids: Vec<u32> = self.tcp.keys().copied().collect();
         for id in ids {
             let Some(mut conn) = self.tcp.remove(&id) else {
@@ -1662,6 +1621,9 @@ impl Stack {
             let mut caller_gone = false;
             let state = {
                 let sock = self.sockets.get_mut::<TcpSock<'static>>(conn.handle);
+                let pending = conn.from_caller.iter().map(|(bytes, _)| bytes.len()).sum();
+                conn.send_window.maintain(sock, now, pending);
+                let mut received = 0;
 
                 while let Some((front, _)) = conn.from_caller.front_mut() {
                     match sock.send_slice(front) {
@@ -1692,6 +1654,7 @@ impl Stack {
                         }) {
                             Ok(data) if data.is_empty() => break,
                             Ok(data) => {
+                                received += data.len();
                                 drained_receive_window = true;
                                 match conn.to_caller.try_send(data) {
                                     Ok(()) => {}
@@ -1716,6 +1679,7 @@ impl Stack {
                         }
                     }
                 }
+                conn.receive_window.maintain(sock, now, received);
                 // The caller is gone: FIN the remote, or `finished` waits for
                 // a remote FIN that can never arrive (we never sent one) and
                 // the socket leaks in the set forever — three cancelled LuCI
@@ -1927,6 +1891,12 @@ impl Stack {
         for conn in self.tcp.values() {
             if conn.resp.is_some() {
                 consider(conn.created + CONNECT_TIMEOUT);
+            }
+            if let Some(at) = conn.send_window.deadline() {
+                consider(at);
+            }
+            if let Some(at) = conn.receive_window.deadline() {
+                consider(at);
             }
         }
         // smoltcp itself may want a poll — data maintain_tcp just pushed into
@@ -2414,59 +2384,6 @@ fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn tcp_window_budget_survives_concurrent_acquire_and_drop() {
-        let bytes = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            for _ in 0..32 {
-                let bytes = &bytes;
-                scope.spawn(move || {
-                    for _ in 0..500 {
-                        let reservation = super::TcpWindowReservation::acquire(bytes);
-                        assert!(
-                            bytes.load(std::sync::atomic::Ordering::Relaxed)
-                                <= super::TCP_WINDOW_BUDGET
-                        );
-                        std::thread::yield_now();
-                        drop(reservation);
-                    }
-                });
-            }
-        });
-        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn tcp_window_budget_is_bounded_and_reusable() {
-        let bytes = std::sync::atomic::AtomicUsize::new(0);
-        let mut reservations = Vec::new();
-        while let Some(reservation) = super::TcpWindowReservation::acquire(&bytes) {
-            reservations.push(reservation);
-        }
-        assert_eq!(
-            reservations.len(),
-            if cfg!(target_pointer_width = "32") {
-                2
-            } else {
-                8
-            }
-        );
-        assert_eq!(
-            super::tcp_buffer_sizes(true),
-            (2 * 1024 * 1024, 2 * 1024 * 1024)
-        );
-        assert_eq!(super::tcp_buffer_sizes(false), (128 * 1024, 64 * 1024));
-        let used = bytes.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(used <= super::TCP_WINDOW_BUDGET);
-        assert!(used + super::TCP_WINDOW_EXTRA > super::TCP_WINDOW_BUDGET);
-        drop(reservations.pop());
-        let reused = super::TcpWindowReservation::acquire(&bytes).unwrap();
-        assert!(super::TcpWindowReservation::acquire(&bytes).is_none());
-        drop(reused);
-        drop(reservations);
-        assert_eq!(bytes.load(std::sync::atomic::Ordering::Relaxed), 0);
-    }
-
     use super::*;
 
     #[test]
