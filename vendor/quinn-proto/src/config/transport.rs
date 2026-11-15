@@ -58,6 +58,7 @@ pub struct TransportConfig {
     pub(crate) congestion_controller_factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
 
     pub(crate) enable_segmentation_offload: bool,
+    pub(crate) gso_payload_only: bool,
 
     pub(crate) qlog_sink: QlogSink,
 }
@@ -376,6 +377,14 @@ impl TransportConfig {
         self
     }
 
+    /// Limit established control-only packets to one datagram per transmit.
+    /// STREAM/DATAGRAM payload batches keep the normal GSO capability.
+    /// Does not change padding requirements, ACK policy, or network timers.
+    pub fn gso_payload_only(&mut self, enabled: bool) -> &mut Self {
+        self.gso_payload_only = enabled;
+        self
+    }
+
     /// qlog capture configuration to use for a particular connection
     #[cfg(feature = "qlog")]
     pub fn qlog_stream(&mut self, stream: Option<QlogStream>) -> &mut Self {
@@ -425,6 +434,7 @@ impl Default for TransportConfig {
             congestion_controller_factory: Arc::new(congestion::CubicConfig::default()),
 
             enable_segmentation_offload: true,
+            gso_payload_only: false,
 
             qlog_sink: QlogSink::default(),
         }
@@ -461,6 +471,7 @@ impl fmt::Debug for TransportConfig {
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
             enable_segmentation_offload,
+            gso_payload_only,
             qlog_sink,
         } = self;
         let mut s = fmt.debug_struct("TransportConfig");
@@ -492,7 +503,8 @@ impl fmt::Debug for TransportConfig {
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             // congestion_controller_factory not debug
-            .field("enable_segmentation_offload", enable_segmentation_offload);
+            .field("enable_segmentation_offload", enable_segmentation_offload)
+            .field("gso_payload_only", gso_payload_only);
         if cfg!(feature = "qlog") {
             s.field("qlog_stream", &qlog_sink.is_enabled());
         }

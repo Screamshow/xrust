@@ -906,8 +906,16 @@ impl Connection {
                 }
             }
 
+            let datagram_frames_before = self.stats.frame_tx.datagram;
             let sent =
                 self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            let payload_work = !sent.stream_frames.is_empty()
+                || self.stats.frame_tx.datagram != datagram_frames_before;
+            let stop_control_batch = self.config.gso_payload_only
+                && self.state.is_established()
+                && space_id == SpaceId::Data
+                && num_datagrams == 1
+                && !payload_work;
             let chrome_handshake_ack = self.config.chrome_initial
                 && self.side.is_client()
                 && space_id == SpaceId::Handshake
@@ -942,6 +950,13 @@ impl Connection {
 
             // Keep information about the packet around until it gets finalized
             sent_frames = Some(sent);
+
+            // Preserve required padding and tracking through the existing
+            // finalization path. Only encoded STREAM/DATAGRAM work keeps GSO;
+            // tiny established control packets cannot set its segment size.
+            if stop_control_batch {
+                break;
+            }
 
             // Keep both the Handshake ACK and Finished in their own batches.
             // Neither tiny packet may set the GSO segment size for the queued

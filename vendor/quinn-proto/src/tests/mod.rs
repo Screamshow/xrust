@@ -4180,3 +4180,116 @@ fn preferred_address() {
     let mut pair = Pair::new(Arc::new(EndpointConfig::default()), server_config);
     pair.connect();
 }
+
+#[test]
+fn payload_only_gso_preserves_stream_delivery() {
+    let _guard = subscribe();
+    let mut cfg = client_config();
+    let mut transport = TransportConfig::default();
+    transport.gso_payload_only(true);
+    cfg.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(cfg);
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let initial = pair.client_conn_mut(client_ch).stats().udp_tx;
+    let payload = vec![0x5a; 20 * 1024];
+    assert_eq!(
+        pair.client_send(client_ch, stream).write(&payload).unwrap(),
+        payload.len()
+    );
+    pair.client_send(client_ch, stream).finish().unwrap();
+    pair.drive();
+    let final_stats = pair.client_conn_mut(client_ch).stats().udp_tx;
+    assert_eq!(final_stats.ios - initial.ios, 2);
+    assert!(final_stats.datagrams - initial.datagrams > final_stats.ios - initial.ios);
+    let accepted = pair.server_streams(server_ch).accept(Dir::Uni).unwrap();
+    let mut receiver = pair.server_recv(server_ch, accepted);
+    let mut chunks = receiver.read(true).unwrap();
+    let mut received = Vec::new();
+    while let Some(chunk) = chunks.next(usize::MAX).unwrap() {
+        received.extend_from_slice(&chunk.bytes);
+    }
+    let _ = chunks.finalize();
+    assert_eq!(received, payload);
+}
+
+#[test]
+fn payload_only_gso_control_sizes_match_single_datagrams() {
+    let _guard = subscribe();
+    fn run(single: bool, payload_only: bool) -> (Vec<usize>, u64, u64) {
+        let mut server_cfg = server_config();
+        let mut server_transport = TransportConfig::default();
+        server_transport.max_concurrent_uni_streams(1000u32.into());
+        server_cfg.transport = Arc::new(server_transport);
+        let mut pair = Pair::new(Default::default(), server_cfg);
+        let mut cfg = client_config();
+        let mut transport = TransportConfig::default();
+        transport
+            .enable_segmentation_offload(!single)
+            .gso_payload_only(payload_only);
+        cfg.transport_config(Arc::new(transport));
+        let (client_ch, server_ch) = pair.connect_with(cfg);
+        let initial = pair.client_conn_mut(client_ch).stats().udp_tx;
+        for _ in 0..1000 {
+            let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+            pair.client_send(client_ch, stream)
+                .reset(0u32.into())
+                .unwrap();
+        }
+        pair.client.drive(pair.time, pair.server.addr);
+        let sizes = pair
+            .client
+            .outbound
+            .iter()
+            .map(|(t, _)| t.size)
+            .collect::<Vec<_>>();
+        pair.drive();
+        assert_eq!(
+            pair.server_conn_mut(server_ch)
+                .stats()
+                .frame_rx
+                .reset_stream,
+            1000
+        );
+        let final_stats = pair.client_conn_mut(client_ch).stats().udp_tx;
+        (
+            sizes,
+            final_stats.ios - initial.ios,
+            final_stats.datagrams - initial.datagrams,
+        )
+    }
+    let (single_sizes, single_ios, single_datagrams) = run(true, false);
+    let (policy_sizes, policy_ios, policy_datagrams) = run(false, true);
+    assert_eq!(policy_sizes, single_sizes);
+    assert_eq!(policy_ios, single_ios);
+    assert_eq!(policy_datagrams, single_datagrams);
+    let (_, legacy_ios, legacy_datagrams) = run(false, false);
+    assert!(
+        legacy_datagrams > legacy_ios,
+        "control test must exercise a real GSO batch"
+    );
+}
+
+#[test]
+fn payload_only_gso_datagram_boundaries() {
+    let _guard = subscribe();
+    let mut config = client_config();
+    let mut transport = TransportConfig::default();
+    transport.gso_payload_only(true);
+    config.transport_config(Arc::new(transport));
+    let mut pair = Pair::default();
+    let (client, server) = pair.connect_with(config);
+    let before = pair.client_conn_mut(client).stats().udp_tx;
+    let payloads = [vec![0x11; 1024], vec![0x22; 1024], vec![0x33; 1024], vec![0x44; 177]];
+    for payload in &payloads {
+        pair.client_datagrams(client).send(Bytes::copy_from_slice(payload), false).unwrap();
+    }
+    pair.drive();
+    let after = pair.client_conn_mut(client).stats().udp_tx;
+    assert!(after.datagrams-before.datagrams > after.ios-before.ios, "must exercise GSO");
+    for expected in payloads {
+        assert_eq!(pair.server_datagrams(server).recv().unwrap().as_ref(), expected.as_slice());
+    }
+    assert_eq!(pair.server_datagrams(server).recv(), None);
+    assert_eq!(pair.server_conn_mut(server).stats().frame_rx.datagram, 4);
+}

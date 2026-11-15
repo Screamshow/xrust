@@ -508,14 +508,19 @@ fn salamander_key(password: &[u8], salt: &[u8]) -> [u8; 32] {
 }
 
 fn salamander_seal_into(password: &[u8], payload: &[u8], out: &mut Vec<u8>) {
+    out.clear();
+    salamander_seal_append(password, payload, out);
+}
+
+fn salamander_seal_append(password: &[u8], payload: &[u8], out: &mut Vec<u8>) {
     let mut salt = [0u8; 8];
     let _ = random_bytes(&mut salt);
     let key = salamander_key(password, &salt);
-    out.clear();
+    let start = out.len();
     out.reserve(8 + payload.len());
     out.extend_from_slice(&salt);
     out.extend_from_slice(payload);
-    salamander_xor(&mut out[8..], &key);
+    salamander_xor(&mut out[start + 8..], &key);
 }
 
 /// XOR full key blocks a machine word at a time, without a Vec capacity check
@@ -638,16 +643,40 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
     }
 
     fn try_send(&self, tx: &quinn::udp::Transmit<'_>) -> io::Result<()> {
-        // Advertise the default limit of one segment: each datagram needs
-        // its own salt. The relay did not propagate ECN to the network.
-        debug_assert!(tx.segment_size.is_none());
         let mut sealed = self.sealed.lock().unwrap();
-        salamander_seal_into(&self.password, tx.contents, &mut sealed);
+        // Quinn supplies one plaintext segment size; every wire datagram
+        // needs an independent salt, including the final short segment.
+        let segment = tx.segment_size;
+        if let Some(size) = segment {
+            if size == 0 || size > usize::from(u16::MAX) - 8 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid Salamander segment size",
+                ));
+            }
+            if tx.contents.len().div_ceil(size) > 16 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "too many Salamander segments",
+                ));
+            }
+            sealed.clear();
+            if tx.contents.is_empty() {
+                // Even an empty plaintext datagram retains its salt prefix.
+                salamander_seal_append(&self.password, &[], &mut sealed);
+            } else {
+                for payload in tx.contents.chunks(size) {
+                    salamander_seal_append(&self.password, payload, &mut sealed);
+                }
+            }
+        } else {
+            salamander_seal_into(&self.password, tx.contents, &mut sealed);
+        }
         self.socket.try_send(&quinn::udp::Transmit {
             destination: tx.destination,
             ecn: None,
             contents: &sealed,
-            segment_size: None,
+            segment_size: segment.map(|size| size + 8),
             src_ip: None,
         })
     }
@@ -686,10 +715,253 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
         segments + (segments * 8).div_ceil(1200)
     }
 
+    fn max_transmit_segments(&self) -> usize {
+        self.socket.max_transmit_segments().clamp(1, 16)
+    }
+
     fn may_fragment(&self) -> bool {
         // From QUIC's perspective this replaces the plaintext loopback
         // socket, whose PMTU discovery behaviour stays in effect.
         self.socket.may_fragment()
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod salamander_gso_tests {
+    use super::*;
+    use quinn::AsyncUdpSocket;
+
+    #[derive(Debug)]
+    struct FallbackSocket {
+        segments: std::sync::atomic::AtomicUsize,
+        block_once: std::sync::atomic::AtomicBool,
+        sent: std::sync::Mutex<Vec<(Vec<u8>, Option<usize>)>>,
+    }
+
+    #[derive(Debug)]
+    struct Writable;
+
+    impl quinn::UdpPoller for Writable {
+        fn poll_writable(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl quinn::AsyncUdpSocket for FallbackSocket {
+        fn create_io_poller(self: Arc<Self>) -> Pin<Box<dyn quinn::UdpPoller>> {
+            Box::pin(Writable)
+        }
+        fn try_send(&self, tx: &quinn::udp::Transmit<'_>) -> io::Result<()> {
+            if self
+                .block_once
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+            {
+                self.segments.store(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            self.sent
+                .lock()
+                .unwrap()
+                .push((tx.contents.to_vec(), tx.segment_size));
+            Ok(())
+        }
+        fn poll_recv(
+            &self,
+            _: &mut Context<'_>,
+            _: &mut [io::IoSliceMut<'_>],
+            _: &mut [quinn::udp::RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:12345".parse().unwrap())
+        }
+        fn max_transmit_segments(&self) -> usize {
+            self.segments.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_fallback_preserves_buffered_segments_and_single_datagrams() {
+        let backend = Arc::new(FallbackSocket {
+            segments: std::sync::atomic::AtomicUsize::new(64),
+            block_once: std::sync::atomic::AtomicBool::new(true),
+            sent: std::sync::Mutex::new(Vec::new()),
+        });
+        let password = b"fallback-formula";
+        let sender = Arc::new(SalamanderSocket {
+            socket: backend.clone(),
+            peer: backend.local_addr().unwrap(),
+            password: password.to_vec(),
+            sealed: std::sync::Mutex::new(Vec::new()),
+        });
+        assert_eq!(sender.max_transmit_segments(), 16);
+        let data = b"aaaabbbbcc";
+        let tx = quinn::udp::Transmit {
+            destination: sender.peer,
+            ecn: None,
+            contents: data,
+            segment_size: Some(4),
+            src_ip: None,
+        };
+        assert_eq!(
+            sender.try_send(&tx).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(backend.sent.lock().unwrap().is_empty());
+        assert_eq!(sender.max_transmit_segments(), 1);
+        let mut poller = Arc::clone(&sender).create_io_poller();
+        std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx))
+            .await
+            .unwrap();
+        // Quinn may retry an older buffered transmit after the capability
+        // changes. It must remain three separately salted datagrams.
+        sender.try_send(&tx).unwrap();
+        for (contents, segment_size) in [
+            (b"single".as_slice(), None),
+            (b"".as_slice(), None),
+            (b"".as_slice(), Some(4)),
+        ] {
+            sender
+                .try_send(&quinn::udp::Transmit {
+                    destination: sender.peer,
+                    ecn: None,
+                    contents,
+                    segment_size,
+                    src_ip: None,
+                })
+                .unwrap();
+        }
+        let sent = backend.sent.lock().unwrap();
+        assert_eq!(sent.len(), 4);
+        assert_eq!(sent[0].1, Some(12));
+        assert_eq!(sent[0].0.len(), data.len() + 3 * 8);
+        for (wire, expected) in sent[0].0.chunks(12).zip(data.chunks(4)) {
+            assert_eq!(wire.len(), expected.len() + 8);
+            let key = blake2b256(&[password.as_slice(), &wire[..8]].concat());
+            let plain: Vec<_> = wire[8..]
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ key[i % 32])
+                .collect();
+            assert_eq!(plain, expected);
+        }
+        assert_eq!(sent[1].1, None);
+        assert_eq!(sent[1].0.len(), 14);
+        let key = blake2b256(&[password.as_slice(), &sent[1].0[..8]].concat());
+        assert_eq!(
+            sent[1].0[8..]
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ key[i % 32])
+                .collect::<Vec<_>>(),
+            b"single"
+        );
+        assert_eq!(sent[2].0.len(), 8);
+        assert_eq!(sent[3].0.len(), 8);
+        drop(sent);
+        for size in [0, usize::from(u16::MAX) - 7, usize::MAX] {
+            let invalid = quinn::udp::Transmit {
+                destination: sender.peer,
+                ecn: None,
+                contents: b"x",
+                segment_size: Some(size),
+                src_ip: None,
+            };
+            assert_eq!(
+                sender.try_send(&invalid).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let invalid = quinn::udp::Transmit {
+            destination: sender.peer,
+            ecn: None,
+            contents: &[0; 17],
+            segment_size: Some(1),
+            src_ip: None,
+        };
+        assert_eq!(
+            sender.try_send(&invalid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            backend.sent.lock().unwrap().len(),
+            4,
+            "invalid descriptors must not reach the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn gso_keeps_independent_wire_datagrams_and_salts() {
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = receiver.local_addr().unwrap();
+        let password = b"synthetic-independent-formula";
+        let sender =
+            SalamanderSocket::bind(&quinn::TokioRuntime, peer, password.to_vec(), None).unwrap();
+        assert!(
+            sender.max_transmit_segments() >= 3,
+            "requires UDP GSO support"
+        );
+        let data = [vec![0x11; 1250], vec![0x22; 1250], vec![0x33; 177]].concat();
+        let sender = Arc::new(sender);
+        let mut poller = Arc::clone(&sender).create_io_poller();
+        loop {
+            std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                .await
+                .unwrap();
+            match sender.try_send(&quinn::udp::Transmit {
+                destination: peer,
+                ecn: None,
+                contents: &data,
+                segment_size: Some(1250),
+                src_ip: None,
+            }) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("GSO send failed: {e}"),
+            }
+        }
+        let mut salts = std::collections::HashSet::new();
+        for expected in data.chunks(1250) {
+            let mut buf = vec![0; 65536];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(n, expected.len() + 8);
+            assert!(
+                salts.insert(buf[..8].to_vec()),
+                "each datagram needs a fresh salt"
+            );
+            let key = blake2b256(&[password.as_slice(), &buf[..8]].concat());
+            let decoded: Vec<u8> = buf[8..n]
+                .iter()
+                .enumerate()
+                .map(|(i, b)| b ^ key[i % 32])
+                .collect();
+            assert_eq!(decoded, expected);
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                receiver.recv_from(&mut [0; 2048])
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            sender
+                .try_send(&quinn::udp::Transmit {
+                    destination: peer,
+                    ecn: None,
+                    contents: b"x",
+                    segment_size: Some(0),
+                    src_ip: None
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 }
 

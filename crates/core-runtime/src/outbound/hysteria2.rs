@@ -259,10 +259,9 @@ impl Hysteria2 {
     async fn dial(&self) -> io::Result<Arc<Hy2Shared>> {
         let port = self.pick_port();
         let addr = resolve_host(&self.server, port).await?;
-        let (mut ep_config, transport) = self.quic.build_hy2_configs(self.congestion());
+        let (mut ep_config, mut transport) = self.quic.build_hy2_configs(self.congestion());
         let quic_tls = self.tls.quic_config(&[b"h3"])?.with_hy2_chrome()?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
-        client_config.transport_config(Arc::new(transport));
         quic_go_client_shape(&mut ep_config, &mut client_config);
         let runtime = quinn::default_runtime()
             .ok_or_else(|| io::Error::other("hysteria2: no quinn runtime"))?;
@@ -284,6 +283,12 @@ impl Hysteria2 {
         } else {
             None
         };
+        // Only direct Salamander opts into payload-only GSO. Plain HY2,
+        // port hopping, Gecko and all other QUIC callers keep their profile.
+        if direct_obfs.is_some() {
+            transport.gso_payload_only(true);
+        }
+        client_config.transport_config(Arc::new(transport));
         let need_relay = hopping || (self.obfs_password.is_some() && direct_obfs.is_none());
         let mut endpoint = if let Some(socket) = direct_obfs {
             quinn::Endpoint::new_with_abstract_socket(ep_config, None, Arc::new(socket), runtime)?
