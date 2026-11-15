@@ -372,6 +372,7 @@ mod tests {
                 local_max_error_reset_streams: None,
                 data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
                 recv_min_refresh: None,
+                pseudo_order: crate::frame::PseudoOrder::default(),
             },
         )
     }

@@ -60,6 +60,8 @@ struct Encoder<B> {
     /// xrust: what is buffered is WINDOW_UPDATE frames only: Go writes the
     /// connection's and the stream's update together before it flushes
     only_window_updates: bool,
+    /// Do not append anything past an opt-in consumed-credit flush boundary.
+    exact_credit_boundary: bool,
 }
 
 #[derive(Debug)]
@@ -110,6 +112,7 @@ where
                 min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
                 frame_per_write: false,
                 only_window_updates: false,
+                exact_credit_boundary: false,
             },
         }
     }
@@ -142,6 +145,23 @@ where
     /// over TLS each of its frames is a record of its own.
     pub(crate) fn set_frame_per_write(&mut self, on: bool) {
         self.encoder.frame_per_write = on;
+    }
+
+    pub(crate) fn finish_credit_pair(&mut self) {
+        self.encoder.exact_credit_boundary = true;
+    }
+
+    pub(crate) fn prepare_credit_pair(&mut self) -> bool {
+        if self.encoder.exact_credit_boundary {
+            return false;
+        }
+        // Start on an empty codec so two 13-byte updates cannot straddle the
+        // capacity boundary or share an older control frame's flush.
+        if !self.encoder.buf.get_ref().is_empty() || self.encoder.next.is_some() {
+            self.encoder.exact_credit_boundary = true;
+            return false;
+        }
+        self.encoder.has_capacity()
     }
 
     /// xrust: buffer bytes that are not a frame -- the client connection
@@ -196,6 +216,7 @@ where
         tracing::trace!("flushing buffer");
         // Flush the upstream
         ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+        self.encoder.exact_credit_boundary = false;
 
         Poll::Ready(Ok(()))
     }
@@ -335,6 +356,9 @@ where
     }
 
     fn has_capacity(&self) -> bool {
+        if self.exact_credit_boundary {
+            return false;
+        }
         if self.frame_per_write && !self.buf.get_ref().is_empty() && !self.only_window_updates {
             return false;
         }

@@ -35,6 +35,8 @@ use std::time::Duration;
 pub(super) enum BufferStatus {
     Complete,
     CodecFull,
+    /// Flush a consumed-credit pair before accepting the next one.
+    Flush,
 }
 
 #[derive(Debug)]

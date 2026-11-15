@@ -6,6 +6,7 @@ use crate::proto;
 use http::{HeaderMap, Request, Response};
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::io;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
@@ -42,6 +43,12 @@ pub(super) struct Recv {
     /// Streams that have pending window updates
     pending_window_updates: store::Queue<stream::NextWindowUpdate>,
 
+    /// Opt-in consumed-credit snapshots. Unlike pending_window_updates, these
+    /// retain each Read's increments even when the connection runs later.
+    exact_credits: VecDeque<ExactCredit>,
+    exact_yield_to_send: bool,
+    exact_flushing: Option<store::Key>,
+
     /// New streams to be accepted
     pending_accept: store::Queue<stream::NextAccept>,
 
@@ -70,6 +77,17 @@ pub(super) enum Event {
     Data(DataEvent),
     Trailers(HeaderMap),
     InformationalHeaders(peer::PollMessage),
+}
+
+// Connection-wide, lazy allocation: at most 64 pairs, not a queue per stream.
+// A producer retains its one unqueued consumed quantum when this is full.
+const MAX_EXACT_CREDITS: usize = 64;
+
+#[derive(Debug)]
+struct ExactCredit {
+    key: store::Key,
+    connection: WindowSize,
+    stream: WindowSize,
 }
 
 #[derive(Debug)]
@@ -110,6 +128,9 @@ impl Recv {
             in_flight_data: 0 as WindowSize,
             next_stream_id: Ok(next_stream_id.into()),
             pending_window_updates: store::Queue::new(),
+            exact_credits: VecDeque::new(),
+            exact_yield_to_send: false,
+            exact_flushing: None,
             last_processed_id: StreamId::ZERO,
             max_stream_id: StreamId::MAX,
             pending_accept: store::Queue::new(),
@@ -125,6 +146,49 @@ impl Recv {
     /// xrust: see `FlowControl::set_min_refresh`
     pub fn min_refresh(&self) -> Option<WindowSize> {
         self.min_refresh
+    }
+
+    pub fn has_exact_credits(&self) -> bool {
+        !self.exact_credits.is_empty()
+    }
+
+    pub fn poll_exact_credit_flushed(
+        &mut self,
+        cx: &Context<'_>,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) -> Poll<()> {
+        if stream.pending_exact_credits == 0 {
+            return Poll::Ready(());
+        }
+        stream.exact_flush_waiting = true;
+        stream.recv_task = Some(cx.waker().clone());
+        if let Some(task) = task.take() {
+            task.wake();
+        }
+        Poll::Pending
+    }
+
+    /// Called only after the codec (including underlying poll_flush) is ready.
+    pub fn finish_exact_credit_flush(&mut self, store: &mut Store, counts: &mut Counts) {
+        if let Some(key) = self.exact_flushing.take() {
+            Self::release_exact_credit(key, store, counts);
+        }
+    }
+
+    fn release_exact_credit(key: store::Key, store: &mut Store, counts: &mut Counts) {
+        if let Some(stream) = store.try_resolve(key) {
+            counts.transition(stream, |_, stream| {
+                stream.pending_exact_credits = stream
+                    .pending_exact_credits
+                    .checked_sub(1)
+                    .expect("exact credit token released once");
+                if stream.pending_exact_credits == 0 && stream.exact_flush_waiting {
+                    stream.exact_flush_waiting = false;
+                    stream.notify_recv();
+                }
+            });
+        }
     }
 
     /// Returns the initial receive window size
@@ -506,6 +570,87 @@ impl Recv {
         }
 
         Ok(())
+    }
+
+    /// Buffered DATA may be consumed after terminal connection EOF. Preserve
+    /// local accounting without retaining a token or stream-update queue entry
+    /// that an exited driver can never flush. Ordinary release stays unchanged.
+    pub fn release_capacity_after_eof(
+        &mut self,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+    ) -> Result<(), UserError> {
+        if capacity > stream.in_flight_recv_data {
+            return Err(UserError::ReleaseCapacityTooBig);
+        }
+        self.in_flight_data -= capacity;
+        stream.in_flight_recv_data -= capacity;
+        self.flow
+            .assign_capacity(capacity)
+            .expect("valid terminal connection credit");
+        stream
+            .recv_flow
+            .assign_capacity(capacity)
+            .expect("valid terminal stream credit");
+        Ok(())
+    }
+
+    /// Release bytes actually consumed by a caller, freezing Go-style credit
+    /// increments now instead of coalescing them at the next connection poll.
+    /// Pending means that NO credit/counter has changed; the caller must retain
+    /// the same consumed debt until woken. Ordinary release_capacity is unchanged.
+    pub fn poll_release_capacity_exact(
+        &mut self,
+        cx: &Context<'_>,
+        capacity: WindowSize,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) -> Poll<Result<(), UserError>> {
+        if capacity > stream.in_flight_recv_data {
+            return Poll::Ready(Err(UserError::ReleaseCapacityTooBig));
+        }
+        if self.exact_credits.len() == MAX_EXACT_CREDITS {
+            stream.exact_credit_waiting = true;
+            stream.recv_task = Some(cx.waker().clone());
+            self.pending_window_updates.push(stream);
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+            return Poll::Pending;
+        }
+
+        self.in_flight_data -= capacity;
+        stream.in_flight_recv_data -= capacity;
+        self.flow
+            .assign_capacity(capacity)
+            .expect("valid returned connection credit");
+        stream
+            .recv_flow
+            .assign_capacity(capacity)
+            .expect("valid returned stream credit");
+        let connection = self.flow.unclaimed_capacity().unwrap_or(0);
+        let stream_credit = stream.recv_flow.unclaimed_capacity().unwrap_or(0);
+        // Claim queued credit immediately, just as buffering a WINDOW_UPDATE
+        // claims it. Deferred/closed-stream release cannot return it twice.
+        self.flow
+            .inc_window(connection)
+            .expect("valid queued connection credit");
+        stream
+            .recv_flow
+            .inc_window(stream_credit)
+            .expect("valid queued stream credit");
+        if connection != 0 || stream_credit != 0 {
+            stream.pending_exact_credits += 1;
+            self.exact_credits.push_back(ExactCredit {
+                key: stream.key(),
+                connection,
+                stream: stream_credit,
+            });
+            if let Some(task) = task.take() {
+                task.wake();
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 
     /// Release any unclaimed capacity for a closed stream.
@@ -1104,6 +1249,12 @@ impl Recv {
         store: &mut Store,
         counts: &mut Counts,
     ) {
+        if let Some(key) = self.exact_flushing.take() {
+            Self::release_exact_credit(key, store, counts);
+        }
+        while let Some(credit) = self.exact_credits.pop_front() {
+            Self::release_exact_credit(credit.key, store, counts);
+        }
         self.clear_stream_window_update_queue(store, counts);
         self.clear_all_reset_streams(store, counts);
 
@@ -1116,6 +1267,10 @@ impl Recv {
         while let Some(stream) = self.pending_window_updates.pop(store) {
             counts.transition(stream, |_, stream| {
                 tracing::trace!("clear_stream_window_update_queue; stream={:?}", stream.id);
+                if stream.exact_credit_waiting {
+                    stream.exact_credit_waiting = false;
+                    stream.notify_recv();
+                }
             })
         }
     }
@@ -1143,6 +1298,13 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        // A normal send/receive progress turn follows each pair. A continuously
+        // refilled credit queue must not starve upload DATA or other streams.
+        if self.exact_yield_to_send {
+            self.exact_yield_to_send = false;
+        } else if !self.exact_credits.is_empty() {
+            return self.buffer_exact_credit(store, dst);
+        }
         // Send any pending connection level window updates
         if self.send_connection_window_update(dst)? == BufferStatus::CodecFull {
             return Ok(BufferStatus::CodecFull);
@@ -1154,6 +1316,50 @@ impl Recv {
         }
 
         Ok(BufferStatus::Complete)
+    }
+
+    fn buffer_exact_credit<T, B>(
+        &mut self,
+        store: &mut Store,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> io::Result<BufferStatus>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        if !dst.prepare_credit_pair() {
+            return Ok(BufferStatus::CodecFull);
+        }
+        let credit = self
+            .exact_credits
+            .front_mut()
+            .expect("nonempty credit queue");
+        if credit.connection != 0 {
+            if !dst.has_send_capacity() {
+                return Ok(BufferStatus::CodecFull);
+            }
+            dst.buffer(frame::WindowUpdate::new(StreamId::zero(), credit.connection).into())
+                .expect("valid queued connection update");
+            credit.connection = 0;
+        }
+        if credit.stream != 0 {
+            let receiving = store
+                .try_resolve(credit.key)
+                .map_or(false, |stream| stream.is_recv && !stream.state.is_reset());
+            if receiving {
+                if !dst.has_send_capacity() {
+                    return Ok(BufferStatus::CodecFull);
+                }
+                dst.buffer(frame::WindowUpdate::new(credit.key.stream_id(), credit.stream).into())
+                    .expect("valid queued stream update");
+            }
+            credit.stream = 0;
+        }
+        self.exact_flushing = Some(credit.key);
+        self.exact_credits.pop_front();
+        self.exact_yield_to_send = true;
+        dst.finish_credit_pair();
+        Ok(BufferStatus::Flush)
     }
 
     /// Send connection level window update
@@ -1212,6 +1418,11 @@ impl Recv {
             counts.transition(stream, |_, stream| {
                 tracing::trace!("pending_window_updates -- pop; stream={:?}", stream.id);
                 debug_assert!(!stream.is_pending_window_update);
+
+                if stream.exact_credit_waiting {
+                    stream.exact_credit_waiting = false;
+                    stream.notify_recv();
+                }
 
                 if !stream.state.is_recv_streaming() {
                     // No need to send window updates on the stream if the stream is
@@ -1308,6 +1519,10 @@ impl Recv {
 }
 
 #[cfg(test)]
+#[path = "exact_credit_tests.rs"]
+mod exact_credit_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1330,6 +1545,7 @@ mod tests {
             local_max_error_reset_streams: None,
             data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
             recv_min_refresh: None,
+            pseudo_order: crate::frame::PseudoOrder::default(),
         };
         let mut recv = Recv::new(peer::Dyn::Server, &config);
         let mut store = Store::new();

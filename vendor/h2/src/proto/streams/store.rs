@@ -79,6 +79,19 @@ pub(super) trait Resolve {
 // ===== impl Store =====
 
 impl Store {
+    /// Resolve a retained slot even after its protocol-active ID was unlinked.
+    /// Key's stream ID guards a recycled slab slot (ABA) without a panic.
+    pub fn try_resolve(&mut self, key: Key) -> Option<Ptr<'_>> {
+        if self
+            .slab
+            .get(key.index.0 as usize)
+            .map_or(false, |stream| stream.id == key.stream_id)
+        {
+            Some(Ptr { key, store: self })
+        } else {
+            None
+        }
+    }
     pub fn new() -> Self {
         Store {
             slab: slab::Slab::new(),
@@ -387,6 +400,12 @@ impl<N> fmt::Debug for Queue<N> {
 }
 
 // ===== impl Ptr =====
+
+impl Key {
+    pub fn stream_id(self) -> StreamId {
+        self.stream_id
+    }
+}
 
 impl<'a> Ptr<'a> {
     /// Returns the Key associated with the stream

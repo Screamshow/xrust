@@ -16,8 +16,8 @@ use futures_sink::Sink;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_util::codec::FramedRead as InnerFramedRead;
 use tokio_util::codec::length_delimited;
+use tokio_util::codec::FramedRead as InnerFramedRead;
 
 use std::io;
 
@@ -147,6 +147,14 @@ where
     /// xrust: see `FramedWrite::set_frame_per_write`.
     pub(crate) fn set_frame_per_write(&mut self, on: bool) {
         self.framed_write().set_frame_per_write(on)
+    }
+
+    pub(crate) fn finish_credit_pair(&mut self) {
+        self.framed_write().finish_credit_pair();
+    }
+
+    pub(crate) fn prepare_credit_pair(&mut self) -> bool {
+        self.framed_write().prepare_credit_pair()
     }
 
     /// xrust: see `FramedWrite::buffer_raw`.

@@ -537,6 +537,34 @@ impl FlowControl {
             .release_capacity(sz as proto::WindowSize)
             .map_err(Into::into)
     }
+
+    /// Return actually consumed bytes as a bounded, non-coalescing update pair.
+    ///
+    /// Connection and stream increments are fixed when this returns Ready,
+    /// ordered connection-first and flushed as one pair by the connection task.
+    /// Pending changes no credit; retain `sz` and retry after being woken. This
+    /// opt-in API is for Go-style body-read credit; ordinary release_capacity
+    /// and builder settings are unaffected. A dropped/reset stream omits its
+    /// queued stream credit; the corresponding connection credit is retained.
+    pub fn poll_release_capacity_exact(
+        &mut self,
+        cx: &mut Context<'_>,
+        sz: usize,
+    ) -> Poll<Result<(), crate::Error>> {
+        if sz > proto::MAX_WINDOW_SIZE as usize {
+            return Poll::Ready(Err(UserError::ReleaseCapacityTooBig.into()));
+        }
+        self.inner
+            .poll_release_capacity_exact(cx, sz as proto::WindowSize)
+            .map_err(Into::into)
+    }
+
+    /// Wait until this stream's already queued exact credit is flushed. This
+    /// fences graceful body EOF without requiring a pump task or a per-read
+    /// delivery acknowledgement. Keep the RecvStream alive while waiting.
+    pub fn poll_exact_credit_flushed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.inner.poll_exact_credit_flushed(cx)
+    }
 }
 
 // ===== impl PingPong =====

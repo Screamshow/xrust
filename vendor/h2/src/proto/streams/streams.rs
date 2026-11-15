@@ -97,6 +97,10 @@ struct Actions {
 
     /// If the connection errors, a copy is kept for any StreamRefs.
     conn_error: Option<proto::Error>,
+
+    /// The connection driver has reached terminal EOF/teardown. Unlike
+    /// conn_error (also used for graceful GOAWAY), no wire credit can flush.
+    recv_closed: bool,
 }
 
 /// Contains the buffer of frames to be written to the wire.
@@ -175,6 +179,7 @@ where
             match status {
                 BufferStatus::Complete => return Poll::Ready(Ok(())),
                 BufferStatus::CodecFull => ready!(dst.poll_ready(cx))?,
+                BufferStatus::Flush => unreachable!("refusal does not queue credit pairs"),
             }
         }
     }
@@ -195,19 +200,24 @@ where
     where
         T: AsyncWrite + Unpin,
     {
+        let mut exact_pairs = 0;
         loop {
             // Make any required socket progress before taking stream locks.
             ready!(dst.poll_ready(cx))?;
 
             let status = {
                 let mut me = self.inner.lock().unwrap();
+                let me = &mut *me;
+                me.actions
+                    .recv
+                    .finish_exact_credit_flush(&mut me.store, &mut me.counts);
                 let status = me.buffer_pending(&self.send_buffer, dst)?;
 
                 // Register the task while holding the same lock used to
                 // observe that all pending frames have been buffered. A
                 // producer that queues another frame while the codec is being
                 // flushed will then take and wake this task.
-                if status == BufferStatus::Complete {
+                if status != BufferStatus::CodecFull {
                     me.actions.task = Some(cx.waker().clone());
                 }
 
@@ -215,7 +225,7 @@ where
             };
 
             match status {
-                BufferStatus::Complete => {}
+                BufferStatus::Complete | BufferStatus::Flush => {}
                 BufferStatus::CodecFull => continue,
             }
 
@@ -223,10 +233,32 @@ where
             // stream-state or send-buffer mutexes.
             ready!(dst.flush(cx))?;
 
-            let reclaimed = {
+            let (reclaimed, exact_pending) = {
                 let mut me = self.inner.lock().unwrap();
-                me.reclaim_written_frame(&self.send_buffer, dst)
+                let me = &mut *me;
+                me.actions
+                    .recv
+                    .finish_exact_credit_flush(&mut me.store, &mut me.counts);
+                (
+                    me.reclaim_written_frame(&self.send_buffer, dst),
+                    me.actions.recv.has_exact_credits(),
+                )
             };
+
+            if status == BufferStatus::Flush {
+                exact_pairs += 1;
+                // Individual flush boundaries do not require a task wake per
+                // read. Senders get the normal turn between pairs; input and
+                // the executor get a turn after at most eight pairs (64 KiB).
+                if exact_pairs == 8 {
+                    cx.waker().wake_by_ref();
+                    return Poll::Ready(Ok(()));
+                }
+            }
+
+            if exact_pending {
+                continue;
+            }
 
             if !reclaimed {
                 return Poll::Ready(Ok(()));
@@ -469,6 +501,7 @@ impl Inner {
                 send: Send::new(&config),
                 task: None,
                 conn_error: None,
+                recv_closed: false,
             },
             store: Store::new(),
             refs: 1,
@@ -940,6 +973,7 @@ impl Inner {
         clear_pending_accept: bool,
     ) -> Result<(), ()> {
         let actions = &mut self.actions;
+        actions.recv_closed = true;
         let counts = &mut self.counts;
         let mut send_buffer = send_buffer.inner.lock().unwrap();
         let send_buffer = &mut *send_buffer;
@@ -986,13 +1020,12 @@ impl Inner {
         //
         // TODO: It would probably be better to interleave updates w/ data
         // frames.
-        if self
+        let status = self
             .actions
             .recv
-            .buffer_pending(&mut self.store, &mut self.counts, dst)?
-            == BufferStatus::CodecFull
-        {
-            return Ok(BufferStatus::CodecFull);
+            .buffer_pending(&mut self.store, &mut self.counts, dst)?;
+        if status != BufferStatus::Complete {
+            return Ok(status);
         }
 
         // Send any other pending frames
@@ -1578,6 +1611,38 @@ impl OpaqueStreamRef {
         me.actions
             .recv
             .release_capacity(capacity, &mut stream, &mut me.actions.task)
+    }
+
+    pub fn poll_release_capacity_exact(
+        &mut self,
+        cx: &Context<'_>,
+        capacity: WindowSize,
+    ) -> Poll<Result<(), UserError>> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        let mut stream = me.store.resolve(self.key);
+        if me.actions.recv_closed {
+            return Poll::Ready(
+                me.actions
+                    .recv
+                    .release_capacity_after_eof(capacity, &mut stream),
+            );
+        }
+        me.actions
+            .recv
+            .poll_release_capacity_exact(cx, capacity, &mut stream, &mut me.actions.task)
+    }
+
+    pub fn poll_exact_credit_flushed(&mut self, cx: &Context<'_>) -> Poll<()> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        if me.actions.recv_closed {
+            return Poll::Ready(());
+        }
+        let mut stream = me.store.resolve(self.key);
+        me.actions
+            .recv
+            .poll_exact_credit_flushed(cx, &mut stream, &mut me.actions.task)
     }
 
     /// Clear the receive queue and set the status to no longer receive data frames.

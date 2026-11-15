@@ -106,6 +106,12 @@ pub(super) struct Stream {
     /// Task tracking receiving frames
     pub recv_task: Option<Waker>,
 
+    /// A consumed-credit producer is waiting for bounded control-queue space.
+    pub exact_credit_waiting: bool,
+    pub exact_flush_waiting: bool,
+    /// Queue/codec tokens retain the slab entry, never an Arc/stream ref.
+    pub pending_exact_credits: usize,
+
     /// Task tracking pushed promises.
     pub push_task: Option<Waker>,
 
@@ -191,6 +197,9 @@ impl Stream {
             pending_recv: buffer::Deque::new(),
             is_recv: true,
             recv_task: None,
+            exact_credit_waiting: false,
+            exact_flush_waiting: false,
+            pending_exact_credits: 0,
             push_task: None,
             pending_push_promises: store::Queue::new(),
             content_length: ContentLength::Omitted,
@@ -256,6 +265,7 @@ impl Stream {
         self.is_closed() &&
             // There are no more outstanding references to the stream
             self.ref_count == 0 &&
+            self.pending_exact_credits == 0 &&
             // The stream is not in any queue
             !self.is_pending_send && !self.is_pending_send_capacity &&
             !self.is_pending_accept && !self.is_pending_window_update &&
