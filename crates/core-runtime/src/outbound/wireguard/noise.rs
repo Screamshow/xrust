@@ -1302,3 +1302,100 @@ mod tests {
         assert_eq!(&opened_by_init[..reply_msg.len()], reply_msg);
     }
 }
+
+#[cfg(test)]
+mod mtu_padding_wire_tests {
+    use super::super::awg;
+    use super::*;
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
+    use chacha20poly1305::aead::AeadInPlace;
+
+    #[test]
+    fn mtu_wire_boundaries_reference_aead_and_tamper() {
+        let key = [0x5a; 32];
+        let reference = ChaCha20Poly1305::new(Key::from_slice(&key));
+        for (prefix, protected, word) in [
+            (0, false, 4u32),
+            (16, false, 0x12345678),
+            (16, true, 0x12345678),
+        ] {
+            for (len, expected_padding) in [
+                (0, 0),
+                (15, 1),
+                (16, 0),
+                (17, 15),
+                (1376, 0),
+                (1380, 0),
+                (1381, 15),
+                (1392, 4),
+                (2760, 0),
+                (2761, 15),
+            ] {
+                let mut sender = Session {
+                    local_index: 7,
+                    remote_index: 9,
+                    send_cipher: ChaChaPoly::new(&key),
+                    recv_cipher: ChaChaPoly::new(&[0x33; 32]),
+                    send_counter: 0,
+                    recv_max: 0,
+                    recv_any: false,
+                    recv_bitmap: [0; 32],
+                    awg_transport: (word, word),
+                };
+                let payload: Vec<u8> = (0..len).map(|n| (n % 251) as u8).collect();
+                let pad = if prefix == 0 {
+                    awg::normal_transport_padding(len, 1380)
+                } else {
+                    let params = awg::AwgParams::from_obj(
+                        serde_json::json!({"s4":16}).as_object().unwrap(),
+                        "test",
+                    )
+                    .unwrap()
+                    .unwrap();
+                    awg::transport_padding(&params, 5000, len, prefix, 1380)
+                };
+                assert_eq!(pad, expected_padding);
+                let mut wire = Vec::new();
+                assert!(sender.seal_into(&payload, len + pad, prefix, &mut wire));
+                assert_eq!(wire.len(), prefix + 32 + len + expected_padding);
+                wire[..prefix].fill(0xa5);
+                if protected {
+                    let (nonce, body) = wire.split_at_mut(prefix);
+                    assert!(awg::mask_header(&[0x77; 32], nonce, &mut body[..16]));
+                    // Independent reference primitive unmasks the protected header.
+                    chacha20::ChaCha20::new((&[0x77; 32]).into(), (&[0xa5; 12]).into())
+                        .apply_keystream(&mut body[..16]);
+                }
+                assert!(wire[..prefix].iter().all(|b| *b == 0xa5));
+                assert_eq!(&wire[prefix..prefix + 4], &word.to_le_bytes());
+                assert_eq!(&wire[prefix + 4..prefix + 8], &9u32.to_le_bytes());
+                assert_eq!(&wire[prefix + 8..prefix + 16], &0u64.to_le_bytes());
+                let encrypted = &wire[prefix + 16..];
+                let decode = |bytes: &[u8]| {
+                    let (ciphertext, tag) = bytes.split_at(bytes.len() - 16);
+                    let mut plaintext = ciphertext.to_vec();
+                    reference
+                        .decrypt_in_place_detached(
+                            Nonce::from_slice(&[0; 12]),
+                            b"",
+                            &mut plaintext,
+                            tag.into(),
+                        )
+                        .map(|()| plaintext)
+                };
+                let decoded = decode(encrypted).expect("independent RustCrypto AEAD");
+                assert_eq!(&decoded[..len], &payload);
+                assert!(decoded[len..].iter().all(|b| *b == 0));
+                assert_eq!(decoded.len(), len + expected_padding);
+                let mut bad_tag = encrypted.to_vec();
+                *bad_tag.last_mut().unwrap() ^= 1;
+                assert!(decode(&bad_tag).is_err());
+                if len > 0 {
+                    let mut bad_content = encrypted.to_vec();
+                    bad_content[0] ^= 1;
+                    assert!(decode(&bad_content).is_err());
+                }
+            }
+        }
+    }
+}

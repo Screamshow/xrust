@@ -553,11 +553,34 @@ pub fn trailer_len(udp_window: u32, datagram_size: usize) -> usize {
     (u64::from_le_bytes(buf) % (window - datagram_size) as u64) as usize
 }
 
+/// Ordinary WireGuard padding, bounded by the last MTU-sized unit.
+/// Matches amneziawg-go b5928efb device/send.go calculatePaddingSize.
+/// Oversized packets keep all their bytes: only the added padding is bounded.
+pub fn normal_transport_padding(pkt_len: usize, mtu: usize) -> usize {
+    let last_unit = if mtu != 0 && pkt_len > mtu {
+        pkt_len % mtu
+    } else {
+        pkt_len
+    };
+    let padding = (16 - last_unit % 16) % 16;
+    if mtu == 0 {
+        padding
+    } else {
+        padding.min(mtu - last_unit)
+    }
+}
+
 /// Transport plaintext padding for one data packet (`randomPaddingAddition`
 /// and friends): the AWG 3.x content-padding addition, else a random trailer
-/// when trailers are on, else the WireGuard multiple-of-16 pad. Clamped by
+/// when trailers are on, else MTU-aware WireGuard padding. Additions are clamped by
 /// the peer's UDP window exactly like the reference.
-pub fn transport_padding(a: &AwgParams, udp_window: u32, pkt_len: usize, s4: usize) -> usize {
+pub fn transport_padding(
+    a: &AwgParams,
+    udp_window: u32,
+    pkt_len: usize,
+    s4: usize,
+    mtu: usize,
+) -> usize {
     // Include both the transport header and the AEAD authentication tag.
     let datagram_size = s4 + 32 + pkt_len;
     let addition = match a.content_padding {
@@ -570,7 +593,7 @@ pub fn transport_padding(a: &AwgParams, udp_window: u32, pkt_len: usize, s4: usi
             let space = (udp_window as usize).saturating_sub(datagram_size);
             n.min(space)
         }
-        None => (16 - pkt_len % 16) % 16,
+        None => normal_transport_padding(pkt_len, mtu),
     }
 }
 
@@ -731,7 +754,7 @@ mod tests {
             .unwrap()
             .unwrap();
         for window in [0, 400, 448, 500, 548, 600] {
-            let padding = transport_padding(&a, window, 400, 16);
+            let padding = transport_padding(&a, window, 400, 16, 0);
             assert_eq!(padding, 100usize.min((window as usize).saturating_sub(448)));
         }
         let legacy = AwgParams::from_obj(&obj(&[("jc", json!(1))]), "test")
@@ -739,7 +762,7 @@ mod tests {
             .unwrap();
         for size in [0, 1, 15, 16, 400, 1408] {
             assert_eq!(
-                transport_padding(&legacy, 500, size, 16),
+                transport_padding(&legacy, 500, size, 16, 0),
                 (16 - size % 16) % 16
             );
         }
@@ -994,25 +1017,25 @@ mod tests {
             disable_cookies: false,
         });
         // plain: multiple-of-16 pad
-        assert_eq!(transport_padding(&plain, 500, 40, 0), 8);
-        assert_eq!(transport_padding(&plain, 500, 32, 0), 0);
+        assert_eq!(transport_padding(&plain, 500, 40, 0, 0), 8);
+        assert_eq!(transport_padding(&plain, 500, 32, 0, 0), 0);
 
         // content padding: picked inside the range, clamped by the window
         let o = obj(&[("content_padding_addition", json!("10-100"))]);
         let a = AwgParams::from_obj(&o, "x").expect("awg").expect("set");
         for _ in 0..50 {
-            let n = transport_padding(&a, 500, 40, 12);
+            let n = transport_padding(&a, 500, 40, 12, 0);
             assert!((10..=100).contains(&n));
         }
         // Header, tag and prefix total 12+32+40=84: no room below 80.
-        let n = transport_padding(&a, 80, 40, 12);
+        let n = transport_padding(&a, 80, 40, 12, 0);
         assert_eq!(n, 0);
 
         // trailers without content padding: random below the window budget
         let o = obj(&[("random_trailers", json!(true))]);
         let a = AwgParams::from_obj(&o, "x").expect("awg").expect("set");
         for _ in 0..50 {
-            let n = transport_padding(&a, 500, 40, 0);
+            let n = transport_padding(&a, 500, 40, 0, 0);
             assert!(n < 500 - 72);
         }
     }
@@ -1076,5 +1099,68 @@ mod tests {
             assert!((10..=20).contains(&v));
         }
         assert_eq!(pick_secs(None, 120).as_secs(), 120);
+    }
+}
+
+#[cfg(test)]
+mod mtu_padding_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn official_mtu_boundary_vectors() {
+        // Literal expected lengths, including the reference's oversized modulo rule.
+        for (mtu, len, expected) in [
+            (1380, 0, 0),
+            (1380, 15, 1),
+            (1380, 16, 0),
+            (1380, 17, 15),
+            (1380, 1375, 1),
+            (1380, 1376, 0),
+            (1380, 1377, 3),
+            (1380, 1379, 1),
+            (1380, 1380, 0),
+            (1380, 1381, 15),
+            (1380, 1392, 4),
+            (1380, 2759, 1),
+            (1380, 2760, 0),
+            (1380, 2761, 15),
+            (1500, 1499, 1),
+            (1500, 1500, 0),
+            (1500, 1501, 15),
+            (1280, 1280, 0),
+            (1280, 1281, 15),
+            (0, 1380, 12),
+            (0, 0, 0),
+            (1, 17, 0),
+        ] {
+            assert_eq!(
+                normal_transport_padding(len, mtu),
+                expected,
+                "len={len} mtu={mtu}"
+            );
+        }
+        // The arithmetic itself does not overflow even at usize's upper bound.
+        assert_eq!(normal_transport_padding(usize::MAX, 0), 1);
+        assert_eq!(normal_transport_padding(usize::MAX, usize::MAX), 0);
+    }
+
+    #[test]
+    fn awg_fallback_uses_inner_mtu_optional_policies_keep_window_rules() {
+        let params = |value: serde_json::Value| {
+            AwgParams::from_obj(value.as_object().unwrap(), "test")
+                .unwrap()
+                .unwrap()
+        };
+        let plain = params(json!({"s4":16}));
+        assert_eq!(transport_padding(&plain, 5000, 1380, 16, 1380), 0);
+        assert_eq!(transport_padding(&plain, 5000, 1381, 16, 1380), 15);
+        // MTU must never replace optional content-padding/window policy.
+        let content = params(json!({"s4":16,"content_padding_addition":7}));
+        assert_eq!(transport_padding(&content, 2000, 1380, 16, 1380), 7);
+        assert_eq!(transport_padding(&content, 1431, 1380, 16, 1), 3);
+        let trailers = params(json!({"s4":16,"random_trailers":true}));
+        // Exactly one byte of window room makes the random trailer deterministically zero.
+        assert_eq!(transport_padding(&trailers, 1429, 1380, 16, 1), 0);
     }
 }

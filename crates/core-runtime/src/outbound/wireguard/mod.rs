@@ -1055,8 +1055,8 @@ impl Stack {
             peer.udp_window = peer.udp_window.max((s4 + 32 + pkt.len()) as u32);
         }
         let pad_len = params.map_or_else(
-            || (16 - pkt.len() % 16) % 16,
-            |a| awg::transport_padding(a, peer.udp_window, pkt.len(), s4),
+            || awg::normal_transport_padding(pkt.len(), self.cfg.mtu),
+            |a| awg::transport_padding(a, peer.udp_window, pkt.len(), s4, self.cfg.mtu),
         );
         let mut out = self.wire_buffers.pop().unwrap_or_default();
         if !session.seal_into(pkt, pkt.len() + pad_len, s4, &mut out) {
