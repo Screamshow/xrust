@@ -184,6 +184,9 @@ impl AsyncRead for GrpcStream {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if out.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         let this = &mut *self;
         loop {
             if this.data_left > 0 {
@@ -385,6 +388,49 @@ fn parse_hunk_head(raw: &[u8]) -> io::Result<Option<(usize, usize, usize)>> {
 
 #[cfg(test)]
 mod tests {
+    async fn response_tunnel(
+        payload: Vec<u8>,
+        end: bool,
+    ) -> (AnyStream, tokio::task::JoinHandle<()>) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::Builder::new()
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .unwrap();
+            let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let response = http::Response::builder().status(200).body(()).unwrap();
+            let mut send = respond.send_response(response, false).unwrap();
+            send.send_data(Bytes::from(payload), end).unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let tunnel = connect(Box::new(client_io), "bench", "example.com")
+            .await
+            .unwrap();
+        (tunnel, server)
+    }
+
+    #[tokio::test]
+    async fn available_hunk_does_not_wait_for_another_message() {
+        use tokio::io::AsyncReadExt;
+        let (mut tunnel, server) = response_tunnel(GrpcStream::encode_frame(b"hello"), false).await;
+        let mut out = [0; 128];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), tunnel.read(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[..n], b"hello");
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), tunnel.read(&mut []))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        drop(tunnel);
+        server.abort();
+    }
+
     #[test]
     fn pooled_encoding_preserves_every_grpc_and_protobuf_byte() {
         for len in [
