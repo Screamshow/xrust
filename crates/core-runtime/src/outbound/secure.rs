@@ -153,11 +153,10 @@ impl Vless {
     /// A datagram relay: the request head names the destination (or the
     /// packetaddr magic name) and the framing takes over from there.
     pub async fn connect_udp(&self, target: &Target) -> io::Result<tokio::net::UdpSocket> {
-        let (local, peer) = crate::outbound::quic::udp_loopback_pair().await?;
         let mode = self.packet_encoding;
-        let stream = self
-            .dial(mode.command(), &mode.request_target(target))
-            .await?;
+        let request_target = mode.request_target(target)?;
+        let (local, peer) = crate::outbound::quic::udp_loopback_pair().await?;
+        let stream = self.dial(mode.command(), &request_target).await?;
         spawn_packet_bridge(stream, peer, mode, target.clone());
         Ok(local)
     }
