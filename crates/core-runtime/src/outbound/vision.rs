@@ -437,25 +437,28 @@ impl VisionStream {
     /// `VisionConn.unPadding` over `raw`, moving payload into `self.payload`.
     fn unpad(&mut self) {
         let mut index = 0usize;
-        if self.remaining_content == -1
-            && self.remaining_padding == -1
-            && self.raw.len() >= 21
-            && self.raw[..16] == self.uuid
-        {
-            index = 16;
-            self.remaining_content = 0;
-            self.remaining_padding = 0;
-            self.current_command = 0;
-        }
         if self.remaining_content == -1 && self.remaining_padding == -1 {
-            // a peer that does not frame at all: the reference decides that from
-            // the first bytes, so a short read must wait rather than guess
-            if index == 0 && self.raw.len() < 21 && !self.eof {
+            if self.raw.starts_with(&self.uuid) {
+                if self.raw.len() < self.uuid.len() + 5 {
+                    return;
+                }
+                index = self.uuid.len();
+                self.remaining_content = 0;
+                self.remaining_padding = 0;
+                self.current_command = PADDING_CONTINUE;
+            } else {
+                // Wait for more data only while the initial bytes can still be
+                // the frame UUID. Once unframed, every later byte is payload.
+                if self.raw.is_empty() || (!self.eof && self.uuid.starts_with(&self.raw)) {
+                    return;
+                }
+                self.payload.extend_from_slice(&self.raw);
+                self.raw.clear();
+                self.remaining_content = 0;
+                self.remaining_padding = 0;
+                self.current_command = PADDING_END;
                 return;
             }
-            self.payload.extend_from_slice(&self.raw[index..]);
-            self.raw.clear();
-            return;
         }
         while index < self.raw.len() {
             if self.remaining_content <= 0 && self.remaining_padding <= 0 {
@@ -531,6 +534,16 @@ impl AsyncRead for VisionStream {
                 }
                 return std::task::Poll::Ready(Ok(()));
             }
+            if this.eof {
+                if this.remaining_content > 0 || this.remaining_padding > 0 || !this.raw.is_empty()
+                {
+                    return std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "incomplete Vision frame",
+                    )));
+                }
+                return std::task::Poll::Ready(Ok(()));
+            }
             if this.current_command != PADDING_CONTINUE
                 && this.remaining_content == 0
                 && this.remaining_padding == 0
@@ -546,9 +559,6 @@ impl AsyncRead for VisionStream {
                     this.server_hello.feed(&out.filled()[start..]);
                 }
                 return result;
-            }
-            if this.eof {
-                return std::task::Poll::Ready(Ok(()));
             }
             if this.raw.capacity() - this.raw.len() < READ_CHUNK {
                 this.raw.reserve(READ_CHUNK);
@@ -572,8 +582,6 @@ impl AsyncRead for VisionStream {
             };
             if got == 0 {
                 this.eof = true;
-                // a closed peer may still leave a tail in the framing
-                this.unpad();
             } else {
                 // SAFETY: `got` bytes past `base` were just initialised by the
                 // read above, inside the buffer `spare` pointed into
@@ -1090,13 +1098,76 @@ mod tests {
         assert_eq!(&sink.payload[..], &b"payload"[..]);
     }
 
+    #[tokio::test]
+    async fn unframed_traffic_passes_through_before_eof() {
+        let (mut stream, mut peer) = pair();
+        let greeting = b"220 Ready\r\n";
+        let mut received = [0; 11];
+        peer.write_all(greeting).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            stream.read_exact(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&received, greeting);
+
+        // After falling back to unframed reads, a UUID at the beginning of
+        // a later read belongs to the payload too.
+        let wire = wire_frame(true, PADDING_END, b"payload", 0);
+        peer.write_all(&wire).await.unwrap();
+        peer.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received.as_slice(), &wire[..]);
+    }
+
     #[test]
-    fn unframed_traffic_passes_through() {
-        let (mut sink, _) = pair();
-        sink.raw = BytesMut::from(&b"plain bytes"[..]);
-        sink.eof = true;
-        sink.unpad();
-        assert_eq!(&sink.payload[..], &b"plain bytes"[..]);
+    fn fragmented_vision_prefix_waits_for_the_header() {
+        let wire = wire_frame(true, PADDING_END, b"payload", 0);
+        for split in 1..uuid().len() + 5 {
+            let (mut stream, _) = pair();
+            stream.raw.extend_from_slice(&wire[..split]);
+            stream.unpad();
+            assert!(stream.payload.is_empty(), "split {split}");
+            stream.raw.extend_from_slice(&wire[split..]);
+            stream.unpad();
+            assert_eq!(&stream.payload[..], b"payload", "split {split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_reports_eof_inside_a_frame_after_delivering_payload() {
+        let wire = wire_frame(true, PADDING_CONTINUE, b"hello", 3);
+        let mut with_next = wire.clone();
+        with_next.extend_from_slice(&wire_frame(false, PADDING_END, b"next", 0));
+        for (name, bytes, expected) in [
+            ("initial header", &wire[..uuid().len() + 2], &b""[..]),
+            ("content", &wire[..uuid().len() + 5 + 3], &b"hel"[..]),
+            ("padding", &wire[..wire.len() - 2], &b"hello"[..]),
+            (
+                "continuation header",
+                &with_next[..wire.len() + 2],
+                &b"hello"[..],
+            ),
+        ] {
+            let (mut stream, mut peer) = pair();
+            peer.write_all(bytes).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            let error = stream.read_to_end(&mut received).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{name}");
+            assert_eq!(received, expected, "{name}");
+        }
+        for (bytes, expected) in [(&wire[..], &b"hello"[..]), (&uuid()[..8], &uuid()[..8])] {
+            let (mut stream, mut peer) = pair();
+            peer.write_all(bytes).await.unwrap();
+            peer.shutdown().await.unwrap();
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+        }
     }
 
     #[test]
