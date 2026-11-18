@@ -303,13 +303,12 @@ impl PacketReader {
                     let mut meta = vec![0u8; meta_len];
                     stream.read_exact(&mut meta).await?;
                     let keep = meta[2] == 2;
-                    let mut payload = Vec::new();
                     if meta[3] & 1 != 0 {
+                        let mut payload = Vec::new();
                         read_xudp_data(stream, &mut payload).await?;
-                    }
-                    // a fin (4) or an option-only frame carries no datagram
-                    if keep && !payload.is_empty() {
-                        return Ok(payload);
+                        if keep {
+                            return Ok(payload);
+                        }
                     }
                 }
             }
@@ -695,11 +694,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_option_only_xudp_frame_is_skipped() {
-        let mut empty = 4u16.to_be_bytes().to_vec();
-        empty.extend_from_slice(&[0, 0, 2, 0]);
-        let framed = [empty, inbound_frame(b"xyz")].concat();
-        assert_eq!(feed(framed, PacketEncoding::Xudp).await, [b"xyz".to_vec()]);
+    async fn xudp_skips_control_keep_and_delivers_empty_and_nonempty_datagrams() {
+        let mut control = 4u16.to_be_bytes().to_vec();
+        control.extend_from_slice(&[0, 0, 2, 0]);
+        let framed = [control, inbound_frame(b""), inbound_frame(b"xyz")].concat();
+        assert_eq!(
+            feed(framed, PacketEncoding::Xudp).await,
+            [Vec::new(), b"xyz".to_vec()]
+        );
     }
 
     #[test]
