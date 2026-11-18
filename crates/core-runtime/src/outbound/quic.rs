@@ -1558,7 +1558,7 @@ impl VarintReader {
     }
 }
 
-/// Per-session fragment reassembler (hy2 PACKET frames).
+/// Fragment reassembler for HY2 datagrams, keyed by packet identity.
 ///
 /// Fragments are `Bytes`: a slice of the datagram is shared by reference
 /// count, so a single-fragment packet -- the overwhelmingly common case --
@@ -1568,25 +1568,25 @@ impl VarintReader {
 /// Only a few packets are held in assembly (upstream Hysteria keeps one):
 /// a new packet past [`DEFRAG_MAX_PENDING`] drops the oldest unfinished one,
 /// and a packet whose fragments add up past the largest UDP payload is
-/// dropped, so a lossy or hostile peer cannot grow the session's memory.
-pub(crate) struct Defragger {
+/// dropped, so a lossy or hostile peer cannot grow the buffer indefinitely.
+pub(crate) struct Defragger<K = u16> {
     // unfinished packets, oldest first
-    items: std::collections::VecDeque<PendingPacket>,
+    items: std::collections::VecDeque<PendingPacket<K>>,
 }
 
-/// Unfinished packets one session keeps.
+/// Unfinished packets one reassembler keeps.
 const DEFRAG_MAX_PENDING: usize = 4;
 /// Largest reassembled packet: one UDP payload.
 const DEFRAG_MAX_BYTES: usize = 0xffff;
 
-struct PendingPacket {
-    id: u16,
+struct PendingPacket<K> {
+    id: K,
     slots: Vec<Option<bytes::Bytes>>,
     received: usize,
     size: usize,
 }
 
-impl Defragger {
+impl<K: PartialEq> Defragger<K> {
     pub fn new() -> Self {
         Self {
             items: std::collections::VecDeque::new(),
@@ -1596,7 +1596,7 @@ impl Defragger {
     /// Feed one fragment; returns the reassembled payload when complete.
     pub fn feed(
         &mut self,
-        packet_id: u16,
+        packet_id: K,
         frag_id: u8,
         frag_total: u8,
         data: bytes::Bytes,

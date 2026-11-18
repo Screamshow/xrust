@@ -1049,6 +1049,50 @@ mod tests {
         (out, echo_addr)
     }
 
+    #[tokio::test]
+    async fn udp_replies_stay_in_their_quic_sessions() {
+        let (out, echo) = udp_test_pair().await;
+        let target = Target::Ip(echo);
+        let first = out.connect_udp(&target).await.expect("first UDP session");
+        let second = out.connect_udp(&target).await.expect("second UDP session");
+        let connection = {
+            let pool = out.shared.lock().await;
+            assert_eq!(pool.len(), 1, "both sessions must share one connection");
+            assert_eq!(pool[0].sessions.lock().unwrap().len(), 2);
+            pool[0].conn.clone()
+        };
+
+        for (socket, payload) in [(&first, b"first"), (&second, b"other")] {
+            socket.send(payload).await.expect("send datagram");
+        }
+        async fn expect_reply(socket: &tokio::net::UdpSocket, payload: &[u8]) {
+            let mut buf = [0; 64];
+            let size = tokio::time::timeout(Duration::from_secs(2), socket.recv(&mut buf))
+                .await
+                .expect("UDP session did not receive its reply")
+                .expect("UDP receive");
+            assert_eq!(&buf[..size], payload);
+        }
+        expect_reply(&first, b"first").await;
+        expect_reply(&second, b"other").await;
+
+        // Packet IDs are per session. Both sessions use the same ID while
+        // the server has unfinished fragments for both.
+        let dest = echo.to_string();
+        for (session, fragment, payload) in [
+            (0, 0, &b"first-"[..]),
+            (1, 0, &b"other-"[..]),
+            (0, 1, &b"payload"[..]),
+            (1, 1, &b"message"[..]),
+        ] {
+            connection
+                .send_datagram(pack_hy2(session, 7, fragment, 2, &dest, payload).into())
+                .expect("send fragment");
+        }
+        expect_reply(&first, b"first-payload").await;
+        expect_reply(&second, b"other-message").await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_pool_expansion_reuses_an_open_connection() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

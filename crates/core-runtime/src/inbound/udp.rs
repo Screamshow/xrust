@@ -57,7 +57,22 @@ pub(crate) async fn recv_with<R>(
     }
 }
 
-type FlowKey = (SocketAddr, SocketAddr);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct FlowKey {
+    source: SocketAddr,
+    dest: SocketAddr,
+    hy2_session: Option<(u64, u32)>,
+}
+
+impl FlowKey {
+    fn network(source: SocketAddr, dest: SocketAddr) -> Self {
+        Self {
+            source,
+            dest,
+            hy2_session: None,
+        }
+    }
+}
 
 /// Packets held back while the outbound socket is not writable. The old
 /// code spent one `to_vec()` plus one `tokio::spawn` per packet here, which
@@ -327,9 +342,15 @@ pub(crate) struct TunReply {
     pub payload: Vec<u8>,
 }
 
+pub(crate) struct Hy2Reply {
+    pub session_id: u32,
+    pub src: SocketAddr,
+    pub payload: Vec<u8>,
+}
+
 /// Where a reply datagram goes: back out of a socket the client is reading
 /// from, down a stream it is reading a length-prefixed sequence off, or back to
-/// the TUN interface.
+/// a TUN interface or Hysteria2 session.
 #[derive(Clone)]
 pub(crate) enum Reply {
     /// Weak on purpose: a session task that outlives its inbound must not be
@@ -342,6 +363,11 @@ pub(crate) enum Reply {
     Tun {
         sender: tokio::sync::mpsc::Sender<TunReply>,
     },
+    Hy2 {
+        connection_id: u64,
+        session_id: u32,
+        sender: tokio::sync::mpsc::Sender<Hy2Reply>,
+    },
 }
 
 /// A weak reply handle that is still backed by a socket.
@@ -352,6 +378,19 @@ fn live(socket: &Weak<UdpSocket>) -> io::Result<Arc<UdpSocket>> {
 }
 
 impl Reply {
+    fn flow_key(&self, source: SocketAddr, dest: SocketAddr) -> FlowKey {
+        let mut key = FlowKey::network(source, dest);
+        if let Self::Hy2 {
+            connection_id,
+            session_id,
+            ..
+        } = self
+        {
+            key.hy2_session = Some((*connection_id, *session_id));
+        }
+        key
+    }
+
     async fn send(
         &self,
         framed: &[u8],
@@ -372,6 +411,18 @@ impl Reply {
                 })
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "tun reply channel closed")),
+            Reply::Hy2 {
+                session_id, sender, ..
+            } => sender
+                .send(Hy2Reply {
+                    session_id: *session_id,
+                    src: remote,
+                    payload: framed.to_vec(),
+                })
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "hysteria2 reply channel closed")
+                }),
         }
     }
 }
@@ -404,7 +455,7 @@ pub(crate) struct FlowOpener {
 
 impl FlowOpener {
     pub async fn run(mut self, reply: Reply, tag: &str) -> io::Result<()> {
-        let (source, dest) = self.key;
+        let FlowKey { source, dest, .. } = self.key;
         let target = Target::Ip(dest);
         let mut next = self.first.take();
         loop {
@@ -543,12 +594,8 @@ impl UdpHub {
     /// which needs the async exchange), and the caller should fall back to
     /// spawning the full [`UdpHub::handle`].
     pub fn try_existing(&self, source: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
-        let flow = self
-            .flows
-            .read()
-            .expect("flows")
-            .get(&(source, dest))
-            .cloned();
+        let key = FlowKey::network(source, dest);
+        let flow = self.flows.read().expect("flows").get(&key).cloned();
         let Some(flow) = flow else {
             return false;
         };
@@ -557,7 +604,7 @@ impl UdpHub {
             .as_ref()
             .is_some_and(|tracker| tracker.is_closed())
         {
-            self.flows.write().expect("flows").remove(&(source, dest));
+            self.flows.write().expect("flows").remove(&key);
             return false;
         }
         let FlowKind::Outbound { sock } = &flow.kind else {
@@ -599,7 +646,7 @@ impl UdpHub {
         dest: SocketAddr,
         payload: &[u8],
     ) -> Option<FlowOpener> {
-        let key = (source, dest);
+        let key = FlowKey::network(source, dest);
         // a flow still draining its queue keeps later datagrams behind it
         if self.pending_count.load(Ordering::Acquire) != 0 && self.queue_pending(key, payload) {
             return None;
@@ -717,7 +764,7 @@ impl UdpHub {
         tag: &str,
         target: &Target,
     ) -> std::io::Result<Option<Arc<Flow>>> {
-        let key = (source, dest);
+        let key = reply.flow_key(source, dest);
         if let Some(flow) = self.live_flow(key) {
             flow.touch();
             return Ok(Some(flow));
@@ -737,7 +784,7 @@ impl UdpHub {
         held.push(payload.to_vec());
         let force = held.len() >= MAX_SNIFF_DATAGRAMS;
         match self
-            .open_flow(reply.clone(), source, dest, tag, target, &held, force)
+            .open_flow(reply.clone(), key, tag, target, &held, force)
             .await?
         {
             Opened::Wait(timeout) => {
@@ -825,14 +872,14 @@ impl UdpHub {
             let Some(hub) = hub.upgrade() else {
                 return;
             };
-            let (source, dest) = key;
+            let FlowKey { source, dest, .. } = key;
             let _gate = hub.gate(key).lock_owned().await;
             // a later datagram may have completed the sniff meanwhile
             let Some(held) = hub.held.lock().expect("held").remove(&key) else {
                 return;
             };
             let flow = match hub
-                .open_flow(reply.clone(), source, dest, &tag, &target, &held, true)
+                .open_flow(reply.clone(), key, &tag, &target, &held, true)
                 .await
             {
                 Ok(Opened::Flow(flow)) => flow,
@@ -856,18 +903,16 @@ impl UdpHub {
 
     /// Route a new flow by its datagrams so far and open it. `force` routes
     /// even when the sniff would rather see another datagram.
-    #[allow(clippy::too_many_arguments)]
     async fn open_flow(
         self: &Arc<Self>,
         reply: Reply,
-        source: SocketAddr,
-        dest: SocketAddr,
+        key: FlowKey,
         tag: &str,
         target: &Target,
         datagrams: &[Vec<u8>],
         force: bool,
     ) -> std::io::Result<Opened> {
-        let key = (source, dest);
+        let source = key.source;
         let mut ctx = ConnContext::new(tag, source, target.clone(), "udp");
         let views: Vec<&[u8]> = datagrams.iter().map(Vec::as_slice).collect();
         let decision = self.router.route_datagrams(&mut ctx, &views).await?;
@@ -919,7 +964,6 @@ impl UdpHub {
                     Arc::clone(&sock),
                     reply,
                     self.frame,
-                    source,
                     tag,
                     timeout,
                     Arc::clone(self),
@@ -1020,7 +1064,7 @@ impl UdpHub {
         self.flows
             .read()
             .expect("flows")
-            .get(&(source, dest))
+            .get(&FlowKey::network(source, dest))
             .is_some_and(|flow| flow.idle() < flow.timeout)
     }
 
@@ -1118,7 +1162,6 @@ fn spawn_reverse(
     outbound: Arc<UdpSocket>,
     reply: Reply,
     frame: DatagramFrame,
-    source: SocketAddr,
     tag: &str,
     idle: Duration,
     hub: Arc<UdpHub>,
@@ -1126,6 +1169,7 @@ fn spawn_reverse(
     tracker: Option<Arc<crate::clash_state::ConnHandle>>,
 ) -> tokio::task::AbortHandle {
     let tag = tag.to_string();
+    let FlowKey { source, dest, .. } = key;
     tokio::spawn(async move {
         // the datagram being replied, as large as the largest so far
         let mut datagram = Vec::new();
@@ -1161,10 +1205,10 @@ fn spawn_reverse(
                     let framed: &[u8] = if frame == DatagramFrame::Raw {
                         &datagram
                     } else {
-                        frame.apply_into(key.1, &datagram, &mut out);
+                        frame.apply_into(dest, &datagram, &mut out);
                         &out
                     };
-                    if let Err(err) = reply.send(framed, source, key.1).await {
+                    if let Err(err) = reply.send(framed, source, dest).await {
                         logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
                         hub.remove_flow(key, &outbound).await;
                         return;
@@ -1271,7 +1315,7 @@ mod tests {
             .flows
             .read()
             .unwrap()
-            .get(&(source, dest))
+            .get(&FlowKey::network(source, dest))
             .unwrap()
             .tracker
             .as_ref()
@@ -1289,7 +1333,7 @@ mod tests {
         .unwrap();
         let flows = hub.flows.read().unwrap();
         let fresh = flows
-            .get(&(source, dest))
+            .get(&FlowKey::network(source, dest))
             .unwrap()
             .tracker
             .as_ref()
@@ -1380,7 +1424,7 @@ mod tests {
             .flows
             .read()
             .unwrap()
-            .get(&(source, dest))
+            .get(&FlowKey::network(source, dest))
             .unwrap()
             .clone();
         flow.hold_back(b"queued");
@@ -1437,7 +1481,7 @@ mod tests {
             .flows
             .read()
             .unwrap()
-            .get(&(source, dest))
+            .get(&FlowKey::network(source, dest))
             .unwrap()
             .tracker
             .as_ref()
@@ -1449,7 +1493,12 @@ mod tests {
         let result = crate::clash_state::close_invalid_routes(&router).await;
         assert!(result["closed"].as_u64().unwrap() > 0);
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(!hub.flows.read().unwrap().contains_key(&(source, dest)));
+        assert!(
+            !hub.flows
+                .read()
+                .unwrap()
+                .contains_key(&FlowKey::network(source, dest))
+        );
         hub.handle(
             Reply::Socket(Arc::downgrade(&reply)),
             source,
@@ -1463,7 +1512,7 @@ mod tests {
             .flows
             .read()
             .unwrap()
-            .get(&(source, dest))
+            .get(&FlowKey::network(source, dest))
             .unwrap()
             .tracker
             .as_ref()
@@ -1512,7 +1561,7 @@ mod tests {
                 hub.flows
                     .read()
                     .expect("flows")
-                    .contains_key(&(source, dest)),
+                    .contains_key(&FlowKey::network(source, dest)),
                 "active receive-only flow was swept at packet {sequence}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1530,7 +1579,7 @@ mod tests {
             Duration::from_secs(1),
             DatagramFrame::Raw,
         );
-        let key = (
+        let key = FlowKey::network(
             "127.0.0.1:30000".parse().expect("source"),
             "127.0.0.1:30001".parse().expect("dest"),
         );
@@ -1550,7 +1599,6 @@ mod tests {
             old,
             Reply::Socket(Arc::downgrade(&reply)),
             DatagramFrame::Raw,
-            key.0,
             "test",
             Duration::from_millis(20),
             Arc::clone(&hub),

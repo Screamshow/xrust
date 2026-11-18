@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::tls::ServerTls;
-use super::udp::{DatagramFrame, Reply, TunReply, UdpHub};
+use super::udp::{DatagramFrame, Hy2Reply, Reply, UdpHub};
 use crate::inbound::{AnyStream, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
 use crate::outbound::hysteria2::{
@@ -197,7 +197,10 @@ impl Hysteria2 {
             self.local_addr
         ));
 
+        let mut next_connection_id = 0_u64;
         while let Some(incoming) = self.endpoint.accept().await {
+            let connection_id = next_connection_id;
+            next_connection_id = next_connection_id.wrapping_add(1);
             let router = Arc::clone(&self.router);
             let users = Arc::clone(&self.users);
             let hub = Arc::clone(&self.hub);
@@ -212,7 +215,8 @@ impl Hysteria2 {
                         return;
                     }
                 };
-                handle_hy2_connection(conn, router, users, hub, tag, local_addr).await;
+                handle_hy2_connection(conn, connection_id, router, users, hub, tag, local_addr)
+                    .await;
             });
         }
     }
@@ -220,6 +224,7 @@ impl Hysteria2 {
 
 async fn handle_hy2_connection(
     conn: quinn::Connection,
+    connection_id: u64,
     router: Arc<Router>,
     users: Arc<HashMap<String, String>>,
     hub: Arc<UdpHub>,
@@ -248,17 +253,16 @@ async fn handle_hy2_connection(
         "hysteria2[{tag}] {peer} authenticated as {user_name}"
     ));
 
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<TunReply>(128);
+    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::channel::<Hy2Reply>(128);
 
     // UDP reply sender back to QUIC datagrams
     let conn_udp_send = conn.clone();
-    let packet_counter = Arc::new(AtomicU32::new(0));
-    let packet_counter_clone = Arc::clone(&packet_counter);
     let reply_handle = tokio::spawn(async move {
+        let packet_counter = AtomicU32::new(0);
         while let Some(reply) = reply_rx.recv().await {
-            let pid = next_packet_id(&packet_counter_clone);
+            let pid = next_packet_id(&packet_counter);
             let src_str = reply.src.to_string();
-            let pkt = pack_hy2(0, pid, 0, 1, &src_str, &reply.payload);
+            let pkt = pack_hy2(reply.session_id, pid, 0, 1, &src_str, &reply.payload);
             let _ = conn_udp_send.send_datagram(pkt.into());
         }
     });
@@ -330,28 +334,26 @@ async fn handle_hy2_connection(
 
     // Accept datagrams (UDP)
     let conn_dg = conn.clone();
-    let defragger = Arc::new(std::sync::Mutex::new(Defragger::new()));
     let hub_dg = Arc::clone(&hub);
     let tag_dg = tag.clone();
     let dg_handle = tokio::spawn(async move {
+        let mut defragger = Defragger::new();
         loop {
             let data = match conn_dg.read_datagram().await {
                 Ok(d) => d,
                 Err(_) => break,
             };
-            let Some((_sid, pid, frag_id, frag_total, dest, payload)) = parse_hy2_packet(&data)
+            let Some((session_id, pid, frag_id, frag_total, dest, payload)) =
+                parse_hy2_packet(&data)
             else {
                 continue;
             };
-            let complete = {
-                let mut defrag = defragger.lock().expect("defragger");
-                defrag.feed(
-                    pid,
-                    frag_id,
-                    frag_total,
-                    bytes::Bytes::copy_from_slice(payload),
-                )
-            };
+            let complete = defragger.feed(
+                (session_id, pid),
+                frag_id,
+                frag_total,
+                bytes::Bytes::copy_from_slice(payload),
+            );
             if let Some(pkt) = complete {
                 let target = match parse_target_str(dest) {
                     Some(t) => t,
@@ -368,7 +370,9 @@ async fn handle_hy2_connection(
                 };
                 let _ = hub_dg
                     .handle(
-                        Reply::Tun {
+                        Reply::Hy2 {
+                            connection_id,
+                            session_id,
                             sender: reply_tx.clone(),
                         },
                         peer,
