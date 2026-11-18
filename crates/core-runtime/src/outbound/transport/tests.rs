@@ -46,7 +46,7 @@ fn ws_transport(max_early_data: usize, header_name: &str) -> Transport {
         host: None,
         headers: vec![("X-Test".into(), "1".into())],
         max_early_data,
-        early_data_header_name: header_name.into(),
+        early_data_header_name: Some(header_name.into()),
     })
 }
 
@@ -160,6 +160,54 @@ async fn without_a_header_name_early_data_rides_in_sec_websocket_protocol() {
 }
 
 #[tokio::test]
+async fn early_data_in_path_preserves_the_query_and_respects_the_budget() {
+    for (budget, target) in [(1, "/t/?key=1"), (2, "/t/-_8?key=1")] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let config = serde_json::json!({"transport": {
+            "type": "ws",
+            "path": "/t/?key=1",
+            "max_early_data": budget,
+            "early_data_in_path": true,
+            "headers": {"Sec-WebSocket-Protocol": "chat"}
+        }});
+        let transport = Transport::parse(config.as_object().unwrap(), "out").unwrap();
+        let (head, written) = connect_transport(listener, transport, &[0xfb, 0xff]).await;
+        assert_eq!(written, 2);
+        assert!(
+            head.starts_with(&format!("GET {target} HTTP/1.1\r\n")),
+            "got:\n{head}"
+        );
+        assert_eq!(head.matches("Sec-WebSocket-Protocol: ").count(), 1);
+        assert!(head.contains("Sec-WebSocket-Protocol: chat\r\n"));
+    }
+}
+
+#[test]
+fn early_data_in_path_and_a_named_header_cannot_be_combined() {
+    use serde_json::json;
+    for (in_path, message) in [
+        (json!(true), "conflicts with early_data_header_name"),
+        (json!("true"), "early_data_in_path"),
+    ] {
+        let outbound = json!({
+            "type": "vless", "server": "127.0.0.1", "server_port": 443,
+            "uuid": "b831381d-6324-4d53-ad4f-8cda48b30811",
+            "transport": {
+                "type": "ws", "max_early_data": 2048, "early_data_in_path": in_path,
+                "early_data_header_name": "Sec-WebSocket-Protocol"
+            }
+        });
+        let error =
+            core_config::check_str(&json!({"outbounds": [outbound]}).to_string()).unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+        let parsed = Transport::parse(outbound.as_object().unwrap(), "out");
+        assert!(parsed.err().unwrap().to_string().contains(message));
+    }
+}
+
+#[tokio::test]
 async fn without_the_budget_nothing_rides_along() {
     for name in [SWP, ""] {
         let (head, consumed) = connect_with(0, name, b"ignored").await;
@@ -201,7 +249,7 @@ async fn connect_configured(header_name: &str, configured: &str) -> String {
         host: None,
         headers: vec![(configured.into(), "chat".into())],
         max_early_data: 2048,
-        early_data_header_name: header_name.into(),
+        early_data_header_name: Some(header_name.into()),
     });
     connect_transport(listener, transport, b"payload").await.0
 }
@@ -269,7 +317,7 @@ async fn early_data_reaches_our_server_intact() {
                     first,
                     EarlyData {
                         max,
-                        header_name: name,
+                        header_name: Some(name),
                     },
                 )
                 .await
@@ -411,7 +459,7 @@ async fn a_host_header_is_written_once() {
         host: None,
         headers: vec![("Host".into(), "cdn.example.com".into())],
         max_early_data: 0,
-        early_data_header_name: String::new(),
+        early_data_header_name: Some(String::new()),
     });
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
@@ -597,7 +645,7 @@ fn lazy_request(max: usize) -> WsRequest {
         host: "example.com".to_string(),
         headers: Vec::new(),
         max_early_data: max,
-        early_data_header_name: String::new(),
+        early_data_header_name: Some(String::new()),
     }
 }
 

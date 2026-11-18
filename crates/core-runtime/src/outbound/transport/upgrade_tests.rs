@@ -62,7 +62,7 @@ async fn ws_head(headers: &[(String, String)]) -> String {
     let head = tokio::spawn(upgrade_head(server, true));
     let no_early = EarlyData {
         max: 0,
-        header_name: "",
+        header_name: Some(""),
     };
     let handshake = ws_handshake(
         Box::new(client),

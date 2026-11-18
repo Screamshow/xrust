@@ -2,16 +2,14 @@
 //! the reference sing-box (SING_BOX_REF) and against Xray (XRAY_REF); the
 //! reference cases are skipped unless the variable is set.
 //!
-//! An empty `early_data_header_name` means `Sec-WebSocket-Protocol` here, as
-//! in Xray. sing-box reads it as "append to the path" instead, so the
-//! unnamed shape is checked against Xray and our server only, and the
-//! sing-box cases always name the header.
+//! The header mode uses Sec-WebSocket-Protocol by default for Xray links.
+//! Client profiles for sing-box can opt into early data in the path.
 //!
 //! The first write is the 26-byte VLESS request for an IPv4 target with the
 //! 9-byte probe behind it, 35 bytes, which rides early when it fits the
 //! budget (35 is not a multiple of 3, so standard base64 would pad it); the
-//! small budgets below put it over, where it goes as a frame after a plain
-//! upgrade, as Xray's client sends it.
+//! small budgets exercise an ordinary frame. In particular, Trojan needs
+//! its first request intact even with early data in the path.
 
 use std::net::SocketAddr;
 use std::process::{Child, Command};
@@ -667,15 +665,20 @@ async fn vless_and_trojan_early_data_against_both_references() {
         let tls = json!({"enabled": true,
             "certificate_path": format!("{certs}/localhost.crt"),
             "key_path": format!("{certs}/localhost.key")});
-        for (protocol, max) in [
-            ("vless", 2048),
-            ("vless", 20),
-            ("trojan", 2048),
-            ("trojan", 20),
+        for (protocol, max, in_path) in [
+            ("vless", 2048, false),
+            ("vless", 20, false),
+            ("trojan", 2048, false),
+            ("trojan", 20, false),
+            ("vless", 2048, true),
+            ("vless", 20, true),
+            ("trojan", 2048, true),
+            ("trojan", 20, true),
         ] {
-            let label = format!("ours->sing-box {protocol} ws+tls ed={max}");
+            let placement = if in_path { "path" } else { "header" };
+            let label = format!("ours->sing-box {protocol} ws+tls ed={max} in {placement}");
             let port = free_port();
-            let transport = ws(max, Some(SWP));
+            let transport = ws(max, (!in_path).then_some(SWP));
             let users = if protocol == "vless" {
                 json!([{"uuid": UUID}])
             } else {
@@ -695,8 +698,12 @@ async fn vless_and_trojan_early_data_against_both_references() {
                 wait_listening(port).await,
                 "{label}: sing-box did not start"
             );
+            let mut outgoing_transport = transport;
+            if in_path {
+                outgoing_transport["early_data_in_path"] = json!(true);
+            }
             let mut outbound = json!({"type": protocol, "tag": "up", "server": "127.0.0.1",
-                "server_port": port, "tls": client_tls, "transport": ws(max, Some(SWP))});
+                "server_port": port, "tls": client_tls, "transport": outgoing_transport});
             if protocol == "vless" {
                 outbound["uuid"] = json!(UUID);
             } else {
@@ -710,12 +717,12 @@ async fn vless_and_trojan_early_data_against_both_references() {
 }
 
 async fn start_outbound(outbound: Value) -> core_runtime::BoxInstance {
-    core_runtime::start(&json!({
+    let config = json!({
         "log": {"level": "error"},
         "inbounds": [{"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 0}],
         "outbounds": [outbound],
         "route": {"final": "up"}
-    }))
-    .await
-    .expect("start client")
+    });
+    core_config::check_str(&config.to_string()).expect("client config");
+    core_runtime::start(&config).await.expect("start client")
 }

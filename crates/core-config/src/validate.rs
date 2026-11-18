@@ -4887,6 +4887,7 @@ fn validate_v2ray_transport(tty: &str, t: &Map<String, Value>, at: &str) -> Resu
         "headers",
         "max_early_data",
         "early_data_header_name",
+        "early_data_in_path",
     ];
     const QUIC: &[&str] = &["type"];
     const GRPC: &[&str] = &[
@@ -4928,6 +4929,23 @@ fn validate_v2ray_transport(tty: &str, t: &Map<String, Value>, at: &str) -> Resu
             for f in ["path", "early_data_header_name"] {
                 if let Some(v) = t.get(f) {
                     check_string_field(v, &format!("{at}.{f}"), "V2RayWebsocketOptions", f)?;
+                }
+            }
+            if let Some(v) = t.get("early_data_in_path") {
+                check_bool_field(
+                    v,
+                    &format!("{at}.early_data_in_path"),
+                    "V2RayWebsocketOptions",
+                    "early_data_in_path",
+                )?;
+                if v == &Value::Bool(true)
+                    && t.get("early_data_header_name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+                {
+                    return Err(format!(
+                        "{at}: early_data_in_path conflicts with early_data_header_name"
+                    ));
                 }
             }
             if let Some(v) = t.get("max_early_data") {
