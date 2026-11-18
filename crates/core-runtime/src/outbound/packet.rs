@@ -354,13 +354,28 @@ async fn read_xudp_data(
     Ok(())
 }
 
-tokio::task_local! {
-    pub(crate) static UDP_BRIDGE_TIMEOUT: std::time::Duration;
+#[derive(Clone)]
+pub(crate) struct UdpBridgePolicy {
+    pub timeout: std::time::Duration,
+    pub flow_close: Option<crate::clash_state::CloseSignal>,
 }
 
-pub(crate) fn udp_bridge_timeout() -> std::time::Duration {
-    UDP_BRIDGE_TIMEOUT
-        .try_with(|timeout| *timeout)
+tokio::task_local! {
+    pub(crate) static UDP_BRIDGE_POLICY: UdpBridgePolicy;
+}
+
+impl UdpBridgePolicy {
+    pub(crate) fn current() -> Self {
+        UDP_BRIDGE_POLICY.try_with(Clone::clone).unwrap_or(Self {
+            timeout: crate::inbound::udp::DEFAULT_UDP_TIMEOUT,
+            flow_close: None,
+        })
+    }
+}
+
+fn udp_bridge_timeout() -> std::time::Duration {
+    UDP_BRIDGE_POLICY
+        .try_with(|policy| policy.timeout)
         .unwrap_or(crate::inbound::udp::DEFAULT_UDP_TIMEOUT)
 }
 

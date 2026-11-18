@@ -599,17 +599,17 @@ impl UdpHub {
         let Some(flow) = flow else {
             return false;
         };
+        let FlowKind::Outbound { sock } = &flow.kind else {
+            return false;
+        };
         if flow
             .tracker
             .as_ref()
             .is_some_and(|tracker| tracker.is_closed())
         {
-            self.flows.write().expect("flows").remove(&key);
+            self.remove_flow(key, sock);
             return false;
         }
-        let FlowKind::Outbound { sock } = &flow.kind else {
-            return false;
-        };
         // while a writer is draining the backlog, new packets go behind it:
         // a lucky try_send must not overtake the queued datagrams
         if flow.writing.load(Ordering::Acquire) {
@@ -953,11 +953,15 @@ impl UdpHub {
                 // Outbound bridges read the per-flow idle policy before spawning
                 // their pumps, including route-options overrides.
                 let signal = tracker.close_signal();
+                let policy = crate::outbound::packet::UdpBridgePolicy {
+                    timeout,
+                    flow_close: Some(signal.clone()),
+                };
                 let sock = tokio::select! {
                     biased;
                     _ = signal.wait() => return Err(super::closed_by_api()),
-                    result = crate::outbound::packet::UDP_BRIDGE_TIMEOUT
-                        .scope(timeout, self.router.connect_udp_index(idx, target)) => result?,
+                    result = crate::outbound::packet::UDP_BRIDGE_POLICY
+                        .scope(policy, self.router.connect_udp_index(idx, target)) => result?,
                 };
                 let sock = Arc::new(sock);
                 let task = spawn_reverse(
@@ -1068,7 +1072,7 @@ impl UdpHub {
             .is_some_and(|flow| flow.idle() < flow.timeout)
     }
 
-    async fn remove_flow(&self, key: FlowKey, socket: &Arc<UdpSocket>) {
+    fn remove_flow(&self, key: FlowKey, socket: &Arc<UdpSocket>) {
         let mut flows = self.flows.write().expect("flows");
         if flows.get(&key).is_some_and(
             |flow| matches!(&flow.kind, FlowKind::Outbound {sock} if Arc::ptr_eq(sock, socket)),
@@ -1188,7 +1192,7 @@ fn spawn_reverse(
                     if let Some(tracker) = &tracker { tracker.close_signal().wait().await; }
                     else { std::future::pending::<()>().await; }
                 } => {
-                    hub.remove_flow(key, &outbound).await;
+                    hub.remove_flow(key, &outbound);
                     return;
                 }
             };
@@ -1210,13 +1214,13 @@ fn spawn_reverse(
                     };
                     if let Err(err) = reply.send(framed, source, dest).await {
                         logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
-                        hub.remove_flow(key, &outbound).await;
+                        hub.remove_flow(key, &outbound);
                         return;
                     }
                 }
                 Ok(Err(err)) => {
                     logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
-                    hub.remove_flow(key, &outbound).await;
+                    hub.remove_flow(key, &outbound);
                     return;
                 }
                 Err(_) => {
@@ -1225,7 +1229,7 @@ fn spawn_reverse(
                         continue;
                     }
                     // Idle timeout â€” drop the flow (reference udpnat purge).
-                    hub.remove_flow(key, &outbound).await;
+                    hub.remove_flow(key, &outbound);
                     return;
                 }
             }

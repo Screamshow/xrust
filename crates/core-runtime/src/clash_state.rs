@@ -48,7 +48,11 @@ pub struct CloseSignal {
 }
 
 impl CloseSignal {
-    /// Resolves once the connection was closed through the API.
+    pub(crate) fn close(&self) {
+        trigger(&self.closed, &self.notify);
+    }
+
+    /// Resolves once the connection is marked closed.
     pub async fn wait(&self) {
         loop {
             let notified = self.notify.notified();

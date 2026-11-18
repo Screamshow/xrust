@@ -1,6 +1,7 @@
 //! hysteria2 outbound interop: our box dials the reference sing-box
 //! acting as hy2 server (test cert fixture, insecure client, TCP path).
-//! Skipped unless SING_BOX_REF is set (docker gate and CI set it).
+//! The restart test uses an independent Xray server. Reference tests require
+//! SING_BOX_REF or XRAY_REF, respectively.
 
 use std::net::SocketAddr;
 use std::process::{Child, Command};
@@ -8,7 +9,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 const CERT_PEM: &str = include_str!("../../../tests/golden/certs/localhost.crt");
 const KEY_PEM: &str = include_str!("../../../tests/golden/certs/localhost.key");
@@ -203,4 +204,116 @@ async fn interop_hysteria2() {
         },
     )
     .await;
+}
+
+async fn socks_udp_associate(proxy: SocketAddr) -> (TcpStream, UdpSocket) {
+    let mut control = TcpStream::connect(proxy).await.unwrap();
+    control.write_all(&[5, 1, 0]).await.unwrap();
+    let mut auth = [0; 2];
+    control.read_exact(&mut auth).await.unwrap();
+    assert_eq!(auth, [5, 0]);
+    control
+        .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut reply = [0; 10];
+    control.read_exact(&mut reply).await.unwrap();
+    assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+    let relay = SocketAddr::from((
+        [reply[4], reply[5], reply[6], reply[7]],
+        u16::from_be_bytes([reply[8], reply[9]]),
+    ));
+    let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    udp.connect(relay).await.unwrap();
+    (control, udp)
+}
+
+async fn udp_roundtrip(
+    udp: &UdpSocket,
+    target: SocketAddr,
+    payload: &[u8],
+    wait: Duration,
+) -> bool {
+    let std::net::IpAddr::V4(addr) = target.ip() else {
+        panic!("expected IPv4 UDP echo");
+    };
+    let mut request = vec![0, 0, 0, 1];
+    request.extend_from_slice(&addr.octets());
+    request.extend_from_slice(&target.port().to_be_bytes());
+    request.extend_from_slice(payload);
+    udp.send(&request).await.unwrap();
+    let mut reply = [0; 256];
+    let Ok(received) = tokio::time::timeout(wait, udp.recv(&mut reply)).await else {
+        return false;
+    };
+    assert_eq!(&reply[..received.unwrap()], request);
+    true
+}
+
+#[tokio::test]
+async fn existing_socks_udp_flow_recovers_after_xray_restart() {
+    let Some(bin) = std::env::var_os("XRAY_REF") else {
+        return;
+    };
+    let bin = bin.to_string_lossy();
+    let port = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = echo.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        let mut buf = [0; 256];
+        while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
+            let _ = echo.send_to(&buf[..n], peer).await;
+        }
+    });
+    let certs = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/certs");
+    let peer_config = json!({
+        "log": {"loglevel": "error"},
+        "inbounds": [{"protocol": "hysteria", "listen": "127.0.0.1", "port": port,
+            "settings": {"version": 2, "users": [{"auth": "interop-pass"}]},
+            "streamSettings": {"network": "hysteria", "security": "tls",
+                "hysteriaSettings": {"version": 2},
+                "tlsSettings": {"alpn": ["h3"], "certificates": [{
+                    "certificateFile": format!("{certs}/localhost.crt"),
+                    "keyFile": format!("{certs}/localhost.key")
+                }]}}}],
+        "outbounds": [{"protocol": "freedom", "settings": {
+            "finalRules": [{"action": "allow", "ip": ["127.0.0.1/32"]}]
+        }}]
+    });
+    let server = start_ref(&bin, &peer_config);
+    assert!(wait_listening(port).await);
+    let client = core_runtime::start(&json!({
+        "log": {"level": "error"},
+        "inbounds": [{"type": "mixed", "listen": "127.0.0.1", "listen_port": 0}],
+        "outbounds": [{"type": "hysteria2", "tag": "up", "server": "127.0.0.1", "server_port": port,
+            "password": "interop-pass", "idle_timeout": "3s", "keep_alive_period": "1s",
+            "tls": {"enabled": true, "server_name": "localhost", "certificate": CERT_PEM}}],
+        "route": {"final": "up"}
+    }))
+    .await
+    .unwrap();
+    let proxy = client.inbound_addrs()[0].1;
+    let (_original_associate, original) = socks_udp_associate(proxy).await;
+    let wait = Duration::from_secs(3);
+    assert!(udp_roundtrip(&original, target, b"first", wait).await);
+
+    drop(server);
+    let offline = Duration::from_millis(4500);
+    assert!(!udp_roundtrip(&original, target, b"offline", offline).await);
+    let _server = start_ref(&bin, &peer_config);
+    assert!(wait_listening(port).await);
+    let (_new_associate, new) = socks_udp_associate(proxy).await;
+    assert!(udp_roundtrip(&new, target, b"fresh channel", wait).await);
+    assert!(
+        udp_roundtrip(&original, target, b"same UDP socket", wait).await,
+        "the existing SOCKS UDP flow stayed attached to the closed QUIC connection"
+    );
+    assert!(udp_roundtrip(&original, target, b"next datagram", wait).await);
+    client.shutdown();
+    echo_task.abort();
 }

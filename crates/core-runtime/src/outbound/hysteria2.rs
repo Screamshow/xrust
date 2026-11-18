@@ -451,43 +451,54 @@ impl Hysteria2 {
         let dest_f = dest.clone();
         let sess_f = Arc::clone(&session);
         let peer_f = Arc::clone(&peer);
-        // the flow's idle policy, route-options `udp_timeout` included
-        let udp_timeout = crate::outbound::packet::udp_bridge_timeout();
+        let policy = crate::outbound::packet::UdpBridgePolicy::current();
+        let udp_timeout = policy.timeout;
+        let close_flow = CloseUdpFlowOnDrop(policy.flow_close);
         // held across the spawn so the task's own removal comes after the insert
         let mut handles = shared.handles.lock().expect("handles");
         let handle = tokio::spawn(async move {
+            let _close_flow = close_flow;
             let _lease = lease;
             let check_interval = udp_timeout.min(Duration::from_secs(5));
-            loop {
-                // a shared per-thread buffer: an idle session keeps none
-                let sent = crate::inbound::udp::recv_with(&peer_f, |pkt| {
-                    send_hy2_datagram(&conn_f, sid, &dest_f, pkt, &sess_f)
-                });
-                match tokio::time::timeout(check_interval, sent).await {
-                    Ok(Ok(sent)) => {
-                        sess_f
-                            .last_activity
-                            .store(crate::inbound::udp::now_ms(), Ordering::Relaxed);
-                        if let Err(e) = sent {
-                            logging::debug(format_args!("hysteria2 udp send {sid}: {e}"));
-                            // one bad packet is dropped; a dead connection ends the session
-                            if conn_f.close_reason().is_some() {
+            let forward = async {
+                loop {
+                    // a shared per-thread buffer: an idle session keeps none
+                    let sent = crate::inbound::udp::recv_with(&peer_f, |pkt| {
+                        send_hy2_datagram(&conn_f, sid, &dest_f, pkt, &sess_f)
+                    });
+                    match tokio::time::timeout(check_interval, sent).await {
+                        Ok(Ok(sent)) => {
+                            sess_f
+                                .last_activity
+                                .store(crate::inbound::udp::now_ms(), Ordering::Relaxed);
+                            if let Err(e) = sent {
+                                logging::debug(format_args!("hysteria2 udp send {sid}: {e}"));
+                                // one bad packet is dropped; a dead connection ends the session
+                                if conn_f.close_reason().is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            logging::debug(format_args!("hysteria2 udp recv {sid}: {e}"));
+                            break;
+                        }
+                        Err(_) => {
+                            let elapsed = crate::inbound::udp::now_ms()
+                                .saturating_sub(sess_f.last_activity.load(Ordering::Relaxed));
+                            if elapsed >= udp_timeout.as_millis() as u64 {
                                 break;
                             }
                         }
                     }
-                    Ok(Err(e)) => {
-                        logging::debug(format_args!("hysteria2 udp recv {sid}: {e}"));
-                        break;
-                    }
-                    Err(_) => {
-                        let elapsed = crate::inbound::udp::now_ms()
-                            .saturating_sub(sess_f.last_activity.load(Ordering::Relaxed));
-                        if elapsed >= udp_timeout.as_millis() as u64 {
-                            break;
-                        }
-                    }
                 }
+            };
+            // A UDP socket has no EOF when its local peer disappears. End the
+            // bridge on QUIC close so the hub can reopen the flow on demand.
+            tokio::select! {
+                biased;
+                _ = conn_f.closed() => {}
+                _ = forward => {}
             }
             if let Some(shared) = shared_f.upgrade() {
                 shared.sessions.lock().expect("sessions").remove(&sid);
@@ -502,6 +513,16 @@ impl Hysteria2 {
         handles.insert(sid, handle.abort_handle());
         drop(handles);
         Ok(local)
+    }
+}
+
+struct CloseUdpFlowOnDrop(Option<crate::clash_state::CloseSignal>);
+
+impl Drop for CloseUdpFlowOnDrop {
+    fn drop(&mut self) {
+        if let Some(signal) = &self.0 {
+            signal.close();
+        }
     }
 }
 
@@ -1161,9 +1182,12 @@ mod tests {
         let (out, echo) = udp_test_pair().await;
         let mut socks = Vec::new();
         for _ in 0..32 {
-            let sock = crate::outbound::packet::UDP_BRIDGE_TIMEOUT
+            let sock = crate::outbound::packet::UDP_BRIDGE_POLICY
                 .scope(
-                    Duration::from_millis(300),
+                    crate::outbound::packet::UdpBridgePolicy {
+                        timeout: Duration::from_millis(300),
+                        flow_close: None,
+                    },
                     out.connect_udp(&Target::Ip(echo)),
                 )
                 .await
