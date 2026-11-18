@@ -220,25 +220,29 @@ impl Hysteria2 {
         let mut pool = self.shared.lock().await;
         // hopping happens inside the connection (relay), so only closed ones go
         pool.retain(|s| s.conn.close_reason().is_none());
-        let best = pool
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, s)| s.leases.load(Ordering::Relaxed));
-        let shared = match best {
-            Some((i, s))
+        let best = pool.iter().min_by_key(|s| s.leases.load(Ordering::Relaxed));
+        match best {
+            Some(s)
                 if s.leases.load(Ordering::Relaxed) < POOL_STREAMS_PER_CONN
                     || pool.len() >= POOL_MAX_CONNS =>
             {
-                Arc::clone(&pool[i])
+                Ok(Arc::clone(s))
             }
-            _ => {
-                let s = self.dial().await?;
-                s.start_demux();
-                pool.push(Arc::clone(&s));
-                Arc::clone(pool.last().expect("pushed"))
-            }
-        };
-        Ok(shared)
+            _ => match self.dial().await {
+                Ok(s) => {
+                    s.start_demux();
+                    pool.push(Arc::clone(&s));
+                    Ok(s)
+                }
+                // Leases and connection state can change while dialing.
+                Err(error) => pool
+                    .iter()
+                    .filter(|s| s.conn.close_reason().is_none())
+                    .min_by_key(|s| s.leases.load(Ordering::Relaxed))
+                    .cloned()
+                    .ok_or(error),
+            },
+        }
     }
 
     /// The reference paces its upload at the rate the config names and
@@ -1007,7 +1011,7 @@ mod tests {
     const CERT_PEM: &str = include_str!("../../../../tests/golden/certs/localhost.crt");
     const KEY_PEM: &str = include_str!("../../../../tests/golden/certs/localhost.key");
 
-    async fn udp_test_pair() -> (Hysteria2, std::net::SocketAddr) {
+    async fn start_test_client() -> Hysteria2 {
         let router = crate::route::Router::new(
             &serde_json::json!({"outbounds": [{"type": "direct", "tag": "direct"}]}),
         )
@@ -1022,6 +1026,16 @@ mod tests {
             .expect("bind hy2 inbound");
         let port = server.local_addr().expect("server addr").port();
         tokio::spawn(server.serve());
+        let cfg = serde_json::json!({
+            "type": "hysteria2", "tag": "hy2-out", "server": "127.0.0.1",
+            "server_port": port, "password": "udp-pass",
+            "tls": {"enabled": true, "insecure": true, "server_name": "localhost"}
+        });
+        Hysteria2::build(cfg.as_object().unwrap(), "out").unwrap()
+    }
+
+    async fn udp_test_pair() -> (Hysteria2, std::net::SocketAddr) {
+        let out = start_test_client().await;
         let echo = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind udp echo");
@@ -1032,13 +1046,70 @@ mod tests {
                 let _ = echo.send_to(&buf[..n], from).await;
             }
         });
-        let cfg = serde_json::json!({
-            "type": "hysteria2", "tag": "hy2-out", "server": "127.0.0.1",
-            "server_port": port, "password": "udp-pass",
-            "tls": {"enabled": true, "insecure": true, "server_name": "localhost"}
-        });
-        let out = Hysteria2::build(cfg.as_object().unwrap(), "out").unwrap();
         (out, echo_addr)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_pool_expansion_reuses_an_open_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut out = start_test_client().await;
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::Ip(echo.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = echo.accept().await {
+                let (mut read, mut write) = socket.into_split();
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                });
+            }
+        });
+
+        let mut buf = [0; 8];
+        let mut streams = Vec::new();
+        for payload in [b"first", b"other"] {
+            let mut stream = tokio::time::timeout(Duration::from_secs(5), out.connect(&target))
+                .await
+                .expect("existing stream connect timeout")
+                .expect("existing stream");
+            stream.write_all(payload).await.expect("send");
+            let received = &mut buf[..payload.len()];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(received))
+                .await
+                .expect("existing stream echo timeout")
+                .expect("read echo");
+            assert_eq!(&buf[..payload.len()], payload);
+            streams.push(stream);
+        }
+        {
+            let pool = out.shared.lock().await;
+            assert_eq!(pool.len(), 1);
+            assert_eq!(
+                pool[0].leases.load(Ordering::Relaxed),
+                POOL_STREAMS_PER_CONN
+            );
+        }
+
+        // Reserve the port so only new dials fail. The established QUIC
+        // connection still talks to the original server and can carry a new stream.
+        let unanswered = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        out.port = unanswered.local_addr().unwrap().port();
+        out.connect_timeout = Duration::from_millis(100);
+        let mut stream = tokio::time::timeout(Duration::from_secs(5), out.connect(&target))
+            .await
+            .expect("fallback stream connect timeout")
+            .expect("reuse open connection");
+        tokio::time::timeout(Duration::from_secs(1), unanswered.recv_from(&mut buf))
+            .await
+            .expect("pool expansion did not attempt a fresh dial")
+            .expect("receive fresh dial");
+        stream.write_all(b"fallback").await.expect("send");
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut buf))
+            .await
+            .expect("fallback stream echo timeout")
+            .expect("read echo");
+        assert_eq!(&buf, b"fallback");
+        drop(streams);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
