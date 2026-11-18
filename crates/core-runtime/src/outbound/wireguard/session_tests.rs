@@ -27,6 +27,73 @@ async fn connect(wg: &WireGuard) -> AnyStream {
     .unwrap()
 }
 
+#[test]
+fn reserved_and_awg_options_agree_at_check_and_endpoint_build() {
+    let mut root = json!({"endpoints": [{
+        "type": "wireguard", "tag": "wg", "private_key": fixture::b64(fixture::CLIENT_KEY),
+        "address": ["10.66.66.2/24"],
+        "peers": [{"address": "127.0.0.1", "port": 9,
+            "public_key": fixture::b64(fixture::public([73; 32])),
+            "allowed_ips": ["0.0.0.0/0"], "reserved": [19, 81, 203]}]
+    }]});
+    let build = |root: &Value| WireGuard::build(root["endpoints"][0].as_object().unwrap(), "wg");
+    let check_plain = |root: &Value| {
+        core_config::check_str(&root.to_string()).unwrap();
+        let wg = build(root).unwrap();
+        assert!(wg.cfg.awg.is_none(), "{root}");
+        assert_eq!(wg.cfg.peers[0].reserved, [19, 81, 203]);
+    };
+    check_plain(&root);
+    for key in ["h1", "rekey_after_time"] {
+        for value in [
+            json!(0),
+            json!("0"),
+            json!("0-0"),
+            json!(" 00 - 0 "),
+            json!(""),
+            Value::Null,
+            json!({}),
+        ] {
+            root["endpoints"][0][key] = value;
+            check_plain(&root);
+        }
+        root["endpoints"][0].as_object_mut().unwrap().remove(key);
+    }
+    for key in ["header_protection_key", "i1", "ip"] {
+        root["endpoints"][0][key] = json!(" \t ");
+    }
+    check_plain(&root);
+
+    root["endpoints"][0]["rekey_after_time"] = json!("120-130");
+    let error = "nonzero reserved cannot be combined with AmneziaWG obfuscation";
+    assert!(
+        core_config::check_str(&root.to_string())
+            .unwrap_err()
+            .contains(error)
+    );
+    assert!(build(&root).unwrap_err().to_string().contains(error));
+
+    root["endpoints"][0]["peers"][0]["reserved"] = json!([0, 0, 0]);
+    core_config::check_str(&root.to_string()).unwrap();
+    assert_eq!(
+        build(&root).unwrap().cfg.awg.unwrap().rekey_after_time,
+        Some((120, 130))
+    );
+
+    root["endpoints"][0]["rekey_after_time"] = json!("130-120");
+    assert!(
+        core_config::check_str(&root.to_string())
+            .unwrap_err()
+            .contains("range start > end")
+    );
+    assert!(
+        build(&root)
+            .unwrap_err()
+            .to_string()
+            .contains("range start > end")
+    );
+}
+
 #[tokio::test]
 async fn reserved_bytes_reach_the_handshake_socket() {
     let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();

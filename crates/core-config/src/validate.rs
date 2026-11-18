@@ -7766,99 +7766,10 @@ fn go_b64_rawurl_decoded_len(s: &str) -> usize {
     }
 }
 
-/// reference `option.AWGRange` decode (`normalizeAWGRange`): canonical
-/// `"N"` / `"N-M"` string, `""` when unset. Errors mirror
-/// `AWGRange.UnmarshalJSON` / `normalizeAWGRange`.
-fn awg_normalize_range(spec: &str) -> Result<String, String> {
-    let trimmed = spec.trim();
-    if trimmed.is_empty() {
-        return Ok(String::new());
-    }
-    let parts: Vec<&str> = trimmed.split('-').collect();
-    if parts.len() > 2 {
-        return Err(format!(
-            "invalid range {:?}: expected uint32 or \"min-max\"",
-            trimmed
-        ));
-    }
-    let start_s = parts[0].trim();
-    let start = match parse_go_u32(start_s) {
-        Some(n) => n,
-        None => return Err(awg_parse_err(trimmed, parts[0], start_s)),
-    };
-    let end = if parts.len() == 2 {
-        let end_s = parts[1].trim();
-        match parse_go_u32(end_s) {
-            Some(n) => n,
-            None => return Err(awg_parse_err(trimmed, parts[1], end_s)),
-        }
-    } else {
-        start
-    };
-    if end < start {
-        return Err(format!("invalid range {trimmed:?}: range start > end"));
-    }
-    if end == 0 {
-        return Ok(String::new());
-    }
-    if start == end {
-        return Ok(start.to_string());
-    }
-    Ok(format!("{start}-{end}"))
-}
-
-fn awg_parse_err(spec: &str, raw_part: &str, trimmed_part: &str) -> String {
-    let reason = if trimmed_part.is_empty() || !trimmed_part.bytes().all(|b| b.is_ascii_digit()) {
-        "invalid syntax"
-    } else {
-        "value out of range"
-    };
-    format!(
-        "invalid range {:?}: parse {:?}: strconv.ParseUint: parsing {:?}: {reason}",
-        spec, raw_part, trimmed_part
-    )
-}
-
-fn parse_go_u32(s: &str) -> Option<u32> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
-}
-
-/// AWGRange-typed field decode: null/empty-object OK, string normalized,
-/// in-range number OK; anything else is `invalid range <json>`.
 fn check_awg_range(value: &Value, at: &str) -> Result<(), String> {
-    match value {
-        v if is_zero_json(v) => Ok(()),
-        Value::Null => Ok(()),
-        Value::String(s) => awg_normalize_range(s)
-            .map(drop)
-            .map_err(|m| format!("{at}: {m}")),
-        Value::Number(n) => match n.as_u64() {
-            Some(x) if x <= u32::MAX as u64 => Ok(()),
-            _ => Err(format!(
-                "{at}: invalid range {value}: expected uint32 or \"min-max\" string"
-            )),
-        },
-        other => Err(format!(
-            "{at}: invalid range {other}: expected uint32 or \"min-max\" string"
-        )),
-    }
-}
-
-/// canonical form of an AWGRange field (`None` = unset), used by the
-/// initialize-time `IsSet` gate. Decode errors are unreachable here.
-fn awg_range_canonical(value: Option<&Value>) -> Option<String> {
-    match value? {
-        Value::String(s) => awg_normalize_range(s).ok().filter(|c| !c.is_empty()),
-        Value::Number(n) => n
-            .as_u64()
-            .filter(|x| *x != 0 && *x <= u32::MAX as u64)
-            .map(|x| x.to_string()),
-        v if is_zero_json(v) => None,
-        _ => None,
-    }
+    crate::wireguard::parse_awg_range(Some(value))
+        .map(drop)
+        .map_err(|error| format!("{at}: {error}"))
 }
 
 /// Go `netip.ParsePrefix` failure reason (without the wrapper).
@@ -8154,43 +8065,22 @@ fn wireguard_endpoint_decode(i: usize, obj: &Map<String, Value>) -> Result<(), S
     if let Some(v) = obj.get("address") {
         check_prefix_list(v, &format!("{at}.address"))?;
     }
-    for f in ["jc", "jmin", "jmax", "s1", "s2", "s3", "s4"] {
+    for &f in crate::wireguard::AWG_INTEGER_FIELDS {
         if let Some(v) = obj.get(f) {
             ep_unsigned(v, &format!("{at}.{f}"), AWG, f, u32::MAX as u64)?;
         }
     }
-    for f in [
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "content_padding_addition",
-        "rekey_after_time",
-        "rekey_timeout",
-        "reject_after_time",
-        "keepalive_timeout",
-        "max_handshake_attempts",
-    ] {
+    for &f in crate::wireguard::AWG_RANGE_FIELDS {
         if let Some(v) = obj.get(f) {
             check_awg_range(v, &format!("{at}.{f}"))?;
         }
     }
-    for f in [
-        "i1",
-        "i2",
-        "i3",
-        "i4",
-        "i5",
-        "id",
-        "ip",
-        "ib",
-        "header_protection_key",
-    ] {
+    for &f in crate::wireguard::AWG_STRING_FIELDS {
         if let Some(v) = obj.get(f) {
             ep_str(v, &format!("{at}.{f}"), AWG, f)?;
         }
     }
-    for f in ["random_trailers", "disable_cookies"] {
+    for &f in crate::wireguard::AWG_BOOLEAN_FIELDS {
         if let Some(v) = obj.get(f) {
             ep_bool(v, &format!("{at}.{f}"), AWG, f)?;
         }
@@ -8489,57 +8379,21 @@ fn wireguard_endpoint_initialize(
     }
 
     let u32_field = |key: &str| -> u64 { obj.get(key).and_then(Value::as_u64).unwrap_or(0) };
-    let (jc, jmin, jmax) = (u32_field("jc"), u32_field("jmin"), u32_field("jmax"));
+    let (jmin, jmax) = (u32_field("jmin"), u32_field("jmax"));
     let (s1, s2, s3, s4) = (
         u32_field("s1"),
         u32_field("s2"),
         u32_field("s3"),
         u32_field("s4"),
     );
-    let hpk = endpoint_str(obj, "header_protection_key");
-    let (id, ip, ib) = (
-        endpoint_str(obj, "id"),
-        endpoint_str(obj, "ip"),
-        endpoint_str(obj, "ib"),
-    );
-    let (i1, i2) = (endpoint_str(obj, "i1"), endpoint_str(obj, "i2"));
-    let ranges_set = [
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "content_padding_addition",
-        "rekey_after_time",
-        "rekey_timeout",
-        "reject_after_time",
-        "keepalive_timeout",
-        "max_handshake_attempts",
-    ]
-    .iter()
-    .any(|f| awg_range_canonical(obj.get(*f)).is_some());
-    let awg_set = jc != 0
-        || jmin != 0
-        || jmax != 0
-        || s1 != 0
-        || s2 != 0
-        || s3 != 0
-        || s4 != 0
-        || ranges_set
-        || [
-            i1,
-            i2,
-            endpoint_str(obj, "i3"),
-            endpoint_str(obj, "i4"),
-            endpoint_str(obj, "i5"),
-        ]
-        .iter()
-        .any(|s| !s.is_empty())
-        || !id.is_empty()
-        || !ip.is_empty()
-        || !ib.is_empty()
-        || !hpk.is_empty()
-        || obj.get("random_trailers").and_then(Value::as_bool) == Some(true)
-        || obj.get("disable_cookies").and_then(Value::as_bool) == Some(true);
+    let awg_text = |key| {
+        let value = endpoint_str(obj, key);
+        if value.trim().is_empty() { "" } else { value }
+    };
+    let hpk = awg_text("header_protection_key");
+    let (id, ip, ib) = (awg_text("id"), awg_text("ip"), awg_text("ib"));
+    let (i1, i2) = (awg_text("i1"), awg_text("i2"));
+    let awg_set = crate::wireguard::has_awg_options(obj);
     if awg_set
         && obj
             .get("peers")

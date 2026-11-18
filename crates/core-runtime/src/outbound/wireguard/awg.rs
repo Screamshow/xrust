@@ -12,40 +12,10 @@
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use core_config::wireguard::{has_awg_options, parse_awg_range};
 use serde_json::{Map, Value};
 
 use super::noise::HeaderRange;
-
-pub const AWG_FIELDS: &[&str] = &[
-    "jc",
-    "jmin",
-    "jmax",
-    "s1",
-    "s2",
-    "s3",
-    "s4",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "i1",
-    "i2",
-    "i3",
-    "i4",
-    "i5",
-    "id",
-    "ip",
-    "ib",
-    "header_protection_key",
-    "content_padding_addition",
-    "rekey_after_time",
-    "rekey_timeout",
-    "reject_after_time",
-    "keepalive_timeout",
-    "max_handshake_attempts",
-    "random_trailers",
-    "disable_cookies",
-];
 
 pub const INIT: usize = 0;
 pub const RESPONSE: usize = 1;
@@ -238,7 +208,7 @@ impl AwgParams {
     }
 
     pub fn from_obj(obj: &Map<String, Value>, at: &str) -> anyhow::Result<Option<Self>> {
-        if !AWG_FIELDS.iter().any(|f| awg_field_present(obj.get(*f))) {
+        if !has_awg_options(obj) {
             return Ok(None);
         }
         let junk_count = uint_field(obj, "jc", 0, at)?;
@@ -286,7 +256,10 @@ impl AwgParams {
         };
         let mut headers = STD_HEADERS;
         for (i, slot) in headers.iter_mut().enumerate() {
-            *slot = header_range(obj, &format!("h{}", i + 1), (i + 1) as u32, at)?;
+            let key = format!("h{}", i + 1);
+            *slot = parse_awg_range(obj.get(&key))
+                .map_err(|error| anyhow!("{at}.{key}: {error}"))?
+                .unwrap_or(*slot);
         }
         let mut ipackets: [Option<JunkChain>; 5] = [None, None, None, None, None];
         for (i, slot) in ipackets.iter_mut().enumerate() {
@@ -343,93 +316,13 @@ impl AwgParams {
     }
 }
 
-pub fn awg_field_present(value: Option<&Value>) -> bool {
-    match value {
-        None | Some(Value::Null) => false,
-        Some(Value::Number(n)) => n.as_f64().is_some_and(|v| v != 0.0),
-        Some(Value::String(s)) => !s.trim().is_empty(),
-        Some(Value::Bool(b)) => *b,
-        Some(_) => true,
-    }
-}
-
-/// `normalizeAWGRange` from sing-box-lx `option/wireguard_awg.go`: `"N"`,
-/// `"N-M"`, JSON number, or unset (0 / "" / null → default).
-fn header_range(
-    obj: &Map<String, Value>,
-    key: &str,
-    default: u32,
-    at: &str,
-) -> anyhow::Result<HeaderRange> {
-    let Some(v) = obj.get(key) else {
-        return Ok((default, default));
-    };
-    let spec: Option<String> = match v {
-        Value::Null => None,
-        Value::Number(n) => match n.as_u64() {
-            Some(x) if x <= u32::MAX as u64 => {
-                if x == 0 {
-                    None
-                } else {
-                    Some(x.to_string())
-                }
-            }
-            _ => return Err(anyhow!("{at}.{key}: invalid range {n}: expected uint32")),
-        },
-        Value::String(s) => {
-            let t = s.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
-            }
-        }
-        other => {
-            return Err(anyhow!(
-                "{at}.{key}: invalid range {other}: expected uint32 or \"min-max\" string"
-            ));
-        }
-    };
-    let Some(spec) = spec else {
-        return Ok((default, default));
-    };
-    let parts: Vec<&str> = spec.split('-').collect();
-    if parts.len() > 2 {
-        return Err(anyhow!(
-            "{at}.{key}: invalid range {spec:?}: expected uint32 or \"min-max\""
-        ));
-    }
-    let start = parse_u32(parts[0].trim())
-        .ok_or_else(|| anyhow!("{at}.{key}: invalid range {spec:?}: parse {:?}", parts[0]))?;
-    let end = if parts.len() == 2 {
-        parse_u32(parts[1].trim())
-            .ok_or_else(|| anyhow!("{at}.{key}: invalid range {spec:?}: parse {:?}", parts[1]))?
-    } else {
-        start
-    };
-    if end < start {
-        return Err(anyhow!(
-            "{at}.{key}: invalid range {spec:?}: range start > end"
-        ));
-    }
-    if end == 0 {
-        return Ok((default, default));
-    }
-    Ok((start, end))
-}
-
 /// Optional ranged knob (`AWGRange`): unset means `None` (the caller keeps
 /// its WireGuard default).
 fn opt_range(obj: &Map<String, Value>, key: &str, at: &str) -> anyhow::Result<Option<HeaderRange>> {
-    if !awg_field_present(obj.get(key)) {
-        return Ok(None);
-    }
-    // A range that normalizes to unset ("0" / "") means "not configured".
-    let probe = header_range(obj, key, u32::MAX, at)?;
-    if probe == (u32::MAX, u32::MAX) {
-        return Ok(None);
-    }
-    Ok(Some(probe))
+    parse_awg_range(obj.get(key))
+        // Older runtime builds also treated this optional value as unset.
+        .map(|range| range.filter(|&range| range != (u32::MAX, u32::MAX)))
+        .map_err(|error| anyhow!("{at}.{key}: {error}"))
 }
 
 fn uint_field(obj: &Map<String, Value>, key: &str, default: u64, at: &str) -> anyhow::Result<u64> {
@@ -441,13 +334,6 @@ fn uint_field(obj: &Map<String, Value>, key: &str, default: u64, at: &str) -> an
             .ok_or_else(|| anyhow!("{at}.{key}: must be a non-negative integer <= {}", u32::MAX)),
         Some(_) => Err(anyhow!("{at}.{key}: must be a non-negative integer")),
     }
-}
-
-fn parse_u32(s: &str) -> Option<u32> {
-    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    s.parse().ok()
 }
 
 fn parse_len(val: &str) -> Result<usize, String> {

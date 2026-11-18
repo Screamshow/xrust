@@ -1,8 +1,109 @@
-//! Shared normalization for WireGuard peer reserved bytes. The empty value
-//! disables the extension; every nonempty representation must contain 3 bytes.
+//! WireGuard configuration shared by validation and runtime endpoint setup.
 use base64::Engine as _;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
+pub(crate) const AWG_INTEGER_FIELDS: &[&str] = &["jc", "jmin", "jmax", "s1", "s2", "s3", "s4"];
+pub(crate) const AWG_RANGE_FIELDS: &[&str] = &[
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "content_padding_addition",
+    "rekey_after_time",
+    "rekey_timeout",
+    "reject_after_time",
+    "keepalive_timeout",
+    "max_handshake_attempts",
+];
+pub(crate) const AWG_STRING_FIELDS: &[&str] = &[
+    "i1",
+    "i2",
+    "i3",
+    "i4",
+    "i5",
+    "id",
+    "ip",
+    "ib",
+    "header_protection_key",
+];
+pub(crate) const AWG_BOOLEAN_FIELDS: &[&str] = &["random_trailers", "disable_cookies"];
+
+/// Invalid ranges count as configured so callers still report their errors.
+pub fn has_awg_options(obj: &Map<String, Value>) -> bool {
+    AWG_RANGE_FIELDS
+        .iter()
+        .any(|&field| !matches!(parse_awg_range(obj.get(field)), Ok(None)))
+        || AWG_INTEGER_FIELDS
+            .iter()
+            .chain(AWG_STRING_FIELDS)
+            .chain(AWG_BOOLEAN_FIELDS)
+            .any(|&field| match obj.get(field) {
+                None | Some(Value::Null) => false,
+                Some(Value::Number(n)) => n.as_f64().is_some_and(|v| v != 0.0),
+                Some(Value::String(s)) => !s.trim().is_empty(),
+                Some(Value::Bool(b)) => *b,
+                Some(_) => true,
+            })
+}
+
+/// Decode an AWG range with the reference's error messages. Zero means unset.
+pub fn parse_awg_range(value: Option<&Value>) -> Result<Option<(u32, u32)>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let (start, end) = match value {
+        Value::Null => return Ok(None),
+        Value::Object(map) if map.is_empty() => return Ok(None),
+        Value::String(spec) => {
+            let spec = spec.trim();
+            if spec.is_empty() {
+                return Ok(None);
+            }
+            if let Some((start, end)) = spec.split_once('-') {
+                if end.contains('-') {
+                    return Err(format!(
+                        "invalid range {spec:?}: expected uint32 or \"min-max\""
+                    ));
+                }
+                let start = parse_range_part(spec, start)?;
+                let end = parse_range_part(spec, end)?;
+                if start > end {
+                    return Err(format!("invalid range {spec:?}: range start > end"));
+                }
+                (start, end)
+            } else {
+                let single = parse_range_part(spec, spec)?;
+                (single, single)
+            }
+        }
+        _ => {
+            let single = value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    format!("invalid range {value}: expected uint32 or \"min-max\" string")
+                })?;
+            (single, single)
+        }
+    };
+    Ok((end != 0).then_some((start, end)))
+}
+
+fn parse_range_part(spec: &str, raw: &str) -> Result<u32, String> {
+    let part = raw.trim();
+    let reason = if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+        "invalid syntax"
+    } else if let Ok(number) = part.parse() {
+        return Ok(number);
+    } else {
+        "value out of range"
+    };
+    Err(format!(
+        "invalid range {spec:?}: parse {raw:?}: strconv.ParseUint: parsing {part:?}: {reason}"
+    ))
+}
+
+/// An empty value disables the extension. Other representations must hold three bytes.
 pub fn parse_reserved(value: &Value) -> Result<[u8; 3], String> {
     let bytes = match value {
         Value::Null => return Ok([0; 3]),
