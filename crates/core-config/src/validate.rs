@@ -8387,7 +8387,9 @@ fn endpoint_peers_decode(i: usize, value: &Value) -> Result<(), String> {
 fn check_reserved(value: &Value, at: &str) -> Result<(), String> {
     const WGP: &str = "WireGuardPeer.peers";
     match value {
-        Value::Null => Ok(()),
+        Value::Null | Value::String(_) => crate::wireguard::parse_reserved(value)
+            .map(|_| ())
+            .map_err(|e| format!("{at}: {e}")),
         Value::Object(map) if map.is_empty() => Ok(()),
         Value::Array(items) => {
             for (idx, item) in items.iter().enumerate() {
@@ -8401,7 +8403,6 @@ fn check_reserved(value: &Value, at: &str) -> Result<(), String> {
                             ));
                         }
                     },
-                    v if is_zero_json(v) => {}
                     other => {
                         return Err(format!(
                             "{at}[{idx}]: json: cannot unmarshal {} into Go struct field {WGP}.reserved of type uint8",
@@ -8410,7 +8411,9 @@ fn check_reserved(value: &Value, at: &str) -> Result<(), String> {
                     }
                 }
             }
-            Ok(())
+            crate::wireguard::parse_reserved(value)
+                .map(|_| ())
+                .map_err(|e| format!("{at}: {e}"))
         }
         other => Err(format!(
             "{at}: json: cannot unmarshal {} into Go struct field {WGP}.reserved of type []uint8",
@@ -8537,6 +8540,22 @@ fn wireguard_endpoint_initialize(
         || !hpk.is_empty()
         || obj.get("random_trailers").and_then(Value::as_bool) == Some(true)
         || obj.get("disable_cookies").and_then(Value::as_bool) == Some(true);
+    if awg_set
+        && obj
+            .get("peers")
+            .and_then(Value::as_array)
+            .is_some_and(|peers| {
+                peers.iter().any(|peer| {
+                    peer.get("reserved")
+                        .and_then(|value| crate::wireguard::parse_reserved(value).ok())
+                        .is_some_and(|bytes| bytes != [0; 3])
+                })
+            })
+    {
+        return Err(format!(
+            "{at}: nonzero reserved cannot be combined with AmneziaWG obfuscation"
+        ));
+    }
 
     if awg_set {
         if jmin > jmax {

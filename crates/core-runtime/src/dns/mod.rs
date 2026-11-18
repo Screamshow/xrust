@@ -351,6 +351,15 @@ impl DnsService {
             .find_map(|s| s.store.as_ref().and_then(|f| f.lookup_domain(ip)))
     }
 
+    pub(crate) fn touch_fakeip(&self, ip: IpAddr, domain: &str) -> bool {
+        self.servers.values().any(|server| {
+            server
+                .store
+                .as_ref()
+                .is_some_and(|store| store.touch(ip, domain))
+        })
+    }
+
     pub fn is_fakeip(&self, ip: IpAddr) -> bool {
         self.servers
             .values()

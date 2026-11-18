@@ -4,6 +4,7 @@ pub mod netip_parse;
 pub mod srs;
 pub mod validate;
 pub mod vless_enc;
+pub mod wireguard;
 
 use serde_json::Value;
 

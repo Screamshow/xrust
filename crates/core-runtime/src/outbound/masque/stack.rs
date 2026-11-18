@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
@@ -19,7 +20,7 @@ use smoltcp::socket::tcp::{
 };
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::logging;
 
@@ -111,11 +112,13 @@ pub(crate) enum Cmd {
         id: u32,
         dst: SocketAddr,
         to_caller: mpsc::Sender<Vec<u8>>,
+        stalled: Arc<AtomicBool>,
         resp: oneshot::Sender<Result<(), String>>,
     },
     TcpData {
         id: u32,
         bytes: Vec<u8>,
+        consumed: oneshot::Sender<()>,
     },
     TcpClose {
         id: u32,
@@ -137,9 +140,10 @@ struct TcpConn {
     handle: SocketHandle,
     #[allow(dead_code)]
     dst: SocketAddr,
-    to_caller: mpsc::Sender<Vec<u8>>,
+    to_caller: Option<mpsc::Sender<Vec<u8>>>,
+    stalled: Arc<AtomicBool>,
     resp: Option<oneshot::Sender<Result<(), String>>>,
-    from_caller: VecDeque<Vec<u8>>,
+    from_caller: VecDeque<(Vec<u8>, oneshot::Sender<()>)>,
     stash: Option<Vec<u8>>,
     created: Instant,
     caller_eof: bool,
@@ -258,6 +262,7 @@ impl Stack {
                 id,
                 dst,
                 to_caller,
+                stalled,
                 resp,
             } => {
                 let smol_addr = match dst.ip() {
@@ -295,7 +300,8 @@ impl Stack {
                     TcpConn {
                         handle,
                         dst,
-                        to_caller,
+                        to_caller: Some(to_caller),
+                        stalled,
                         resp: Some(resp),
                         from_caller: VecDeque::new(),
                         stash: None,
@@ -304,9 +310,13 @@ impl Stack {
                     },
                 );
             }
-            Cmd::TcpData { id, bytes } => {
+            Cmd::TcpData {
+                id,
+                bytes,
+                consumed,
+            } => {
                 let overflow = self.tcp.get(&id).is_some_and(|c| {
-                    c.from_caller.iter().map(|b| b.len()).sum::<usize>() + bytes.len()
+                    c.from_caller.iter().map(|(b, _)| b.len()).sum::<usize>() + bytes.len()
                         > EGRESS_BUF_MAX
                 });
                 if overflow {
@@ -320,13 +330,12 @@ impl Stack {
                     return;
                 }
                 if let Some(c) = self.tcp.get_mut(&id) {
-                    c.from_caller.push_back(bytes);
+                    c.from_caller.push_back((bytes, consumed));
                 }
             }
             Cmd::TcpClose { id } => {
                 if let Some(c) = self.tcp.get_mut(&id) {
                     c.caller_eof = true;
-                    c.from_caller.clear();
                 }
             }
             Cmd::UdpOpen { target, resp } => {
@@ -437,23 +446,26 @@ impl Stack {
         }
     }
 
-    fn maintain_tcp(&mut self) {
+    fn maintain_tcp(&mut self) -> bool {
+        let mut drained_receive_window = false;
         let ids: Vec<u32> = self.tcp.keys().copied().collect();
         for id in ids {
             let Some(mut conn) = self.tcp.remove(&id) else {
                 continue;
             };
             let mut rbuf = std::mem::take(&mut self.scratch);
-            let mut remote_closed = false;
+            let mut remote_closed = conn.to_caller.is_none();
             let mut caller_gone = false;
             let state = {
                 let sock = self.sockets.get_mut::<TcpSock<'static>>(conn.handle);
 
-                while let Some(front) = conn.from_caller.front_mut() {
+                while let Some((front, _)) = conn.from_caller.front_mut() {
                     match sock.send_slice(front) {
                         Ok(0) => break,
                         Ok(n) if n >= front.len() => {
-                            conn.from_caller.pop_front();
+                            if let Some((_, consumed)) = conn.from_caller.pop_front() {
+                                let _ = consumed.send(());
+                            }
                         }
                         Ok(n) => {
                             let rest = front.split_off(n);
@@ -466,21 +478,27 @@ impl Stack {
                     }
                 }
 
-                if conn.stash.is_none() {
+                if conn.stash.is_none()
+                    && let Some(to_caller) = &conn.to_caller
+                {
                     loop {
                         match sock.recv_slice(&mut rbuf) {
                             Ok(0) => break,
-                            Ok(n) => match conn.to_caller.try_send(rbuf[..n].to_vec()) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(v)) => {
-                                    conn.stash = Some(v);
-                                    break;
+                            Ok(n) => {
+                                drained_receive_window = true;
+                                match to_caller.try_send(rbuf[..n].to_vec()) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(v)) => {
+                                        conn.stalled.store(true, Ordering::SeqCst);
+                                        conn.stash = Some(v);
+                                        break;
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        caller_gone = true;
+                                        break;
+                                    }
                                 }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    caller_gone = true;
-                                    break;
-                                }
-                            },
+                            }
                             Err(TcpRecvError::InvalidState) => break,
                             Err(TcpRecvError::Finished) => {
                                 remote_closed = true;
@@ -489,22 +507,32 @@ impl Stack {
                         }
                     }
                 }
+                // FIN follows every accepted byte, including data still queued
+                // behind smoltcp's full send ring. Reading the reply stays open.
+                if conn.caller_eof && conn.from_caller.is_empty() {
+                    sock.close();
+                }
                 sock.state()
             };
             self.scratch = rbuf;
 
-            if let Some(stash) = conn.stash.take() {
-                match conn.to_caller.try_send(stash) {
+            if let Some(stash) = conn.stash.take()
+                && let Some(to_caller) = &conn.to_caller
+            {
+                match to_caller.try_send(stash) {
                     Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(v)) => conn.stash = Some(v),
+                    Err(mpsc::error::TrySendError::Full(v)) => {
+                        conn.stalled.store(true, Ordering::SeqCst);
+                        conn.stash = Some(v);
+                    }
                     Err(mpsc::error::TrySendError::Closed(_)) => caller_gone = true,
                 }
             }
-            if conn.to_caller.is_closed() {
+            if conn.to_caller.as_ref().is_some_and(mpsc::Sender::is_closed) {
                 caller_gone = true;
             }
 
-            if state == TcpState::Established
+            if matches!(state, TcpState::Established | TcpState::CloseWait)
                 && let Some(resp) = conn.resp.take()
             {
                 let _ = resp.send(Ok(()));
@@ -515,9 +543,15 @@ impl Stack {
 
             let connect_failed = conn.resp.is_some()
                 && (state == TcpState::Closed || conn.created.elapsed() >= CONNECT_TIMEOUT);
-            let finished = state == TcpState::Closed
-                || caller_gone
-                || (conn.caller_eof && remote_closed && conn.stash.is_none());
+            // Publish receive EOF after the stash, while allowing the caller
+            // to keep writing and the TCP socket to complete its FIN exchange.
+            if remote_closed && conn.stash.is_none() {
+                conn.to_caller.take();
+            }
+            let finished = caller_gone
+                || (matches!(state, TcpState::Closed | TcpState::TimeWait)
+                    && conn.stash.is_none()
+                    && !self.sockets.get::<TcpSock<'static>>(conn.handle).can_recv());
 
             if connect_failed && let Some(resp) = conn.resp.take() {
                 let _ = resp.send(Err(match state {
@@ -534,6 +568,7 @@ impl Stack {
                 self.tcp.insert(id, conn);
             }
         }
+        drained_receive_window
     }
 
     fn idle_expired(&self) -> bool {
@@ -581,6 +616,7 @@ pub(crate) async fn run(
     cfg: Arc<StackCfg>,
     mut leg: Leg,
     mut rx: mpsc::Receiver<Cmd>,
+    wake: Arc<Notify>,
 ) -> io::Result<()> {
     let mut device = MasqueDevice::new(cfg.mtu);
     let mut iconfig = IfaceConfig::new(HardwareAddress::Ip);
@@ -627,9 +663,14 @@ pub(crate) async fn run(
             stack.process_cmd(cmd);
             stack.last_activity = Instant::now();
         }
-        stack.poll_stack();
-        stack.flush_leg(&mut leg).await?;
         stack.maintain_tcp();
+        stack.poll_stack();
+        if stack.maintain_tcp() {
+            stack
+                .iface
+                .poll_egress(SmolInstant::now(), &mut stack.device, &mut stack.sockets);
+        }
+        stack.flush_leg(&mut leg).await?;
         if stack.idle_expired() {
             logging::debug(format_args!(
                 "masque[{}]: idle-suspend tunnel",
@@ -639,6 +680,7 @@ pub(crate) async fn run(
         }
         let deadline = stack.next_deadline();
         tokio::select! {
+            _ = wake.notified() => {},
             cmd = rx.recv() => match cmd {
                 Some(cmd) => {
                     stack.process_cmd(cmd);
@@ -839,6 +881,59 @@ fn ip_info(pkt: &[u8]) -> Option<(IpAddr, IpAddr, u8, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_fin_preserves_queued_upload() {
+        let cfg = Arc::new(StackCfg {
+            tag: "half-close-test".into(),
+            mtu: 1280,
+            local_addr: Some("172.16.0.2".parse().unwrap()),
+            local_cidr: Some("172.16.0.2/24".parse().unwrap()),
+            local_addr_v6: None,
+            local_cidr_v6: None,
+            idle_timeout: None,
+        });
+        let mut device = MasqueDevice::new(cfg.mtu);
+        let mut iface = Interface::new(
+            IfaceConfig::new(HardwareAddress::Ip),
+            &mut device,
+            SmolInstant::now(),
+        );
+        iface.update_ip_addrs(|ips| ips.push(cfg.local_cidr.unwrap()).unwrap());
+        let mut stack = Stack {
+            cfg,
+            device,
+            iface,
+            sockets: SocketSet::new(Vec::new()),
+            tcp: HashMap::new(),
+            udp: HashMap::new(),
+            next_port: EPHEMERAL_BASE,
+            scratch: vec![0; SCRATCH_BUF],
+            out_q: VecDeque::new(),
+            last_activity: Instant::now(),
+        };
+        let (to_caller, _replies) = mpsc::channel(REPLY_QUEUE);
+        let (resp, _connected) = oneshot::channel();
+        stack.process_cmd(Cmd::TcpConnect {
+            id: 1,
+            dst: "172.16.0.1:1234".parse().unwrap(),
+            to_caller,
+            resp,
+            stalled: Arc::new(AtomicBool::new(false)),
+        });
+        let (consumed, _accepted) = oneshot::channel();
+        stack.process_cmd(Cmd::TcpData {
+            id: 1,
+            bytes: b"request before FIN".to_vec(),
+            consumed,
+        });
+        stack.process_cmd(Cmd::TcpClose { id: 1 });
+        assert_eq!(
+            stack.tcp[&1].from_caller.len(),
+            1,
+            "FIN discarded an accepted upload"
+        );
+    }
 
     #[test]
     fn ipv4_udp_roundtrip() {

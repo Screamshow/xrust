@@ -28,6 +28,39 @@ async fn connect(wg: &WireGuard) -> AnyStream {
 }
 
 #[tokio::test]
+async fn reserved_bytes_reach_the_handshake_socket() {
+    let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let wg = Arc::new(
+        WireGuard::build(
+            json!({
+                "private_key": fixture::b64(fixture::CLIENT_KEY),
+                "address": ["10.66.66.2/24"],
+                "peers": [{"address": "127.0.0.1", "port": sink.local_addr().unwrap().port(),
+                    "public_key": fixture::b64(fixture::public([73; 32])),
+                    "allowed_ips": ["0.0.0.0/0"], "reserved": [19, 81, 203]}]
+            })
+            .as_object()
+            .unwrap(),
+            "reserved-test",
+        )
+        .unwrap(),
+    );
+    let task = tokio::spawn(async move {
+        wg.connect(&Target::Ip("10.66.66.1:4321".parse().unwrap()))
+            .await
+    });
+    let mut wire = [0; 2048];
+    let received = tokio::time::timeout(Duration::from_secs(8), sink.recv_from(&mut wire))
+        .await
+        .unwrap()
+        .unwrap()
+        .0;
+    task.abort();
+    assert_eq!(received, noise::INITIATION_LEN);
+    assert_eq!(&wire[1..4], &[19, 81, 203]);
+}
+
+#[tokio::test]
 async fn tcp_fin_delivers_all_bytes_and_preserves_the_write_half() {
     for (local_fin, size) in [(false, 17), (true, 17), (false, 2 * 1024 * 1024)] {
         let response: Vec<_> = (0..size).map(|n| (n % 251) as u8).collect();

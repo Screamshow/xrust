@@ -43,7 +43,7 @@ const STREAM_QPACK_ENCODER: u8 = 0x02;
 const STREAM_QPACK_DECODER: u8 = 0x03;
 
 const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
-const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x07;
+const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x08;
 const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 // The official WARP client still advertises the deprecated
 // SETTINGS_H3_DATAGRAM_00; WARP expects it (reference masque.go).
@@ -65,6 +65,8 @@ pub(crate) struct H3Conn {
     conn: quinn::Connection,
     endpoint: quinn::Endpoint,
     send: AsyncMutex<quinn::SendStream>,
+    /// RFC 9114 / RFC 9204 critical streams live as long as the connection.
+    control_streams: Vec<quinn::SendStream>,
     rx: mpsc::Receiver<Vec<u8>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
@@ -189,9 +191,6 @@ impl H3Conn {
             .write_all(&[STREAM_QPACK_ENCODER])
             .await
             .map_err(|e| io::Error::other(format!("masque h3: write qpack stream: {e}")))?;
-        qpack_enc
-            .finish()
-            .map_err(|e| io::Error::other(format!("masque h3: finish qpack stream: {e}")))?;
         let mut qpack_dec = conn
             .open_uni()
             .await
@@ -200,9 +199,6 @@ impl H3Conn {
             .write_all(&[STREAM_QPACK_DECODER])
             .await
             .map_err(|e| io::Error::other(format!("masque h3: write qpack stream: {e}")))?;
-        qpack_dec
-            .finish()
-            .map_err(|e| io::Error::other(format!("masque h3: finish qpack stream: {e}")))?;
 
         // Accept the server's unidirectional streams; the control stream
         // yields the SETTINGS that gate the request. Everything up to the
@@ -338,7 +334,7 @@ impl H3Conn {
         // the h2 shim does no route advertisement, the h3 path requires it
         // before the endpoint routes anything our way.
         let capsule = encode_route_advertisement(&default_routes);
-        if let Err(e) = send.write_all(&capsule).await {
+        if let Err(e) = send.write_all(&capsule_data_frame(&capsule)).await {
             for task in &tasks {
                 task.abort();
             }
@@ -353,6 +349,7 @@ impl H3Conn {
             conn,
             endpoint,
             send: AsyncMutex::new(send),
+            control_streams: vec![control, qpack_enc, qpack_dec],
             rx,
             tasks,
         })
@@ -399,7 +396,19 @@ impl H3Conn {
         }
         self.conn.close(quinn::VarInt::from_u32(0), b"");
         self.endpoint.close(quinn::VarInt::from_u32(0), b"");
+        self.control_streams.clear();
     }
+}
+
+/// RFC 9297 section 3.1: the Capsule Protocol occupies the HTTP data
+/// stream, not the QUIC request stream's frame namespace. A naked route
+/// capsule (type 3) would be parsed as HTTP/3 CANCEL_PUSH and rejected.
+fn capsule_data_frame(capsule: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(capsule.len() + 16);
+    put_varint(&mut frame, FRAME_DATA);
+    put_varint(&mut frame, capsule.len() as u64);
+    frame.extend_from_slice(capsule);
+    frame
 }
 
 impl Drop for H3Conn {
@@ -810,6 +819,118 @@ mod tests {
             17,
             false
         ));
+    }
+
+    #[test]
+    fn route_capsule_is_inside_an_http3_data_frame() {
+        let capsule = encode_route_advertisement(&default_routes());
+        let frame = capsule_data_frame(&capsule);
+        let (kind, header) = read_varint(&frame).unwrap();
+        let (length, length_bytes) = read_varint(&frame[header..]).unwrap();
+        assert_eq!(kind, 0, "CONNECT capsules belong in DATA, not CANCEL_PUSH");
+        assert_eq!(length as usize, capsule.len());
+        assert_eq!(&frame[header + length_bytes..], capsule);
+        assert_eq!(capsule[0], 3, "ROUTE_ADVERTISEMENT keeps its capsule type");
+    }
+
+    #[tokio::test]
+    async fn h3_keeps_critical_streams_open_and_frames_route_capsules() {
+        use core_tls::rustls;
+        const CERT: &str = include_str!("../../../../../tests/golden/certs/localhost.crt");
+        const KEY: &str = include_str!("../../../../../tests/golden/certs/localhost.key");
+        core_tls::install_default_provider();
+        let certs = rustls_pemfile::certs(&mut CERT.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut KEY.as_bytes())
+            .unwrap()
+            .unwrap();
+        let mut tls =
+            rustls::ServerConfig::builder_with_provider(core_tls::quic::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let crypto = core_tls::quic::QuicServerConfig::try_from(tls).unwrap();
+        let server = quinn::ServerConfig::new(
+            Arc::new(crypto),
+            Arc::new(core_tls::quic::HandshakeTokenKeyRustCrypto::new([17; 64])),
+        );
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(&[19; 32]))),
+            Some(server),
+            std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+            quinn::default_runtime().unwrap(),
+        )
+        .unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let connection = endpoint
+                .accept()
+                .await
+                .unwrap()
+                .accept()
+                .unwrap()
+                .await
+                .unwrap();
+            let mut control = connection.open_uni().await.unwrap();
+            // Control stream, SETTINGS: ENABLE_CONNECT_PROTOCOL=1 (0x8),
+            // H3_DATAGRAM=1 (0x33). Independent RFC wire constants.
+            control.write_all(&[0, 4, 4, 8, 1, 0x33, 1]).await.unwrap();
+            let (mut response, request) = connection.accept_bi().await.unwrap();
+            let mut request = FrameReader::new(request);
+            assert_eq!(request.next().await.unwrap().unwrap().0, 1);
+            // HEADERS, three QPACK bytes: required insert count/base=0,
+            // indexed static :status 200 (index 25).
+            response.write_all(&[1, 3, 0, 0, 0xd9]).await.unwrap();
+            let (kind, payload) = request.next().await.unwrap().unwrap();
+            assert_eq!(kind, 0, "route capsule was sent outside HTTP/3 DATA");
+            assert_eq!(read_capsule_from(&mut payload.as_slice()).unwrap().0, 3);
+            for expected in [0, 2, 3] {
+                let mut stream = connection.accept_uni().await.unwrap();
+                let mut kind = [0];
+                stream.read_exact(&mut kind).await.unwrap();
+                assert_eq!(kind[0], expected);
+                if expected == 0 {
+                    let mut frames = FrameReader::new(stream);
+                    assert_eq!(frames.next().await.unwrap().unwrap().0, 4);
+                    stream = frames.stream;
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(250), stream.read(&mut kind))
+                        .await
+                        .is_err(),
+                    "critical stream {expected} closed while tunnel was live"
+                );
+            }
+        });
+        let object = serde_json::json!({"tls":{"server_name":"localhost","certificate":CERT}});
+        let tls = MasqueTls::new(
+            object.as_object().unwrap(),
+            &Profile::standard(),
+            &super::super::profile::MasqueKeys::default(),
+            "localhost",
+            "h3-lifetime",
+        )
+        .unwrap();
+        let mut tunnel = H3Conn::connect(
+            &tls,
+            &Profile::standard(),
+            "https://localhost/",
+            address,
+            None,
+            Some(Duration::from_secs(3)),
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        tunnel.close();
     }
 
     fn read_capsule_from<'a>(rest: &'a mut &'a [u8]) -> Result<(u64, &'a [u8]), ()> {

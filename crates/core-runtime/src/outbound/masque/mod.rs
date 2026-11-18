@@ -21,19 +21,19 @@ mod profile;
 mod qpack;
 pub(crate) mod stack;
 mod static_tables;
+mod stream;
 mod tls;
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
 use smoltcp::wire::{IpAddress, IpCidr};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 
 use crate::inbound::udp::DEFAULT_UDP_TIMEOUT;
 use crate::inbound::{AnyStream, Target};
@@ -107,6 +107,7 @@ pub(crate) struct MasqueCfg {
 struct MasqueShared {
     cmd_tx: mpsc::Sender<Cmd>,
     next_id: AtomicU32,
+    wake: Arc<Notify>,
 }
 
 /// MASQUE CONNECT-IP outbound (see module docs).
@@ -657,6 +658,7 @@ impl Masque {
         let shared = Arc::new(MasqueShared {
             cmd_tx: tx,
             next_id: AtomicU32::new(1),
+            wake: Arc::new(Notify::new()),
         });
         let cfg = Arc::new(StackCfg {
             tag: self.cfg.tag.clone(),
@@ -667,8 +669,9 @@ impl Masque {
             local_cidr_v6: self.cfg.local_cidr_v6,
             idle_timeout: self.cfg.idle_timeout,
         });
+        let wake = Arc::clone(&shared.wake);
         tokio::spawn(async move {
-            if let Err(e) = run(cfg, leg, rx).await {
+            if let Err(e) = run(cfg, leg, rx, wake).await {
                 logging::error(format_args!("masque stack exited: {e}"));
             }
         });
@@ -686,9 +689,9 @@ impl Masque {
         let shared = self.shared().await?;
         let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (local, remote) = tokio::io::duplex(CALLER_BUF);
-        let (caller_read, caller_write) = tokio::io::split(local);
         let (to_caller_tx, to_caller_rx) = mpsc::channel(REPLY_QUEUE);
         let (resp_tx, resp_rx) = oneshot::channel();
+        let stalled = Arc::new(AtomicBool::new(false));
 
         shared
             .cmd_tx
@@ -696,56 +699,24 @@ impl Masque {
                 id,
                 dst,
                 to_caller: to_caller_tx,
+                stalled: Arc::clone(&stalled),
                 resp: resp_tx,
             })
             .await
             .map_err(|_| io::Error::other("masque: stack task stopped"))?;
 
-        // caller → stack: forward reads as TCP data chunks.
-        let cmd_tx = Arc::clone(&shared).cmd_tx.clone();
-        tokio::spawn(async move {
-            let mut read = caller_read;
-            let mut buf = vec![0u8; SCRATCH_BUF];
-            loop {
-                match read.read(&mut buf).await {
-                    Ok(0) => {
-                        let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
-                        break;
-                    }
-                    Ok(n) => {
-                        if cmd_tx
-                            .send(Cmd::TcpData {
-                                id,
-                                bytes: buf[..n].to_vec(),
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
-                        break;
-                    }
-                }
-            }
-        });
-
-        // stack → caller: pump replies with per-connection backpressure.
-        tokio::spawn(async move {
-            let mut write = caller_write;
-            let mut replies = to_caller_rx;
-            while let Some(bytes) = replies.recv().await {
-                if write.write_all(&bytes).await.is_err() {
-                    break;
-                }
-                let _ = write.flush().await;
-            }
-        });
+        let stream = stream::bridge(
+            id,
+            shared.cmd_tx.clone(),
+            Arc::clone(&shared.wake),
+            local,
+            remote,
+            to_caller_rx,
+            stalled,
+        );
 
         match tokio::time::timeout(CONNECT_TIMEOUT, resp_rx).await {
-            Ok(Ok(Ok(()))) => Ok(Box::new(remote)),
+            Ok(Ok(Ok(()))) => Ok(stream),
             Ok(Ok(Err(e))) => Err(io::Error::other(format!("masque: {e}"))),
             Ok(Err(_)) => Err(io::Error::other("masque: stack task stopped")),
             Err(_) => Err(io::Error::new(

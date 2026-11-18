@@ -593,10 +593,10 @@ impl FakeIpStore {
         new_state.cur4 = old_state.cur4;
         new_state.cur6 = old_state.cur6;
         new_state.addr_to_domain = old_state.addr_to_domain.clone();
-        for (d, ip) in old_state.domain_to_v4.iter() {
+        for (d, ip) in old_state.domain_to_v4.iter().rev() {
             new_state.domain_to_v4.put(d.clone(), *ip);
         }
-        for (d, ip) in old_state.domain_to_v6.iter() {
+        for (d, ip) in old_state.domain_to_v6.iter().rev() {
             new_state.domain_to_v6.put(d.clone(), *ip);
         }
     }
@@ -614,15 +614,12 @@ impl FakeIpStore {
     }
 
     pub fn lookup_domain(&self, ip: IpAddr) -> Option<String> {
-        let memory = self
-            .state
-            .lock()
-            .expect("fakeip state")
-            .addr_to_domain
-            .get(&ip)
-            .cloned();
-        if memory.is_some() {
-            return memory;
+        {
+            let mut state = self.state.lock().expect("fakeip state");
+            if let Some(domain) = state.addr_to_domain.get(&ip).cloned() {
+                Self::touch_record(&mut state, ip, &domain);
+                return Some(domain);
+            }
         }
         if !self.contains(ip) {
             return None;
@@ -643,6 +640,27 @@ impl FakeIpStore {
             self.persist(&state, ip, &domain, evicted, superseded);
         }
         Some(domain)
+    }
+
+    /// Activity must not revive an evicted mapping or touch another domain
+    /// which has since received the same address after a pool wrap/reload.
+    pub(crate) fn touch(&self, ip: IpAddr, domain: &str) -> bool {
+        let mut state = self.state.lock().expect("fakeip state");
+        if state
+            .addr_to_domain
+            .get(&ip)
+            .is_none_or(|known| known != domain)
+        {
+            return false;
+        }
+        Self::touch_record(&mut state, ip, domain)
+    }
+
+    fn touch_record(state: &mut FakeIpState, ip: IpAddr, domain: &str) -> bool {
+        match ip {
+            IpAddr::V4(ip) => state.domain_to_v4.get(domain) == Some(&ip),
+            IpAddr::V6(ip) => state.domain_to_v6.get(domain) == Some(&ip),
+        }
     }
 
     pub fn lookup_address(&self, domain: &str, v6: bool) -> Option<IpAddr> {
@@ -1999,6 +2017,55 @@ mod tests {
         assert_eq!(store.lookup_address("c.example", false), Some(b));
         assert!(store.contains(a));
         assert!(!store.contains("198.17.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn reverse_fakeip_lookup_refreshes_lru() {
+        for v6 in [false, true] {
+            let store = FakeIpStore::new(
+                Some(IpPrefix::parse("198.18.0.0/15").unwrap()),
+                Some(IpPrefix::parse("fd00::/64").unwrap()),
+            );
+            let active = store.create("active.example", v6).unwrap();
+            for i in 1..FAKEIP_MAP_CAPACITY {
+                store.create(&format!("idle-{i}.example"), v6).unwrap();
+            }
+            assert_eq!(
+                store.lookup_domain(active).as_deref(),
+                Some("active.example")
+            );
+            store.create("new.example", v6).unwrap();
+            assert_eq!(
+                store.lookup_domain(active).as_deref(),
+                Some("active.example"),
+                "a just-used mapping was evicted"
+            );
+        }
+    }
+
+    #[test]
+    fn fakeip_activity_is_identity_checked_and_survives_reload() {
+        let prefix = Some(IpPrefix::parse("198.18.0.0/15").unwrap());
+        let old = FakeIpStore::new(prefix, None);
+        let active = old.create("active.example", false).unwrap();
+        for i in 1..FAKEIP_MAP_CAPACITY {
+            old.create(&format!("idle-{i}.example"), false).unwrap();
+        }
+        assert!(!old.touch(active, "different.example"));
+        assert!(old.touch(active, "active.example"));
+        let reloaded = FakeIpStore::new(prefix, None);
+        reloaded.migrate_from(&old);
+        reloaded.create("new.example", false).unwrap();
+        assert_eq!(
+            reloaded.lookup_domain(active).as_deref(),
+            Some("active.example")
+        );
+        let wrapped = FakeIpStore::new(Some(IpPrefix::parse("10.0.0.0/30").unwrap()), None);
+        let first = wrapped.create("old.example", false).unwrap();
+        for i in 0..8 {
+            wrapped.create(&format!("wrap-{i}.example"), false).unwrap();
+        }
+        assert!(!wrapped.touch(first, "old.example"));
     }
 
     #[test]

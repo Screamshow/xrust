@@ -9,6 +9,7 @@ pub mod awg;
 pub(crate) mod awg_masque;
 pub(crate) mod awg_quic;
 pub mod noise;
+mod reserved;
 #[cfg(test)]
 mod session_tests;
 mod tcp_window;
@@ -72,7 +73,6 @@ const IGNORED_FIELDS: &[&str] = &[
     "udp_nat_max",
     "workers",
     "network_strategy",
-    "reserved",
     "bind_interface",
     "inet4_bind_address",
     "inet6_bind_address",
@@ -141,6 +141,7 @@ struct PeerConfig {
     allowed_ips_v4: Vec<(u32, u8)>,
     allowed_ips_v6: Vec<(u128, u8)>,
     keepalive: Option<(u32, u32)>,
+    reserved: [u8; 3],
 }
 
 #[derive(Clone, Debug)]
@@ -376,6 +377,15 @@ impl WireGuard {
                     peer.get("persistent_keepalive_interval"),
                     &format!("{peer_at}.persistent_keepalive_interval"),
                 )?;
+                let reserved = core_config::wireguard::parse_reserved(
+                    peer.get("reserved").unwrap_or(&Value::Null),
+                )
+                .map_err(|e| anyhow::anyhow!("{peer_at}: {e}"))?;
+                if awg.is_some() && reserved != [0; 3] {
+                    anyhow::bail!(
+                        "{peer_at}: nonzero reserved cannot be combined with AmneziaWG obfuscation"
+                    );
+                }
                 peers.push(PeerConfig {
                     host,
                     port,
@@ -384,6 +394,7 @@ impl WireGuard {
                     allowed_ips_v4,
                     allowed_ips_v6,
                     keepalive,
+                    reserved,
                 });
             }
         }
@@ -953,9 +964,10 @@ impl Stack {
             },
             SocketAddr::V4(_) => &self.sock,
         };
+        let bytes = reserved::outbound(bytes, self.peers[pi].endpoint.reserved);
         let result = match class {
-            Some(class) => send_control(sock, bytes, addr, class),
-            None => sock.try_send_to(bytes, addr),
+            Some(class) => send_control(sock, &bytes, addr, class),
+            None => sock.try_send_to(&bytes, addr),
         };
         if let Err(e) = result
             && e.kind() != io::ErrorKind::WouldBlock
@@ -1019,7 +1031,8 @@ impl Stack {
         };
         let Some(params) = self.cfg.awg.as_ref() else {
             if let Some(s) = sock {
-                let _ = s.try_send_to(resp, src);
+                let resp = reserved::outbound(resp, self.peers[pi].endpoint.reserved);
+                let _ = s.try_send_to(&resp, src);
             }
             return;
         };
@@ -1071,6 +1084,9 @@ impl Stack {
                 let (prefix, message) = out.split_at_mut(s4);
                 awg::mask_header(key, prefix, &mut message[..16]);
             }
+        }
+        if params.is_none() {
+            out[1..4].copy_from_slice(&peer.endpoint.reserved);
         }
         peer.reactive_keepalive = None;
         peer.another_keepalive = false;
@@ -1345,6 +1361,16 @@ impl Stack {
     }
 
     fn process_inbound(&mut self, buf: &[u8], src: SocketAddr) {
+        // Like the reference bind, remove the unencrypted WARP routing bytes
+        // before type classification and MAC checks. AWG's 32-bit headers and
+        // header protection have their own semantics and remain untouched.
+        let canonical;
+        let buf = if self.cfg.awg.is_none() {
+            canonical = reserved::inbound(buf);
+            canonical.as_ref()
+        } else {
+            buf
+        };
         // AWG-aware classification: the message may carry an s-padding
         // prefix, a masked magic-header type word and a random trailer.
         let known_index = |idx: u32| self.index_peer.contains_key(&idx);
@@ -3009,6 +3035,7 @@ mod tests {
                 allowed_ips_v4: vec![(0, 0)],
                 allowed_ips_v6: vec![(0, 0)],
                 keepalive: None,
+                reserved: [0; 3],
             }),
             PeerRt::new(PeerConfig {
                 host: "b".into(),
@@ -3018,6 +3045,7 @@ mod tests {
                 allowed_ips_v4: vec![(u32::from(Ipv4Addr::new(10, 1, 0, 0)), 16)],
                 allowed_ips_v6: Vec::new(),
                 keepalive: None,
+                reserved: [0; 3],
             }),
             PeerRt::new(PeerConfig {
                 host: "c".into(),
@@ -3027,6 +3055,7 @@ mod tests {
                 allowed_ips_v4: vec![(u32::from(Ipv4Addr::new(10, 1, 2, 0)), 24)],
                 allowed_ips_v6: Vec::new(),
                 keepalive: None,
+                reserved: [0; 3],
             }),
         ];
         assert_eq!(lpm_v4(&peers, Ipv4Addr::new(8, 8, 8, 8)), Some(0));

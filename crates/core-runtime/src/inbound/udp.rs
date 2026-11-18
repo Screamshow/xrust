@@ -100,6 +100,47 @@ struct Flow {
     backlog: Mutex<VecDeque<Vec<u8>>>,
     /// exactly one writer task is (or will be) draining `backlog`
     writing: AtomicBool,
+    fakeip: Option<FakeIpActivity>,
+}
+
+/// A flow remembers the identity it routed, not just its recyclable FakeIP.
+/// Check the current DNS service so hot reload never leaves activity touching
+/// an obsolete pool. Busy UDP streams take the DNS lock at most once a second.
+struct FakeIpActivity {
+    address: IpAddr,
+    domain: String,
+    next_touch_ms: AtomicU64,
+}
+
+impl FakeIpActivity {
+    fn from_context(ctx: &ConnContext) -> Option<Self> {
+        let Target::Ip(address) = ctx.origin_destination.as_ref()? else {
+            return None;
+        };
+        Some(Self {
+            address: address.ip(),
+            domain: ctx.fakeip_domain.clone()?,
+            next_touch_ms: AtomicU64::new(0),
+        })
+    }
+
+    fn touch_at(&self, now: u64, service: impl FnOnce() -> Option<Arc<crate::dns::DnsService>>) {
+        let next = self.next_touch_ms.load(Ordering::Relaxed);
+        if now >= next
+            && self
+                .next_touch_ms
+                .compare_exchange(
+                    next,
+                    now.saturating_add(1000),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            && let Some(service) = service()
+        {
+            service.touch_fakeip(self.address, &self.domain);
+        }
+    }
 }
 
 enum FlowKind {
@@ -117,7 +158,11 @@ impl Flow {
     }
 
     fn touch(&self) {
-        self.last_ms.store(now_ms(), Ordering::Relaxed);
+        let now = now_ms();
+        self.last_ms.store(now, Ordering::Relaxed);
+        if let Some(fakeip) = &self.fakeip {
+            fakeip.touch_at(now, crate::dns::current);
+        }
     }
 
     fn idle(&self) -> Duration {
@@ -844,6 +889,7 @@ impl UdpHub {
                 timeout: self.timeout,
                 backlog: Mutex::new(VecDeque::new()),
                 writing: AtomicBool::new(false),
+                fakeip: None,
             },
             Decision::Outbound(idx) => {
                 let tracker = Arc::new(crate::clash_state::ConnHandle::open_with_context(
@@ -890,6 +936,7 @@ impl UdpHub {
                     timeout,
                     backlog: Mutex::new(VecDeque::new()),
                     writing: AtomicBool::new(false),
+                    fakeip: FakeIpActivity::from_context(&ctx),
                 }
             }
         };
@@ -1145,6 +1192,61 @@ fn spawn_reverse(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn fakeip_activity_refreshes_the_current_pool_with_a_bounded_lock_rate() {
+        let service = crate::dns::DnsService::build(&serde_json::json!({
+            "dns": {"servers": [{"type":"fakeip", "tag":"fake", "inet4_range":"198.18.0.0/15"}]}
+        }))
+        .unwrap()
+        .unwrap();
+        let store = service.server("fake").unwrap().store.clone().unwrap();
+        let address = store.create("active.example", false).unwrap();
+        for i in 1..16384 {
+            store.create(&format!("idle-{i}.example"), false).unwrap();
+        }
+        let activity = FakeIpActivity {
+            address,
+            domain: "active.example".into(),
+            next_touch_ms: AtomicU64::new(0),
+        };
+        let calls = AtomicU64::new(0);
+        for now in 0..1000 {
+            activity.touch_at(now, || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Some(service.clone())
+            });
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        store.create("new.example", false).unwrap();
+        assert_eq!(
+            store.lookup_domain(address).as_deref(),
+            Some("active.example")
+        );
+        let reloaded = crate::dns::DnsService::build(&serde_json::json!({
+            "dns": {"servers": [{"type":"fakeip", "tag":"fake", "inet4_range":"198.18.0.0/15"}]}
+        }))
+        .unwrap()
+        .unwrap();
+        reloaded.migrate_from(&service);
+        for i in 1..16384 {
+            reloaded
+                .server("fake")
+                .unwrap()
+                .store
+                .as_ref()
+                .unwrap()
+                .create(&format!("second-{i}.example"), false)
+                .unwrap();
+        }
+        activity.touch_at(1000, || Some(reloaded.clone()));
+        let pool = reloaded.server("fake").unwrap().store.clone().unwrap();
+        pool.create("after-reload.example", false).unwrap();
+        assert_eq!(
+            pool.lookup_domain(address).as_deref(),
+            Some("active.example")
+        );
+    }
     #[tokio::test]
     async fn selector_switch_closes_udp_flow_and_next_packet_reopens_it() {
         let router = Router::new(&serde_json::json!({"outbounds":[
@@ -1441,6 +1543,7 @@ mod tests {
                 timeout: Duration::from_secs(1),
                 backlog: Mutex::new(VecDeque::new()),
                 writing: AtomicBool::new(false),
+                fakeip: None,
             }),
         );
         let task = spawn_reverse(
