@@ -1258,7 +1258,7 @@ impl SplitConn {
 
     /// End the whole session: cancel the download request (an HTTP/1.1
     /// download connection is closed, an HTTP/2 stream is reset) and stop
-    /// the upload. Reads see EOF from here on.
+    /// the upload. The caller can still read the retained download chunk.
     fn finish(&mut self) {
         self.direct_h2 = None;
         if let Some(task) = self.dl_task.take() {
@@ -1500,7 +1500,11 @@ impl AsyncRead for XhttpConn {
                         split.session_id, idle.limit
                     ));
                     split.finish();
-                    return Poll::Ready(Ok(()));
+                    if split.pending.is_empty() {
+                        return Poll::Ready(Ok(()));
+                    }
+                    // Credit backpressure may have stopped a partial H2 read.
+                    // The canceled stream no longer needs credit to drain it.
                 }
             }
         }
@@ -4188,100 +4192,111 @@ mod tests {
         .expect("all exact pairs must drain without another input wake");
     }
 
-    #[tokio::test]
-    async fn direct_h2_bounded_credit_keeps_neighbor_and_cancel_working() {
-        use std::sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, Ordering},
-        };
-        use tokio::io::AsyncReadExt;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            const BULK: usize = 65 * 8192;
-            let (client_io, server_io) = tokio::io::duplex(65536);
-            let (reset_tx, mut reset_rx) = mpsc::unbounded_channel();
-            let server = tokio::spawn(async move {
-                let mut connection = h2io::server_builder()
-                    .handshake::<_, Bytes>(server_io)
-                    .await
-                    .unwrap();
-                while let Some(Ok((request, mut response))) = connection.accept().await {
-                    let bulk = request.uri().path() == "/bulk";
-                    let mut send = response
-                        .send_response(http::Response::new(()), false)
-                        .unwrap();
-                    send.send_data(
-                        if bulk {
-                            Bytes::from(vec![b'x'; BULK])
-                        } else {
-                            Bytes::from_static(b"ok")
-                        },
-                        !bulk,
-                    )
-                    .unwrap();
-                    if bulk {
-                        let reset_tx = reset_tx.clone();
-                        tokio::spawn(async move {
-                            let reason = std::future::poll_fn(|cx| send.poll_reset(cx))
-                                .await
-                                .unwrap();
-                            reset_tx.send(reason).unwrap();
-                        });
-                    }
-                }
-            });
-            let (mut client, mut connection) = h2io::client_builder()
-                .handshake::<_, Bytes>(client_io)
+    struct FullH2CreditQueue {
+        client: h2::client::SendRequest<Bytes>,
+        connection: h2::client::Connection<tokio::io::DuplexStream, Bytes>,
+        body: h2::RecvStream,
+        resets: mpsc::UnboundedReceiver<h2::Reason>,
+        server: JoinHandle<()>,
+    }
+
+    /// Stop polling the live connection after receiving the body, so callers
+    /// can fill the credit queue and exercise a pending read before resuming.
+    async fn full_h2_credit_queue() -> FullH2CreditQueue {
+        const BULK: usize = 65 * 8192;
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let (reset_tx, resets) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let mut connection = h2io::server_builder()
+                .handshake::<_, Bytes>(server_io)
                 .await
                 .unwrap();
-            let paused = Arc::new(AtomicBool::new(false));
-            let driver_waker = Arc::new(Mutex::new(None::<std::task::Waker>));
-            let driver = {
-                let paused = paused.clone();
-                let driver_waker = driver_waker.clone();
-                tokio::spawn(async move {
-                    let _ = std::future::poll_fn(|cx| {
-                        *driver_waker.lock().unwrap() = Some(cx.waker().clone());
-                        if paused.load(Ordering::SeqCst) {
-                            Poll::Pending
-                        } else {
-                            Pin::new(&mut connection).poll(cx)
-                        }
-                    })
-                    .await;
-                })
-            };
-            let (response, _) = client
-                .send_request(
-                    http::Request::builder()
-                        .uri("http://localhost/bulk")
-                        .body(())
-                        .unwrap(),
-                    true,
+            while let Some(Ok((request, mut response))) = connection.accept().await {
+                let bulk = request.uri().path() == "/bulk";
+                let mut send = response
+                    .send_response(http::Response::new(()), false)
+                    .unwrap();
+                send.send_data(
+                    if bulk {
+                        Bytes::from(vec![b'x'; BULK])
+                    } else {
+                        Bytes::from_static(b"ok")
+                    },
+                    !bulk,
                 )
                 .unwrap();
-            let mut body = response.await.unwrap().into_body();
-            let mut received = 0;
-            while received < BULK {
-                let bytes = body.data().await.unwrap().unwrap();
-                assert!(bytes.iter().all(|&byte| byte == b'x'));
-                received += bytes.len();
+                if bulk {
+                    let reset_tx = reset_tx.clone();
+                    tokio::spawn(async move {
+                        let reason = std::future::poll_fn(|cx| send.poll_reset(cx))
+                            .await
+                            .unwrap();
+                        reset_tx.send(reason).unwrap();
+                    });
+                }
             }
-            assert_eq!(received, BULK);
-            paused.store(true, Ordering::SeqCst);
-            let mut cx = Context::from_waker(std::task::Waker::noop());
-            for _ in 0..64 {
-                assert!(matches!(
-                    body.flow_control()
-                        .poll_release_capacity_exact(&mut cx, 8192),
-                    Poll::Ready(Ok(()))
-                ));
-            }
-            assert!(
+        });
+        let (mut client, mut connection) = h2io::client_builder()
+            .handshake::<_, Bytes>(client_io)
+            .await
+            .unwrap();
+        let (response, _) = client
+            .send_request(
+                http::Request::builder()
+                    .uri("http://localhost/bulk")
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        let mut body = tokio::select! {
+            body = async {
+                let mut body = response.await.unwrap().into_body();
+                let mut received = 0;
+                while received < BULK {
+                    let bytes = body.data().await.unwrap().unwrap();
+                    assert!(bytes.iter().all(|&byte| byte == b'x'));
+                    received += bytes.len();
+                }
+                assert_eq!(received, BULK);
+                body
+            } => body,
+            result = &mut connection => panic!("credit test connection exited: {result:?}"),
+        };
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        for _ in 0..64 {
+            assert!(matches!(
                 body.flow_control()
-                    .poll_release_capacity_exact(&mut cx, 8192)
-                    .is_pending()
-            );
-            assert_eq!(body.flow_control().used_capacity(), 8192);
+                    .poll_release_capacity_exact(&mut cx, 8192),
+                Poll::Ready(Ok(()))
+            ));
+        }
+        assert!(
+            body.flow_control()
+                .poll_release_capacity_exact(&mut cx, 8192)
+                .is_pending()
+        );
+        assert_eq!(body.flow_control().used_capacity(), 8192);
+        FullH2CreditQueue {
+            client,
+            connection,
+            body,
+            resets,
+            server,
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_h2_bounded_credit_keeps_neighbor_and_cancel_working() {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let FullH2CreditQueue {
+                mut client,
+                connection,
+                mut body,
+                mut resets,
+                server,
+            } = full_h2_credit_queue().await;
             let (neighbor, _) = client
                 .send_request(
                     http::Request::builder()
@@ -4291,8 +4306,7 @@ mod tests {
                     true,
                 )
                 .unwrap();
-            paused.store(false, Ordering::SeqCst);
-            driver_waker.lock().unwrap().as_ref().unwrap().wake_by_ref();
+            let driver = tokio::spawn(connection);
             let response = neighbor.await.unwrap();
             let mut split = SplitConn::new(&cfg(json!({"mode":"packet-up"})));
             // A neighboring direct reader uses the same connection while the
@@ -4310,7 +4324,7 @@ mod tests {
             assert_eq!(bytes, b"ok");
             assert_eq!(body.flow_control().used_capacity(), 8192);
             drop(body);
-            assert_eq!(reset_rx.recv().await.unwrap(), h2::Reason::CANCEL);
+            assert_eq!(resets.recv().await.unwrap(), h2::Reason::CANCEL);
             drop(neighbor);
             drop(client);
             driver.abort();
@@ -4318,6 +4332,45 @@ mod tests {
         })
         .await
         .expect("bounded credit must not starve neighbor or cancellation");
+    }
+
+    #[tokio::test]
+    async fn h2_packet_up_idle_timeout_drains_pending_data_before_eof() {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let FullH2CreditQueue {
+                client,
+                connection,
+                body,
+                mut resets,
+                server,
+            } = full_h2_credit_queue().await;
+            let mut split = SplitConn::new(&cfg(json!({"mode":"packet-up"})));
+            // The final 8 KiB chunk has been partly read, but there is no
+            // space to release the credit for the already consumed bytes.
+            split.pending = Bytes::from_static(b"xxxx");
+            split.direct_h2 = Some(DirectH2Download {
+                response: None,
+                body: Some(body),
+                credit_due: 8192 - split.pending.len(),
+            });
+            split.half_closed = Some(HalfClosed::new(std::time::Duration::ZERO));
+            let mut conn = XhttpConn {
+                split: Box::new(split),
+            };
+            let mut tail = Vec::new();
+            conn.read_to_end(&mut tail).await.unwrap();
+            assert_eq!(tail, b"xxxx");
+            assert_eq!(conn.read(&mut [0]).await.unwrap(), 0);
+
+            let driver = tokio::spawn(connection);
+            assert_eq!(resets.recv().await.unwrap(), h2::Reason::CANCEL);
+            drop(client);
+            driver.abort();
+            server.abort();
+        })
+        .await
+        .expect("half-close timeout must preserve received bytes before EOF");
     }
 
     #[tokio::test]
