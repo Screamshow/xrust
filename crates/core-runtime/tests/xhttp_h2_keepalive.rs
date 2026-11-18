@@ -7,6 +7,7 @@
 //!
 //! The keep-alive period is shortened through `xmux.h_keep_alive_period`;
 //! the PING timeout is the production one.
+//! The gRPC regression test uses the same relay in front of stock Xray.
 
 use portable_atomic::AtomicU64;
 use std::net::{IpAddr, SocketAddr};
@@ -466,4 +467,92 @@ async fn slow_transfer_outlives_the_ping_timeout() {
     );
     assert_eq!(got.len(), parts, "slow transfer cut short");
     assert_eq!(stand.relay.accepted(), 1);
+}
+
+#[tokio::test]
+async fn configured_grpc_keep_alive_reopens_a_silent_connection_to_xray() {
+    let Some(xray) = std::env::var_os("XRAY_REF") else {
+        return;
+    };
+    struct Server(std::process::Child, std::path::PathBuf);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+            let _ = std::fs::remove_file(&self.1);
+        }
+    }
+
+    let port = free_port();
+    let config = json!({
+        "log": {"loglevel": "error"},
+        "inbounds": [{"protocol": "vless", "listen": "127.0.0.1", "port": port,
+            "settings": {"clients": [{"id": UUID}], "decryption": "none"},
+            "streamSettings": {"network": "grpc", "security": "tls",
+                "grpcSettings": {"serviceName": "keepalive-test"},
+                "tlsSettings": {"alpn": ["h2"], "certificates": [{
+                    "certificateFile": cert_file("localhost.crt"),
+                    "keyFile": cert_file("localhost.key")
+                }]}}}],
+        "outbounds": [{"protocol": "freedom", "settings": {
+            "finalRules": [{"action": "allow", "ip": ["127.0.0.1/32"]}]
+        }}]
+    });
+    let path = std::env::temp_dir().join(format!("xrust-grpc-{}-{port}.json", std::process::id()));
+    std::fs::write(&path, config.to_string()).unwrap();
+    let _server = Server(
+        std::process::Command::new(xray)
+            .args(["run", "-c"])
+            .arg(&path)
+            .spawn()
+            .unwrap(),
+        path,
+    );
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while TcpStream::connect(address).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Xray did not start");
+    let (relay, dial) = Relay::spawn(address).await;
+    let outbound = json!({"type": "vless", "tag": "up", "uuid": UUID,
+        "server": "127.0.0.1", "server_port": dial.port(),
+        "tls": {"enabled": true, "server_name": "localhost", "certificate_path": cert_file("localhost.crt")},
+        "transport": {"type": "grpc", "service_name": "keepalive-test",
+            "idle_timeout": "10s", "ping_timeout": "1s"}
+    });
+    let config = json!({"log": {"level": "error"}, "inbounds": [
+        {"type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 0}],
+        "outbounds": [outbound], "route": {"final": "up"}
+    });
+    core_config::check_str(&config.to_string()).unwrap();
+    let client = core_runtime::start(&config).await.unwrap();
+    let socks = inbound_addr(&client, "in");
+    let echo = spawn_echo().await;
+    let mut app = tokio::time::timeout(Duration::from_secs(4), socks_connect(socks, echo))
+        .await
+        .unwrap()
+        .unwrap();
+    app.write_all(b"live").await.unwrap();
+    let mut buf = [0; 4];
+    tokio::time::timeout(Duration::from_secs(4), app.read_exact(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf, b"live");
+    assert_eq!(relay.accepted(), 1);
+
+    relay.set_all(Link::Silent);
+    let read = tokio::time::timeout(Duration::from_secs(14), app.read(&mut buf)).await;
+    assert!(
+        matches!(read, Ok(Ok(0) | Err(_))),
+        "the gRPC connection should be closed by keepalive, got {read:?}"
+    );
+    echo_once(socks, echo, Duration::from_secs(4))
+        .await
+        .expect("fresh connection after a lost PING");
+    assert_eq!(relay.accepted(), 2);
+    client.shutdown();
 }

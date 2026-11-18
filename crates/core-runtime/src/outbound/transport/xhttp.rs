@@ -29,8 +29,8 @@ use tokio::task::JoinHandle;
 
 use super::h1io;
 use super::h2io::{
-    CounterGuard, H2_PING_TIMEOUT, H2Acquire, H2Connection, H2Counter, H2Fresh, H2Pool, ReadClock,
-    TrackedStream, drive_h2_connection, h2_conn_idle, h2_handshake,
+    CounterGuard, H2_PING_TIMEOUT, H2Acquire, H2Connection, H2Counter, H2Fresh, H2KeepAlive,
+    H2Pool, ReadClock, TrackedStream, drive_h2_connection, h2_conn_idle, h2_handshake,
 };
 use crate::inbound::AnyStream;
 
@@ -655,7 +655,7 @@ impl XhttpConfig {
             clock,
             self.pool
                 .h2_keep_alive()
-                .map(|period| (period, H2_PING_TIMEOUT)),
+                .map(|period| H2KeepAlive::always(period, H2_PING_TIMEOUT)),
             std::sync::Arc::downgrade(&self.h2_pool),
             counter.clone(),
             self.h2_idle,
@@ -2245,7 +2245,7 @@ mod tests {
         let driver = tokio::spawn(h2io::drive_h2_connection(
             connection,
             clock,
-            keep_alive,
+            keep_alive.map(|(period, timeout)| h2io::H2KeepAlive::always(period, timeout)),
             std::sync::Arc::downgrade(&pool),
             counter,
             idle,
@@ -2365,7 +2365,7 @@ mod tests {
         let driver = tokio::spawn(h2io::drive_h2_connection(
             connection,
             clock,
-            Some((TEST_PERIOD, TEST_PING_TIMEOUT)),
+            Some(h2io::H2KeepAlive::always(TEST_PERIOD, TEST_PING_TIMEOUT)),
             std::sync::Arc::downgrade(&pool),
             counter,
             Some(TEST_H2_IDLE),

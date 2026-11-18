@@ -35,9 +35,11 @@
 | Поле | Тип | По умолчанию | Описание |
 |---|---|---|---|
 | `service_name` | string | — | Имя gRPC-сервиса. |
-| `idle_timeout` | string | — | Таймаут простоя. |
-| `ping_timeout` | string | — | Таймаут ping-сообщения. |
-| `permit_without_stream` | boolean | — | Разрешить работу без активного потока. |
+| `idle_timeout` | string | — | Время без входящих данных перед проверкой HTTP/2 PING. Минимальный интервал включённой проверки — `10s`. |
+| `ping_timeout` | string | `20s` | Время ожидания ответа на PING, если проверка включена. |
+| `permit_without_stream` | boolean | false | Разрешает PING, когда в соединении нет открытых gRPC-потоков. |
+
+Клиент включает проверки при положительном `idle_timeout` или `ping_timeout`, либо при `permit_without_stream: true`.
 
 ## httpupgrade
 

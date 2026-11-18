@@ -14,6 +14,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use serde_json::Value;
 use sha1::Digest as _;
@@ -96,6 +97,7 @@ enum Kind {
     },
     Grpc {
         service_name: String,
+        keep_alive: Option<h2io::H2KeepAlive>,
     },
     Http {
         host: Vec<String>,
@@ -279,16 +281,14 @@ impl Transport {
                     .map(str::to_string),
                 headers: parse_headers(transport.get("headers"), at)?,
             },
-            "grpc" => {
-                warn_unimplemented_grpc_fields(transport, at);
-                Kind::Grpc {
-                    service_name: transport
-                        .get("service_name")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                }
-            }
+            "grpc" => Kind::Grpc {
+                service_name: transport
+                    .get("service_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                keep_alive: grpc_keep_alive(transport, at)?,
+            },
             "http" => {
                 warn_unimplemented_http_fields(transport, at);
                 let mut method = transport
@@ -493,15 +493,14 @@ impl Transport {
                     .finish_dial(Some(send_request.clone()), max_conns)
                     .await
                     .expect("counter present");
+                let keep_alive = match &self.kind {
+                    Kind::Grpc { keep_alive, .. } => *keep_alive,
+                    _ => None,
+                };
                 tokio::spawn(h2io::drive_h2_connection(
                     connection,
                     clock,
-                    // No PINGs: Xray's gRPC dialer hands grpc-go keepalive
-                    // parameters only when the config asks for them, and its
-                    // HTTP/2 transport leaves `ReadIdleTimeout` unset. A
-                    // connection nobody can use is dropped when a stream
-                    // fails on it, and an unused one on the idle close below.
-                    None,
+                    keep_alive,
                     std::sync::Arc::downgrade(&self.h2_pool),
                     counter.clone(),
                     self.h2_idle,
@@ -566,7 +565,7 @@ impl Transport {
         server: &str,
     ) -> io::Result<AnyStream> {
         match &self.kind {
-            Kind::Grpc { service_name } => {
+            Kind::Grpc { service_name, .. } => {
                 // Xray's dialer hands grpc-go the TLS server name as the
                 // authority, or the destination's domain without TLS, and
                 // never a port (`grpc/dial.go`).
@@ -655,7 +654,7 @@ impl Transport {
                     .unwrap_or(server);
                 httpupgrade_handshake(stream, path, host, headers).await?
             }
-            Kind::Grpc { service_name } => {
+            Kind::Grpc { service_name, .. } => {
                 // Xray's dialer hands grpc-go the TLS server name as the
                 // authority, or the destination's domain without TLS, and
                 // never a port (`grpc/dial.go`); ours used to send
@@ -737,17 +736,70 @@ impl Transport {
     }
 }
 
-/// `transport.grpc` keepalive knobs: the h2 layer does not send PINGs yet, so
-/// the values are parsed (validating the duration) and reported as a gap.
-fn warn_unimplemented_grpc_fields(transport: &serde_json::Map<String, Value>, at: &str) {
-    let mut warned = false;
-    for key in ["idle_timeout", "ping_timeout", "permit_without_stream"] {
-        if transport.contains_key(key) && !warned {
-            crate::logging::warn(format_args!(
-                "{at}: transport grpc keepalive options are not implemented yet; ignoring"
-            ));
-            warned = true;
+fn grpc_keep_alive(
+    transport: &serde_json::Map<String, Value>,
+    at: &str,
+) -> anyhow::Result<Option<h2io::H2KeepAlive>> {
+    let duration = |key| {
+        let value = transport.get(key);
+        let at = format!("{at}.transport.{key}");
+        if let Some(magnitude) = value
+            .and_then(Value::as_str)
+            .and_then(|s| s.strip_prefix('-'))
+        {
+            // Nonpositive durations are treated as unset, as in Xray.
+            let magnitude = Value::String(magnitude.to_owned());
+            crate::outbound::urltest::parse_duration(Some(&magnitude), Duration::ZERO, &at)?;
+            Ok(Duration::ZERO)
+        } else {
+            crate::outbound::urltest::parse_duration(value, Duration::ZERO, &at)
         }
+    };
+    let period = duration("idle_timeout")?;
+    let timeout = duration("ping_timeout")?;
+    let permit_without_stream = transport
+        .get("permit_without_stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if period.is_zero() && timeout.is_zero() && !permit_without_stream {
+        return Ok(None);
+    }
+    // Xray enables grpc-go keepalive only on request, with a 10 s minimum
+    // period and a 20 s wait for an ACK when no timeout is set.
+    Ok(Some(h2io::H2KeepAlive {
+        period: period.max(Duration::from_secs(10)),
+        timeout: if timeout.is_zero() {
+            Duration::from_secs(20)
+        } else {
+            timeout
+        },
+        permit_without_stream,
+    }))
+}
+
+#[cfg(test)]
+#[test]
+fn grpc_keep_alive_uses_xray_defaults_only_on_request() {
+    use serde_json::json;
+    for (options, expected) in [
+        (json!({}), None),
+        (json!({"idle_timeout": "0s", "ping_timeout": "-1s"}), None),
+        (json!({"idle_timeout": "30s"}), Some((30, 20, false))),
+        (
+            json!({"idle_timeout": "1s", "ping_timeout": "2s"}),
+            Some((10, 2, false)),
+        ),
+        (json!({"permit_without_stream": true}), Some((10, 20, true))),
+    ] {
+        let actual = grpc_keep_alive(options.as_object().unwrap(), "test").unwrap();
+        assert_eq!(
+            actual.map(|k| (
+                k.period.as_secs(),
+                k.timeout.as_secs(),
+                k.permit_without_stream
+            )),
+            expected
+        );
     }
 }
 
