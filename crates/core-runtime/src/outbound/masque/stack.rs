@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollResult, SocketHandle, SocketSet};
@@ -28,6 +28,7 @@ use super::h2::H2Conn;
 use super::h3::H3Conn;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const EPHEMERAL_BASE: u16 = 49152;
 
@@ -107,12 +108,41 @@ impl Drop for Leg {
 /// `UdpOpen` completion: local port + reply stream.
 pub(crate) type UdpReply = oneshot::Sender<Result<(u16, mpsc::Receiver<Vec<u8>>), String>>;
 
+#[derive(Default)]
+pub(crate) struct TcpSignals {
+    pub(super) read_stalled: AtomicBool,
+    caller_state: AtomicU8,
+}
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+pub(super) enum CallerState {
+    Active,
+    Cancelled,
+    Draining,
+}
+
+impl TcpSignals {
+    pub(super) fn set_caller_state(&self, state: CallerState) {
+        self.caller_state.store(state as u8, Ordering::Release);
+    }
+
+    fn caller_state(&self) -> CallerState {
+        match self.caller_state.load(Ordering::Acquire) {
+            0 => CallerState::Active,
+            1 => CallerState::Cancelled,
+            2 => CallerState::Draining,
+            _ => unreachable!(),
+        }
+    }
+}
+
 pub(crate) enum Cmd {
     TcpConnect {
         id: u32,
         dst: SocketAddr,
         to_caller: mpsc::Sender<Vec<u8>>,
-        stalled: Arc<AtomicBool>,
+        signals: Arc<TcpSignals>,
         resp: oneshot::Sender<Result<(), String>>,
     },
     TcpData {
@@ -141,12 +171,13 @@ struct TcpConn {
     #[allow(dead_code)]
     dst: SocketAddr,
     to_caller: Option<mpsc::Sender<Vec<u8>>>,
-    stalled: Arc<AtomicBool>,
+    signals: Arc<TcpSignals>,
     resp: Option<oneshot::Sender<Result<(), String>>>,
     from_caller: VecDeque<(Vec<u8>, oneshot::Sender<()>)>,
     stash: Option<Vec<u8>>,
     created: Instant,
     caller_eof: bool,
+    drain_deadline: Option<Instant>,
 }
 
 struct UdpSess {
@@ -262,7 +293,7 @@ impl Stack {
                 id,
                 dst,
                 to_caller,
-                stalled,
+                signals,
                 resp,
             } => {
                 let smol_addr = match dst.ip() {
@@ -301,12 +332,13 @@ impl Stack {
                         handle,
                         dst,
                         to_caller: Some(to_caller),
-                        stalled,
+                        signals,
                         resp: Some(resp),
                         from_caller: VecDeque::new(),
                         stash: None,
                         created: Instant::now(),
                         caller_eof: false,
+                        drain_deadline: None,
                     },
                 );
             }
@@ -453,9 +485,28 @@ impl Stack {
             let Some(mut conn) = self.tcp.remove(&id) else {
                 continue;
             };
+            match conn.signals.caller_state() {
+                CallerState::Active => {}
+                CallerState::Cancelled => {
+                    self.sockets.remove(conn.handle);
+                    continue;
+                }
+                CallerState::Draining => {
+                    let now = Instant::now();
+                    let deadline = conn.drain_deadline.get_or_insert(now + TCP_DRAIN_TIMEOUT);
+                    if now >= *deadline {
+                        self.sockets.remove(conn.handle);
+                        continue;
+                    }
+                    // A successful shutdown has handed all upload bytes to TCP.
+                    // Keep the socket through FIN, with no caller to receive replies.
+                    conn.caller_eof = true;
+                    conn.to_caller = None;
+                    conn.stash = None;
+                }
+            }
             let mut rbuf = std::mem::take(&mut self.scratch);
             let mut remote_closed = conn.to_caller.is_none();
-            let mut caller_gone = false;
             let state = {
                 let sock = self.sockets.get_mut::<TcpSock<'static>>(conn.handle);
 
@@ -479,23 +530,23 @@ impl Stack {
                 }
 
                 if conn.stash.is_none()
-                    && let Some(to_caller) = &conn.to_caller
+                    && (conn.to_caller.is_some()
+                        || (conn.drain_deadline.is_some() && sock.can_recv()))
                 {
                     loop {
                         match sock.recv_slice(&mut rbuf) {
                             Ok(0) => break,
                             Ok(n) => {
                                 drained_receive_window = true;
-                                match to_caller.try_send(rbuf[..n].to_vec()) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(v)) => {
-                                        conn.stalled.store(true, Ordering::SeqCst);
-                                        conn.stash = Some(v);
-                                        break;
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        caller_gone = true;
-                                        break;
+                                if let Some(to_caller) = &conn.to_caller {
+                                    match to_caller.try_send(rbuf[..n].to_vec()) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(v)) => {
+                                            conn.signals.read_stalled.store(true, Ordering::SeqCst);
+                                            conn.stash = Some(v);
+                                            break;
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
                                     }
                                 }
                             }
@@ -522,14 +573,11 @@ impl Stack {
                 match to_caller.try_send(stash) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(v)) => {
-                        conn.stalled.store(true, Ordering::SeqCst);
+                        conn.signals.read_stalled.store(true, Ordering::SeqCst);
                         conn.stash = Some(v);
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => caller_gone = true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
                 }
-            }
-            if conn.to_caller.as_ref().is_some_and(mpsc::Sender::is_closed) {
-                caller_gone = true;
             }
 
             if matches!(state, TcpState::Established | TcpState::CloseWait)
@@ -548,10 +596,9 @@ impl Stack {
             if remote_closed && conn.stash.is_none() {
                 conn.to_caller.take();
             }
-            let finished = caller_gone
-                || (matches!(state, TcpState::Closed | TcpState::TimeWait)
-                    && conn.stash.is_none()
-                    && !self.sockets.get::<TcpSock<'static>>(conn.handle).can_recv());
+            let finished = matches!(state, TcpState::Closed | TcpState::TimeWait)
+                && conn.stash.is_none()
+                && !self.sockets.get::<TcpSock<'static>>(conn.handle).can_recv();
 
             if connect_failed && let Some(resp) = conn.resp.take() {
                 let _ = resp.send(Err(match state {
@@ -589,6 +636,10 @@ impl Stack {
         for conn in self.tcp.values() {
             if conn.resp.is_some() {
                 consider(conn.created + CONNECT_TIMEOUT);
+            }
+            if let Some(deadline) = conn.drain_deadline {
+                // Retain periodic TCP polling if a packet or FIN needs retransmission.
+                consider(deadline.min(now + Duration::from_secs(1)));
             }
         }
         if let Some(idle) = self.cfg.idle_timeout {
@@ -881,14 +932,16 @@ fn ip_info(pkt: &[u8]) -> Option<(IpAddr, IpAddr, u8, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inbound::AnyStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::timeout;
 
-    #[test]
-    fn local_fin_preserves_queued_upload() {
+    fn test_stack(addr: Ipv4Addr) -> Stack {
         let cfg = Arc::new(StackCfg {
             tag: "half-close-test".into(),
             mtu: 1280,
-            local_addr: Some("172.16.0.2".parse().unwrap()),
-            local_cidr: Some("172.16.0.2/24".parse().unwrap()),
+            local_addr: Some(addr),
+            local_cidr: Some(IpCidr::new(IpAddress::Ipv4(addr), 24)),
             local_addr_v6: None,
             local_cidr_v6: None,
             idle_timeout: None,
@@ -900,7 +953,7 @@ mod tests {
             SmolInstant::now(),
         );
         iface.update_ip_addrs(|ips| ips.push(cfg.local_cidr.unwrap()).unwrap());
-        let mut stack = Stack {
+        Stack {
             cfg,
             device,
             iface,
@@ -911,15 +964,23 @@ mod tests {
             scratch: vec![0; SCRATCH_BUF],
             out_q: VecDeque::new(),
             last_activity: Instant::now(),
-        };
+        }
+    }
+
+    const PEER: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 1);
+    const CALLER: Ipv4Addr = Ipv4Addr::new(172, 16, 0, 2);
+
+    #[test]
+    fn local_fin_preserves_queued_upload() {
+        let mut stack = test_stack(CALLER);
         let (to_caller, _replies) = mpsc::channel(REPLY_QUEUE);
         let (resp, _connected) = oneshot::channel();
         stack.process_cmd(Cmd::TcpConnect {
             id: 1,
-            dst: "172.16.0.1:1234".parse().unwrap(),
+            dst: SocketAddr::from((PEER, 1234)),
             to_caller,
             resp,
-            stalled: Arc::new(AtomicBool::new(false)),
+            signals: Arc::new(TcpSignals::default()),
         });
         let (consumed, _accepted) = oneshot::channel();
         stack.process_cmd(Cmd::TcpData {
@@ -933,6 +994,188 @@ mod tests {
             1,
             "FIN discarded an accepted upload"
         );
+    }
+
+    struct TcpPair {
+        stack: Stack,
+        peer: Stack,
+        peer_handle: SocketHandle,
+        commands: mpsc::Receiver<Cmd>,
+        wake: Arc<Notify>,
+    }
+
+    impl TcpPair {
+        fn new() -> (Self, AnyStream) {
+            let mut stack = test_stack(CALLER);
+            let mut peer = test_stack(PEER);
+            let mut listener = TcpSock::new(
+                TcpBuffer::new(vec![0; SOCKET_BUF]),
+                TcpBuffer::new(vec![0; SOCKET_BUF]),
+            );
+            listener.set_ack_delay(None);
+            listener.listen(1234).unwrap();
+            let peer_handle = peer.sockets.add(listener);
+            let (to_caller, replies) = mpsc::channel(REPLY_QUEUE);
+            let (resp, mut connected) = oneshot::channel();
+            let signals = Arc::new(TcpSignals::default());
+            stack.process_cmd(Cmd::TcpConnect {
+                id: 1,
+                dst: SocketAddr::from((PEER, 1234)),
+                to_caller,
+                resp,
+                signals: Arc::clone(&signals),
+            });
+            let handle = stack.tcp[&1].handle;
+            stack.sockets.get_mut::<TcpSock>(handle).set_ack_delay(None);
+            let (tx, commands) = mpsc::channel(CMD_QUEUE);
+            let (local, remote) = tokio::io::duplex(SCRATCH_BUF);
+            let wake = Arc::new(Notify::new());
+            let caller = super::super::stream::bridge(
+                1,
+                tx,
+                Arc::clone(&wake),
+                local,
+                remote,
+                replies,
+                signals,
+            );
+            let mut pair = Self {
+                stack,
+                peer,
+                peer_handle,
+                commands,
+                wake,
+            };
+            pair.exchange_packets();
+            pair.exchange_packets();
+            connected.try_recv().unwrap().unwrap();
+            assert_eq!(pair.peer_socket().state(), TcpState::Established);
+            (pair, caller)
+        }
+
+        fn peer_socket(&mut self) -> &mut TcpSock<'static> {
+            self.peer.sockets.get_mut(self.peer_handle)
+        }
+
+        fn exchange_packets(&mut self) {
+            self.stack.maintain_tcp();
+            self.stack.poll_stack();
+            self.peer.device.rx.append(&mut self.stack.device.tx);
+            self.peer.poll_stack();
+            self.stack.device.rx.append(&mut self.peer.device.tx);
+            self.stack.poll_stack();
+            self.stack.maintain_tcp();
+        }
+
+        async fn receive_command(&mut self) {
+            let command = timeout(Duration::from_secs(1), self.commands.recv())
+                .await
+                .expect("caller did not notify the stack")
+                .expect("caller command queue closed");
+            self.stack.process_cmd(command);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_after_peer_fin_releases_the_tcp_socket() {
+        let (mut pair, mut caller) = TcpPair::new();
+        pair.peer_socket().close();
+        pair.exchange_packets();
+        let mut byte = [0];
+        let n = timeout(Duration::from_secs(1), caller.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(pair.stack.tcp[&1].to_caller.is_none());
+        let handle = pair.stack.tcp[&1].handle;
+        assert_eq!(
+            pair.stack.sockets.get::<TcpSock>(handle).state(),
+            TcpState::CloseWait
+        );
+
+        caller.write_all(b"request after peer EOF").await.unwrap();
+        pair.receive_command().await;
+        pair.exchange_packets();
+        let mut received = [0; 22];
+        assert_eq!(
+            pair.peer_socket().recv_slice(&mut received).unwrap(),
+            received.len()
+        );
+        assert_eq!(&received, b"request after peer EOF");
+
+        drop(caller);
+        timeout(Duration::from_secs(1), pair.wake.notified())
+            .await
+            .unwrap();
+        pair.stack.maintain_tcp();
+        assert!(!pair.stack.tcp.contains_key(&1));
+        assert_eq!(pair.stack.sockets.iter().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_after_shutdown_delivers_queued_data_and_fin() {
+        let (mut pair, mut caller) = TcpPair::new();
+        let payload = b"request before local EOF";
+        caller.write_all(payload).await.unwrap();
+        let shutdown = tokio::spawn(async move {
+            caller.shutdown().await.unwrap();
+            caller
+        });
+        pair.receive_command().await;
+        pair.stack.maintain_tcp();
+        pair.receive_command().await;
+        let caller = timeout(Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        let handle = pair.stack.tcp[&1].handle;
+        assert_eq!(
+            pair.stack.sockets.get::<TcpSock>(handle).send_queue(),
+            payload.len()
+        );
+        let replies = pair.stack.tcp[&1].to_caller.as_ref().unwrap().clone();
+        drop(caller);
+        timeout(Duration::from_secs(1), replies.closed())
+            .await
+            .unwrap();
+
+        pair.exchange_packets();
+        assert!(pair.stack.tcp[&1].drain_deadline.is_some());
+        let mut received = [0; 32];
+        let n = pair.peer_socket().recv_slice(&mut received).unwrap();
+        assert_eq!(&received[..n], payload);
+        assert!(matches!(
+            pair.peer_socket().recv_slice(&mut received),
+            Err(TcpRecvError::Finished)
+        ));
+
+        pair.peer_socket().close();
+        pair.exchange_packets();
+        assert!(!pair.stack.tcp.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn draining_stops_at_the_deadline_when_peer_keeps_writing_open() {
+        let (mut pair, mut caller) = TcpPair::new();
+        let shutdown = tokio::spawn(async move { caller.shutdown().await.unwrap() });
+        pair.receive_command().await;
+        timeout(Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        pair.exchange_packets();
+        let conn = pair.stack.tcp.get_mut(&1).unwrap();
+        assert!(conn.drain_deadline.is_some());
+        assert_eq!(
+            pair.stack.sockets.get::<TcpSock>(conn.handle).state(),
+            TcpState::FinWait2
+        );
+
+        conn.drain_deadline = Some(Instant::now());
+        pair.stack.maintain_tcp();
+        assert!(!pair.stack.tcp.contains_key(&1));
+        assert_eq!(pair.stack.sockets.iter().count(), 0);
     }
 
     #[test]

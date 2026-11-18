@@ -27,7 +27,7 @@ mod tls;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -43,7 +43,7 @@ use crate::outbound::quic::udp_loopback_pair;
 use crate::outbound::urltest::parse_duration;
 
 use profile::{MasqueKeys, Profile, parse_keys, parse_profile};
-use stack::{Cmd, Leg, StackCfg, run};
+use stack::{Cmd, Leg, StackCfg, TcpSignals, run};
 use tls::MasqueTls;
 
 const AUTO_H3: u8 = 0;
@@ -691,7 +691,7 @@ impl Masque {
         let (local, remote) = tokio::io::duplex(CALLER_BUF);
         let (to_caller_tx, to_caller_rx) = mpsc::channel(REPLY_QUEUE);
         let (resp_tx, resp_rx) = oneshot::channel();
-        let stalled = Arc::new(AtomicBool::new(false));
+        let signals = Arc::new(TcpSignals::default());
 
         shared
             .cmd_tx
@@ -699,7 +699,7 @@ impl Masque {
                 id,
                 dst,
                 to_caller: to_caller_tx,
-                stalled: Arc::clone(&stalled),
+                signals: Arc::clone(&signals),
                 resp: resp_tx,
             })
             .await
@@ -712,7 +712,7 @@ impl Masque {
             local,
             remote,
             to_caller_rx,
-            stalled,
+            signals,
         );
 
         match tokio::time::timeout(CONNECT_TIMEOUT, resp_rx).await {

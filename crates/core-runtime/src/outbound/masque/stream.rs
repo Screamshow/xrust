@@ -1,17 +1,16 @@
-//! The caller owns both pumps. Dropping a stream (also on connect timeout)
-//! cancels its pending reads/writes and releases the stack's reply receiver.
+//! The caller owns both pumps and a lifetime signal independent of receive EOF.
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use super::stack::Cmd;
+use super::stack::{CallerState, Cmd, TcpSignals};
 use crate::inbound::AnyStream;
 
 pub(super) fn bridge(
@@ -21,7 +20,7 @@ pub(super) fn bridge(
     local: DuplexStream,
     remote: DuplexStream,
     mut replies: mpsc::Receiver<Vec<u8>>,
-    stalled: Arc<AtomicBool>,
+    signals: Arc<TcpSignals>,
 ) -> AnyStream {
     let (mut read, mut write) = tokio::io::split(local);
     let upload = tokio::spawn(async move {
@@ -62,10 +61,12 @@ pub(super) fn bridge(
             }
         }
     });
+    let download_signals = Arc::clone(&signals);
+    let download_wake = Arc::clone(&wake);
     let download = tokio::spawn(async move {
         while let Some(bytes) = replies.recv().await {
-            if stalled.swap(false, Ordering::SeqCst) {
-                wake.notify_one();
+            if download_signals.read_stalled.swap(false, Ordering::SeqCst) {
+                download_wake.notify_one();
             }
             if write.write_all(&bytes).await.is_err() {
                 break;
@@ -78,6 +79,9 @@ pub(super) fn bridge(
         inner: remote,
         upload: Some(upload),
         download,
+        signals,
+        wake,
+        write_shutdown: false,
     })
 }
 
@@ -85,10 +89,19 @@ struct CallerStream {
     inner: DuplexStream,
     upload: Option<JoinHandle<io::Result<()>>>,
     download: AbortHandle,
+    signals: Arc<TcpSignals>,
+    wake: Arc<Notify>,
+    write_shutdown: bool,
 }
 
 impl Drop for CallerStream {
     fn drop(&mut self) {
+        self.signals.set_caller_state(if self.write_shutdown {
+            CallerState::Draining
+        } else {
+            CallerState::Cancelled
+        });
+        self.wake.notify_one();
         if let Some(upload) = &self.upload {
             upload.abort();
         }
@@ -127,9 +140,15 @@ impl AsyncWrite for CallerStream {
             // Wait until all bytes were accepted and TcpClose was enqueued.
             let result = std::task::ready!(Pin::new(upload).poll(cx));
             self.upload.take();
-            return Poll::Ready(result.unwrap_or_else(|error| Err(io::Error::other(error))));
+            let result = result.unwrap_or_else(|error| Err(io::Error::other(error)));
+            self.write_shutdown = result.is_ok();
+            return Poll::Ready(result);
         }
-        Poll::Ready(Ok(()))
+        Poll::Ready(if self.write_shutdown {
+            Ok(())
+        } else {
+            Err(stack_stopped())
+        })
     }
 }
 
@@ -155,7 +174,7 @@ mod tests {
             local,
             remote,
             reply_rx,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(TcpSignals::default()),
         );
         stream.write_all(b"write after receive EOF").await.unwrap();
         let mut shutdown = tokio::spawn(async move {
@@ -192,7 +211,7 @@ mod tests {
             local,
             remote,
             reply_rx,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(TcpSignals::default()),
         );
         stream.write_all(&[7; 32]).await.unwrap();
         // One block is awaiting actual stack acceptance. The next write must
@@ -241,7 +260,7 @@ mod tests {
             local,
             remote,
             reply_rx,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(TcpSignals::default()),
         );
         stream.write_all(b"queued").await.unwrap();
         let first = rx.recv().await.unwrap();
