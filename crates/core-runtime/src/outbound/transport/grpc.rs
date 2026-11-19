@@ -9,6 +9,8 @@
 //!
 //! (`00` = uncompressed, `len` = protobuf payload size, `0A` = protobuf
 //! field 1 length-delimited, varint = byte length of the payload bytes.)
+//! Xray's multi mode uses the same wire tag repeated within a MultiHunk. Each
+//! upload can still carry one field; downloads must read every field in order.
 
 use std::collections::VecDeque;
 use std::io;
@@ -41,14 +43,21 @@ fn path_escape(s: &str) -> String {
 }
 
 /// Xray custom service names starting with `/` specify both the service
-/// path and method; ordinary names retain the escaped `/service/Tun` form.
-fn service_path(service: &str) -> String {
+/// path and method; ordinary names use the escaped service and mode's method.
+fn service_path(service: &str, multi_mode: bool) -> String {
     if !service.starts_with('/') {
-        return format!("/{}/Tun", path_escape(service));
+        let method = if multi_mode { "TunMulti" } else { "Tun" };
+        return format!("/{}/{method}", path_escape(service));
     }
     let last = service.rfind('/').unwrap_or(0);
     let body = &service[1..last.max(1)];
-    let method = service[last + 1..].split('|').next().unwrap_or("");
+    let mut methods = service[last + 1..].split('|');
+    let first = methods.next().unwrap_or("");
+    let method = if multi_mode {
+        methods.next().unwrap_or(first)
+    } else {
+        first
+    };
     let body = body
         .split('/')
         .map(path_escape)
@@ -58,10 +67,10 @@ fn service_path(service: &str) -> String {
 }
 
 /// The request a tunnel opens, the way grpc-go sends it.
-fn request(service_name: &str, authority: &str) -> io::Result<http::Request<()>> {
+fn request(service_name: &str, authority: &str, multi_mode: bool) -> io::Result<http::Request<()>> {
     // Escape ordinary service names as one segment, but preserve Xray's
     // explicit custom service/method path when the name starts with `/`.
-    let path = service_path(service_name);
+    let path = service_path(service_name, multi_mode);
     // `:scheme` is `http` even over TLS: the reference hands grpc-go insecure
     // credentials, because the TLS is its own layer underneath, and grpc-go
     // then has no reason to call the connection anything else
@@ -91,6 +100,7 @@ pub(super) async fn connect(
     stream: AnyStream,
     service_name: &str,
     authority: &str,
+    multi_mode: bool,
 ) -> io::Result<AnyStream> {
     let (send_request, connection) = super::h2io::grpc_client_builder()
         .handshake(stream)
@@ -104,7 +114,7 @@ pub(super) async fn connect(
         .await
         .map_err(|e| io::Error::other(format!("grpc: h2 ready: {e}")))?;
     let (response, send) = send_request
-        .send_request(request(service_name, authority)?, false)
+        .send_request(request(service_name, authority, multi_mode)?, false)
         .map_err(|e| io::Error::other(format!("grpc: send_request: {e}")))?;
 
     Ok(Box::new(GrpcStream {
@@ -113,6 +123,7 @@ pub(super) async fn connect(
         },
         data_left: 0,
         skip: 0,
+        multi_frame_left: multi_mode.then_some(0),
     }))
 }
 
@@ -122,9 +133,10 @@ pub(super) fn open_pooled(
     send_req: &mut h2::client::SendRequest<Bytes>,
     service_name: &str,
     authority: &str,
+    multi_mode: bool,
 ) -> io::Result<AnyStream> {
     let (response, send) = send_req
-        .send_request(request(service_name, authority)?, false)
+        .send_request(request(service_name, authority, multi_mode)?, false)
         .map_err(|e| io::Error::other(format!("grpc: send_request: {e}")))?;
     Ok(Box::new(GrpcStream {
         io: H2Io {
@@ -132,6 +144,7 @@ pub(super) fn open_pooled(
         },
         data_left: 0,
         skip: 0,
+        multi_frame_left: multi_mode.then_some(0),
     }))
 }
 
@@ -144,6 +157,8 @@ pub(crate) struct GrpcStream {
     /// Bytes of the current message that follow its payload (unknown protobuf
     /// fields, normally none), dropped before the next message starts.
     skip: usize,
+    /// Remaining MultiHunk body bytes after the current field, or None for gun.
+    multi_frame_left: Option<usize>,
 }
 
 /// The server half of the same stream: the request body is the downlink, the
@@ -156,6 +171,7 @@ pub(crate) fn server(recv: h2::RecvStream, send: h2::SendStream<Bytes>) -> AnySt
         },
         data_left: 0,
         skip: 0,
+        multi_frame_left: None,
     })
 }
 
@@ -203,21 +219,27 @@ impl AsyncRead for GrpcStream {
                     continue;
                 }
             } else {
-                let before = this.io.h2.pending_len;
-                if let Some((data, skip)) =
-                    start_hunk(&mut this.io.h2.pending, &mut this.io.h2.pending_len)?
-                {
-                    // The header parses out of `pending` on a path of its
-                    // own; repay its bytes here or every frame leaks 5..16
-                    // bytes of window until the stream stalls.
+                let field = if let Some(frame_left) = &mut this.multi_frame_left {
+                    start_multi_field(&mut this.io.h2, frame_left)?
+                } else {
+                    let before = this.io.h2.pending_len;
+                    let hunk = start_hunk(&mut this.io.h2.pending, &mut this.io.h2.pending_len)?;
+                    // start_hunk consumed the frame header from pending.
                     this.io.h2.release(before - this.io.h2.pending_len);
+                    hunk
+                };
+                if let Some((data, skip)) = field {
                     this.data_left = data;
                     this.skip = skip;
                     continue;
                 }
             }
             if this.io.h2.is_eof() {
-                if !this.io.h2.pending.is_empty() || this.data_left > 0 || this.skip > 0 {
+                if !this.io.h2.pending.is_empty()
+                    || this.data_left > 0
+                    || this.skip > 0
+                    || this.multi_frame_left.is_some_and(|len| len > 0)
+                {
                     return Poll::Ready(Err(io::Error::other("grpc: stream ended mid-frame")));
                 }
                 return Poll::Ready(Ok(()));
@@ -300,6 +322,88 @@ fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     }
 }
 
+fn copy_prefix(pending: &VecDeque<Bytes>, dst: &mut [u8]) {
+    let mut at = 0;
+    for chunk in pending {
+        let len = chunk.len().min(dst.len() - at);
+        dst[at..at + len].copy_from_slice(&chunk[..len]);
+        at += len;
+        if at == dst.len() {
+            break;
+        }
+    }
+}
+
+/// Read a gRPC prefix or the next protobuf field header directly from the
+/// HTTP/2 queue. Body bytes remain queued and are streamed by poll_read.
+fn start_multi_field(
+    h2: &mut H2Stream,
+    frame_left: &mut usize,
+) -> io::Result<Option<(usize, usize)>> {
+    if *frame_left == 0 {
+        let mut prefix = [0; 5];
+        if h2.pending_len < prefix.len() {
+            return Ok(None);
+        }
+        copy_prefix(&h2.pending, &mut prefix);
+        if prefix[0] != 0 {
+            return Err(io::Error::other("grpc: compressed frames unsupported"));
+        }
+        *frame_left = u32::from_be_bytes([prefix[1], prefix[2], prefix[3], prefix[4]]) as usize;
+        h2.skip_pending(prefix.len());
+        return Ok(Some((0, 0)));
+    }
+
+    // A protobuf field key and its length or varint value fit in 20 bytes.
+    let mut scratch = [0; 20];
+    let have = h2.pending_len.min(*frame_left).min(scratch.len());
+    let raw = &mut scratch[..have];
+    copy_prefix(&h2.pending, raw);
+    let Some((key, key_len)) = multi_varint(raw, *frame_left)? else {
+        return Ok(None);
+    };
+    if !(1..=0x1fff_ffff).contains(&(key >> 3)) || (key >> 3 == 1 && key != 0x0a) {
+        return Err(io::Error::other("grpc: invalid MultiHunk field key"));
+    }
+    let (head, body) = match key & 7 {
+        0 | 2 => {
+            let Some((value, len)) = multi_varint(&raw[key_len..], *frame_left - key_len)? else {
+                return Ok(None);
+            };
+            let body = if key & 7 == 2 {
+                usize::try_from(value)
+                    .map_err(|_| io::Error::other("grpc: invalid MultiHunk field length"))?
+            } else {
+                0
+            };
+            (key_len + len, body)
+        }
+        1 => (key_len, 8),
+        5 => (key_len, 4),
+        _ => return Err(io::Error::other("grpc: unsupported MultiHunk wire type")),
+    };
+    if body > *frame_left - head {
+        return Err(io::Error::other("grpc: truncated MultiHunk field"));
+    }
+    *frame_left -= head + body;
+    h2.skip_pending(head);
+    if key == 0x0a {
+        Ok(Some((body, 0)))
+    } else {
+        Ok(Some((0, body)))
+    }
+}
+
+fn multi_varint(raw: &[u8], remaining: usize) -> io::Result<Option<(u64, usize)>> {
+    match read_varint(raw) {
+        Some((_, 10)) if raw[9] > 1 => Err(io::Error::other("grpc: bad MultiHunk varint")),
+        None if raw.len() >= remaining || raw.len() >= 10 => {
+            Err(io::Error::other("grpc: bad MultiHunk varint"))
+        }
+        parsed => Ok(parsed),
+    }
+}
+
 /// Consume the header of the next Hunk (5-byte gRPC prefix, protobuf tag and
 /// length varint) and return `(payload_len, trailing_len)`: the payload bytes
 /// that follow in the buffer, and any bytes of the message after them. Only
@@ -318,17 +422,7 @@ fn start_hunk(
     }
     let mut scratch = [0u8; 16];
     let have = (*pending_len).min(scratch.len());
-    {
-        let mut at = 0usize;
-        for chunk in pending.iter() {
-            let take = chunk.len().min(have - at);
-            scratch[at..at + take].copy_from_slice(&chunk[..take]);
-            at += take;
-            if at == have {
-                break;
-            }
-        }
-    }
+    copy_prefix(pending, &mut scratch[..have]);
     let Some((payload, trailing, consumed)) = parse_hunk_head(&scratch[..have])? else {
         return Ok(None);
     };
@@ -391,6 +485,7 @@ mod tests {
     async fn response_tunnel(
         payload: Vec<u8>,
         end: bool,
+        multi_mode: bool,
     ) -> (AnyStream, tokio::task::JoinHandle<()>) {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
@@ -404,7 +499,7 @@ mod tests {
             send.send_data(Bytes::from(payload), end).unwrap();
             while connection.accept().await.is_some() {}
         });
-        let tunnel = connect(Box::new(client_io), "bench", "example.com")
+        let tunnel = connect(Box::new(client_io), "bench", "example.com", multi_mode)
             .await
             .unwrap();
         (tunnel, server)
@@ -413,7 +508,8 @@ mod tests {
     #[tokio::test]
     async fn available_hunk_does_not_wait_for_another_message() {
         use tokio::io::AsyncReadExt;
-        let (mut tunnel, server) = response_tunnel(GrpcStream::encode_frame(b"hello"), false).await;
+        let (mut tunnel, server) =
+            response_tunnel(GrpcStream::encode_frame(b"hello"), false, false).await;
         let mut out = [0; 128];
         let n = tokio::time::timeout(std::time::Duration::from_secs(2), tunnel.read(&mut out))
             .await
@@ -428,6 +524,51 @@ mod tests {
             0
         );
         drop(tunnel);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn multi_hunk_reads_all_fields_across_h2_chunks() {
+        use tokio::io::AsyncReadExt;
+
+        // The second field's length starts at the default 16 KiB DATA boundary.
+        let first = vec![0x5a; 16_375];
+        let mut multi = GrpcStream::encode_frame(&first);
+        multi.extend_from_slice(b"\x0a\x05hello\x10\x01\x0a\x00\x0a\x05world");
+        let body_len = (multi.len() - 5) as u32;
+        multi[1..5].copy_from_slice(&body_len.to_be_bytes());
+        multi.extend_from_slice(b"\0\0\0\0\0");
+        multi.extend_from_slice(&GrpcStream::encode_frame(b"next frame"));
+
+        let (mut tunnel, server) = response_tunnel(multi, true, true).await;
+        let mut got = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tunnel.read_to_end(&mut got),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(got, [first.as_slice(), b"helloworldnext frame"].concat());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn multi_hunk_rejects_a_truncated_field() {
+        use tokio::io::AsyncReadExt;
+
+        let bytes = b"\0\0\0\0\x05\x0a\x03ab".to_vec();
+        let (mut tunnel, server) = response_tunnel(bytes, true, true).await;
+        let mut got = Vec::new();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tunnel.read_to_end(&mut got),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(err.to_string(), "grpc: stream ended mid-frame");
+        assert_eq!(got, b"ab");
         server.abort();
     }
 
@@ -478,7 +619,7 @@ mod tests {
         });
 
         let stream: AnyStream = Box::new(client_io);
-        let _tunnel = connect(stream, "GunService", "example.com")
+        let _tunnel = connect(stream, "GunService", "example.com", false)
             .await
             .expect("connect");
         let request = server.await.expect("server task");
@@ -546,11 +687,14 @@ mod tests {
         assert_eq!(path_escape("a b"), "a%20b");
         assert_eq!(path_escape("a?b,c;d"), "a%3Fb%2Cc%3Bd");
         assert_eq!(path_escape("k:v@w"), "k:v@w");
-        assert_eq!(service_path("api/test"), "/api%2Ftest/Tun");
-        assert_eq!(service_path("/20763/test"), "/20763/test");
-        assert_eq!(service_path("/a b/c?d|Multi"), "/a%20b/c%3Fd");
-        assert_eq!(service_path("/Tun"), "//Tun");
-        assert_eq!(service_path("/"), "//");
+        assert_eq!(service_path("api/test", false), "/api%2Ftest/Tun");
+        assert_eq!(service_path("api/test", true), "/api%2Ftest/TunMulti");
+        assert_eq!(service_path("/20763/test", false), "/20763/test");
+        assert_eq!(service_path("/20763/test", true), "/20763/test");
+        assert_eq!(service_path("/a b/c?d|Multi", false), "/a%20b/c%3Fd");
+        assert_eq!(service_path("/a b/c?d|Multi", true), "/a%20b/Multi");
+        assert_eq!(service_path("/Tun", false), "//Tun");
+        assert_eq!(service_path("/", false), "//");
     }
 
     #[test]

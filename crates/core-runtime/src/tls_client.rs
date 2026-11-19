@@ -7,6 +7,7 @@ use std::io;
 use std::sync::Arc;
 
 use core_tls::rustls;
+use rustls::pki_types::ServerName;
 use rustls_pemfile::certs;
 use rustls_pemfile::private_key;
 use serde_json::Value;
@@ -136,6 +137,30 @@ fn decode_pin_list(
     Ok(out)
 }
 
+fn verification_names(value: Option<&Value>, at: &str) -> anyhow::Result<Vec<ServerName<'static>>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let names = value
+        .as_array()
+        .map_or_else(|| std::slice::from_ref(value), Vec::as_slice);
+    anyhow::ensure!(
+        !names.is_empty(),
+        "{at}: tls.verify_server_name cannot be empty"
+    );
+    names
+        .iter()
+        .map(|value| {
+            let name = value.as_str().unwrap_or("").trim();
+            ServerName::try_from(name.to_owned()).map_err(|_| {
+                anyhow::anyhow!(
+                    "{at}: tls.verify_server_name must contain valid DNS names or IP addresses"
+                )
+            })
+        })
+        .collect()
+}
+
 /// Standard base64, with or without padding. The reference writes padded values;
 /// a hand-edited config often loses the padding, and rejecting that would make
 /// the pin unusable rather than merely untidy.
@@ -208,6 +233,8 @@ pub struct Reality {
 #[derive(Clone, Debug)]
 pub struct TlsOptions {
     server_name: String,
+    verify_server_name: Vec<ServerName<'static>>,
+    xray_pinned_peer_cert_sha256: Vec<[u8; 32]>,
     insecure: bool,
     disable_sni: bool,
     alpn: Vec<Vec<u8>>,
@@ -313,6 +340,14 @@ impl TlsOptions {
         let certificate_sha256 = decode_pin_list(tls, "certificate_sha256", at)?;
         let certificate_public_key_sha256 =
             decode_pin_list(tls, "certificate_public_key_sha256", at)?;
+        let verify_server_name = verification_names(tls.get("verify_server_name"), at)?;
+        let xray_pinned_peer_cert_sha256 =
+            decode_pin_list(tls, "xray_pinned_peer_cert_sha256", at)?;
+        anyhow::ensure!(
+            !tls.contains_key("xray_pinned_peer_cert_sha256")
+                || !xray_pinned_peer_cert_sha256.is_empty(),
+            "{at}: tls.xray_pinned_peer_cert_sha256 cannot be empty"
+        );
 
         let fingerprint = match tls.get("utls").and_then(Value::as_object) {
             Some(u) if u.get("enabled").and_then(Value::as_bool) == Some(true) => {
@@ -374,6 +409,15 @@ impl TlsOptions {
         };
 
         let has_pins = !certificate_sha256.is_empty() || !certificate_public_key_sha256.is_empty();
+        anyhow::ensure!(
+            !has_pins || xray_pinned_peer_cert_sha256.is_empty(),
+            "{at}: tls.xray_pinned_peer_cert_sha256 cannot be combined with native pins"
+        );
+        anyhow::ensure!(
+            reality.is_none()
+                || (xray_pinned_peer_cert_sha256.is_empty() && verify_server_name.is_empty()),
+            "{at}: Xray TLS certificate verification is not applicable to REALITY"
+        );
         if reality.is_some() && (insecure || has_pins) {
             let ignored = match (insecure, has_pins) {
                 (true, true) => "tls.insecure and the certificate pins are",
@@ -427,6 +471,8 @@ impl TlsOptions {
             reality,
             stack,
             server_name,
+            verify_server_name,
+            xray_pinned_peer_cert_sha256,
             insecure,
             disable_sni,
             alpn,
@@ -502,6 +548,34 @@ impl TlsOptions {
         !self.certificate_sha256.is_empty() || !self.certificate_public_key_sha256.is_empty()
     }
 
+    fn xray_verifier(
+        &self,
+    ) -> io::Result<Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>> {
+        let has_xray_pins = !self.xray_pinned_peer_cert_sha256.is_empty();
+        if !has_xray_pins && self.verify_server_name.is_empty() {
+            return Ok(None);
+        }
+        let chain = if has_xray_pins {
+            None
+        } else {
+            Some(core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?.into_inner())
+        };
+        let verifier = Arc::new(core_tls::verify::XrayVerifier::new(
+            self.xray_pinned_peer_cert_sha256.clone(),
+            self.verify_server_name.clone(),
+            chain,
+            ServerName::try_from(self.server_name.clone()).ok(),
+        ));
+        if self.has_pins() {
+            return Ok(Some(Arc::new(core_tls::verify::PinVerifier::new(
+                verifier,
+                self.certificate_sha256.clone(),
+                self.certificate_public_key_sha256.clone(),
+            ))));
+        }
+        Ok(Some(verifier))
+    }
+
     /// The certificate verifier for the rustls paths, or `None` for the plain
     /// root store.
     ///
@@ -511,6 +585,9 @@ impl TlsOptions {
     fn rustls_verifier(
         &self,
     ) -> io::Result<Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>> {
+        if let Some(verifier) = self.xray_verifier()? {
+            return Ok(Some(verifier));
+        }
         if self.has_pins() {
             let verifier = if self.insecure {
                 core_tls::verify::PinVerifier::instead_of_chain(
@@ -591,6 +668,11 @@ impl TlsOptions {
         }
         self.certificate_sha256.hash(&mut ca);
         self.certificate_public_key_sha256.hash(&mut ca);
+        self.xray_pinned_peer_cert_sha256.hash(&mut ca);
+        self.verify_server_name.hash(&mut ca);
+        if !self.xray_pinned_peer_cert_sha256.is_empty() {
+            self.server_name.hash(&mut ca);
+        }
         let key = (
             self.min_tls13,
             self.max_tls12,
@@ -745,6 +827,11 @@ impl TlsOptions {
     /// The verifier for our own stack without REALITY: the same policy as
     /// [`TlsOptions::rustls_verifier`].
     fn own_stack_verifier(&self) -> io::Result<Box<dyn core_tls::verify::CertVerifier>> {
+        if let Some(verifier) = self.xray_verifier()? {
+            return Ok(Box::new(core_tls::verify::WebpkiVerifier::from_verifier(
+                verifier,
+            )));
+        }
         if self.has_pins() && self.insecure {
             return Ok(Box::new(core_tls::verify::PinVerifier::instead_of_chain(
                 self.certificate_sha256.clone(),

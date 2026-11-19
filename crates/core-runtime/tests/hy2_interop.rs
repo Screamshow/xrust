@@ -242,7 +242,7 @@ async fn udp_roundtrip(
     request.extend_from_slice(&target.port().to_be_bytes());
     request.extend_from_slice(payload);
     udp.send(&request).await.unwrap();
-    let mut reply = [0; 256];
+    let mut reply = vec![0; request.len() + 1];
     let Ok(received) = tokio::time::timeout(wait, udp.recv(&mut reply)).await else {
         return false;
     };
@@ -265,7 +265,7 @@ async fn existing_socks_udp_flow_recovers_after_xray_restart() {
     let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let target = echo.local_addr().unwrap();
     let echo_task = tokio::spawn(async move {
-        let mut buf = [0; 256];
+        let mut buf = [0; 8192];
         while let Ok((n, peer)) = echo.recv_from(&mut buf).await {
             let _ = echo.send_to(&buf[..n], peer).await;
         }
@@ -301,6 +301,8 @@ async fn existing_socks_udp_flow_recovers_after_xray_restart() {
     let (_original_associate, original) = socks_udp_associate(proxy).await;
     let wait = Duration::from_secs(3);
     assert!(udp_roundtrip(&original, target, b"first", wait).await);
+    let fragmented: Vec<u8> = (0..4097).map(|i| (i % 251) as u8).collect();
+    assert!(udp_roundtrip(&original, target, &fragmented, wait).await);
 
     drop(server);
     let offline = Duration::from_millis(4500);

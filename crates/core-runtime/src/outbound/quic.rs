@@ -22,8 +22,8 @@ use crate::util::random_bytes;
 
 /// Reference `hysteria.MbpsToBps`.
 pub(crate) const MBPS_TO_BPS: u64 = 125_000;
-/// Reference `protocol.MaxUDPSize` (hy2).
-pub(crate) const HY2_MAX_UDP: usize = 4096;
+/// Maximum application payload of an IPv4 UDP datagram.
+pub(crate) const HY2_MAX_UDP: usize = 65_507;
 
 const PADDING_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 

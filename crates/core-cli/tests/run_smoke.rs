@@ -194,7 +194,7 @@ fn version_as_sing_box_is_the_block_forkop_parses() {
     // ones go at the end
     assert!(
         lines.contains(
-            &"Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended,outbound.transport-mark"
+            &"Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended,outbound.transport-mark,transport.xhttp.split,transport.grpc.multi,tls.xray-pins,tls.verify-name"
         ),
         "{said}"
     );

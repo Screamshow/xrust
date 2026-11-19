@@ -11,6 +11,7 @@ use std::fmt::Debug;
 use std::io;
 use std::sync::Arc;
 
+use der::Decode as _;
 use rustls::RootCertStore;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, SignatureVerificationAlgorithm, UnixTime};
@@ -78,6 +79,30 @@ fn bad(msg: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xray_pinned_ca_expiration_is_checked() {
+        let ca = rustls_pemfile::certs(
+            &mut include_bytes!("../../../tests/golden/certs/urltest-ca.crt").as_slice(),
+        )
+        .next()
+        .unwrap()
+        .unwrap();
+        let leaf = rustls_pemfile::certs(
+            &mut include_bytes!("../../../tests/golden/certs/urltest-valid.crt").as_slice(),
+        )
+        .next()
+        .unwrap()
+        .unwrap();
+        let constraints = pinned_ca_constraints(ca.as_ref()).unwrap().unwrap();
+        let names = [ServerName::try_from("localhost").unwrap()];
+        let expired =
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs(constraints.not_after + 1));
+        assert!(matches!(
+            verify_pinned_ca(&leaf, &[], &names, expired, &ca, constraints),
+            Err(webpki::Error::BadDerTime)
+        ));
+    }
 
     fn fixture_der() -> Vec<u8> {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -694,6 +719,10 @@ impl WebpkiVerifier {
     pub fn into_inner(self) -> Arc<dyn ServerCertVerifier> {
         self.chain
     }
+
+    pub fn from_verifier(chain: Arc<dyn ServerCertVerifier>) -> Self {
+        Self { chain }
+    }
 }
 
 impl Debug for WebpkiVerifier {
@@ -724,6 +753,259 @@ impl CertVerifier for WebpkiVerifier {
     ) -> io::Result<()> {
         verify_leaf_signature(signed, leaf, scheme, signature)
     }
+}
+
+/// Xray's certificate pins authenticate a matching leaf directly, or make a
+/// matching CA from the peer's chain the sole anchor. A separate verification
+/// name changes only certificate verification, leaving ClientHello SNI alone.
+#[derive(Debug)]
+pub struct XrayVerifier {
+    pins: Vec<[u8; 32]>,
+    names: Vec<ServerName<'static>>,
+    chain: Option<Arc<dyn ServerCertVerifier>>,
+    server_name: Option<ServerName<'static>>,
+}
+
+impl XrayVerifier {
+    pub fn new(
+        pins: Vec<[u8; 32]>,
+        names: Vec<ServerName<'static>>,
+        chain: Option<Arc<dyn ServerCertVerifier>>,
+        server_name: Option<ServerName<'static>>,
+    ) -> Self {
+        Self {
+            pins,
+            names,
+            chain,
+            server_name,
+        }
+    }
+
+    fn pin_matches(&self, cert: &CertificateDer<'_>) -> bool {
+        let hash: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(cert.as_ref()).into();
+        self.pins.contains(&hash)
+    }
+}
+
+impl ServerCertVerifier for XrayVerifier {
+    fn verify_server_cert(
+        &self,
+        leaf: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let fallback = self.server_name.as_ref().unwrap_or(server_name);
+        let names = if self.names.is_empty() {
+            std::slice::from_ref(fallback)
+        } else {
+            &self.names
+        };
+        if !self.pins.is_empty() {
+            if self.pin_matches(leaf) {
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+            let (ca, constraints) = intermediates
+                .iter()
+                .find_map(|cert| {
+                    if !self.pin_matches(cert) {
+                        return None;
+                    }
+                    let constraints = pinned_ca_constraints(cert.as_ref()).ok().flatten()?;
+                    Some((cert, constraints))
+                })
+                .ok_or_else(|| {
+                    rustls::Error::General(
+                        "peer certificate does not match tls.xray_pinned_peer_cert_sha256".into(),
+                    )
+                })?;
+            return verify_pinned_ca(leaf, intermediates, names, now, ca, constraints).map_err(
+                |err| rustls::Error::General(format!("pinned CA validation failed: {err}")),
+            );
+        }
+
+        let verifier = self
+            .chain
+            .as_deref()
+            .ok_or_else(|| rustls::Error::General("no certificate verifier".into()))?;
+        let mut result = Err(rustls::Error::General(
+            "no certificate verification name".into(),
+        ));
+        for name in names {
+            result = verifier.verify_server_cert(leaf, intermediates, name, ocsp_response, now);
+            if result.is_ok() {
+                break;
+            }
+        }
+        result
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &core_crypto::verify::ALGORITHMS)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &core_crypto::verify::ALGORITHMS)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        core_crypto::verify::ALGORITHMS.supported_schemes()
+    }
+}
+
+struct PinnedCaConstraints {
+    not_before: u64,
+    not_after: u64,
+    permits_signing: bool,
+    permits_server_auth: bool,
+    path_len: Option<u64>,
+}
+
+fn verify_pinned_ca(
+    leaf: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    names: &[ServerName<'_>],
+    now: UnixTime,
+    ca: &CertificateDer<'_>,
+    constraints: PinnedCaConstraints,
+) -> Result<rustls::client::danger::ServerCertVerified, webpki::Error> {
+    if now.as_secs() < constraints.not_before || now.as_secs() > constraints.not_after {
+        return Err(webpki::Error::BadDerTime);
+    }
+    if !constraints.permits_signing || !constraints.permits_server_auth {
+        return Err(webpki::Error::UnknownIssuer);
+    }
+    let anchors = [webpki::anchor_from_trusted_cert(ca)?];
+    let verify_path = |path: &webpki::VerifiedPath<'_>| {
+        if constraints
+            .path_len
+            .is_some_and(|max| path.intermediate_certificates().count() as u64 > max)
+        {
+            return Err(webpki::Error::PathLenConstraintViolated);
+        }
+        Ok(())
+    };
+    let leaf = webpki::EndEntityCert::try_from(leaf)?;
+    leaf.verify_for_usage(
+        core_crypto::verify::ALGORITHMS.all,
+        &anchors,
+        intermediates,
+        now,
+        webpki::KeyUsage::server_auth(),
+        None,
+        Some(&verify_path),
+    )?;
+    let mut error = webpki::Error::UnsupportedNameType;
+    for name in names {
+        match leaf.verify_is_valid_for_subject_name(name) {
+            Ok(()) => return Ok(rustls::client::danger::ServerCertVerified::assertion()),
+            Err(err) => error = err,
+        }
+    }
+    Err(error)
+}
+
+// WebPKI strips validity, usages and basic constraints from trust anchors.
+// Xray checks those on the particular certificate selected by the CA pin.
+fn pinned_ca_constraints(cert: &[u8]) -> io::Result<Option<PinnedCaConstraints>> {
+    let mut certificate = Der::new(Der::new(cert).take(0x30)?);
+    let mut tbs = Der::new(certificate.take(0x30)?);
+    if tbs.data.first() == Some(&0xa0) {
+        tbs.take(0xa0)?; // version
+    }
+    for tag in [0x02, 0x30, 0x30] {
+        tbs.take(tag)?; // serial, signature, issuer
+    }
+    let validity = tbs.take(0x30)?;
+    tbs.take(0x30)?; // subject
+    tbs.take(0x30)?; // SPKI
+    for tag in [0x81, 0x82] {
+        if tbs.data.first() == Some(&tag) {
+            tbs.take(tag)?; // unique identifiers
+        }
+    }
+    if tbs.data.first() != Some(&0xa3) {
+        return Ok(None);
+    }
+    let mut is_ca = false;
+    let mut path_len = None;
+    let mut permits_signing = true;
+    let mut permits_server_auth = true;
+    let mut extensions = Der::new(Der::new(tbs.take(0xa3)?).take(0x30)?);
+    while !extensions.data.is_empty() {
+        let mut extension = Der::new(extensions.take(0x30)?);
+        let oid = extension.take(0x06)?;
+        if extension.data.first() == Some(&0x01) {
+            extension.take(0x01)?; // critical marker
+        }
+        let value = extension.take(0x04)?;
+        match oid {
+            [0x55, 0x1d, 0x13] => {
+                // basicConstraints
+                let mut constraints = Der::new(Der::new(value).take(0x30)?);
+                is_ca =
+                    constraints.data.first() == Some(&0x01) && constraints.take(0x01)? == [0xff];
+                if !constraints.data.is_empty() {
+                    path_len =
+                        Some(u64::from_der(constraints.data).map_err(|err| bad(err.to_string()))?);
+                }
+            }
+            [0x55, 0x1d, 0x0f] => {
+                // keyUsage
+                let usage =
+                    der::asn1::BitStringRef::from_der(value).map_err(|err| bad(err.to_string()))?;
+                let bytes = usage.raw_bytes();
+                permits_signing = bytes.iter().all(|byte| *byte == 0)
+                    || bytes.first().is_some_and(|byte| byte & 0x04 != 0); // keyCertSign
+            }
+            [0x55, 0x1d, 0x25] => {
+                // extendedKeyUsage
+                let mut usage = Der::new(Der::new(value).take(0x30)?);
+                permits_server_auth = usage.data.is_empty();
+                while !usage.data.is_empty() {
+                    permits_server_auth |= matches!(
+                        usage.take(0x06)?,
+                        [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01] | [0x55, 0x1d, 0x25, 0x00]
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    if !is_ca {
+        return Ok(None);
+    }
+    let (not_before, not_after) =
+        der_element(validity, 0).ok_or_else(|| bad("missing pinned CA validity"))?;
+    Ok(Some(PinnedCaConstraints {
+        not_before: x509_time(not_before)?,
+        not_after: x509_time(not_after)?,
+        permits_signing,
+        permits_server_auth,
+        path_len,
+    }))
+}
+
+fn x509_time(input: &[u8]) -> io::Result<u64> {
+    let duration = match input.first() {
+        Some(0x17) => der::asn1::UtcTime::from_der(input).map(|t| t.to_unix_duration()),
+        Some(0x18) => der::asn1::GeneralizedTime::from_der(input).map(|t| t.to_unix_duration()),
+        _ => return Err(bad("missing pinned CA certificate time")),
+    };
+    duration
+        .map(|time| time.as_secs())
+        .map_err(|err| bad(err.to_string()))
 }
 
 /// Verify a TLS handshake `CertificateVerify` signature against `leaf`.

@@ -97,6 +97,7 @@ enum Kind {
     },
     Grpc {
         service_name: String,
+        multi_mode: bool,
         keep_alive: Option<h2io::H2KeepAlive>,
     },
     Http {
@@ -287,6 +288,11 @@ impl Transport {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                multi_mode: match transport.get("multi_mode") {
+                    None | Some(Value::Null) => false,
+                    Some(Value::Bool(enabled)) => *enabled,
+                    Some(_) => anyhow::bail!("{at}.transport.multi_mode: expected a boolean"),
+                },
                 keep_alive: grpc_keep_alive(transport, at)?,
             },
             "http" => {
@@ -397,6 +403,10 @@ impl Transport {
         dial: &crate::outbound::dial::DialOptions,
     ) -> io::Result<AnyStream> {
         if let Kind::Xhttp(cfg) = &self.kind {
+            if cfg.has_download_settings() {
+                let dialer = self.dialer(tls, server, port, dial);
+                return cfg.connect_split(tls, server, port, dial, dialer).await;
+            }
             match cfg.connect_h2_stream(tls, server, port, dial).await? {
                 xhttp::H2Connect::Stream(stream) => return Ok(stream),
                 xhttp::H2Connect::Fallback(stream) => {
@@ -565,7 +575,11 @@ impl Transport {
         server: &str,
     ) -> io::Result<AnyStream> {
         match &self.kind {
-            Kind::Grpc { service_name, .. } => {
+            Kind::Grpc {
+                service_name,
+                multi_mode,
+                ..
+            } => {
                 // Xray's dialer hands grpc-go the TLS server name as the
                 // authority, or the destination's domain without TLS, and
                 // never a port (`grpc/dial.go`).
@@ -573,7 +587,7 @@ impl Transport {
                     .map(TlsOptions::server_name)
                     .filter(|name| !name.is_empty())
                     .unwrap_or(server);
-                grpc::open_pooled(&mut send_req, service_name, sni)
+                grpc::open_pooled(&mut send_req, service_name, sni, *multi_mode)
             }
             Kind::Http {
                 host,
@@ -654,7 +668,11 @@ impl Transport {
                     .unwrap_or(server);
                 httpupgrade_handshake(stream, path, host, headers).await?
             }
-            Kind::Grpc { service_name, .. } => {
+            Kind::Grpc {
+                service_name,
+                multi_mode,
+                ..
+            } => {
                 // Xray's dialer hands grpc-go the TLS server name as the
                 // authority, or the destination's domain without TLS, and
                 // never a port (`grpc/dial.go`); ours used to send
@@ -663,7 +681,7 @@ impl Transport {
                     .map(TlsOptions::server_name)
                     .filter(|name| !name.is_empty())
                     .unwrap_or(server);
-                grpc::connect(stream, service_name, sni).await?
+                grpc::connect(stream, service_name, sni, *multi_mode).await?
             }
             Kind::Http {
                 host,

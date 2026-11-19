@@ -77,6 +77,7 @@ async fn preserves_large_upload_under_backpressure_and_reports_rejection() {
                     session_id: "session".into(), seq: 0,
                     dialer: std::sync::Arc::new(|| Box::pin(async { Err(io::Error::other("must not use H1")) })),
                     h2_client: Some(client),
+                    first_connection: None,
                 };
                 let worker = tokio::spawn(packet_upload_worker(reader, writer, failure.clone(), flushed.clone(), std::sync::Arc::new(tokio::sync::Notify::new())));
                 let data: Vec<u8> = (0..2_100_013).map(|i| (i % 251) as u8).collect();

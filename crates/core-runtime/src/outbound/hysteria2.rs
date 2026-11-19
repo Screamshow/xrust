@@ -805,7 +805,9 @@ fn send_hy2_datagram(
     sess: &UdpSession,
 ) -> io::Result<()> {
     if payload.len() > HY2_MAX_UDP {
-        return Err(io::Error::other("hysteria2: udp payload exceeds 4096"));
+        return Err(io::Error::other(format!(
+            "hysteria2: udp payload exceeds {HY2_MAX_UDP}"
+        )));
     }
     let pid = next_packet_id(&sess.packet_id);
     let header_len = 8 + varint_len(dest.len() as u64) + dest.len();
@@ -821,14 +823,11 @@ fn send_hy2_datagram(
         }
     }
     let max_data = budget.saturating_sub(header_len).max(1);
-    let chunks: Vec<&[u8]> = payload.chunks(max_data).collect();
-    if chunks.len() > 255 {
-        return Err(io::Error::other(
-            "hysteria2: udp packet needs too many fragments",
-        ));
-    }
-    for (i, chunk) in chunks.iter().enumerate() {
-        let pkt = pack_hy2(sid, pid, i as u8, chunks.len() as u8, dest, chunk);
+    let chunks = payload.chunks(max_data);
+    let count = u8::try_from(chunks.len())
+        .map_err(|_| io::Error::other("hysteria2: udp packet needs too many fragments"))?;
+    for (i, chunk) in chunks.enumerate() {
+        let pkt = pack_hy2(sid, pid, i as u8, count, dest, chunk);
         conn.send_datagram(pkt.into()).map_err(io_from_datagram)?;
     }
     Ok(())
