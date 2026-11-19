@@ -373,10 +373,16 @@ impl UdpBridgePolicy {
     }
 }
 
-fn udp_bridge_timeout() -> std::time::Duration {
-    UDP_BRIDGE_POLICY
-        .try_with(|policy| policy.timeout)
-        .unwrap_or(crate::inbound::udp::DEFAULT_UDP_TIMEOUT)
+/// UDP sockets cannot signal EOF to the hub. Mark the flow closed when its
+/// bridge ends, including when an owner aborts the task.
+pub(super) struct CloseUdpFlowOnDrop(pub(super) Option<crate::clash_state::CloseSignal>);
+
+impl Drop for CloseUdpFlowOnDrop {
+    fn drop(&mut self) {
+        if let Some(signal) = &self.0 {
+            signal.close();
+        }
+    }
 }
 
 pub(crate) fn spawn_packet_bridge(
@@ -385,15 +391,15 @@ pub(crate) fn spawn_packet_bridge(
     mode: PacketEncoding,
     target: Target,
 ) {
-    spawn_packet_bridge_with_timeout(stream, peer, mode, target, udp_bridge_timeout());
+    spawn_packet_bridge_with_policy(stream, peer, mode, target, UdpBridgePolicy::current());
 }
 
-fn spawn_packet_bridge_with_timeout(
+fn spawn_packet_bridge_with_policy(
     stream: AnyStream,
     peer: UdpSocket,
     mode: PacketEncoding,
     target: Target,
-    timeout: std::time::Duration,
+    policy: UdpBridgePolicy,
 ) {
     let (activity, idle) = tokio::sync::watch::channel(tokio::time::Instant::now());
     let sent = activity.clone();
@@ -437,7 +443,10 @@ fn spawn_packet_bridge_with_timeout(
             }
         }
     };
+    let close_flow = CloseUdpFlowOnDrop(policy.flow_close);
+    let timeout = policy.timeout;
     tokio::spawn(async move {
+        let _close_flow = close_flow;
         tokio::select! { _ = downstream => {}, _ = upstream => {}, _ = wait_bridge_idle(idle, timeout) => {} }
     });
 }
@@ -493,12 +502,15 @@ mod tests {
                 let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
                 let address = peer.local_addr().unwrap();
                 let (stream, _remote) = tokio::io::duplex(1024);
-                spawn_packet_bridge_with_timeout(
+                spawn_packet_bridge_with_policy(
                     Box::new(stream),
                     peer,
                     mode,
                     Target::Ip("127.0.0.1:53".parse().unwrap()),
-                    std::time::Duration::from_millis(50),
+                    UdpBridgePolicy {
+                        timeout: std::time::Duration::from_millis(50),
+                        flow_close: None,
+                    },
                 );
                 drop(client);
                 tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -522,12 +534,15 @@ mod tests {
         for _ in 0..2 {
             let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
             let (stream, remote) = tokio::io::duplex(1024);
-            spawn_packet_bridge_with_timeout(
+            spawn_packet_bridge_with_policy(
                 Box::new(stream),
                 peer,
                 PacketEncoding::LengthPrefixed,
                 Target::Ip("127.0.0.1:53".parse().unwrap()),
-                std::time::Duration::from_secs(5),
+                UdpBridgePolicy {
+                    timeout: std::time::Duration::from_secs(5),
+                    flow_close: None,
+                },
             );
             flows.push((
                 client,
@@ -564,12 +579,15 @@ mod tests {
     async fn send_only_packet_bridge_survives_multiple_idle_windows() {
         let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
         let (stream, mut remote) = tokio::io::duplex(1024);
-        spawn_packet_bridge_with_timeout(
+        spawn_packet_bridge_with_policy(
             Box::new(stream),
             peer,
             PacketEncoding::LengthPrefixed,
             Target::Ip("127.0.0.1:53".parse().unwrap()),
-            std::time::Duration::from_millis(150),
+            UdpBridgePolicy {
+                timeout: std::time::Duration::from_millis(150),
+                flow_close: None,
+            },
         );
         let mut buf = [0u8; 3];
         for _ in 0..12 {
@@ -593,15 +611,34 @@ mod tests {
                 let (client, peer) = crate::outbound::quic::udp_loopback_pair().await.unwrap();
                 let address = peer.local_addr().unwrap();
                 let (stream, remote) = tokio::io::duplex(1024);
-                spawn_packet_bridge(
-                    Box::new(stream),
-                    peer,
-                    mode,
-                    Target::Ip("127.0.0.1:53".parse().unwrap()),
+                let flow = crate::clash_state::ConnHandle::open(crate::clash_state::ConnMeta {
+                    network: "udp",
+                    inbound: "test".into(),
+                    source: client.local_addr().unwrap().to_string(),
+                    host: String::new(),
+                    destination: "127.0.0.1:53".into(),
+                    chains: Vec::new(),
+                    rule: String::new(),
+                    rule_payload: String::new(),
+                });
+                let closed = flow.close_signal();
+                UDP_BRIDGE_POLICY.sync_scope(
+                    UdpBridgePolicy {
+                        timeout: std::time::Duration::from_secs(30),
+                        flow_close: Some(closed.clone()),
+                    },
+                    || {
+                        spawn_packet_bridge(
+                            Box::new(stream),
+                            peer,
+                            mode,
+                            Target::Ip("127.0.0.1:53".parse().unwrap()),
+                        );
+                    },
                 );
                 drop(remote);
-                drop(client);
                 let released = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    closed.wait().await;
                     loop {
                         if UdpSocket::bind(address).await.is_ok() {
                             break;
@@ -612,7 +649,7 @@ mod tests {
                 .await;
                 assert!(
                     released.is_ok(),
-                    "packet bridge retained UDP socket after remote EOF"
+                    "packet bridge did not close the flow and release its UDP socket after EOF"
                 );
             }
         }

@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::inbound::{AnyStream, Target, network_includes_tcp, network_includes_udp};
 use crate::logging;
+use crate::outbound::packet::{CloseUdpFlowOnDrop, UdpBridgePolicy};
 use crate::outbound::proxy::{server_endpoint, server_host};
 use crate::outbound::quic::{
     CongestionKind, Defragger, HY2_MAX_UDP, MBPS_TO_BPS, POOL_MAX_CONNS, POOL_STREAMS_PER_CONN,
@@ -451,7 +452,7 @@ impl Hysteria2 {
         let dest_f = dest.clone();
         let sess_f = Arc::clone(&session);
         let peer_f = Arc::clone(&peer);
-        let policy = crate::outbound::packet::UdpBridgePolicy::current();
+        let policy = UdpBridgePolicy::current();
         let udp_timeout = policy.timeout;
         let close_flow = CloseUdpFlowOnDrop(policy.flow_close);
         // held across the spawn so the task's own removal comes after the insert
@@ -513,16 +514,6 @@ impl Hysteria2 {
         handles.insert(sid, handle.abort_handle());
         drop(handles);
         Ok(local)
-    }
-}
-
-struct CloseUdpFlowOnDrop(Option<crate::clash_state::CloseSignal>);
-
-impl Drop for CloseUdpFlowOnDrop {
-    fn drop(&mut self) {
-        if let Some(signal) = &self.0 {
-            signal.close();
-        }
     }
 }
 

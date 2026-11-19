@@ -527,8 +527,7 @@ async fn banner_roundtrip(proxy: SocketAddr, banner: SocketAddr, label: &str) {
     assert_eq!(&buf, b"HELO x\r\n", "{label}: echo after the banner");
 }
 
-/// SOCKS5 UDP ASSOCIATE, two datagrams there and back.
-async fn udp_roundtrip(proxy: SocketAddr, echo: SocketAddr, label: &str) {
+async fn socks_udp_associate(proxy: SocketAddr) -> (TcpStream, UdpSocket) {
     let mut control = TcpStream::connect(proxy).await.expect("connect inbound");
     control.write_all(&[5, 1, 0]).await.expect("greeting");
     let mut auth = [0u8; 2];
@@ -542,29 +541,47 @@ async fn udp_roundtrip(proxy: SocketAddr, echo: SocketAddr, label: &str) {
         .read_exact(&mut reply)
         .await
         .expect("associate reply");
-    assert_eq!(reply[1], 0, "{label}: associate refused");
+    assert_eq!(&reply[..4], &[5, 0, 0, 1], "UDP associate refused");
     let relay = SocketAddr::new(
         IpAddr::V4(Ipv4Addr::new(reply[4], reply[5], reply[6], reply[7])),
         u16::from_be_bytes([reply[8], reply[9]]),
     );
     let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
+    socket.connect(relay).await.expect("connect UDP relay");
+    (control, socket)
+}
+
+async fn udp_exchange(
+    socket: &UdpSocket,
+    echo: SocketAddr,
+    payload: &[u8],
+    wait: Duration,
+) -> bool {
     let IpAddr::V4(v4) = echo.ip() else {
         panic!("expected v4 echo addr");
     };
+    let mut datagram = vec![0, 0, 0, 1];
+    datagram.extend_from_slice(&v4.octets());
+    datagram.extend_from_slice(&echo.port().to_be_bytes());
+    datagram.extend_from_slice(payload);
+    socket.send(&datagram).await.expect("send");
+    let mut buf = [0u8; 4096];
+    let Ok(received) = tokio::time::timeout(wait, socket.recv(&mut buf)).await else {
+        return false;
+    };
+    assert_eq!(&buf[..received.expect("recv")], &datagram);
+    true
+}
+
+/// SOCKS5 UDP ASSOCIATE, two datagrams there and back.
+async fn udp_roundtrip(proxy: SocketAddr, echo: SocketAddr, label: &str) {
+    let (_control, socket) = socks_udp_associate(proxy).await;
     for payload in [&b"first datagram"[..], &[0x42u8; 1200][..]] {
-        let mut datagram = vec![0, 0, 0, 1];
-        datagram.extend_from_slice(&v4.octets());
-        datagram.extend_from_slice(&echo.port().to_be_bytes());
-        datagram.extend_from_slice(payload);
-        socket.send_to(&datagram, relay).await.expect("send");
-        let mut buf = vec![0u8; 4096];
-        let n = tokio::time::timeout(Duration::from_secs(5), socket.recv(&mut buf))
-            .await
-            .unwrap_or_else(|_| panic!("{label}: no udp answer"))
-            .expect("recv");
-        assert_eq!(&buf[10..n], payload, "{label}: datagram must echo");
+        assert!(
+            udp_exchange(&socket, echo, payload, Duration::from_secs(5)).await,
+            "{label}: no UDP answer"
+        );
     }
-    drop(control);
 }
 
 fn free_port() -> u16 {
@@ -679,6 +696,67 @@ fn xray_tls() -> Value {
         "certificateFile": format!("{certs}/localhost.crt"),
         "keyFile": format!("{certs}/localhost.key")
     }]})
+}
+
+#[tokio::test]
+async fn xudp_flow_recovers_after_xray_restart_with_reality_vision() {
+    let Some(bin) = std::env::var_os("XRAY_REF") else {
+        return;
+    };
+    let bin = bin.to_string_lossy();
+    let port = free_port();
+    let decoy = free_port();
+    let private = [21u8; 32];
+    let peer = json!({
+        "log": {"loglevel": "error"},
+        "inbounds": [
+            {"listen":"127.0.0.1", "port":port, "protocol":"vless",
+             "settings":{"clients":[{"id":UUID_TEXT, "flow":"xtls-rprx-vision"}], "decryption":"none"},
+             "streamSettings":{"network":"raw", "security":"reality",
+                 "realitySettings":{"dest":format!("127.0.0.1:{decoy}"), "serverNames":["localhost"],
+                   "privateKey":reality_private(&private), "shortIds":[SHORT_ID]}}},
+            {"listen":"127.0.0.1", "port":decoy, "protocol":"vless",
+             "settings":{"clients":[{"id":UUID_TEXT}], "decryption":"none"},
+             "streamSettings":{"security":"tls", "tlsSettings":xray_tls()}}
+        ],
+        "outbounds":[{"protocol":"freedom",
+            "settings":{"finalRules":[{"action":"allow", "ip":["127.0.0.1/32"]}]}}]
+    });
+    let server = start_ref(&bin, &peer);
+    assert!(wait_listening(port).await);
+    // A regular imported TCP profile leaves packet_encoding at its default.
+    let (client, proxy) = start_client(json!({
+        "type": "vless", "tag": "up", "server": "127.0.0.1", "server_port": port,
+        "uuid": UUID_TEXT, "flow": "xtls-rprx-vision",
+        "tls": {"enabled": true, "server_name": "localhost",
+            "utls": {"enabled": true, "fingerprint": "firefox"},
+            "reality": {"enabled": true, "public_key": reality_public(&private), "short_id": SHORT_ID}}
+    }))
+    .await;
+    let echo = spawn_udp_echo().await;
+    let wait = Duration::from_secs(3);
+    let (_original_control, original) = tokio::time::timeout(wait, socks_udp_associate(proxy))
+        .await
+        .expect("original UDP associate");
+    assert!(udp_exchange(&original, echo, b"before restart", wait).await);
+
+    drop(server);
+    assert!(
+        !udp_exchange(&original, echo, b"offline", Duration::from_millis(350)).await,
+        "the stopped server must not answer"
+    );
+    let _server = start_ref(&bin, &peer);
+    assert!(wait_listening(port).await);
+    let (_fresh_control, fresh) = tokio::time::timeout(wait, socks_udp_associate(proxy))
+        .await
+        .expect("fresh UDP associate");
+    assert!(udp_exchange(&fresh, echo, b"fresh source port", wait).await);
+    assert!(
+        udp_exchange(&original, echo, b"same UDP socket", wait).await,
+        "the first datagram on the existing SOCKS UDP socket must reopen the VLESS tunnel"
+    );
+    assert!(udp_exchange(&original, echo, b"next datagram", wait).await);
+    client.shutdown();
 }
 
 #[tokio::test]
