@@ -319,3 +319,162 @@ async fn existing_socks_udp_flow_recovers_after_xray_restart() {
     client.shutdown();
     echo_task.abort();
 }
+
+async fn loopback_hy2_server(listen: &str, obfs: bool) -> SocketAddr {
+    let router = core_runtime::route::Router::new(
+        &json!({"outbounds": [{"type": "direct", "tag": "direct"}]}),
+    )
+    .unwrap();
+    let mut cfg = json!({
+        "type": "hysteria2", "tag": "hy2-in", "listen": listen, "listen_port": 0,
+        "users": [{"password": "interop-pass"}],
+        "tls": {"enabled": true, "certificate": CERT_PEM, "key": KEY_PEM}
+    });
+    if obfs {
+        cfg["obfs"] = json!({"type": "salamander", "password": "loopback-fixture"});
+    }
+    let server = core_runtime::inbound::hysteria2::Hysteria2::bind(&cfg, router)
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(server.serve());
+    addr
+}
+
+fn loopback_hy2_client(
+    server: SocketAddr,
+    obfs: bool,
+) -> core_runtime::outbound::hysteria2::Hysteria2 {
+    let mut cfg = json!({
+        "type": "hysteria2", "tag": "hy2-out", "server": server.ip().to_string(),
+        "server_port": server.port(), "password": "interop-pass", "connect_timeout": "2s",
+        "tls": {"enabled": true, "server_name": "localhost", "certificate": CERT_PEM}
+    });
+    if obfs {
+        cfg["obfs"] = json!({"type": "salamander", "password": "loopback-fixture"});
+    }
+    core_runtime::outbound::hysteria2::Hysteria2::build(cfg.as_object().unwrap(), "test").unwrap()
+}
+
+async fn loopback_hy2_udp_echo() -> SocketAddr {
+    let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = echo.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut bytes = vec![0; 65_535];
+        while let Ok((len, peer)) = echo.recv_from(&mut bytes).await {
+            if echo.send_to(&bytes[..len], peer).await.is_err() {
+                break;
+            }
+        }
+    });
+    addr
+}
+
+async fn loopback_hy2_exchange(flow: &UdpSocket, data: &[u8]) {
+    assert_eq!(flow.send(data).await.unwrap(), data.len());
+    let mut reply = vec![0; data.len() + 1];
+    let len = tokio::time::timeout(Duration::from_secs(3), flow.recv(&mut reply))
+        .await
+        .unwrap_or_else(|_| panic!("HY2 {}-byte UDP reply timed out", data.len()))
+        .unwrap();
+    assert_eq!(&reply[..len], data);
+}
+
+#[tokio::test]
+async fn loopback_hy2_inbound_sends_fragmented_udp_replies() {
+    use core_runtime::inbound::Target;
+
+    let server = loopback_hy2_server("127.0.0.1", false).await;
+    let client = loopback_hy2_client(server, false);
+    let target = Target::Ip(loopback_hy2_udp_echo().await);
+    let flow = client.connect_udp(&target).await.unwrap();
+    loopback_hy2_exchange(&flow, b"plain short").await;
+    let data: Vec<u8> = (0..4097).map(|i| (i % 251) as u8).collect();
+    loopback_hy2_exchange(&flow, &data).await;
+    loopback_hy2_exchange(&flow, &[]).await;
+    loopback_hy2_exchange(&flow, b"plain after fragments").await;
+}
+
+async fn loopback_hy2_salamander_clients(listen: &str) {
+    use core_runtime::inbound::Target;
+
+    let server = loopback_hy2_server(listen, true).await;
+    let a = loopback_hy2_client(server, true);
+    let b = loopback_hy2_client(server, true);
+    let target = Target::Ip(loopback_hy2_udp_echo().await);
+    let (flow_a, flow_b) = tokio::try_join!(a.connect_udp(&target), b.connect_udp(&target))
+        .expect("both concurrent Salamander clients connect");
+    tokio::join!(
+        loopback_hy2_exchange(&flow_a, b"salamander first"),
+        loopback_hy2_exchange(&flow_b, b"salamander second")
+    );
+    let data: Vec<u8> = (0..4097).map(|i| (i % 251) as u8).collect();
+    tokio::join!(
+        loopback_hy2_exchange(&flow_a, &data),
+        loopback_hy2_exchange(&flow_b, b"salamander second again")
+    );
+
+    let tcp = Target::Ip(spawn_echo().await);
+    let mut stream = a.connect(&tcp).await.unwrap();
+    stream.write_all(b"tcp echo").await.unwrap();
+    let mut reply = [0; 8];
+    tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&reply, b"tcp echo");
+}
+
+#[tokio::test]
+async fn loopback_hy2_salamander_inbound_keeps_ipv4_clients_distinct() {
+    loopback_hy2_salamander_clients("127.0.0.1").await;
+}
+
+#[tokio::test]
+async fn loopback_hy2_salamander_inbound_keeps_ipv6_clients_distinct() {
+    loopback_hy2_salamander_clients("::1").await;
+}
+
+#[tokio::test]
+async fn loopback_hy2_salamander_inbound_accepts_xray_client() {
+    let Some(bin) = std::env::var_os("XRAY_REF") else {
+        return;
+    };
+    let server = loopback_hy2_server("127.0.0.1", true).await;
+    let target = loopback_hy2_udp_echo().await;
+    let port = free_port();
+    let certs = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/golden/certs");
+    let _client = start_ref(
+        &bin.to_string_lossy(),
+        &json!({
+            "log": {"loglevel": "error"},
+            "inbounds": [{"protocol": "socks", "listen": "127.0.0.1", "port": port,
+                "settings": {"auth": "noauth", "udp": true}}],
+            "outbounds": [{"protocol": "hysteria",
+                "settings": {"version": 2, "address": server.ip().to_string(), "port": server.port()},
+                "streamSettings": {"network": "hysteria", "security": "tls",
+                    "hysteriaSettings": {"version": 2, "auth": "interop-pass"},
+                    "tlsSettings": {"serverName": "localhost", "alpn": ["h3"],
+                        "certificates": [{"certificateFile": format!("{certs}/localhost.crt"),
+                                          "usage": "verify"}]},
+                    "finalmask": {"udp": [{"type": "salamander",
+                                           "settings": {"password": "loopback-fixture"}}]}}}]
+        }),
+    );
+    let proxy = SocketAddr::from(([127, 0, 0, 1], port));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if TcpStream::connect(proxy).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("Xray SOCKS listener did not start");
+    let (_associate, udp) = socks_udp_associate(proxy).await;
+    let timeout = Duration::from_secs(3);
+    assert!(udp_roundtrip(&udp, target, b"Xray Salamander UDP", timeout).await);
+    let data: Vec<u8> = (0..4097).map(|i| (i % 251) as u8).collect();
+    assert!(udp_roundtrip(&udp, target, &data, timeout).await);
+}

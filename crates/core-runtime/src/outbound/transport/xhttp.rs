@@ -977,8 +977,8 @@ impl XhttpConfig {
 /// What an upload request's response said, once the task behind it has seen it.
 ///
 /// The error lives behind a lock rather than in the write path because it
-/// arrives on somebody else's task: a refused upload POST shows up as the next
-/// `poll_write` failing, not as the write that was already in flight.
+/// arrives on somebody else's task. Failure is terminal and remains visible
+/// to later writes and flushes.
 #[derive(Clone, Default)]
 struct Failure(std::sync::Arc<std::sync::Mutex<Option<io::Error>>>);
 
@@ -989,8 +989,11 @@ impl Failure {
         }
     }
 
-    fn take(&self) -> Option<io::Error> {
-        self.0.lock().ok().and_then(|mut slot| slot.take())
+    fn error(&self) -> Option<io::Error> {
+        self.0.lock().ok().and_then(|slot| {
+            slot.as_ref()
+                .map(|error| io::Error::new(error.kind(), error.to_string()))
+        })
     }
 }
 
@@ -1180,8 +1183,6 @@ impl PostWriter {
             };
             let hname = http::HeaderName::try_from(name.as_str())
                 .map_err(|e| io::Error::other(format!("xhttp: header name: {e}")))?;
-            let hvalue = http::HeaderValue::try_from(*piece)
-                .map_err(|e| io::Error::other(format!("xhttp: header value: {e}")))?;
             if let UplinkPlacement::Cookie = self.cfg.meta.uplink_data {
                 if let Some(h) = req.headers_mut().get_mut("cookie") {
                     let mut v = h.as_bytes().to_vec();
@@ -1191,8 +1192,12 @@ impl PostWriter {
                         .map_err(|e| io::Error::other(format!("xhttp: cookie: {e}")))?;
                     continue;
                 }
-                req.headers_mut().insert("cookie", hvalue);
+                let value = http::HeaderValue::from_str(&format!("{name}={piece}"))
+                    .map_err(|e| io::Error::other(format!("xhttp: cookie: {e}")))?;
+                req.headers_mut().insert("cookie", value);
             } else {
+                let hvalue = http::HeaderValue::try_from(*piece)
+                    .map_err(|e| io::Error::other(format!("xhttp: header value: {e}")))?;
                 req.headers_mut().insert(hname, hvalue);
             }
         }
@@ -1242,8 +1247,8 @@ struct SplitConn {
     dl_error: Option<io::Error>,
     dl: mpsc::Receiver<io::Result<Bytes>>,
     direct_h2: Option<DirectH2Download>,
-    dl_task: Option<tokio::task::JoinHandle<()>>,
-    ack_task: Option<tokio::task::JoinHandle<()>>,
+    dl_task: Option<JoinHandle<()>>,
+    ack_task: Option<JoinHandle<()>>,
     up: Up,
     session_id: String,
     /// Armed when a packet-up upload is shut down; see [`HALF_CLOSE_IDLE`].
@@ -1475,23 +1480,14 @@ impl SplitConn {
 
     /// The upload request's response when it *is* the download stream, which is
     /// what stream-one does: one request, body up and body down.
-    fn spawn_upload_download(
-        &mut self,
-        task: JoinHandle<io::Result<h1io::Body>>,
-        failure: Failure,
-    ) {
+    fn spawn_upload_download(&mut self, response: h1io::Response, failure: Failure) {
         let (tx, rx) = mpsc::channel::<io::Result<Bytes>>(4);
         self.dl = rx;
         self.dl_task = Some(tokio::spawn(async move {
-            match task.await {
-                Ok(Ok(body)) => pump(body, tx).await,
-                Ok(Err(e)) => {
-                    failure.set(e);
-                    let _ = tx.send(Err(failure.take().expect("just set"))).await;
-                }
+            match response.read().await {
+                Ok(body) => pump(body, tx).await,
                 Err(e) => {
-                    let e = io::Error::other(format!("xhttp: upload: {e}"));
-                    failure.set(io::Error::other(e.to_string()));
+                    failure.set(io::Error::new(e.kind(), e.to_string()));
                     let _ = tx.send(Err(e)).await;
                 }
             }
@@ -1502,19 +1498,15 @@ impl SplitConn {
     /// is stream-up: the download has a connection of its own, so this response
     /// only says whether the server took the request. Drain it and keep a
     /// failure for the next write.
-    fn spawn_upload_ack(&mut self, task: JoinHandle<io::Result<h1io::Body>>, failure: Failure) {
+    fn spawn_upload_ack(&mut self, response: h1io::Response, failure: Failure) {
         if let Some(old) = self.ack_task.take() {
             old.abort();
         }
         self.ack_task = Some(tokio::spawn(async move {
-            let mut body = match task.await {
-                Ok(Ok(body)) => body,
-                Ok(Err(e)) => {
-                    failure.set(e);
-                    return;
-                }
+            let mut body = match response.read().await {
+                Ok(body) => body,
                 Err(e) => {
-                    failure.set(io::Error::other(format!("xhttp: upload: {e}")));
+                    failure.set(e);
                     return;
                 }
             };
@@ -1688,19 +1680,19 @@ impl AsyncWrite for XhttpConn {
             Up::Stream(state) => {
                 // a refused upload POST is reported here, not on the write that
                 // was already in flight when the answer came back
-                if let Some(e) = state.failure.take() {
+                if let Some(e) = state.failure.error() {
                     return Poll::Ready(Err(e));
                 }
                 Pin::new(&mut state.io).poll_write(cx, buf)
             }
             Up::H2Stream(state) => {
-                if let Some(e) = state.failure.take() {
+                if let Some(e) = state.failure.error() {
                     return Poll::Ready(Err(e));
                 }
                 Pin::new(&mut state.io).poll_write(cx, buf)
             }
             Up::Packets(state) => {
-                if let Some(e) = state.failure.take() {
+                if let Some(e) = state.failure.error() {
                     return Poll::Ready(Err(e));
                 }
                 let res = Pin::new(&mut state.io).poll_write(cx, buf);
@@ -1718,10 +1710,20 @@ impl AsyncWrite for XhttpConn {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let split = &mut *self.split;
         match &mut split.up {
-            Up::Stream(state) => Pin::new(&mut state.io).poll_flush(cx),
-            Up::H2Stream(state) => Pin::new(&mut state.io).poll_flush(cx),
+            Up::Stream(state) => {
+                if let Some(e) = state.failure.error() {
+                    return Poll::Ready(Err(e));
+                }
+                Pin::new(&mut state.io).poll_flush(cx)
+            }
+            Up::H2Stream(state) => {
+                if let Some(e) = state.failure.error() {
+                    return Poll::Ready(Err(e));
+                }
+                Pin::new(&mut state.io).poll_flush(cx)
+            }
             Up::Packets(state) => {
-                if let Some(e) = state.failure.take() {
+                if let Some(e) = state.failure.error() {
                     return Poll::Ready(Err(e));
                 }
                 let written = state
@@ -1745,7 +1747,7 @@ impl AsyncWrite for XhttpConn {
                     // The worker can complete (or fail) between the first
                     // counter check and registration of this notification.
                     // Recheck after polling, when the waiter is registered.
-                    if let Some(e) = state.failure.take() {
+                    if let Some(e) = state.failure.error() {
                         return Poll::Ready(Err(e));
                     }
                     if state
@@ -1779,9 +1781,15 @@ impl AsyncWrite for XhttpConn {
         let split = &mut *self.split;
         match &mut split.up {
             Up::Stream(state) => {
+                if let Some(e) = state.failure.error() {
+                    return Poll::Ready(Err(e));
+                }
                 ready!(Pin::new(&mut state.io).poll_shutdown(cx))?;
             }
             Up::H2Stream(state) => {
+                if let Some(e) = state.failure.error() {
+                    return Poll::Ready(Err(e));
+                }
                 ready!(Pin::new(&mut state.io).poll_shutdown(cx))?;
             }
             Up::Packets(state) => {
@@ -3187,6 +3195,137 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("403"));
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn packet_up_cookie_payload_names_each_chunk() {
+        for (headers, expected) in [
+            (json!({}), "x_data_0=cGl; x_data_1=uZw"),
+            (
+                json!({"cookie": "proxy=value"}),
+                "proxy=value; x_data_0=cGl; x_data_1=uZw",
+            ),
+        ] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let mut writer = PostWriter {
+                cfg: cfg(json!({
+                    "mode": "packet-up", "uplink_data_placement": "cookie",
+                    "uplink_chunk_size": 3, "headers": headers
+                })),
+                scheme: "http".into(),
+                authority: "srv".into(),
+                session_id: "test-session".into(),
+                seq: 0,
+                dialer: std::sync::Arc::new(|| {
+                    Box::pin(async { Err(io::Error::other("first connection was supplied")) })
+                }),
+                h2_client: None,
+                first_connection: Some(Box::new(client)),
+            };
+            let peer = async {
+                let head = read_request_head(&mut server).await;
+                assert_eq!(
+                    head.lines().find_map(|line| line.strip_prefix("cookie: ")),
+                    Some(expected)
+                );
+                server
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(writer.send_packet(b"ping"), peer)
+            })
+            .await
+            .unwrap();
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_http1_stream_one_cancels_a_pending_response() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let dialer = std::sync::Arc::new(|| {
+            Box::pin(async { Err(io::Error::other("unused dial")) })
+                as Pin<Box<dyn Future<Output = io::Result<AnyStream>> + Send>>
+        });
+        let config = cfg(json!({"mode": "stream-one"}));
+        let connection = super::connect(Box::new(client), false, false, "srv", 80, &config, dialer)
+            .await
+            .unwrap();
+        read_request_head(&mut peer).await;
+        drop(connection);
+        let mut byte = [0];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), peer.read(&mut byte))
+                .await
+                .expect("upload response reader must drop with the tunnel")
+                .unwrap(),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn http1_stream_one_rejection_reaches_both_halves() {
+        let (client, mut peer) = tokio::io::duplex(65536);
+        let dialer = std::sync::Arc::new(|| {
+            Box::pin(async { Err(io::Error::other("unused dial")) })
+                as Pin<Box<dyn Future<Output = io::Result<AnyStream>> + Send>>
+        });
+        let config = cfg(json!({"mode": "stream-one"}));
+        let mut connection =
+            super::connect(Box::new(client), false, false, "srv", 80, &config, dialer)
+                .await
+                .unwrap();
+        read_request_head(&mut peer).await;
+        peer.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut byte = [0];
+        let read = connection.read(&mut byte).await.unwrap_err();
+        let write = connection.write(b"ping").await.unwrap_err();
+        assert!(read.to_string().contains("403"));
+        assert!(write.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn packet_up_keeps_rejected_post_visible_to_later_flush() {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let (download, _get_peer) = tokio::io::duplex(65536);
+            let (post_tx, mut post_rx) = mpsc::unbounded_channel();
+            let dialer: std::sync::Arc<super::Dialer> = std::sync::Arc::new(move || {
+                let post_tx = post_tx.clone();
+                Box::pin(async move {
+                    let (client, peer) = tokio::io::duplex(65536);
+                    post_tx.send(peer).unwrap();
+                    Ok(Box::new(client) as AnyStream)
+                })
+            });
+            let config = cfg(json!({"mode": "packet-up"}));
+            let mut connection =
+                super::connect(Box::new(download), false, false, "srv", 80, &config, dialer)
+                    .await
+                    .unwrap();
+            connection.write_all(b"ping").await.unwrap();
+            let mut post = post_rx.recv().await.unwrap();
+            read_request_head(&mut post).await;
+            let mut data = [0; 4];
+            post.read_exact(&mut data).await.unwrap();
+            assert_eq!(&data, b"ping");
+            post.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                let error =
+                    tokio::time::timeout(std::time::Duration::from_millis(500), connection.flush())
+                        .await
+                        .expect("terminal POST error must not leave flush waiting")
+                        .unwrap_err();
+                assert!(error.to_string().contains("403"));
+            }
+        })
+        .await
+        .expect("POST setup must complete");
     }
 
     #[tokio::test]

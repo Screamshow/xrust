@@ -16,12 +16,10 @@ use super::udp::{DatagramFrame, Hy2Reply, Reply, UdpHub};
 use crate::inbound::{AnyStream, ClientConn, Target, drive_framed, parse_listen};
 use crate::logging;
 use crate::outbound::hysteria2::{
-    AUTH_STATUS_OK, FRAME_TCP_REQUEST, MAX_ADDRESS, next_packet_id, pack_hy2, parse_hy2_packet,
-    read_exact_vec, read_varint_stream,
+    AUTH_STATUS_OK, FRAME_TCP_REQUEST, MAX_ADDRESS, MAX_PADDING, parse_hy2_packet,
+    read_bounded_length, read_exact_vec, read_varint_stream, send_hy2_datagram,
 };
-use crate::outbound::quic::{
-    Defragger, QuicStream, SalamanderRelay, salamander_open, salamander_seal,
-};
+use crate::outbound::quic::{Defragger, QuicStream, SalamanderSocket};
 use crate::route::Router;
 
 const DEFAULT_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,7 +32,6 @@ pub struct Hysteria2 {
     users: Arc<HashMap<String, String>>, // password -> username
     hub: Arc<UdpHub>,
     local_addr: SocketAddr,
-    _relay: Option<SalamanderRelay>,
 }
 
 impl Hysteria2 {
@@ -99,79 +96,21 @@ impl Hysteria2 {
         let runtime =
             quinn::default_runtime().ok_or_else(|| anyhow::anyhow!("{at}: no quinn runtime"))?;
 
-        let (endpoint, local_addr, relay) = if let Some(pw) = obfs_password {
-            // Bind loopback socket for Quinn
-            let ep_bind = if addr.is_ipv4() {
-                "127.0.0.1:0"
-            } else {
-                "[::1]:0"
-            };
-            let ep_sock = std::net::UdpSocket::bind(ep_bind)?;
-            let ep = quinn::Endpoint::new(
-                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
-                    &[9u8; 32],
-                ))),
+        let socket = std::net::UdpSocket::bind(addr)?;
+        let ep_config =
+            quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(&[9u8; 32])));
+        let endpoint = if let Some(password) = obfs_password {
+            let socket = SalamanderSocket::listen(&*runtime, socket, password)?;
+            quinn::Endpoint::new_with_abstract_socket(
+                ep_config,
                 Some(server_config),
-                ep_sock,
+                Arc::new(socket),
                 runtime,
-            )?;
-            let ep_local = ep.local_addr()?;
-
-            // Public listening socket with salamander obfs
-            let public_sock = Arc::new(tokio::net::UdpSocket::bind(addr).await?);
-            let actual_local = public_sock.local_addr()?;
-            let loop_sock = Arc::new(tokio::net::UdpSocket::bind(ep_bind).await?);
-            loop_sock.connect(ep_local).await?;
-
-            let pw_in = pw.clone();
-            let pub_in = Arc::clone(&public_sock);
-            let loop_in = Arc::clone(&loop_sock);
-            let in_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65_535];
-                loop {
-                    let (n, _peer) = match pub_in.recv_from(&mut buf).await {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    if let Some(plain) = salamander_open(&pw_in, &buf[..n]) {
-                        let _ = loop_in.send(&plain).await;
-                    }
-                }
-            });
-
-            let pw_out = pw;
-            let pub_out = Arc::clone(&public_sock);
-            let loop_out = Arc::clone(&loop_sock);
-            let out_task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65_535];
-                loop {
-                    let n = match loop_out.recv(&mut buf).await {
-                        Ok(v) => v,
-                        Err(_) => break,
-                    };
-                    let sealed = salamander_seal(&pw_out, &buf[..n]);
-                    let _ = pub_out.send(&sealed).await;
-                }
-            });
-
-            let relay = SalamanderRelay {
-                local: actual_local,
-                handles: vec![in_task, out_task],
-            };
-            (ep, actual_local, Some(relay))
+            )?
         } else {
-            let sock = std::net::UdpSocket::bind(addr)?;
-            let ep = quinn::Endpoint::new(
-                quinn::EndpointConfig::new(Arc::new(core_tls::quic::HmacSha256Key::new(
-                    &[9u8; 32],
-                ))),
-                Some(server_config),
-                sock,
-                runtime,
-            )?;
-            let local = ep.local_addr()?;
-            (ep, local, None)
+            quinn::Endpoint::new(ep_config, Some(server_config), socket, runtime)?
         };
+        let local_addr = endpoint.local_addr()?;
 
         let hub = UdpHub::new(Arc::clone(&router), DEFAULT_UDP_TIMEOUT, DatagramFrame::Raw);
 
@@ -182,7 +121,6 @@ impl Hysteria2 {
             users: Arc::new(users),
             hub,
             local_addr,
-            _relay: relay,
         })
     }
 
@@ -260,10 +198,14 @@ async fn handle_hy2_connection(
     let reply_handle = tokio::spawn(async move {
         let packet_counter = AtomicU32::new(0);
         while let Some(reply) = reply_rx.recv().await {
-            let pid = next_packet_id(&packet_counter);
             let src_str = reply.src.to_string();
-            let pkt = pack_hy2(reply.session_id, pid, 0, 1, &src_str, &reply.payload);
-            let _ = conn_udp_send.send_datagram(pkt.into());
+            let _ = send_hy2_datagram(
+                &conn_udp_send,
+                reply.session_id,
+                &src_str,
+                &reply.payload,
+                &packet_counter,
+            );
         }
     });
 
@@ -289,13 +231,10 @@ async fn handle_hy2_connection(
                 if frame_type != FRAME_TCP_REQUEST {
                     return;
                 }
-                let dest_len = match read_varint_stream(&mut recv).await {
-                    Ok(v) => v as usize,
-                    Err(_) => return,
+                let dest_len = match read_bounded_length(&mut recv, MAX_ADDRESS, "address").await {
+                    Ok(len) if len > 0 => len,
+                    _ => return,
                 };
-                if dest_len > MAX_ADDRESS {
-                    return;
-                }
                 let dest_bytes = match read_exact_vec(&mut recv, dest_len).await {
                     Ok(b) => b,
                     Err(_) => return,
@@ -304,8 +243,8 @@ async fn handle_hy2_connection(
                     Ok(s) => s,
                     Err(_) => return,
                 };
-                let pad_len = match read_varint_stream(&mut recv).await {
-                    Ok(v) => v as usize,
+                let pad_len = match read_bounded_length(&mut recv, MAX_PADDING, "padding").await {
+                    Ok(len) => len,
                     Err(_) => return,
                 };
                 let _pad = match read_exact_vec(&mut recv, pad_len).await {

@@ -578,7 +578,7 @@ fn open_salamander_datagrams(password: &[u8], buf: &mut [u8], stride: usize) -> 
 /// individual datagram, including when the kernel coalesces receives.
 pub(crate) struct SalamanderSocket {
     socket: Arc<dyn quinn::AsyncUdpSocket>,
-    peer: SocketAddr,
+    peer: Option<SocketAddr>,
     password: Vec<u8>,
     sealed: std::sync::Mutex<Vec<u8>>,
 }
@@ -622,7 +622,21 @@ impl SalamanderSocket {
         }
         Ok(Self {
             socket,
-            peer,
+            peer: Some(peer),
+            password,
+            sealed: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    pub(crate) fn listen(
+        runtime: &dyn quinn::Runtime,
+        udp: std::net::UdpSocket,
+        password: Vec<u8>,
+    ) -> io::Result<Self> {
+        udp.set_nonblocking(true)?;
+        Ok(Self {
+            socket: runtime.wrap_udp_socket(udp)?,
+            peer: None,
             password,
             sealed: std::sync::Mutex::new(Vec::new()),
         })
@@ -677,7 +691,7 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
             ecn: None,
             contents: &sealed,
             segment_size: segment.map(|size| size + 8),
-            src_ip: None,
+            src_ip: if self.peer.is_none() { tx.src_ip } else { None },
         })
     }
 
@@ -689,17 +703,19 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
     ) -> Poll<io::Result<usize>> {
         let count = std::task::ready!(self.socket.poll_recv(cx, bufs, meta))?;
         for (buf, meta) in bufs.iter_mut().zip(&mut meta[..count]) {
-            if meta.addr.ip() != self.peer.ip() || meta.stride <= 8 {
+            if self.peer.is_some_and(|peer| meta.addr.ip() != peer.ip()) || meta.stride <= 8 {
                 meta.len = 0;
                 continue;
             }
             meta.len = open_salamander_datagrams(&self.password, &mut buf[..meta.len], meta.stride);
             meta.stride -= 8;
-            // As with the relay, accept replies from the configured IP and
-            // present a stable peer address, without relaying ECN markings.
-            meta.addr = self.peer;
+            // The client keeps its stable peer address. A listener must
+            // retain the actual source and local destination for each client.
+            if let Some(peer) = self.peer {
+                meta.addr = peer;
+                meta.dst_ip = None;
+            }
             meta.ecn = None;
-            meta.dst_ip = None;
         }
         Poll::Ready(Ok(count))
     }
@@ -716,7 +732,11 @@ impl quinn::AsyncUdpSocket for SalamanderSocket {
     }
 
     fn max_transmit_segments(&self) -> usize {
-        self.socket.max_transmit_segments().clamp(1, 16)
+        if self.peer.is_some() {
+            self.socket.max_transmit_segments().clamp(1, 16)
+        } else {
+            1
+        }
     }
 
     fn may_fragment(&self) -> bool {
@@ -791,14 +811,14 @@ mod salamander_gso_tests {
         let password = b"fallback-formula";
         let sender = Arc::new(SalamanderSocket {
             socket: backend.clone(),
-            peer: backend.local_addr().unwrap(),
+            peer: Some(backend.local_addr().unwrap()),
             password: password.to_vec(),
             sealed: std::sync::Mutex::new(Vec::new()),
         });
         assert_eq!(sender.max_transmit_segments(), 16);
         let data = b"aaaabbbbcc";
         let tx = quinn::udp::Transmit {
-            destination: sender.peer,
+            destination: sender.peer.unwrap(),
             ecn: None,
             contents: data,
             segment_size: Some(4),
@@ -824,7 +844,7 @@ mod salamander_gso_tests {
         ] {
             sender
                 .try_send(&quinn::udp::Transmit {
-                    destination: sender.peer,
+                    destination: sender.peer.unwrap(),
                     ecn: None,
                     contents,
                     segment_size,
@@ -862,7 +882,7 @@ mod salamander_gso_tests {
         drop(sent);
         for size in [0, usize::from(u16::MAX) - 7, usize::MAX] {
             let invalid = quinn::udp::Transmit {
-                destination: sender.peer,
+                destination: sender.peer.unwrap(),
                 ecn: None,
                 contents: b"x",
                 segment_size: Some(size),
@@ -874,7 +894,7 @@ mod salamander_gso_tests {
             );
         }
         let invalid = quinn::udp::Transmit {
-            destination: sender.peer,
+            destination: sender.peer.unwrap(),
             ecn: None,
             contents: &[0; 17],
             segment_size: Some(1),

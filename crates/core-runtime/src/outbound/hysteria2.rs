@@ -29,7 +29,7 @@ pub(crate) const AUTH_STATUS_OK: u16 = 233;
 pub(crate) const FRAME_TCP_REQUEST: u64 = 0x401;
 pub(crate) const MAX_ADDRESS: usize = 2048;
 const MAX_MESSAGE: usize = 2048;
-const MAX_PADDING: usize = 4096;
+pub(crate) const MAX_PADDING: usize = 4096;
 const DEFAULT_HANDSHAKE: Duration = Duration::from_secs(15);
 const DEFAULT_CONNECT: Duration = Duration::from_secs(5);
 
@@ -465,7 +465,7 @@ impl Hysteria2 {
                 loop {
                     // a shared per-thread buffer: an idle session keeps none
                     let sent = crate::inbound::udp::recv_with(&peer_f, |pkt| {
-                        send_hy2_datagram(&conn_f, sid, &dest_f, pkt, &sess_f)
+                        send_hy2_datagram(&conn_f, sid, &dest_f, pkt, &sess_f.packet_id)
                     });
                     match tokio::time::timeout(check_interval, sent).await {
                         Ok(Ok(sent)) => {
@@ -682,6 +682,17 @@ pub(crate) async fn read_varint_stream(recv: &mut quinn::RecvStream) -> io::Resu
     }
 }
 
+pub(crate) async fn read_bounded_length(
+    recv: &mut quinn::RecvStream,
+    maximum: usize,
+    field: &str,
+) -> io::Result<usize> {
+    usize::try_from(read_varint_stream(recv).await?)
+        .ok()
+        .filter(|&length| length <= maximum)
+        .ok_or_else(|| io::Error::other(format!("hysteria2: invalid {field} length")))
+}
+
 pub(crate) async fn read_exact_vec(recv: &mut quinn::RecvStream, n: usize) -> io::Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     let mut off = 0;
@@ -712,15 +723,9 @@ async fn read_tcp_response(recv: &mut quinn::RecvStream) -> io::Result<()> {
     recv.read_exact(&mut status)
         .await
         .map_err(|e| io::Error::other(format!("hysteria2: read status: {e}")))?;
-    let msg_len = read_varint_stream(recv).await? as usize;
-    if msg_len > MAX_MESSAGE {
-        return Err(io::Error::other("hysteria2: invalid message length"));
-    }
+    let msg_len = read_bounded_length(recv, MAX_MESSAGE, "message").await?;
     let msg = read_exact_vec(recv, msg_len).await?;
-    let pad_len = read_varint_stream(recv).await? as usize;
-    if pad_len > MAX_PADDING {
-        return Err(io::Error::other("hysteria2: invalid padding length"));
-    }
+    let pad_len = read_bounded_length(recv, MAX_PADDING, "padding").await?;
     let _pad = read_exact_vec(recv, pad_len).await?;
     if status[0] != 0 {
         return Err(io::Error::other(format!(
@@ -776,7 +781,7 @@ pub(crate) fn parse_hy2_packet(data: &[u8]) -> Option<Hy2Packet<'_>> {
     let frag_id = data[6];
     let frag_total = data[7];
     let (dest_len, n) = read_varint(&data[8..])?;
-    let dest_len = dest_len as usize;
+    let dest_len = usize::try_from(dest_len).ok()?;
     if dest_len == 0 || dest_len > MAX_ADDRESS {
         return None;
     }
@@ -797,19 +802,19 @@ pub(crate) fn parse_hy2_packet(data: &[u8]) -> Option<Hy2Packet<'_>> {
 
 pub(crate) type Hy2Packet<'a> = (u32, u16, u8, u8, &'a str, &'a [u8]);
 
-fn send_hy2_datagram(
+pub(crate) fn send_hy2_datagram(
     conn: &quinn::Connection,
     sid: u32,
     dest: &str,
     payload: &[u8],
-    sess: &UdpSession,
+    packet_id: &AtomicU32,
 ) -> io::Result<()> {
     if payload.len() > HY2_MAX_UDP {
         return Err(io::Error::other(format!(
             "hysteria2: udp payload exceeds {HY2_MAX_UDP}"
         )));
     }
-    let pid = next_packet_id(&sess.packet_id);
+    let pid = next_packet_id(packet_id);
     let header_len = 8 + varint_len(dest.len() as u64) + dest.len();
     let mut budget = conn.max_datagram_size().unwrap_or(1197);
     if payload.len() + header_len <= budget {
@@ -1204,22 +1209,27 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn udp_oversize_datagram_does_not_end_session() {
+    async fn udp_fragmented_datagram_does_not_end_session() {
         let (out, echo) = udp_test_pair().await;
         let sock = out.connect_udp(&Target::Ip(echo)).await.expect("udp");
-        let mut buf = [0u8; 64];
+        let mut buf = [0u8; 8192];
         sock.send(b"before").await.expect("send");
         let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
             .await
             .expect("echo before")
             .expect("recv");
         assert_eq!(&buf[..n], b"before");
-        // past the hysteria2 UDP size limit: this one packet is lost
-        sock.send(&[7u8; 5000]).await.expect("send oversize");
+        let fragmented = [7u8; 5000];
+        sock.send(&fragmented).await.expect("send fragmented");
+        let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
+            .await
+            .expect("echo fragmented")
+            .expect("recv");
+        assert_eq!(&buf[..n], &fragmented);
         sock.send(b"after").await.expect("send");
         let n = tokio::time::timeout(Duration::from_secs(5), sock.recv(&mut buf))
             .await
-            .expect("the session must survive an oversize datagram")
+            .expect("the session must survive a fragmented datagram")
             .expect("recv");
         assert_eq!(&buf[..n], b"after");
     }

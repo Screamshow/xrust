@@ -17,7 +17,6 @@ use std::task::{Context, Poll, ready};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::task::JoinHandle;
 
 use crate::inbound::AnyStream;
 
@@ -108,14 +107,20 @@ pub(crate) fn write_head(
     out.extend_from_slice(b"\r\n");
 }
 
-/// Read a response head, plus whatever body bytes arrived with it.
+/// Read the final response head, plus whatever body bytes arrived with it.
 pub(crate) async fn read_head(io: &mut AnyStream) -> io::Result<(Head, BytesMut)> {
     let mut buf = BytesMut::with_capacity(512);
     let mut byte = [0u8; 1];
     loop {
         if let Some(end) = head_end(&buf) {
-            let head = buf.split_to(end);
-            return Ok((parse_head(&head)?, buf));
+            let head = parse_head(&buf.split_to(end))?;
+            // A peer can send 100 Continue or 103 Early Hints before the
+            // response the caller is waiting for. 101 changes the protocol
+            // and must reach the caller as an unsupported final status.
+            if head.status == 101 || !(100..200).contains(&head.status) {
+                return Ok((head, buf));
+            }
+            continue;
         }
         if buf.len() > MAX_HEAD {
             return Err(io::Error::other("xhttp: response head too large"));
@@ -564,24 +569,31 @@ pub(crate) struct Stream {
     ended: bool,
 }
 
+/// The response read half is owned by the caller's task, so dropping that
+/// task closes the read half even when the server has sent no headers.
+pub(crate) struct Response(ReadHalf);
+
+impl Response {
+    pub(crate) async fn read(self) -> io::Result<Body> {
+        let mut io: AnyStream = Box::new(self.0);
+        let (head, pending) = read_head(&mut io).await?;
+        expect_ok(&head, "upload")?;
+        Ok(Body::new(io, &head, pending))
+    }
+}
+
 impl Stream {
     pub(crate) async fn start(
         io: AnyStream,
         request: &http::Request<()>,
         host: &str,
         close: bool,
-    ) -> io::Result<(Self, JoinHandle<io::Result<Body>>)> {
+    ) -> io::Result<(Self, Response)> {
         let mut head = Vec::with_capacity(256);
         write_head(&mut head, request, host, Framing::Chunked, close);
         let (reader, mut writer) = tokio::io::split(io);
         writer.write_all(&head).await?;
         writer.flush().await?;
-        let mut reader: AnyStream = Box::new(ReadHalf(reader));
-        let task = tokio::spawn(async move {
-            let (head, pending) = read_head(&mut reader).await?;
-            expect_ok(&head, "upload")?;
-            Ok(Body::new(reader, &head, pending))
-        });
         Ok((
             Self {
                 io: writer,
@@ -590,7 +602,7 @@ impl Stream {
                 report: 0,
                 ended: false,
             },
-            task,
+            Response(ReadHalf(reader)),
         ))
     }
 
@@ -641,6 +653,9 @@ impl AsyncWrite for Stream {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
         if !this.ended {
+            // A canceled write can leave half a chunk on the wire. Complete
+            // the advertised payload before writing the end-of-body marker.
+            ready!(this.flush_out(cx))?;
             this.ended = true;
             this.out = LAST_CHUNK.to_vec();
             this.pos = 0;
@@ -685,6 +700,56 @@ impl AsyncWrite for ReadHalf {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shutdown_finishes_a_partly_written_http1_chunk() {
+        let (io, mut peer) = tokio::io::duplex(16);
+        let io: AnyStream = Box::new(io);
+        let (_reader, writer) = tokio::io::split(io);
+        let mut stream = Stream {
+            io: writer,
+            out: Vec::new(),
+            pos: 0,
+            report: 0,
+            ended: false,
+        };
+        let payload = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        std::future::poll_fn(|cx| {
+            assert!(Pin::new(&mut stream).poll_write(cx, payload).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+
+        let mut received = Vec::new();
+        let (sent, read) = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            tokio::join!(stream.shutdown(), peer.read_to_end(&mut received))
+        })
+        .await
+        .expect("shutdown must terminate the HTTP/1.1 body");
+        sent.unwrap();
+        read.unwrap();
+        let mut expected = chunk(payload);
+        expected.extend_from_slice(LAST_CHUNK);
+        assert_eq!(received, expected);
+    }
+
+    #[tokio::test]
+    async fn reads_final_response_after_http1_informational_heads() {
+        let (client, mut peer) = tokio::io::duplex(1024);
+        peer.write_all(
+            b"HTTP/1.1 103 Early Hints\r\nLink: </edge>; rel=preload\r\n\r\n\
+              HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\npong",
+        )
+        .await
+        .unwrap();
+        let mut client: AnyStream = Box::new(client);
+        let (head, pending) = read_head(&mut client).await.unwrap();
+        assert_eq!(head.status, 200);
+        let mut body = Body::new(client, &head, pending);
+        let mut reply = [0; 4];
+        assert_eq!(body.read_some(&mut reply).await.unwrap(), 4);
+        assert_eq!(&reply, b"pong");
+    }
+
     use super::*;
 
     fn head(raw: &[u8]) -> io::Result<Head> {

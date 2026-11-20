@@ -414,7 +414,11 @@ impl H2Stream {
 
     /// Wait for the next received chunk into `pending`.
     /// `Ok(false)` means the response body ended (EOF latched).
-    pub(crate) fn poll_recv_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
+    pub(crate) fn poll_recv_more(
+        &mut self,
+        cx: &mut Context<'_>,
+        check_head: impl FnOnce(&http::HeaderMap) -> io::Result<()>,
+    ) -> Poll<io::Result<bool>> {
         if self.recv.is_none() {
             let Some(response) = self.response.as_mut() else {
                 // Response already consumed; recv stream exhausted.
@@ -433,8 +437,10 @@ impl H2Stream {
                     resp.status()
                 ))));
             }
+            let checked = check_head(resp.headers());
             self.recv = Some(resp.into_body());
             self.response = None;
+            checked?;
         }
         let recv = self.recv.as_mut().expect("recv set above");
         match recv.poll_data(cx) {
@@ -444,8 +450,12 @@ impl H2Stream {
                 // pushed as it arrived: no join, no copy of either side.
                 // Capacity is repaid when the bytes leave `pending`, not
                 // while we are still holding them.
-                self.pending.push_back(chunk);
-                self.pending_len += len;
+                // An empty DATA event is not EOF. Keeping it in pending
+                // would wake a reader with a nonempty deque and zero bytes.
+                if len != 0 {
+                    self.pending.push_back(chunk);
+                    self.pending_len += len;
+                }
                 Poll::Ready(Ok(true))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -456,6 +466,17 @@ impl H2Stream {
                 Poll::Ready(Ok(false))
             }
         }
+    }
+
+    pub(crate) fn poll_recv_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<io::Result<Option<http::HeaderMap>>> {
+        let Some(recv) = self.recv.as_mut() else {
+            return Poll::Ready(Ok(None));
+        };
+        recv.poll_trailers(cx)
+            .map_err(|e| io::Error::other(format!("h2: recv trailers: {e}")))
     }
 
     pub(crate) fn is_eof(&self) -> bool {
@@ -864,7 +885,7 @@ mod backpressure_tests {
         // Poll without consuming, as gRPC's header parser does while buffering.
         tokio::time::timeout(
             Duration::from_secs(3),
-            std::future::poll_fn(|cx| io.h2.poll_recv_more(cx)),
+            std::future::poll_fn(|cx| io.h2.poll_recv_more(cx, |_| Ok(()))),
         )
         .await
         .expect("buffer second frame deadline")

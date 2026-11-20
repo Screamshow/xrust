@@ -124,6 +124,8 @@ pub(super) async fn connect(
         data_left: 0,
         skip: 0,
         multi_frame_left: multi_mode.then_some(0),
+        expect_response_trailers: true,
+        response_error: None,
     }))
 }
 
@@ -145,6 +147,8 @@ pub(super) fn open_pooled(
         data_left: 0,
         skip: 0,
         multi_frame_left: multi_mode.then_some(0),
+        expect_response_trailers: true,
+        response_error: None,
     }))
 }
 
@@ -159,6 +163,8 @@ pub(crate) struct GrpcStream {
     skip: usize,
     /// Remaining MultiHunk body bytes after the current field, or None for gun.
     multi_frame_left: Option<usize>,
+    expect_response_trailers: bool,
+    response_error: Option<ResponseError>,
 }
 
 /// The server half of the same stream: the request body is the downlink, the
@@ -172,6 +178,8 @@ pub(crate) fn server(recv: h2::RecvStream, send: h2::SendStream<Bytes>) -> AnySt
         data_left: 0,
         skip: 0,
         multi_frame_left: None,
+        expect_response_trailers: false,
+        response_error: None,
     })
 }
 
@@ -194,6 +202,33 @@ impl GrpcStream {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ResponseError {
+    InvalidStatus,
+    RemoteStatus(u64),
+}
+
+impl ResponseError {
+    fn from_headers(headers: &http::HeaderMap) -> Option<Self> {
+        let status = headers.get("grpc-status")?;
+        if !status.as_bytes().iter().all(u8::is_ascii_digit) {
+            return Some(Self::InvalidStatus);
+        }
+        match status.to_str().ok().and_then(|raw| raw.parse().ok()) {
+            Some(0) => None,
+            Some(code) => Some(Self::RemoteStatus(code)),
+            None => Some(Self::InvalidStatus),
+        }
+    }
+
+    fn as_io_error(self) -> io::Error {
+        match self {
+            Self::InvalidStatus => io::Error::other("grpc: invalid remote status"),
+            Self::RemoteStatus(code) => io::Error::other(format!("grpc: remote status {code}")),
+        }
+    }
+}
+
 impl AsyncRead for GrpcStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -204,6 +239,9 @@ impl AsyncRead for GrpcStream {
             return Poll::Ready(Ok(()));
         }
         let this = &mut *self;
+        if let Some(error) = this.response_error {
+            return Poll::Ready(Err(error.as_io_error()));
+        }
         loop {
             if this.data_left > 0 {
                 if !this.io.h2.pending.is_empty() {
@@ -242,9 +280,27 @@ impl AsyncRead for GrpcStream {
                 {
                     return Poll::Ready(Err(io::Error::other("grpc: stream ended mid-frame")));
                 }
+                if this.expect_response_trailers {
+                    let trailers = ready!(this.io.h2.poll_recv_trailers(cx))?;
+                    this.expect_response_trailers = false;
+                    // Older tunnel peers send END_STREAM without grpc-status.
+                    // They remain compatible, but an explicit error is terminal.
+                    this.response_error = trailers.as_ref().and_then(ResponseError::from_headers);
+                    if let Some(error) = this.response_error {
+                        return Poll::Ready(Err(error.as_io_error()));
+                    }
+                }
                 return Poll::Ready(Ok(()));
             }
-            ready!(this.io.h2.poll_recv_more(cx))?;
+            let response_error = &mut this.response_error;
+            ready!(this.io.h2.poll_recv_more(cx, |headers| {
+                *response_error = ResponseError::from_headers(headers);
+                if let Some(error) = *response_error {
+                    Err(error.as_io_error())
+                } else {
+                    Ok(())
+                }
+            }))?;
         }
     }
 }
@@ -311,6 +367,9 @@ fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
     let mut i = 0;
     loop {
         let b = *buf.get(i)?;
+        if i == 9 && b > 1 {
+            return None;
+        }
         v |= u64::from(b & 0x7F) << (7 * i);
         if b & 0x80 == 0 {
             return Some((v, i + 1));
@@ -396,7 +455,6 @@ fn start_multi_field(
 
 fn multi_varint(raw: &[u8], remaining: usize) -> io::Result<Option<(u64, usize)>> {
     match read_varint(raw) {
-        Some((_, 10)) if raw[9] > 1 => Err(io::Error::other("grpc: bad MultiHunk varint")),
         None if raw.len() >= remaining || raw.len() >= 10 => {
             Err(io::Error::other("grpc: bad MultiHunk varint"))
         }
@@ -454,7 +512,7 @@ fn parse_hunk_head(raw: &[u8]) -> io::Result<Option<(usize, usize, usize)>> {
     }
     let len = u32::from_be_bytes([raw[1], raw[2], raw[3], raw[4]]) as usize;
     if len == 0 {
-        return Err(io::Error::other("grpc: empty Hunk payload"));
+        return Ok(Some((0, 0, 5)));
     }
     // tag (1) + varint (at most 10) is all that has to be present.
     let want = len.min(11);
@@ -482,6 +540,199 @@ fn parse_hunk_head(raw: &[u8]) -> io::Result<Option<(usize, usize, usize)>> {
 
 #[cfg(test)]
 mod tests {
+    async fn contract_response(
+        parts: Vec<Bytes>,
+        status: Option<&'static str>,
+        trailers_only: bool,
+        multi_mode: bool,
+    ) -> (AnyStream, tokio::task::JoinHandle<()>) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut connection = h2::server::Builder::new()
+                .handshake::<_, Bytes>(server_io)
+                .await
+                .unwrap();
+            let (_request, mut respond) = connection.accept().await.unwrap().unwrap();
+            let mut response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc");
+            if trailers_only {
+                response = response.header("grpc-status", status.unwrap());
+            }
+            let mut send = respond
+                .send_response(response.body(()).unwrap(), trailers_only)
+                .unwrap();
+            if !trailers_only {
+                for part in parts {
+                    send.send_data(part, false).unwrap();
+                }
+                if let Some(code) = status {
+                    let mut trailers = http::HeaderMap::new();
+                    trailers.insert("grpc-status", http::HeaderValue::from_static(code));
+                    send.send_trailers(trailers).unwrap();
+                } else {
+                    send.send_data(Bytes::new(), true).unwrap();
+                }
+            }
+            while connection.accept().await.is_some() {}
+        });
+        let stream = connect(Box::new(client_io), "bench", "example.com", multi_mode)
+            .await
+            .unwrap();
+        (stream, server)
+    }
+
+    #[tokio::test]
+    async fn contract_empty_final_data_does_not_hide_truncated_payload() {
+        use tokio::io::AsyncReadExt;
+        for multi_mode in [false, true] {
+            let message = Bytes::from(GrpcStream::encode_frame(b"hello"));
+            let parts = vec![message.slice(..9)];
+            let (mut stream, server) = contract_response(parts, None, false, multi_mode).await;
+            let mut payload = Vec::new();
+            let err = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut payload),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(err.to_string(), "grpc: stream ended mid-frame");
+            assert_eq!(payload, b"he");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_nonzero_rpc_status_is_not_eof() {
+        use tokio::io::AsyncReadExt;
+        for multi_mode in [false, true] {
+            for trailers_only in [true, false] {
+                let message = Bytes::from(GrpcStream::encode_frame(b"before error"));
+                let parts = if trailers_only { vec![] } else { vec![message] };
+                let (mut stream, server) =
+                    contract_response(parts, Some("12"), trailers_only, multi_mode).await;
+                let read = async {
+                    let mut payload = Vec::new();
+                    let err = stream.read_to_end(&mut payload).await.unwrap_err();
+                    assert_eq!(err.to_string(), "grpc: remote status 12");
+                    assert_eq!(
+                        payload,
+                        if trailers_only {
+                            &b""[..]
+                        } else {
+                            &b"before error"[..]
+                        }
+                    );
+                    let err = stream.read(&mut [0; 1]).await.unwrap_err();
+                    assert_eq!(err.to_string(), "grpc: remote status 12");
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(2), read)
+                    .await
+                    .unwrap();
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn contract_empty_proto_message_is_skipped() {
+        use tokio::io::AsyncReadExt;
+        for multi_mode in [false, true] {
+            let mut response = vec![0; 5];
+            response.extend(GrpcStream::encode_frame(b"next"));
+            let (mut stream, server) =
+                contract_response(vec![Bytes::from(response)], None, false, multi_mode).await;
+            let mut payload = Vec::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                stream.read_to_end(&mut payload),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(payload, b"next");
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn contract_hunk_rejects_overflowing_length_varint() {
+        let mut message = [0x80; 16];
+        message[..6].copy_from_slice(&[0, 0, 0, 0, 11, 0x0a]);
+        message[15] = 0x02;
+        assert!(parse_hunk_head(&message).is_err());
+    }
+
+    #[tokio::test]
+    async fn contract_malformed_rpc_status_is_terminal() {
+        use tokio::io::AsyncReadExt;
+        let (mut stream, server) = contract_response(vec![], Some("invalid"), true, true).await;
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut [0; 1]))
+                .await
+                .unwrap();
+        assert_eq!(read.unwrap_err().to_string(), "grpc: invalid remote status");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn contract_write_half_close_preserves_legacy_response_without_trailers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for multi_mode in [false, true] {
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let server = tokio::spawn(async move {
+                let mut connection = h2::server::Builder::new()
+                    .handshake::<_, Bytes>(server_io)
+                    .await
+                    .unwrap();
+                let (request, mut respond) = connection.accept().await.unwrap().unwrap();
+                let mut recv = request.into_body();
+                let worker = tokio::spawn(async move {
+                    let mut upload = Vec::new();
+                    while let Some(part) = recv.data().await {
+                        let part = part.unwrap();
+                        upload.extend_from_slice(&part);
+                        recv.flow_control().release_capacity(part.len()).unwrap();
+                    }
+                    assert_eq!(upload, GrpcStream::encode_frame(b"upload before FIN"));
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap();
+                    let mut send = respond.send_response(response, false).unwrap();
+                    send.send_data(
+                        Bytes::from(GrpcStream::encode_frame(b"response after FIN")),
+                        false,
+                    )
+                    .unwrap();
+                    send.send_data(Bytes::new(), true).unwrap();
+                });
+                while connection.accept().await.is_some() {}
+                worker.await.unwrap();
+            });
+            let mut stream = connect(Box::new(client_io), "bench", "example.com", multi_mode)
+                .await
+                .unwrap();
+            let transfer = async {
+                stream.write_all(b"upload before FIN").await.unwrap();
+                stream.shutdown().await.unwrap();
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).await.unwrap();
+                assert_eq!(bytes, b"response after FIN");
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(2), transfer)
+                .await
+                .unwrap();
+            drop(stream);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
     async fn response_tunnel(
         payload: Vec<u8>,
         end: bool,

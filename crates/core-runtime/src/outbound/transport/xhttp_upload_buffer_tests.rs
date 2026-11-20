@@ -100,11 +100,11 @@ async fn preserves_large_upload_under_backpressure_and_reports_rejection() {
                 assert_eq!(flushed.load(std::sync::atomic::Ordering::Acquire), accepted as u64);
                 if reject {
                     assert_eq!(seq, 2);
-                    assert!(failure.take().unwrap().to_string().contains("403"));
+                    assert!(failure.error().unwrap().to_string().contains("403"));
                 } else {
                     written.unwrap();
                     assert_eq!(received, data);
-                    assert!(failure.take().is_none());
+                    assert!(failure.error().is_none());
                 }
                 driver.abort(); server.abort();
             }

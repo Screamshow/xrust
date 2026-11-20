@@ -182,8 +182,9 @@ impl Client {
         let secs = cfg.h_max_reusable_secs.roll();
         Self {
             io: std::sync::Mutex::new(Some(io)),
-            open_usage: AtomicI32::new(0),
-            // the first handout is the connection's own creation
+            // The fresh connection is already reserved for its caller. Charge
+            // that first handout exactly once before publishing it in the pool.
+            open_usage: AtomicI32::new(1),
             left_usage: AtomicI32::new(if reuse > 0 { reuse as i32 - 1 } else { -1 }),
             left_requests: AtomicI64::new(if requests > 0 {
                 requests as i64
@@ -359,12 +360,9 @@ impl Pool {
         }
         let mut candidates: Vec<Arc<Client>> = Vec::with_capacity(guard.len());
         for client in guard.iter() {
-            // `max_concurrency` counted streams on an HTTP/2 connection; over
-            // HTTP/1.1 the equivalent ceiling is one request, which `take()`
-            // already enforces. A value above one is therefore not a limit.
-            if (self.concurrency <= 1 || client.open_usage.load(Ordering::SeqCst) == 0)
-                && client.has_io()
-            {
+            // The socket can still be parked between a handout and `take`,
+            // or between `give` and release. Idle requires both conditions.
+            if client.open_usage.load(Ordering::SeqCst) == 0 && client.has_io() {
                 candidates.push(Arc::clone(client));
             }
         }
@@ -380,7 +378,6 @@ impl Pool {
     /// Adds a freshly dialled connection, created for the caller.
     pub(crate) async fn insert(self: &Arc<Self>, io: AnyStream) -> Arc<Client> {
         let client = Arc::new(Client::new(io, &self.config));
-        client.acquire();
         self.clients.lock().await.push(Arc::clone(&client));
         client
     }
@@ -407,6 +404,38 @@ fn pick(len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_reserved_http1_socket_is_not_given_to_a_second_upload() {
+        let pool = Pool::new(XmuxConfig::default());
+        let (io, _peer) = tokio::io::duplex(1024);
+        let fresh = pool.insert(Box::new(io)).await;
+        assert!(pool.acquire().await.is_none(), "fresh handout is reserved");
+
+        let mut lease = Lease::new(fresh.clone());
+        let io = lease.take().unwrap();
+        fresh.give(io);
+        assert!(pool.acquire().await.is_none(), "return in progress");
+        drop(lease);
+
+        let reused = pool.acquire().await.unwrap();
+        assert!(Arc::ptr_eq(&fresh, &reused));
+        assert!(pool.acquire().await.is_none(), "reused handout is reserved");
+    }
+
+    #[tokio::test]
+    async fn fresh_http1_handout_counts_once_against_reuse_times() {
+        let pool = Pool::new(XmuxConfig {
+            c_max_reuse_times: IntRange(2, 2),
+            ..XmuxConfig::default()
+        });
+        let (io, _peer) = tokio::io::duplex(1024);
+        let client = pool.insert(Box::new(io)).await;
+        pool.release(&client).await;
+        let reused = pool.acquire().await.expect("room for the second handout");
+        pool.release(&reused).await;
+        assert!(pool.acquire().await.is_none());
+    }
+
     #[test]
     fn h2_keep_alive_follows_xray() {
         let period = |v: serde_json::Value| {
