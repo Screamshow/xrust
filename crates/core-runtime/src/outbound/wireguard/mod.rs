@@ -8,6 +8,7 @@
 pub mod awg;
 pub(crate) mod awg_masque;
 pub(crate) mod awg_quic;
+mod handoff;
 pub mod noise;
 mod reserved;
 #[cfg(test)]
@@ -196,6 +197,7 @@ enum Cmd {
 #[derive(Debug)]
 struct WgShared {
     cmd_tx: mpsc::Sender<Cmd>,
+    receive_feedback: Option<Arc<AtomicBool>>,
     next_id: AtomicU32,
     /// wakes the stack task when a stalled connection's caller made room
     wake: Arc<tokio::sync::Notify>,
@@ -452,14 +454,20 @@ impl WireGuard {
         }
         let (tx, rx) = mpsc::channel(CMD_QUEUE);
         let wake = Arc::new(tokio::sync::Notify::new());
+        let receive_feedback = handoff::adaptive_enabled(
+            self.cfg.awg.is_some(),
+            crate::env_var("WG_HANDOFF").as_deref(),
+        )
+        .then(|| Arc::new(AtomicBool::new(false)));
         let shared = Arc::new(WgShared {
             cmd_tx: tx,
+            receive_feedback: receive_feedback.clone(),
             next_id: AtomicU32::new(1),
             wake: Arc::clone(&wake),
         });
         let cfg = Arc::new(self.cfg.clone());
         tokio::spawn(async move {
-            if let Err(e) = run(cfg, Arc::new(sock), sock_v6, rx, wake).await {
+            if let Err(e) = run(cfg, Arc::new(sock), sock_v6, rx, wake, receive_feedback).await {
                 logging::error(format_args!("wireguard stack exited: {e}"));
             }
         });
@@ -498,41 +506,87 @@ impl WireGuard {
 
         // caller → stack: forward reads as TCP data chunks.
         let cmd_tx = Arc::clone(&shared).cmd_tx.clone();
-        tokio::spawn(async move {
-            let mut read = caller_read;
-            let mut buf = vec![0u8; SCRATCH_BUF];
-            loop {
-                match read.read(&mut buf).await {
-                    Ok(0) => {
-                        let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
-                        break;
+        if let Some(receive_feedback) = shared.receive_feedback.clone() {
+            tokio::spawn(async move {
+                let mut read = caller_read;
+                let mut buf = vec![0u8; SCRATCH_BUF];
+                let mut in_flight = handoff::InFlight::new(receive_feedback);
+                loop {
+                    // Back-pressure persists while smoltcp has outstanding writes.
+                    if in_flight.wait_for_room().await.is_err() {
+                        return;
                     }
-                    Ok(n) => {
+                    let n = match read.read(&mut buf).await {
+                        Ok(n) if n != 0 => n,
+                        _ => {
+                            if in_flight.drain().await.is_ok() {
+                                let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
+                            }
+                            return;
+                        }
+                    };
+                    // Both reads and channel permits can suspend the pump. Apply
+                    // the latest feedback after both, dropping the permit before
+                    // waiting for an ACK if downstream pressure has appeared.
+                    loop {
+                        if in_flight.wait_for_room().await.is_err() {
+                            return;
+                        }
+                        let Ok(permit) = cmd_tx.reserve().await else {
+                            return;
+                        };
+                        if !in_flight.has_room() {
+                            drop(permit);
+                            continue;
+                        }
                         let (consumed, accepted) = oneshot::channel();
-                        if cmd_tx
-                            .send(Cmd::TcpData {
-                                id,
-                                bytes: buf[..n].to_vec(),
-                                consumed,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                        // Do not keep draining the caller into an unbounded
-                        // per-socket queue while smoltcp's send buffer is full.
-                        if accepted.await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
+                        permit.send(Cmd::TcpData {
+                            id,
+                            bytes: buf[..n].to_vec(),
+                            consumed,
+                        });
+                        in_flight.push(accepted);
                         break;
                     }
                 }
-            }
-        });
+            });
+        } else {
+            tokio::spawn(async move {
+                let mut read = caller_read;
+                let mut buf = vec![0u8; SCRATCH_BUF];
+                loop {
+                    match read.read(&mut buf).await {
+                        Ok(0) => {
+                            let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
+                            break;
+                        }
+                        Ok(n) => {
+                            let (consumed, accepted) = oneshot::channel();
+                            if cmd_tx
+                                .send(Cmd::TcpData {
+                                    id,
+                                    bytes: buf[..n].to_vec(),
+                                    consumed,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            // Do not keep draining the caller into an unbounded
+                            // per-socket queue while smoltcp's send buffer is full.
+                            if accepted.await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
+                            break;
+                        }
+                    }
+                }
+            });
+        }
 
         // stack → caller: pump replies with per-connection backpressure.
         let wake = Arc::clone(&shared.wake);
@@ -926,6 +980,7 @@ struct Stack {
     outbox: Vec<(SocketAddr, Vec<u8>)>,
     wire_buffers: Vec<Vec<u8>>,
     udp_gso: bool,
+    receive_activity: Option<handoff::ReceiveActivity>,
 }
 
 impl Stack {
@@ -1722,6 +1777,10 @@ impl Stack {
 
     fn maintain_tcp(&mut self) -> bool {
         let mut drained_receive_window = false;
+        let track_receive = self.receive_activity.is_some();
+        let mut received_tcp = 0usize;
+        let mut queued_tcp = 0usize;
+        let mut receive_stalled = false;
         let now = Instant::now();
         let ids: Vec<u32> = self.tcp.keys().copied().collect();
         for id in ids {
@@ -1792,6 +1851,11 @@ impl Stack {
                         }
                     }
                 }
+                if track_receive {
+                    received_tcp = received_tcp.saturating_add(received);
+                    queued_tcp = queued_tcp.saturating_add(sock.recv_queue());
+                    receive_stalled |= conn.stash.is_some();
+                }
                 conn.receive_window.maintain(sock, now, received);
                 // The caller is gone: FIN the remote, or `finished` waits for
                 // a remote FIN that can never arrive (we never sent one) and
@@ -1854,6 +1918,9 @@ impl Stack {
             } else {
                 self.tcp.insert(id, conn);
             }
+        }
+        if let Some(activity) = &mut self.receive_activity {
+            activity.observe(now, received_tcp, queued_tcp, receive_stalled);
         }
         drained_receive_window
     }
@@ -2099,6 +2166,7 @@ async fn run(
     sock_v6: Option<Arc<UdpSocket>>,
     mut rx: mpsc::Receiver<Cmd>,
     wake: Arc<tokio::sync::Notify>,
+    receive_feedback: Option<Arc<AtomicBool>>,
 ) -> io::Result<()> {
     let mtu = cfg.mtu;
     let mut device = WgDevice::new(mtu);
@@ -2136,6 +2204,7 @@ async fn run(
         outbox: Vec::new(),
         wire_buffers: Vec::new(),
         udp_gso: true,
+        receive_activity: receive_feedback.map(handoff::ReceiveActivity::new),
     };
     // Peer configs live in cfg (Arc) — materialize runtime state.
     let peer_cfgs = stack.cfg.peers.clone();
@@ -2585,6 +2654,7 @@ mod tests {
             outbox: Vec::new(),
             wire_buffers: Vec::new(),
             udp_gso: true,
+            receive_activity: None,
         };
         (stack, sink)
     }
