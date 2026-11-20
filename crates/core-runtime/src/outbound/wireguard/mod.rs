@@ -979,7 +979,7 @@ struct Stack {
     /// Transport datagrams sealed during one device flush, sent together.
     outbox: Vec<(SocketAddr, Vec<u8>)>,
     wire_buffers: Vec<Vec<u8>>,
-    udp_gso: bool,
+    udp_gso: UdpGso,
     receive_activity: Option<handoff::ReceiveActivity>,
 }
 
@@ -2189,6 +2189,11 @@ async fn run(
         .routes_mut()
         .add_default_ipv6_route(Ipv6Address::UNSPECIFIED);
 
+    let udp_gso = if cfg.awg.is_some() {
+        UdpGso::ShortTail
+    } else {
+        UdpGso::Equal
+    };
     let mut stack = Stack {
         cfg,
         sock,
@@ -2203,7 +2208,7 @@ async fn run(
         next_port: EPHEMERAL_BASE,
         outbox: Vec::new(),
         wire_buffers: Vec::new(),
-        udp_gso: true,
+        udp_gso,
         receive_activity: receive_feedback.map(handoff::ReceiveActivity::new),
     };
     // Peer configs live in cfg (Arc) — materialize runtime state.
@@ -2281,6 +2286,13 @@ async fn run(
     }
 }
 
+enum UdpGso {
+    #[cfg(target_os = "linux")]
+    Disabled,
+    Equal,
+    ShortTail,
+}
+
 /// Largest number of datagrams handed to the kernel in one call.
 const SEND_BATCH: usize = 64;
 
@@ -2289,7 +2301,7 @@ const SEND_BATCH: usize = 64;
 /// never wait here, because it is also the one reading the sockets, and a
 /// wait leaves incoming datagrams to overflow the receive buffer. Any other
 /// error skips just that datagram.
-fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str, gso: &mut bool) {
+fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str, gso: &mut UdpGso) {
     let mut sent = 0;
     while sent < items.len() {
         let chunk = &items[sent..items.len().min(sent + SEND_BATCH)];
@@ -2309,13 +2321,13 @@ fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str, 
 fn send_some(
     sock: &UdpSocket,
     chunk: &[(SocketAddr, Vec<u8>)],
-    gso: &mut bool,
+    gso: &mut UdpGso,
 ) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
     if chunk.len() == 1 {
         return sock.try_send_to(&chunk[0].1, chunk[0].0).map(|_| 1);
     }
-    if *gso {
+    if !matches!(gso, UdpGso::Disabled) {
         let (addr, first) = &chunk[0];
         let len = first.len();
         let count = chunk
@@ -2324,24 +2336,31 @@ fn send_some(
             .count()
             .min(65_535 / len.max(1));
         if count > 1 && len > 0 {
+            // Account for the IPv6 and UDP headers at the IP size limit.
+            const MAX_SHORT_TAIL_BYTES: usize = 65_535 - 40 - 8;
+            // UDP_SEGMENT permits a shorter final datagram. Include at most
+            // one, without crossing an address or the byte limit.
+            if matches!(gso, UdpGso::ShortTail)
+                && chunk.get(count).is_some_and(|(to, tail)| {
+                    to == addr
+                        && !tail.is_empty()
+                        && tail.len() < len
+                        && count * len + tail.len() <= MAX_SHORT_TAIL_BYTES
+                })
+            {
+                match send_segmented(sock, &chunk[..=count], len as u16) {
+                    Ok(()) => return Ok(count + 1),
+                    Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => {}
+                    Err(e) if gso_unavailable(&e) => *gso = UdpGso::Equal,
+                    Err(e) => return Err(e),
+                }
+            }
             match send_segmented(sock, &chunk[..count], len as u16) {
                 Ok(()) => return Ok(count),
-                Err(e)
-                    if matches!(
-                        e.raw_os_error(),
-                        Some(
-                            libc::EINVAL
-                                | libc::EIO
-                                | libc::ENOPROTOOPT
-                                | libc::EOPNOTSUPP
-                                | libc::EMSGSIZE
-                        )
-                    ) =>
-                {
-                    // Some kernels and interfaces lack UDP segmentation.
-                    // Retry these unsent datagrams through sendmmsg and keep
-                    // using that path for the rest of this endpoint's life.
-                    *gso = false;
+                Err(e) if gso_unavailable(&e) => {
+                    // Retain equal-size GSO if only the short-tail send is
+                    // unsupported. Otherwise retry with sendmmsg.
+                    *gso = UdpGso::Disabled;
                 }
                 Err(e) => return Err(e),
             }
@@ -2381,6 +2400,14 @@ fn send_some(
             Ok(rc as usize)
         }
     })
+}
+
+#[cfg(target_os = "linux")]
+fn gso_unavailable(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::EIO | libc::ENOPROTOOPT | libc::EOPNOTSUPP | libc::EMSGSIZE)
+    )
 }
 
 /// Scatter/gather avoids joining the encrypted packets in another buffer.
@@ -2432,7 +2459,7 @@ fn send_segmented(
 fn send_some(
     sock: &UdpSocket,
     chunk: &[(SocketAddr, Vec<u8>)],
-    _gso: &mut bool,
+    _gso: &mut UdpGso,
 ) -> io::Result<usize> {
     sock.try_send_to(&chunk[0].1, chunk[0].0).map(|_| 1)
 }
@@ -2653,7 +2680,7 @@ mod tests {
             next_port: EPHEMERAL_BASE,
             outbox: Vec::new(),
             wire_buffers: Vec::new(),
-            udp_gso: true,
+            udp_gso: UdpGso::Equal,
             receive_activity: None,
         };
         (stack, sink)
@@ -3294,7 +3321,11 @@ mod batch_send_tests {
                     .map(|i| (to, vec![i; if i == 69 { 173 } else { 1400 }]))
                     .collect();
                 tx.writable().await.unwrap();
-                let mut gso = enabled;
+                let mut gso = if enabled {
+                    UdpGso::Equal
+                } else {
+                    UdpGso::Disabled
+                };
                 send_datagrams(&tx, &items, "test", &mut gso);
                 let mut buf = [0; 2048];
                 for (_, want) in &items {
@@ -3306,6 +3337,40 @@ mod batch_send_tests {
                     assert_eq!(from, tx.local_addr().unwrap());
                     assert_eq!(&buf[..n], want);
                 }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn short_tail_keeps_datagram_boundaries_and_does_not_absorb_a_second_short_packet() {
+        for host in ["127.0.0.1:0", "[::1]:0"] {
+            let rx = UdpSocket::bind(host).await.unwrap();
+            let tx = UdpSocket::bind(host).await.unwrap();
+            let to = rx.local_addr().unwrap();
+            let items = [
+                (to, vec![1; 1312]),
+                (to, vec![2; 1312]),
+                (to, vec![3; 115]),
+                (to, vec![4; 63]),
+            ];
+            tx.writable().await.unwrap();
+            let mut gso = UdpGso::ShortTail;
+            let sent = send_some(&tx, &items, &mut gso).unwrap();
+            assert!((1..=items.len()).contains(&sent));
+            if matches!(gso, UdpGso::ShortTail) {
+                assert_eq!(sent, 3);
+            }
+            send_datagrams(&tx, &items[sent..], "test", &mut gso);
+            for (_, expected) in &items {
+                let mut payload = [0; 1500];
+                let (len, from) =
+                    tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut payload))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(from, tx.local_addr().unwrap());
+                assert_eq!(&payload[..len], expected);
             }
         }
     }
@@ -3327,7 +3392,7 @@ mod batch_send_tests {
             .collect();
         // a fresh socket learns it is writable from the reactor first
         tx.writable().await.unwrap();
-        send_datagrams(&tx, &items, "test", &mut true);
+        send_datagrams(&tx, &items, "test", &mut UdpGso::Equal);
         let mut buf = vec![0u8; 2048];
         for (i, (_, want)) in items.iter().enumerate() {
             let (n, from) =
@@ -3347,7 +3412,10 @@ mod batch_send_tests {
         let tx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let to = rx.local_addr().unwrap();
         tx.writable().await.unwrap();
-        assert_eq!(send_some(&tx, &[(to, vec![7; 100])], &mut true).unwrap(), 1);
+        assert_eq!(
+            send_some(&tx, &[(to, vec![7; 100])], &mut UdpGso::Equal).unwrap(),
+            1
+        );
         let mut buf = [0u8; 256];
         let (n, _) = rx.recv_from(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], &[7; 100][..]);
