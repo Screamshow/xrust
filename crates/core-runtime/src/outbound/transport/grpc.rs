@@ -102,7 +102,6 @@ pub(super) async fn connect(
     authority: &str,
     multi_mode: bool,
 ) -> io::Result<AnyStream> {
-    let stream = super::h2io::grpc_buffered(stream);
     let (send_request, connection) = super::h2io::grpc_client_builder()
         .handshake(stream)
         .await
@@ -120,17 +119,11 @@ pub(super) async fn connect(
 
     Ok(Box::new(GrpcStream {
         io: H2Io {
-            h2: H2Stream::new(response, send, conn_task).grpc_client_policy(),
+            h2: H2Stream::new(response, send, conn_task),
         },
-        native_recv: super::h2io::grpc_profile_enabled(),
         data_left: 0,
         skip: 0,
         multi_frame_left: multi_mode.then_some(0),
-        write_chunk: if super::h2io::grpc_framing_enabled() {
-            8192
-        } else {
-            super::h2io::WRITE_CHUNK - 16
-        },
         expect_response_trailers: true,
         response_error: None,
     }))
@@ -149,17 +142,11 @@ pub(super) fn open_pooled(
         .map_err(|e| io::Error::other(format!("grpc: send_request: {e}")))?;
     Ok(Box::new(GrpcStream {
         io: H2Io {
-            h2: H2Stream::shared(response, send).grpc_client_policy(),
+            h2: H2Stream::shared(response, send),
         },
-        native_recv: super::h2io::grpc_profile_enabled(),
         data_left: 0,
         skip: 0,
         multi_frame_left: multi_mode.then_some(0),
-        write_chunk: if super::h2io::grpc_framing_enabled() {
-            8192
-        } else {
-            super::h2io::WRITE_CHUNK - 16
-        },
         expect_response_trailers: true,
         response_error: None,
     }))
@@ -176,8 +163,6 @@ pub(crate) struct GrpcStream {
     skip: usize,
     /// Remaining MultiHunk body bytes after the current field, or None for gun.
     multi_frame_left: Option<usize>,
-    write_chunk: usize,
-    native_recv: bool,
     expect_response_trailers: bool,
     response_error: Option<ResponseError>,
 }
@@ -191,11 +176,9 @@ pub(crate) fn server(recv: h2::RecvStream, send: h2::SendStream<Bytes>) -> AnySt
         io: H2Io {
             h2: H2Stream::server(recv, send),
         },
-        native_recv: false,
         data_left: 0,
         skip: 0,
         multi_frame_left: None,
-        write_chunk: super::h2io::WRITE_CHUNK - 16,
         expect_response_trailers: false,
         response_error: None,
     })
@@ -276,26 +259,12 @@ impl AsyncRead for GrpcStream {
                 }
             } else {
                 let field = if let Some(frame_left) = &mut this.multi_frame_left {
-                    start_multi_field(&mut this.io.h2, frame_left, this.native_recv)?
+                    start_multi_field(&mut this.io.h2, frame_left)?
                 } else {
                     let before = this.io.h2.pending_len;
                     let hunk = start_hunk(&mut this.io.h2.pending, &mut this.io.h2.pending_len)?;
-                    if let Some((data, skip)) = hunk {
-                        let used = before - this.io.h2.pending_len;
-                        if this.native_recv {
-                            let body = data + skip + (used - 5);
-                            // grpc-go bounds a single protobuf message, not the whole tunnel.
-                            if body > 4 << 20 {
-                                return Poll::Ready(Err(io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    "grpc: message exceeds the 4 MiB receive limit",
-                                )));
-                            }
-                            this.io.h2.start_grpc_message(used as u32, body as u32)?;
-                        } else {
-                            this.io.h2.release(used);
-                        }
-                    }
+                    // start_hunk consumed the frame header from pending.
+                    this.io.h2.release(before - this.io.h2.pending_len);
                     hunk
                 };
                 if let Some((data, skip)) = field {
@@ -351,21 +320,12 @@ impl AsyncWrite for GrpcStream {
             // (the gRPC framing needs its own bytes, so unlike plain h2
             // there is not even a variant of this that copies less)
             // Leave room for the gRPC prefix, protobuf tag and length varint.
-            let take = buf.len().min(self.write_chunk);
+            let take = buf.len().min(super::h2io::WRITE_CHUNK - 16);
             if super::h2io::upload_pool_enabled() {
-                let small = self.write_chunk == 8192;
-                let mut frame = if small {
-                    super::h2io::grpc_upload_buffer()
-                } else {
-                    super::h2io::upload_buffer(super::h2io::WRITE_CHUNK)
-                };
+                let mut frame = super::h2io::upload_buffer(super::h2io::WRITE_CHUNK);
                 Self::encode_frame_into(&buf[..take], &mut frame);
                 self.io.h2.stage_bytes(
-                    if small {
-                        super::h2io::own_grpc_upload_buffer(frame)
-                    } else {
-                        super::h2io::own_upload_buffer(frame, super::h2io::WRITE_CHUNK)
-                    },
+                    super::h2io::own_upload_buffer(frame, super::h2io::WRITE_CHUNK),
                     take,
                 );
             } else {
@@ -439,7 +399,6 @@ fn copy_prefix(pending: &VecDeque<Bytes>, dst: &mut [u8]) {
 fn start_multi_field(
     h2: &mut H2Stream,
     frame_left: &mut usize,
-    native_recv: bool,
 ) -> io::Result<Option<(usize, usize)>> {
     if *frame_left == 0 {
         let mut prefix = [0; 5];
@@ -450,21 +409,8 @@ fn start_multi_field(
         if prefix[0] != 0 {
             return Err(io::Error::other("grpc: compressed frames unsupported"));
         }
-        let body = u32::from_be_bytes([prefix[1], prefix[2], prefix[3], prefix[4]]);
-        if native_recv {
-            if body > 4 << 20 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "grpc: message exceeds the 4 MiB receive limit",
-                ));
-            }
-            h2.start_grpc_message(prefix.len() as u32, body)?;
-            // start_grpc_message already repaid the prefix's stream credit.
-            consume_prefix(&mut h2.pending, &mut h2.pending_len, prefix.len())?;
-        } else {
-            h2.skip_pending(prefix.len());
-        }
-        *frame_left = body as usize;
+        *frame_left = u32::from_be_bytes([prefix[1], prefix[2], prefix[3], prefix[4]]) as usize;
+        h2.skip_pending(prefix.len());
         return Ok(Some((0, 0)));
     }
 
@@ -539,15 +485,7 @@ fn start_hunk(
     let Some((payload, trailing, consumed)) = parse_hunk_head(&scratch[..have])? else {
         return Ok(None);
     };
-    consume_prefix(pending, pending_len, consumed)?;
-    Ok(Some((payload, trailing)))
-}
-
-fn consume_prefix(
-    pending: &mut VecDeque<Bytes>,
-    pending_len: &mut usize,
-    mut left: usize,
-) -> io::Result<()> {
+    let mut left = consumed;
     while left > 0 {
         let Some(front) = pending.front_mut() else {
             return Err(io::Error::other("grpc: hunk header ran past the stream"));
@@ -560,7 +498,7 @@ fn consume_prefix(
             pending.pop_front();
         }
     }
-    Ok(())
+    Ok(Some((payload, trailing)))
 }
 
 /// The wire decision on the first `have` (5..16) bytes of a Hunk:
@@ -966,71 +904,6 @@ mod tests {
         );
         assert!(!ua.contains("grpc-go"), "{ua}");
         assert!(header("grpc-accept-encoding").is_none(), "no compressors");
-    }
-
-    /// Both profiles must preserve message boundaries under partial credit.
-    #[tokio::test]
-    async fn client_upload_preserves_hunks_under_partial_send_credit() {
-        use tokio::io::AsyncWriteExt;
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let max_hunk = if super::super::h2io::grpc_framing_enabled() {
-                8192
-            } else {
-                super::super::h2io::WRITE_CHUNK - 16
-            };
-            let (client_io, server_io) = tokio::io::duplex(1024);
-            let server = tokio::spawn(async move {
-                let mut b = h2::server::Builder::new();
-                b.initial_window_size(4000);
-                let mut conn = b.handshake::<_, Bytes>(server_io).await.unwrap();
-                let (req, mut response) = conn.accept().await.unwrap().unwrap();
-                let _send = response
-                    .send_response(http::Response::new(()), false)
-                    .unwrap();
-                let driver = tokio::spawn(async move { while conn.accept().await.is_some() {} });
-                let mut recv = req.into_body();
-                let mut raw = Vec::new();
-                let mut boundaries = Vec::new();
-                while let Some(data) = recv.data().await {
-                    let data = data.unwrap();
-                    assert!(data.len() <= 8200);
-                    raw.extend_from_slice(&data);
-                    if !data.is_empty() {
-                        boundaries.push(raw.len());
-                    }
-                    recv.flow_control().release_capacity(data.len()).unwrap();
-                }
-                driver.abort();
-                (raw, boundaries)
-            });
-            let mut tunnel = connect(Box::new(client_io), "bench", "localhost", false)
-                .await
-                .unwrap();
-            tunnel.write_all(&vec![0x5a; 1024 * 1024]).await.unwrap();
-            tunnel.shutdown().await.unwrap();
-            let (raw, boundaries) = server.await.unwrap();
-            let mut at = 0;
-            let mut total = 0;
-            while at < raw.len() {
-                let size = u32::from_be_bytes(raw[at + 1..at + 5].try_into().unwrap()) as usize;
-                assert_eq!(raw[at], 0);
-                assert_eq!(raw[at + 5], 10);
-                let (n, width) = super::read_varint(&raw[at + 6..]).unwrap();
-                assert!(n <= max_hunk as u64);
-                let end = at + 5 + size;
-                assert_eq!(end, at + 6 + width + n as usize);
-                assert!(raw[at + 6 + width..end].iter().all(|b| *b == 0x5a));
-                assert!(
-                    boundaries.contains(&end),
-                    "a DATA item must not cross a Hunk boundary"
-                );
-                total += n;
-                at = end;
-            }
-            assert_eq!(total, 1024 * 1024);
-        })
-        .await
-        .expect("bounded upload with partial credit");
     }
 
     /// Everything still buffered, as one contiguous copy (test view only).

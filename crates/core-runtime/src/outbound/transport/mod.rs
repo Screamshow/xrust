@@ -564,11 +564,6 @@ impl Transport {
             Kind::Grpc { .. } => h2io::grpc_client_builder(),
             _ => h2io::client_builder(),
         };
-        let stream = if matches!(self.kind, Kind::Grpc { .. }) {
-            h2io::grpc_buffered(stream)
-        } else {
-            stream
-        };
         h2io::h2_handshake(stream, &builder, label).await
     }
 

@@ -132,36 +132,11 @@ impl Table {
 
     /// Index the header in the HPACK table.
     pub fn index(&mut self, header: Header) -> Index {
-        self.index_with_policy(header, false)
-    }
-
-    pub fn index_grpc(&mut self, header: Header) -> Index {
-        self.index_with_policy(header, true)
-    }
-
-    fn index_with_policy(&mut self, header: Header, grpc: bool) -> Index {
         // Check the static table
-        let mut statik = index_static(&header);
-        if grpc && matches!(statik, Some((_, false))) {
-            // Go's name lookup uses the last static entry for duplicate names.
-            let name = match &header {
-                Header::Path(_) => Some(5),
-                Header::Method(_) => Some(3),
-                Header::Scheme(_) => Some(7),
-                Header::Status(_) => Some(14),
-                _ => None,
-            };
-            if let Some(n) = name {
-                statik = Some((n, false));
-            }
-        }
-        if grpc && header.is_sensitive() {
-            // Never turn a sensitive value into an indexed representation.
-            return Index::new(statik.map(|(n, _)| (n, false)), header);
-        }
+        let statik = index_static(&header);
 
         // Don't index certain headers. This logic is borrowed from nghttp2.
-        if !grpc && header.skip_value_index() {
+        if header.skip_value_index() {
             // Right now, if this is true, the header name is always in the
             // static table. At some point in the future, this might not be true
             // and this logic will need to be updated.
@@ -175,11 +150,7 @@ impl Table {
         }
 
         // Don't index large headers
-        if if grpc {
-            header.len() > self.max_size
-        } else {
-            header.len() * 4 > self.max_size * 3
-        } {
+        if header.len() * 4 > self.max_size * 3 {
             return Index::new(statik, header);
         }
 

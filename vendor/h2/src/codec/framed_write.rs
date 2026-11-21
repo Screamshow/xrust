@@ -24,7 +24,6 @@ pub struct FramedWrite<T, B> {
     /// Upstream `AsyncWrite`
     inner: T,
     final_flush_done: bool,
-    flush_on_capacity: bool,
 
     encoder: Encoder<B>,
 }
@@ -103,7 +102,6 @@ where
         FramedWrite {
             inner,
             final_flush_done: false,
-            flush_on_capacity: true,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
                 buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
@@ -126,11 +124,7 @@ where
     pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         if !self.encoder.has_capacity() {
             // Try flushing
-            if self.flush_on_capacity || self.encoder.exact_credit_boundary {
-                ready!(self.flush(cx))?;
-            } else {
-                ready!(self.drain(cx))?;
-            }
+            ready!(self.flush(cx))?;
 
             if !self.encoder.has_capacity() {
                 return Poll::Pending;
@@ -151,13 +145,6 @@ where
     /// over TLS each of its frames is a record of its own.
     pub(crate) fn set_frame_per_write(&mut self, on: bool) {
         self.encoder.frame_per_write = on;
-    }
-
-    /// grpc-go's 32-KiB writer must keep partial plaintext buffered across
-    /// codec-capacity drains. Only an actual protocol flush drains that writer.
-    pub(crate) fn set_grpc_buffered(&mut self) {
-        self.flush_on_capacity = false;
-        self.encoder.hpack.set_grpc_client();
     }
 
     pub(crate) fn finish_credit_pair(&mut self) {
@@ -196,13 +183,6 @@ where
         let span = tracing::trace_span!("FramedWrite::flush");
         let _e = span.enter();
 
-        ready!(self.drain(cx))?;
-        ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
-        self.encoder.exact_credit_boundary = false;
-        Poll::Ready(Ok(()))
-    }
-
-    fn drain(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         loop {
             while !self.encoder.is_empty() {
                 let n = match self.encoder.next {
@@ -234,6 +214,10 @@ where
         }
 
         tracing::trace!("flushing buffer");
+        // Flush the upstream
+        ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+        self.encoder.exact_credit_boundary = false;
+
         Poll::Ready(Ok(()))
     }
 

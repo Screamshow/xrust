@@ -84,7 +84,6 @@ pub(super) struct Stream {
     pub recv_flow: FlowControl,
 
     pub in_flight_recv_data: WindowSize,
-    pub grpc_delta: WindowSize,
 
     /// Next node in the linked list of streams waiting to send window updates.
     pub next_window_update: Option<store::Key>,
@@ -191,7 +190,6 @@ impl Stream {
             is_pending_accept: false,
             recv_flow,
             in_flight_recv_data: 0,
-            grpc_delta: 0,
             next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,

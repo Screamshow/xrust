@@ -8,7 +8,6 @@ const DEFAULT_MAX_ALLOWED_SIZE: usize = 4 * 1024;
 
 #[derive(Debug)]
 pub struct Encoder {
-    grpc_client: bool,
     table: Table,
     max_allowed_size: usize,
     size_update: Option<SizeUpdate>,
@@ -32,16 +31,11 @@ impl Encoder {
         let max_size = max_size.min(DEFAULT_MAX_ALLOWED_SIZE);
 
         Encoder {
-            grpc_client: false,
             table: Table::new(max_size, capacity),
             max_allowed_size: DEFAULT_MAX_ALLOWED_SIZE,
             size_update: None,
             scratch: BytesMut::new(),
         }
-    }
-
-    pub(crate) fn set_grpc_client(&mut self) {
-        self.grpc_client = true;
     }
 
     #[cfg(test)]
@@ -120,11 +114,7 @@ impl Encoder {
                 // The header has an associated name. In which case, try to
                 // index it in the table.
                 Ok(header) => {
-                    let index = if self.grpc_client {
-                        self.table.index_grpc(header)
-                    } else {
-                        self.table.index(header)
-                    };
+                    let index = self.table.index(header);
                     self.encode_header(&index, dst);
 
                     last_index = Some(index);
@@ -170,13 +160,7 @@ impl Encoder {
             Index::Name(idx, _) => {
                 let header = self.table.resolve(index);
 
-                encode_not_indexed(
-                    idx,
-                    header.value_slice(),
-                    header.is_sensitive(),
-                    dst,
-                    self.grpc_client,
-                );
+                encode_not_indexed(idx, header.value_slice(), header.is_sensitive(), dst);
             }
             Index::Inserted(_) => {
                 let header = self.table.resolve(index);
@@ -185,8 +169,8 @@ impl Encoder {
 
                 dst.put_u8(0b0100_0000);
 
-                encode_str(header.name().as_slice(), dst, self.grpc_client);
-                encode_str(header.value_slice(), dst, self.grpc_client);
+                encode_str(header.name().as_slice(), dst);
+                encode_str(header.value_slice(), dst);
             }
             Index::InsertedValue(idx, _) => {
                 let header = self.table.resolve(index);
@@ -194,7 +178,7 @@ impl Encoder {
                 assert!(!header.is_sensitive());
 
                 encode_int(idx, 6, 0b0100_0000, dst);
-                encode_str(header.value_slice(), dst, self.grpc_client);
+                encode_str(header.value_slice(), dst);
             }
             Index::NotIndexed(_) => {
                 let header = self.table.resolve(index);
@@ -204,7 +188,6 @@ impl Encoder {
                     header.value_slice(),
                     header.is_sensitive(),
                     dst,
-                    self.grpc_client,
                 );
             }
         }
@@ -223,13 +206,7 @@ impl Encoder {
             | Index::InsertedValue(..) => {
                 let idx = self.table.resolve_idx(last);
 
-                encode_not_indexed(
-                    idx,
-                    value.as_ref(),
-                    value.is_sensitive(),
-                    dst,
-                    self.grpc_client,
-                );
+                encode_not_indexed(idx, value.as_ref(), value.is_sensitive(), dst);
             }
             Index::NotIndexed(_) => {
                 let last = self.table.resolve(last);
@@ -239,7 +216,6 @@ impl Encoder {
                     value.as_ref(),
                     value.is_sensitive(),
                     dst,
-                    self.grpc_client,
                 );
             }
         }
@@ -256,28 +232,28 @@ fn encode_size_update(val: usize, dst: &mut BytesMut) {
     encode_int(val, 5, 0b0010_0000, dst)
 }
 
-fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut, grpc: bool) {
+fn encode_not_indexed(name: usize, value: &[u8], sensitive: bool, dst: &mut BytesMut) {
     if sensitive {
         encode_int(name, 4, 0b10000, dst);
     } else {
         encode_int(name, 4, 0, dst);
     }
 
-    encode_str(value, dst, grpc);
+    encode_str(value, dst);
 }
 
-fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut BytesMut, grpc: bool) {
+fn encode_not_indexed2(name: &[u8], value: &[u8], sensitive: bool, dst: &mut BytesMut) {
     if sensitive {
         dst.put_u8(0b10000);
     } else {
         dst.put_u8(0);
     }
 
-    encode_str(name, dst, grpc);
-    encode_str(value, dst, grpc);
+    encode_str(name, dst);
+    encode_str(value, dst);
 }
 
-fn encode_str(val: &[u8], dst: &mut BytesMut, grpc: bool) {
+fn encode_str(val: &[u8], dst: &mut BytesMut) {
     if !val.is_empty() {
         let idx = position(dst);
 
@@ -288,14 +264,6 @@ fn encode_str(val: &[u8], dst: &mut BytesMut, grpc: bool) {
         huffman::encode(val, dst);
 
         let huff_len = position(dst) - (idx + 1);
-        // golang/net HPACK uses Huffman only for strictly shorter strings.
-        // In particular, the gRPC name `te` is a plain two-byte string.
-        if grpc && huff_len >= val.len() {
-            dst.truncate(idx);
-            encode_int(val.len(), 7, 0, dst);
-            dst.extend_from_slice(val);
-            return;
-        }
 
         if encode_int_one_byte(huff_len, 7) {
             // Write the string head

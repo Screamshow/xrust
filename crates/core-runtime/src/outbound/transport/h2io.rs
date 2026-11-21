@@ -149,85 +149,12 @@ pub(crate) fn client_builder() -> h2::client::Builder {
     builder
 }
 
-/// grpc-go starts at the protocol windows, discovers BDP from DATA-driven
-/// PINGs and buffers writes in 32 KiB. Its pseudo-header order also differs
-/// from `net/http`. Static user overrides disable dynamic growth.
+/// The same, for the gRPC transport: grpc-go sends the pseudo-headers in its
+/// own order (`createHeaderFields`), not `net/http`'s.
 pub(crate) fn grpc_client_builder() -> h2::client::Builder {
-    let mut builder = if grpc_profile_enabled() {
-        let mut b = h2::client::Builder::new();
-        b.initial_max_send_streams(100);
-        let stream = crate::env_var("H2_STREAM_WINDOW");
-        let conn = crate::env_var("H2_CONN_WINDOW");
-        // Explicit existing window overrides remain static and are never
-        // silently enlarged by BDP. Default grpc-go opens with empty SETTINGS.
-        b.grpc_client_profile(stream.is_none() && conn.is_none());
-        if stream.is_some() {
-            b.initial_window_size(client_stream_window());
-        }
-        if conn.is_some() {
-            b.initial_connection_window_size(client_conn_window());
-        }
-        b
-    } else {
-        base_client_builder()
-    };
+    let mut builder = base_client_builder();
     builder.pseudo_header_order(h2::PseudoOrder::MethodSchemePathAuthority);
     builder
-}
-
-/// The measured Xray profile remains opt-in until its saturation upload cost
-/// is resolved. Ordinary H2 and the default gRPC policy stay unchanged.
-pub(super) fn grpc_profile_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| grpc_profile_selected(crate::env_var("GRPC_PROFILE").as_deref()))
-}
-
-fn grpc_profile_selected(value: Option<&str>) -> bool {
-    matches!(value, Some("xray" | "flow"))
-}
-
-#[cfg(test)]
-#[test]
-fn grpc_xray_profile_requires_explicit_selection() {
-    for (value, enabled) in [
-        (None, false),
-        (Some("legacy"), false),
-        (Some("xray"), true),
-        (Some("flow"), true),
-        (Some("typo"), false),
-    ] {
-        assert_eq!(grpc_profile_selected(value), enabled);
-    }
-}
-
-pub(super) fn grpc_framing_enabled() -> bool {
-    grpc_profile_enabled() && crate::env_var("GRPC_PROFILE").as_deref() != Some("flow")
-}
-
-fn grpc_send_fused() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| crate::env_var("GRPC_SEND_FUSED").as_deref() != Some("0"))
-}
-
-pub(super) fn grpc_buffered(stream: AnyStream) -> AnyStream {
-    if grpc_profile_enabled() {
-        Box::new(tokio::io::BufWriter::with_capacity(32 << 10, stream))
-    } else {
-        stream
-    }
-}
-
-static GRPC_UPLOAD_POOL: crate::bufpool::Pool = crate::bufpool::Pool::new();
-pub(super) fn grpc_upload_buffer() -> Vec<u8> {
-    let mut bytes = GRPC_UPLOAD_POOL.take();
-    bytes.reserve(8192 + 16);
-    bytes
-}
-pub(super) fn own_grpc_upload_buffer(bytes: Vec<u8>) -> Bytes {
-    Bytes::from_owner(UploadOwner {
-        bytes,
-        pool: &GRPC_UPLOAD_POOL,
-    })
 }
 
 fn base_client_builder() -> h2::client::Builder {
@@ -277,7 +204,6 @@ pub(crate) struct H2Stream {
     eof: bool,
     /// `None` when a shared owner drives the connection, as mux does
     conn_task: Option<JoinHandle<()>>,
-    release_on_drop: bool,
 }
 
 impl H2Stream {
@@ -315,7 +241,6 @@ impl H2Stream {
             report: 0,
             eof: true,
             conn_task: None,
-            release_on_drop: true,
         }
     }
 
@@ -341,7 +266,6 @@ impl H2Stream {
             report: 0,
             eof: false,
             conn_task,
-            release_on_drop: true,
         }
     }
 
@@ -373,7 +297,6 @@ impl H2Stream {
             report: 0,
             eof: false,
             conn_task,
-            release_on_drop: true,
         }
     }
 
@@ -469,43 +392,22 @@ impl H2Stream {
             let Some(send) = self.send.as_mut() else {
                 return Poll::Ready(Err(io::Error::other("h2: stream send side closed")));
             };
-            // Tiny bidirectional writes share the receive driver's store;
-            // leave their existing lock scheduling intact (BDP-sensitive).
-            if !self.release_on_drop && self.out.len() >= 4096 && grpc_send_fused() {
-                match send.poll_send_bytes(cx, &mut self.out) {
+            let remaining = self.out.len();
+            send.reserve_capacity(remaining);
+            // poll_capacity notifies about capacity *changes*, not every
+            // write. Spend already assigned credit before waiting for more.
+            let cap = if send.capacity() > 0 {
+                send.capacity()
+            } else {
+                match send.poll_capacity(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Some(Ok(_))) => continue,
+                    Poll::Ready(Some(Ok(cap))) => cap,
                     Poll::Ready(Some(Err(e))) => {
-                        return Poll::Ready(Err(io::Error::other(format!("h2: send_data: {e}"))));
+                        return Poll::Ready(Err(io::Error::other(format!("h2: capacity: {e}"))));
                     }
                     Poll::Ready(None) => {
                         return Poll::Ready(Err(io::Error::other("h2: stream closed for writing")));
                     }
-                }
-            }
-            let remaining = self.out.len();
-            let credit = if !self.release_on_drop {
-                // Native gRPC uses many 8-KiB Hunks: avoid three store-lock
-                // acquisitions for each while preserving bounded send credit.
-                send.poll_reserve_capacity(cx, remaining)
-            } else {
-                send.reserve_capacity(remaining);
-                if send.capacity() > 0 {
-                    Poll::Ready(Some(Ok(send.capacity())))
-                } else {
-                    send.poll_capacity(cx)
-                }
-            };
-            // poll_capacity notifies about capacity *changes*, not every
-            // write. Spend already assigned credit before waiting for more.
-            let cap = match credit {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(cap))) => cap,
-                Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Err(io::Error::other(format!("h2: capacity: {e}"))));
-                }
-                Poll::Ready(None) => {
-                    return Poll::Ready(Err(io::Error::other("h2: stream closed for writing")));
                 }
             };
             if cap == 0 {
@@ -571,19 +473,6 @@ impl H2Stream {
                 Poll::Ready(Ok(false))
             }
         }
-    }
-
-    pub(crate) fn start_grpc_message(&mut self, header: u32, body: u32) -> io::Result<()> {
-        if let Some(recv) = &mut self.recv {
-            recv.grpc_start_message(header, body)
-                .map_err(|e| io::Error::other(format!("grpc: message credit: {e}")))?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn grpc_client_policy(mut self) -> Self {
-        self.release_on_drop = !grpc_profile_enabled();
-        self
     }
 
     pub(crate) fn poll_recv_trailers(
@@ -704,18 +593,9 @@ impl Drop for H2Stream {
         // connection window: repay it, or a stream dropped with an unread
         // body shrinks the window the pooled session runs on for good.
         let unread = self.pending_len;
-        if self.release_on_drop {
-            self.release(unread);
-        }
+        self.release(unread);
         if let Some(mut send) = self.send.take() {
-            // grpc-go closes the still-open request half with NO_ERROR after
-            // response END_STREAM; an application cancellation remains CANCEL.
-            let reason = if !self.release_on_drop && self.eof {
-                h2::Reason::NO_ERROR
-            } else {
-                h2::Reason::CANCEL
-            };
-            send.send_reset(reason);
+            send.send_reset(h2::Reason::CANCEL);
         }
         if let Some(task) = self.conn_task.take() {
             task.abort();
@@ -1128,9 +1008,9 @@ mod settings_tests {
 
         let mut preface = [0u8; 24];
         server_io.read_exact(&mut preface).await.expect("preface");
-        // Both clients send SETTINGS. Only Go HTTP sends opening connection
-        // credit; grpc-go starts at the protocol window. Read remaining frames
-        // in the common loop rather than blocking for a nonexistent update.
+        // our SETTINGS and WINDOW_UPDATE, then the server's SETTINGS so the
+        // client may open a stream
+        let _ = read_frame(&mut server_io).await;
         let _ = read_frame(&mut server_io).await;
         server_io
             .write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
@@ -1240,162 +1120,6 @@ mod settings_tests {
             [":method", ":scheme", ":path", ":authority"],
             "{names:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn grpc_empty_opening_and_bdp_credit_before_ping_then_growth() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        async fn write_frame(
-            io: &mut tokio::io::DuplexStream,
-            kind: u8,
-            flags: u8,
-            stream: u32,
-            data: &[u8],
-        ) {
-            let n = data.len() as u32;
-            let mut frame = Vec::from(&n.to_be_bytes()[1..]);
-            frame.extend_from_slice(&[kind, flags]);
-            frame.extend_from_slice(&stream.to_be_bytes());
-            frame.extend_from_slice(data);
-            io.write_all(&frame).await.unwrap();
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            let (client, mut server) = tokio::io::duplex(128 * 1024);
-            let task = tokio::spawn(async move {
-                let mut b = h2::client::Builder::new();
-                b.grpc_client_profile(true);
-                let (mut request, connection) = b.handshake::<_, Bytes>(client).await.unwrap();
-                let driver = tokio::spawn(async move {
-                    let _ = connection.await;
-                });
-                let (_response, _send) = request
-                    .send_request(
-                        http::Request::builder()
-                            .method("POST")
-                            .uri("http://example.com/bench/Tun")
-                            .body(())
-                            .unwrap(),
-                        false,
-                    )
-                    .unwrap();
-                let _driver = driver;
-                std::future::pending::<()>().await;
-            });
-            let mut preface = [0; 24];
-            server.read_exact(&mut preface).await.unwrap();
-            assert_eq!(&preface, b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
-            assert_eq!(read_frame(&mut server).await, (4, 0, 0, Vec::new()));
-            write_frame(&mut server, 4, 0, 0, &[]).await;
-            write_frame(&mut server, 4, 1, 0, &[]).await;
-            loop {
-                let f = read_frame(&mut server).await;
-                assert_ne!(f.0, 8, "no opening credit");
-                if f.0 == 1 {
-                    break;
-                }
-            }
-            write_frame(&mut server, 1, 4, 1, &[0x88]).await;
-            for _ in 0..3 {
-                write_frame(&mut server, 0, 0, 1, &vec![1; 16384]).await;
-            }
-            let mut credit = false;
-            loop {
-                let (kind, flags, stream, body) = read_frame(&mut server).await;
-                if kind == 8 && stream == 0 {
-                    assert_eq!(
-                        u32::from_be_bytes(body.as_slice().try_into().unwrap()),
-                        16384
-                    );
-                    credit = true;
-                }
-                if kind == 6 {
-                    assert!(credit);
-                    assert_eq!(flags, 0);
-                    assert_eq!(body, [2, 4, 16, 16, 9, 14, 7, 7]);
-                    write_frame(&mut server, 6, 1, 0, &body).await;
-                    break;
-                }
-            }
-            let mut grown = false;
-            loop {
-                let (kind, _, stream, body) = read_frame(&mut server).await;
-                if kind == 8 && stream == 0 && body == 32769u32.to_be_bytes() {
-                    grown = true;
-                }
-                if kind == 4 {
-                    assert!(grown, "connection credit before SETTINGS");
-                    assert_eq!(body, [0, 4, 0, 1, 128, 0]);
-                    break;
-                }
-            }
-            task.abort();
-        })
-        .await
-        .expect("bounded gRPC BDP exchange");
-    }
-
-    #[tokio::test]
-    async fn grpc_hpack_matches_go_literals_and_reuses_dynamic_path() {
-        use tokio::io::AsyncWriteExt;
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            for grpc in [false, true] {
-                let (client, mut server) = tokio::io::duplex(65536);
-                let task = tokio::spawn(async move {
-                    let mut b = h2::client::Builder::new();
-                    b.pseudo_header_order(h2::PseudoOrder::MethodSchemePathAuthority);
-                    if grpc {
-                        b.grpc_client_profile(true);
-                    }
-                    let (mut request, connection) = b.handshake::<_, Bytes>(client).await.unwrap();
-                    let _driver = tokio::spawn(async move {
-                        let _ = connection.await;
-                    });
-                    let mut keep = Vec::new();
-                    for _ in 0..2 {
-                        let req = http::Request::builder()
-                            .method("POST")
-                            .uri("http://localhost/bench/Tun")
-                            .header("te", "trailers")
-                            .body(())
-                            .unwrap();
-                        keep.push(request.send_request(req, false).unwrap());
-                    }
-                    std::future::pending::<()>().await;
-                });
-                let mut preface = [0; 24];
-                server.read_exact(&mut preface).await.unwrap();
-                server
-                    .write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
-                    .await
-                    .unwrap();
-                let mut blocks = Vec::new();
-                while blocks.len() < 2 {
-                    let (kind, _, _, body) = read_frame(&mut server).await;
-                    if kind == 1 {
-                        blocks.push(body);
-                    }
-                }
-                if grpc {
-                    assert_eq!(
-                        blocks[0],
-                        [
-                            0x83, 0x86, 0x45, 0x88, 0x62, 0x32, 0xd4, 0x49, 0xd8, 0xdf, 0x6d, 0x5f,
-                            0x41, 0x86, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0x40, 0x02, 0x74, 0x65,
-                            0x86, 0x4d, 0x83, 0x35, 0x05, 0xb1, 0x1f
-                        ]
-                    );
-                    assert_eq!(blocks[1], [0x83, 0x86, 0xc0, 0xbf, 0xbe]);
-                } else {
-                    assert_eq!(
-                        blocks[0][2], 0x04,
-                        "ordinary h2 keeps its existing path policy"
-                    );
-                }
-                task.abort();
-            }
-        })
-        .await
-        .expect("bounded HPACK exchange");
     }
 
     #[tokio::test]

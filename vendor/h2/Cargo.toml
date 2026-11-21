@@ -41,7 +41,7 @@ categories = [
     "web-programming",
     "network-programming",
 ]
-license = "MIT AND Apache-2.0"
+license = "MIT"
 repository = "https://github.com/hyperium/h2"
 
 [package.metadata.docs.rs]

@@ -295,34 +295,6 @@ impl<B: Buf> SendStream<B> {
         self.inner.capacity() as usize
     }
 
-    /// Requests bounded send credit and spends already assigned credit without
-    /// requiring a capacity-change notification. Equivalent to reserve,
-    /// capacity and (only at zero credit) poll_capacity, with one store lock.
-    pub fn poll_reserve_capacity(
-        &mut self,
-        cx: &mut Context,
-        requested: usize,
-    ) -> Poll<Option<Result<usize, crate::Error>>> {
-        self.inner
-            .poll_reserve_capacity(cx, requested.min(0x7fff_ffff) as WindowSize)
-            .map_ok(|n| n as usize)
-            .map_err(Into::into)
-    }
-
-    /// Sends only an already credited prefix, reserving and enqueuing it under
-    /// one stream-store lock. DATA boundaries and queue limits are unchanged.
-    /// The source is advanced by the queued prefix, just as split_to/send_data.
-    pub fn poll_send_bytes(
-        &mut self,
-        cx: &mut Context,
-        data: &mut Bytes,
-    ) -> Poll<Option<Result<usize, crate::Error>>>
-    where
-        B: From<Bytes>,
-    {
-        self.inner.poll_send_bytes(cx, data).map_err(Into::into)
-    }
-
     /// Requests to be notified when the stream's capacity increases.
     ///
     /// Before calling this, capacity should be requested with
@@ -439,12 +411,6 @@ impl RecvStream {
     /// Get the next data frame.
     pub async fn data(&mut self) -> Option<Result<Bytes, crate::Error>> {
         crate::poll_fn(move |cx| self.poll_data(cx)).await
-    }
-
-    /// Reserve stream credit for a grpc-go message read. A no-op outside
-    /// the opt-in gRPC client policy; connection credit remains independent.
-    pub fn grpc_start_message(&mut self, header: u32, body: u32) -> Result<(), crate::Error> {
-        self.inner.inner.grpc_start_message(header, body)
     }
 
     /// Get optional trailers for this stream.
