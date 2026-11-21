@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use smoltcp::socket::tcp::{Socket, SocketBuffer, State};
+use smoltcp::time::Duration as SmolDuration;
 
 pub(super) const SMALL_RECV: usize = 128 * 1024;
 pub(super) const SMALL_SEND: usize = 64 * 1024;
@@ -17,6 +18,16 @@ const TOTAL_EXTRA: usize = 32 * 1024 * 1024;
 const IDLE: Duration = Duration::from_secs(10);
 const RETRY: Duration = Duration::from_millis(250);
 const GROW_AT: usize = SMALL_SEND / 2;
+const AWG_SHORT_RTT: SmolDuration = SmolDuration::from_millis(8);
+const AWG_SHORT_RTT_RECV: usize = 1024 * 1024;
+
+fn awg_receive_limit(rtt: Option<SmolDuration>) -> usize {
+    if rtt.is_some_and(|rtt| rtt <= AWG_SHORT_RTT) {
+        AWG_SHORT_RTT_RECV
+    } else {
+        LARGE
+    }
+}
 
 // Independent halves prevent control connections from consuming either
 // allowance merely by connecting. RX leases last until the socket closes.
@@ -110,6 +121,7 @@ pub(super) struct ReceiveWindow<'a> {
     reservation: Option<Reservation<'a>>,
     received: usize,
     retry_at: Option<Instant>,
+    limit_short_rtt: bool,
 }
 
 impl ReceiveWindow<'static> {
@@ -119,6 +131,13 @@ impl ReceiveWindow<'static> {
 }
 
 impl<'a> ReceiveWindow<'a> {
+    pub(super) fn new(limit_short_rtt: bool) -> Self {
+        Self {
+            limit_short_rtt,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.retry_at
     }
@@ -138,13 +157,22 @@ impl<'a> ReceiveWindow<'a> {
             return;
         }
         self.retry_at = None;
-        let capacity = LARGE.min(socket.receive_window_capacity());
         if !matches!(
             socket.state(),
             State::Established | State::FinWait1 | State::FinWait2
-        ) || capacity <= socket.recv_capacity()
-            || self.received.saturating_add(socket.recv_queue()) < GROW_AT
+        ) || self.received.saturating_add(socket.recv_queue()) < GROW_AT
         {
+            return;
+        }
+        // Use the RTT available when bulk traffic first needs more credit.
+        // A retransmitted SYN can leave the estimator empty at connect time.
+        let limit = if self.limit_short_rtt {
+            awg_receive_limit(socket.smoothed_rtt())
+        } else {
+            LARGE
+        };
+        let capacity = limit.min(socket.receive_window_capacity());
+        if capacity <= socket.recv_capacity() {
             return;
         }
         // Charge all replacement storage while both rings exist. Never shrink
@@ -485,6 +513,44 @@ mod tests {
         drop(connection);
         drop(window);
         assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn awg_receive_limit_preserves_high_and_unknown_rtt() {
+        assert_eq!(awg_receive_limit(None), LARGE);
+        assert_eq!(
+            awg_receive_limit(Some(SmolDuration::from_millis(70))),
+            LARGE
+        );
+        assert_eq!(awg_receive_limit(Some(AWG_SHORT_RTT)), AWG_SHORT_RTT_RECV);
+        assert_eq!(
+            awg_receive_limit(Some(AWG_SHORT_RTT + SmolDuration::from_millis(1))),
+            LARGE
+        );
+    }
+
+    #[test]
+    fn awg_receive_window_uses_available_rtt_at_growth() {
+        let budget = Budget::new(LARGE);
+        let mut connection = Connected::new();
+        let mut window = ReceiveWindow::new(true);
+        let now = Instant::now();
+        let socket = connection.sender();
+        assert!(
+            socket
+                .smoothed_rtt()
+                .is_some_and(|rtt| rtt <= AWG_SHORT_RTT)
+        );
+        window.maintain_with(socket, now, GROW_AT - 1, &budget);
+        assert_eq!(socket.recv_capacity(), SMALL_RECV);
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        window.maintain_with(socket, now, 1, &budget);
+        assert_eq!(socket.recv_capacity(), AWG_SHORT_RTT_RECV);
+        assert_eq!(
+            budget.used.load(Ordering::Relaxed),
+            AWG_SHORT_RTT_RECV - SMALL_RECV
+        );
+        assert_eq!(socket.receive_window_capacity(), LARGE);
     }
 
     #[test]

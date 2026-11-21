@@ -27,7 +27,7 @@ define Package/xrust/Default
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=Routing and Redirection
-  TITLE:=High-performance pure-Rust proxy core (sing-box compatible)
+  TITLE:=High-performance pure-Rust proxy core
   URL:=https://github.com/Screamshow/xrust
   DEPENDS:=+ca-bundle +kmod-nft-tproxy +kmod-tun +ip-full
 endef
@@ -35,29 +35,24 @@ endef
 define Package/xrust
 $(call Package/xrust/Default)
   TITLE+= (Pure-Rust router edition)
-  PROVIDES:=sing-box
 endef
 
 define Package/xrust/description
  Xrust is a pure-Rust, zero-C-crypto proxy core for OpenWrt routers.
- It provides 100% sing-box compatibility with native CLI drop-in support,
- Clash REST API, transparent proxy (TProxy and TUN), and comprehensive
- protocol support (VLESS, VMess, Reality, Shadowsocks, WireGuard/AmneziaWG,
- Trojan, Hysteria2, TUIC, and direct steering).
+ It provides a native CLI, Clash REST API, transparent proxy (TProxy and TUN),
+ and router client support for VLESS, Trojan, Hysteria2, WireGuard and AmneziaWG.
 endef
 
 define Build/Compile/xrust
-	cargo build --release --target $(RUSTC_TARGET_ARCH)-unknown-linux-musl --bin xrust
+	cargo build --locked -p core-cli --no-default-features --features forkop-client --release --target $(RUSTC_TARGET_ARCH)-unknown-linux-musl --bin xrust
 endef
 
 define Package/xrust/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/target/$(RUSTC_TARGET_ARCH)-unknown-linux-musl/release/xrust $(1)/usr/bin/xrust
-	$(LN) xrust $(1)/usr/bin/sing-box
 
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/xrust.init $(1)/etc/init.d/xrust
-	$(LN) xrust $(1)/etc/init.d/sing-box
 
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/xrust.config $(1)/etc/config/xrust

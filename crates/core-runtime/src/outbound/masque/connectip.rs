@@ -173,23 +173,20 @@ pub(crate) fn decrement_hop_limit(b: &mut [u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Compose the outgoing CONNECT-IP datagram payload: context ID 0 varint
-/// followed by the (mutated) IP packet. Mutates `b` in place via
-/// [`decrement_hop_limit`].
-pub(crate) fn compose_datagram(b: &mut [u8]) -> Result<Vec<u8>, Error> {
-    decrement_hop_limit(b)?;
-    let mut out = Vec::with_capacity(1 + b.len());
-    put_varint(&mut out, 0);
-    out.extend_from_slice(b);
-    Ok(out)
+/// Compose the HTTP/3 DATAGRAM payload for request stream 0 and context 0.
+/// Decrement the hop limit in the wire copy so ICMP can quote the original.
+pub(super) fn compose_h3_datagram(packet: &[u8]) -> Result<Vec<u8>, Error> {
+    const IDS: [u8; 2] = [0, 0];
+    let mut wire = Vec::with_capacity(IDS.len() + packet.len());
+    wire.extend_from_slice(&IDS);
+    wire.extend_from_slice(packet);
+    decrement_hop_limit(&mut wire[IDS.len()..])?;
+    Ok(wire)
 }
 
-/// Snapshot of the datagram as the application sent it, capped at [`MIN_MTU`],
-/// for quoting in an ICMP packet-too-big reply after compose mutated the
-/// packet (SPEC 021 A3).
-pub(crate) fn snapshot_head(b: &[u8]) -> Vec<u8> {
-    let snap = b.len().min(usize::from(MIN_MTU));
-    b[..snap].to_vec()
+/// Unmodified datagram bytes to quote in an ICMP packet-too-big reply.
+pub(super) fn icmp_quote_head(packet: &[u8]) -> &[u8] {
+    &packet[..packet.len().min(usize::from(MIN_MTU))]
 }
 
 /// Strip the context ID varint from a received datagram payload and return the
@@ -690,60 +687,59 @@ mod tests {
     }
 
     #[test]
-    fn compose_decrements_ttl_and_prefixes_context_id() {
+    fn compose_h3_prefixes_ids_and_changes_only_the_wire_copy() {
         let mut pkt = rfc792_header();
+        pkt[8] = 64;
         let orig_csum = calculate_ipv4_checksum(&pkt);
         pkt[10..12].copy_from_slice(&orig_csum.to_be_bytes());
-        pkt[8] = 64;
-        let composed = compose_datagram(&mut pkt).unwrap();
-        assert_eq!(composed[0], 0);
-        assert_eq!(&composed[1..], &pkt[..]);
-        assert_eq!(pkt[8], 63);
-        let csum = u16::from_be_bytes([pkt[10], pkt[11]]);
+        let composed = compose_h3_datagram(&pkt).unwrap();
+        assert_eq!(composed.len(), 2 + pkt.len());
+        assert_eq!(&composed[..2], &[0, 0]);
+        let wire = &composed[2..];
+        assert_eq!(wire[8], 63);
+        let csum = u16::from_be_bytes([wire[10], wire[11]]);
         assert_ne!(csum, orig_csum);
-        assert_eq!(calculate_ipv4_checksum(&pkt[..20]), csum);
+        assert_eq!(calculate_ipv4_checksum(&wire[..20]), csum);
+        let mut original = wire.to_vec();
+        original[8] = 64;
+        original[10..12].copy_from_slice(&orig_csum.to_be_bytes());
+        assert_eq!(icmp_quote_head(&pkt), original);
     }
 
     #[test]
     fn compose_rejects_ttl_and_hop_limit_of_one() {
         let mut pkt = rfc792_header();
         pkt[8] = 1;
-        assert_eq!(compose_datagram(&mut pkt), Err(Error::TtlTooSmall(1)));
+        assert_eq!(compose_h3_datagram(&pkt), Err(Error::TtlTooSmall(1)));
         let mut pkt = rfc792_header();
         pkt[8] = 0;
-        assert_eq!(compose_datagram(&mut pkt), Err(Error::TtlTooSmall(0)));
+        assert_eq!(compose_h3_datagram(&pkt), Err(Error::TtlTooSmall(0)));
 
         let mut v6pkt = [0u8; 40];
         v6pkt[0] = 0x60;
         v6pkt[7] = 1;
-        assert_eq!(
-            compose_datagram(&mut v6pkt),
-            Err(Error::HopLimitTooSmall(1))
-        );
+        assert_eq!(compose_h3_datagram(&v6pkt), Err(Error::HopLimitTooSmall(1)));
         v6pkt[7] = 64;
-        assert_eq!(compose_datagram(&mut v6pkt).unwrap()[8], 63);
+        assert_eq!(compose_h3_datagram(&v6pkt).unwrap()[2 + 7], 63);
+        assert_eq!(icmp_quote_head(&v6pkt)[7], 64);
     }
 
     #[test]
     fn compose_rejects_bad_headers() {
-        let mut short = [0x45u8; 10];
+        let short = [0x45u8; 10];
         assert_eq!(
-            compose_datagram(&mut short),
+            compose_h3_datagram(&short),
             Err(Error::PacketTooShort("IPv4 packet too short"))
         );
-        let mut empty: [u8; 0] = [];
-        assert_eq!(compose_datagram(&mut empty), Err(Error::Empty));
-        let mut weird = [0x30u8; 40];
-        assert_eq!(
-            compose_datagram(&mut weird),
-            Err(Error::UnknownIpVersion(3))
-        );
+        assert_eq!(compose_h3_datagram(&[]), Err(Error::Empty));
+        let weird = [0x30u8; 40];
+        assert_eq!(compose_h3_datagram(&weird), Err(Error::UnknownIpVersion(3)));
 
         // IHL below the minimum (4 words -> 16 bytes).
         let mut ihl4 = rfc792_header();
         ihl4[0] = 0x44;
         assert_eq!(
-            compose_datagram(&mut ihl4),
+            compose_h3_datagram(&ihl4),
             Err(Error::InvalidHeaderLength(16))
         );
 
@@ -751,7 +747,7 @@ mod tests {
         let mut ihl15 = [0x4fu8; 24];
         ihl15[8] = 64;
         assert_eq!(
-            compose_datagram(&mut ihl15),
+            compose_h3_datagram(&ihl15),
             Err(Error::InvalidHeaderLength(60))
         );
     }
@@ -852,11 +848,11 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_caps_at_min_mtu() {
+    fn icmp_quote_caps_at_min_mtu() {
         let big = vec![0xaa; 2000];
-        assert_eq!(snapshot_head(&big).len(), 1280);
+        assert_eq!(icmp_quote_head(&big).len(), 1280);
         let small = vec![0xaa; 100];
-        assert_eq!(snapshot_head(&small).len(), 100);
+        assert_eq!(icmp_quote_head(&small).len(), 100);
     }
 
     #[test]

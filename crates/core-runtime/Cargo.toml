@@ -9,13 +9,13 @@ rust-version.workspace = true
 
 [features]
 default = ["full"]
-# Kept as an alias: packaging and test scripts build with
-# `--no-default-features --features rust-x`.
 rust-x = ["full"]
-full = [
+full = ["forkop-client", "server-inbounds"]
+forkop-client = [
     "clash-api",
-    "core-config/full",
+    "core-config/forkop-client",
 ]
+server-inbounds = ["core-config/server-inbounds"]
 clash-api = []
 allocstat = []
 

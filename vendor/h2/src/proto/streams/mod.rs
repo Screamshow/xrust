@@ -1,6 +1,7 @@
 mod buffer;
 mod counts;
 mod flow_control;
+mod grpc;
 mod prioritize;
 mod recv;
 mod send;
@@ -88,6 +89,7 @@ pub struct Config {
 
     /// xrust: see `FlowControl::set_min_refresh`
     pub recv_min_refresh: Option<WindowSize>,
+    pub grpc_client: Option<(bool, WindowSize)>,
 
     /// xrust: see `frame::PseudoOrder`
     pub pseudo_order: crate::frame::PseudoOrder,

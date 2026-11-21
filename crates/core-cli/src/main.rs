@@ -52,38 +52,13 @@ mod rule_set;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// The sing-box configuration this core is compatible with. Forkop X reads it
-/// from the version line to decide which sing-box features to configure.
-const CONFIG_BASELINE: &str = "1.14.2";
-
-/// Compatibility contract: Forkop X parses `sing-box version X` (generator.uc),
-/// recognises this core by the `-rust-x.` suffix, and reads the `Features:`
-/// (runtime.uc) and `Tags:` (ui.uc) lines.
-/// When invoked through the `sing-box` name we print that block, the same one
-/// the OpenWrt package has always shown; under our own name, `xrust <version>`.
-fn bin_invoked_as_sing_box() -> bool {
-    std::env::args()
-        .next()
-        .map(|arg0| {
-            Path::new(&arg0)
-                .file_stem()
-                .is_some_and(|name| name == "sing-box")
-        })
-        .unwrap_or(false)
-}
-
 fn version_line() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    if bin_invoked_as_sing_box() {
-        format!(
-            "sing-box version {CONFIG_BASELINE}-rust-x.{version}\n\
-             Xrust: {version}; configuration compatibility baseline: {CONFIG_BASELINE}\n\
-             Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended,outbound.transport-mark,transport.xhttp.split,transport.grpc.multi,tls.xray-pins,tls.verify-name\n\
-             Tags: with_utls,with_clash_api,with_tailscale\n"
-        )
-    } else {
-        format!("xrust {version}\n")
-    }
+    format!(
+        "xrust version {version}\n\
+         Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended,outbound.transport-mark,transport.xhttp.split,transport.grpc.multi,tls.xray-pins,tls.verify-name\n\
+         Tags: with_utls,with_clash_api,with_tailscale\n"
+    )
 }
 
 fn collect_dir_configs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -203,16 +178,8 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_run(args: &[String]) -> Result<(), String> {
-    let raw = load_config(args).map_err(|e| format!("run: {e}"))?;
-    core_runtime::route::rule_set_remote::remove_legacy_tsrs_cache();
     #[cfg(all(target_os = "linux", not(target_env = "msvc"), feature = "allocstat"))]
     allocstat::start();
-    if let Ok(warnings) = core_config::check_str_warnings(&raw) {
-        // the reference logs ResolveLX deprecations when the box starts
-        for warning in warnings {
-            eprintln!("WARN[0000] {warning}");
-        }
-    }
     // Sized to the cores we are actually allowed to run on. Left to itself tokio
     // reads `sched_getaffinity` at startup, which happens to be right on a router
     // and is a lie the moment something pins the process afterwards: the worker
@@ -267,7 +234,7 @@ fn cmd_reload_plan(args: &[String]) -> Result<(), String> {
     if skip_payloads {
         core_config::check_value_without_rule_set_payloads(&next)
     } else {
-        core_config::check_str(&raw)
+        core_config::validate::validate_with_warnings(&next).map(|_| ())
     }
     .map_err(|_| "reload-plan: candidate configuration rejected".to_string())?;
     let previous: serde_json::Value = serde_json::from_str(
@@ -717,16 +684,12 @@ fn main() -> ExitCode {
         "check" => cmd_check(&cmd_args),
         "reload-plan" => cmd_reload_plan(&cmd_args),
         "run" => cmd_run(&cmd_args),
-        #[cfg(any(feature = "rust-x", feature = "full"))]
-        "tailscale-exit-capability" | "tailscale-ssh-capability" => {
+        "tailscale-native-capability"
+        | "tailscale-exit-capability"
+        | "tailscale-ssh-capability" => {
             println!("1");
             Ok(())
         }
-        "tailscale-native-capability" => {
-            println!("1");
-            Ok(())
-        }
-        #[cfg(any(feature = "rust-x", feature = "full"))]
         "tailscale-luci" => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

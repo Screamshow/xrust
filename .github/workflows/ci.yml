@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
 
 # New commits supersede earlier CI runs on the same branch or PR.
@@ -30,6 +30,7 @@ jobs:
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo test --locked -p core-cli --no-default-features --features forkop-client --test run_smoke
       # The exit gate needs CAP_NET_ADMIN (tproxy); re-run it as root so CI
       # covers what the unprivileged `cargo test` above can only skip.
       - name: Exit gate (privileged)
@@ -96,7 +97,7 @@ jobs:
           if [ '${{ matrix.target }}' = mipsel-unknown-linux-musl ]; then
             bash scripts/build_mips_openwrt.sh
           else
-            cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
+            cargo build --locked -p core-cli --no-default-features --features forkop-client --release --target ${{ matrix.target }}
           fi
       - name: MIPS 24Kc runtime smoke
         if: ${{ matrix.target == 'mipsel-unknown-linux-musl' }}

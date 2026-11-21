@@ -4,6 +4,11 @@ use super::Tailscale;
 use std::{path::Path, sync::atomic::Ordering, time::Duration};
 const STATUS: &str = "/var/run/forkop/ui-state/tailscale-status.json";
 const AUTH: &str = "/var/run/forkop/ui-state/tailscale-auth";
+const NATIVE_BINARY: &str = "/usr/bin/xrust";
+#[cfg(feature = "full")]
+const LEGACY_BINARY: &str = "/usr/lib/rust-x/sing-box";
+#[cfg(feature = "full")]
+const LEGACY_VARIANT: &str = "/etc/forkop/sing-box-variant";
 fn safe_failure_reason(error: &std::io::Error) -> String {
     let reason = error.to_string();
     // Only fixed local protocol diagnostics may enter UI status. Never echo
@@ -30,14 +35,22 @@ fn safe_failure_reason(error: &std::io::Error) -> String {
         format!("{:?}", error.kind())
     }
 }
-fn compatible() -> bool {
-    std::fs::read_to_string("/etc/forkop/sing-box-variant").is_ok_and(|v| v.trim() == "rust-x")
-        && std::process::Command::new("/usr/lib/rust-x/sing-box")
+#[cfg(feature = "full")]
+fn legacy_compatible() -> bool {
+    std::fs::read_to_string(LEGACY_VARIANT).is_ok_and(|v| v.trim() == "rust-x")
+        && std::process::Command::new(LEGACY_BINARY)
             .arg("tailscale-native-capability")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|s| s.success())
+}
+
+fn compatible() -> bool {
+    let installed = Path::new(NATIVE_BINARY).is_file();
+    #[cfg(feature = "full")]
+    let installed = installed || legacy_compatible();
+    installed
         && std::process::Command::new("ucode")
             .args(["/usr/lib/forkop/tailscale/compat.uc", "check"])
             .stdout(std::process::Stdio::null())
@@ -66,12 +79,14 @@ fn file_stamp(_path: &str) -> Option<FileStamp> {
     None
 }
 
-/// Everything `compatible()` reads. The full check (three processes) runs
-/// again only when one of these files changes.
+/// Re-run the compatibility check only when its inputs change.
 fn compatibility_stamp() -> Vec<Option<FileStamp>> {
     [
-        "/etc/forkop/sing-box-variant",
-        "/usr/lib/rust-x/sing-box",
+        NATIVE_BINARY,
+        #[cfg(feature = "full")]
+        LEGACY_VARIANT,
+        #[cfg(feature = "full")]
+        LEGACY_BINARY,
         "/usr/lib/forkop/core/constants.uc",
         "/usr/lib/forkop/tailscale/compat.uc",
     ]

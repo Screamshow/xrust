@@ -628,6 +628,7 @@ impl SalamanderSocket {
         })
     }
 
+    #[cfg(any(feature = "server-inbounds", test))]
     pub(crate) fn listen(
         runtime: &dyn quinn::Runtime,
         udp: std::net::UdpSocket,

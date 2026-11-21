@@ -7,11 +7,9 @@ USE_PROCD=1
 
 NAME="xrust"
 PROG="/usr/bin/xrust"
-[ -x "$PROG" ] || PROG="/usr/bin/sing-box"
 
 DEFAULT_CONF="/etc/xrust/config.json"
-FALLBACK_CONF="/etc/sing-box/config.json"
-RUN_CONF="/tmp/sing-box/config.json"
+RUN_CONF="/tmp/xrust/config.json"
 
 get_config_path() {
 	if [ -f /sbin/uci ]; then
@@ -24,10 +22,6 @@ get_config_path() {
 	fi
 	if [ -f "$RUN_CONF" ]; then
 		echo "$RUN_CONF"
-		return
-	fi
-	if [ -f "$FALLBACK_CONF" ]; then
-		echo "$FALLBACK_CONF"
 		return
 	fi
 	echo "$DEFAULT_CONF"

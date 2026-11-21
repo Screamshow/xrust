@@ -7,6 +7,7 @@ use std::task::{Context, Poll};
 pub(crate) struct Settings {
     /// Our local SETTINGS sync state with the remote.
     local: Local,
+    grpc_client: bool,
     /// Received SETTINGS frame pending processing. The ACK must be written to
     /// the socket first then the settings applied **before** receiving any
     /// further frames.
@@ -28,11 +29,12 @@ enum Local {
 }
 
 impl Settings {
-    pub(crate) fn new(local: frame::Settings) -> Self {
+    pub(crate) fn new(local: frame::Settings, grpc_client: bool) -> Self {
         Settings {
             // We assume the initial local SETTINGS were flushed during
             // the handshake process.
             local: Local::WaitingAck(local),
+            grpc_client,
             remote: None,
             has_received_remote_initial_settings: false,
         }
@@ -50,6 +52,10 @@ impl Settings {
         C: Buf,
         P: Peer,
     {
+        if frame.is_ack() && self.grpc_client {
+            self.local = Local::Synced;
+            return Ok(());
+        }
         if frame.is_ack() {
             match &self.local {
                 Local::WaitingAck(local) => {
@@ -153,6 +159,9 @@ impl Settings {
                     return Poll::Pending;
                 }
 
+                if self.grpc_client {
+                    streams.apply_local_settings(settings)?;
+                }
                 // Buffer the settings frame
                 dst.buffer(settings.clone().into())
                     .expect("invalid settings frame");

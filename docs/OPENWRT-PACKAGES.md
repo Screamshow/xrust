@@ -1,6 +1,25 @@
 # Xrust OpenWrt packages
 
-For the 0.0.29 dev candidate, supported package architectures are
+The Forkop OpenWrt package builds use `cargo build --locked -p core-cli
+--no-default-features --features forkop-client --release` with the appropriate
+target. This profile omits the VLESS and Hysteria2 server listeners and their
+server transport code. The local proxy and interception listeners, Clash API,
+SRS rule sets, and supported proxy outbounds and tunnel endpoints remain enabled.
+Use the default Cargo features to build the standalone executable with server
+listeners.
+
+Packages for Forkop 3 ship the native executable at `/usr/bin/xrust`.
+`xrust version` reports `xrust version <release>` and the capability lines
+used by Forkop. The manifest sets `minimum_forkop_major: 3`. Forkop manages
+the router service and its configuration.
+
+During an upgrade, the published Forkop 2.7.6 updater installs the pinned Xrust
+package before replacing its own backend. It calls `/usr/bin/sing-box version`
+to verify the new core build. A small version-only script translates that call
+using the native executable's reported version. The previous Xrust archives
+provide the legacy layout when rolling back to 2.7.6.
+
+Supported package architectures are
 `aarch64_generic`, `aarch64_cortex-a53`, `aarch64_cortex-a73`, `x86_64` and
 `mipsel_24kc`, each in APK and IPK. MIPS additionally requires the firmware's
 `libc` and `libgcc`; no foreign firmware dependencies are bundled. MIPS uses

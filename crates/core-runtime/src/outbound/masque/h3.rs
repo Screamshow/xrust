@@ -20,8 +20,8 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use super::connectip::{
     CAPSULE_ADDRESS_ASSIGN, CAPSULE_ADDRESS_REQUEST, CAPSULE_ROUTE_ADVERTISEMENT, MIN_MTU, Prefix,
-    Route, compose_datagram, compose_icmp_too_large, encode_route_advertisement,
-    parse_address_assign, parse_context_id, parse_route_advertisement, snapshot_head,
+    Route, compose_h3_datagram, compose_icmp_too_large, encode_route_advertisement,
+    icmp_quote_head, parse_address_assign, parse_context_id, parse_route_advertisement,
     validate_incoming,
 };
 use super::hpack::Field;
@@ -53,6 +53,9 @@ const INITIAL_MTU: u16 = 1242;
 /// Memory quinn keeps for its datagram queue, not a read buffer, so it is a
 /// round 64 KiB rather than the 65_535-byte datagram maximum.
 const DATAGRAM_BUFFER: usize = 65_536;
+/// Let bursts of encapsulated TCP segments drain before Quinn evicts older packets.
+const STANDARD_DATAGRAM_BUFFER: usize = 512 * 1024;
+
 const STREAM_WINDOW: u64 = 8 << 20;
 const CONNECTION_WINDOW: u64 = 16 << 20;
 /// Bound for a single buffered frame payload (stream windows cap this).
@@ -123,8 +126,13 @@ impl H3Conn {
         let mut transport = quinn::TransportConfig::default();
         transport.keep_alive_interval(keep_alive);
         transport.initial_mtu(INITIAL_MTU);
-        transport.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));
-        transport.datagram_send_buffer_size(DATAGRAM_BUFFER);
+        let datagram_buffer = if *profile == Profile::standard() {
+            STANDARD_DATAGRAM_BUFFER
+        } else {
+            DATAGRAM_BUFFER
+        };
+        transport.datagram_receive_buffer_size(Some(datagram_buffer));
+        transport.datagram_send_buffer_size(datagram_buffer);
         transport.stream_receive_window(quinn::VarInt::from_u64(STREAM_WINDOW).unwrap());
         transport.receive_window(quinn::VarInt::from_u64(CONNECTION_WINDOW).unwrap());
         let quic_tls = tls
@@ -363,26 +371,26 @@ impl H3Conn {
             .ok_or_else(|| io::Error::other("masque h3: tunnel closed"))
     }
 
+    pub(crate) fn try_read_packet(&mut self) -> Option<Vec<u8>> {
+        self.rx.try_recv().ok()
+    }
+
     /// Send one outbound IP packet as an HTTP datagram. Returns an ICMP
     /// packet-too-big reply to inject locally when the datagram does not
     /// fit the path. Compose failures (short packet, TTL<=1, unknown
     /// version) drop the packet silently (reference `WritePacket`).
-    pub(crate) async fn write_packet(&mut self, pkt: &mut [u8]) -> io::Result<Option<Vec<u8>>> {
+    pub(super) fn write_packet(&self, pkt: &[u8]) -> io::Result<Option<Vec<u8>>> {
         if pkt.is_empty() {
             return Ok(None);
         }
-        let orig = snapshot_head(pkt);
-        let mut data = match compose_datagram(pkt) {
-            Ok(data) => data,
+        let wire = match compose_h3_datagram(pkt) {
+            Ok(wire) => wire,
             Err(_) => return Ok(None),
         };
-        let mut wire = Vec::with_capacity(data.len() + 1);
-        put_varint(&mut wire, 0); // quarter stream id of our request stream
-        wire.append(&mut data);
         match self.conn.send_datagram(Bytes::from(wire)) {
             Ok(()) => Ok(None),
             Err(quinn::SendDatagramError::TooLarge) => {
-                Ok(compose_icmp_too_large(&orig, MIN_MTU).ok())
+                Ok(compose_icmp_too_large(icmp_quote_head(pkt), MIN_MTU).ok())
             }
             Err(e) => Err(io::Error::other(format!("masque h3: send datagram: {e}"))),
         }

@@ -149,6 +149,10 @@ where
         self.framed_write().set_frame_per_write(on)
     }
 
+    pub(crate) fn set_grpc_buffered(&mut self) {
+        self.framed_write().set_grpc_buffered()
+    }
+
     pub(crate) fn finish_credit_pair(&mut self) {
         self.framed_write().finish_credit_pair();
     }

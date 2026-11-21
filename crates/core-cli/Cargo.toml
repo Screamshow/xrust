@@ -13,12 +13,15 @@ path = "src/main.rs"
 
 [features]
 default = ["full"]
-# Kept as an alias: packaging and test scripts build with
-# `--no-default-features --features rust-x`.
+# Retain the full profile for standalone builds and existing callers.
 rust-x = ["full"]
 full = [
     "core-config/full",
     "core-runtime/full",
+]
+forkop-client = [
+    "core-config/forkop-client",
+    "core-runtime/forkop-client",
 ]
 # counting allocator + per-second heap dump, see src/allocstat.rs
 allocstat = ["core-runtime/allocstat", "dep:portable-atomic"]

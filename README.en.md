@@ -234,7 +234,7 @@ Features are split into phases with automatic differential testing against the r
 
 ### Transition to a native config format
 
-**December 2026 — native format and our own storage.** Instead of parsing someone else's schema and inheriting its constraints, the core gets its own configuration format designed for router workloads, and its own on-flash state store (`/etc/tachyon/`) in place of scattered files and external paths. Rules, lists, and caches move into one predictable format that drags along neither foreign conventions nor extra dependencies.
+**December 2026 — native format and our own storage.** Instead of parsing someone else's schema and inheriting its constraints, the core gets its own configuration format designed for router workloads, and its own on-flash state store (`/etc/xrust/`) in place of scattered files and external paths. Rules, lists, and caches move into one predictable format that drags along neither foreign conventions nor extra dependencies.
 
 **New Year — sing-box config support is removed.** Reading sing-box configs stops being supported. To keep the transition from breaking existing installs, **the automatic migration ships together with F11, before 1 January**: on the first run of the new version, an old-format config is converted once in place, with a backup and a verification step. After that the core reads only its own format, and the dependency on a foreign schema is gone entirely.
 

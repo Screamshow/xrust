@@ -100,7 +100,7 @@ jobs:
           if [ '${{ matrix.name }}' = mipsel ]; then
             bash scripts/build_mips_openwrt.sh
           else
-            cargo build --locked --workspace --no-default-features --features rust-x --release --target ${{ matrix.target }}
+            cargo build --locked -p core-cli --no-default-features --features forkop-client --release --target ${{ matrix.target }}
           fi
 
       - name: MIPS 24Kc executable smoke test

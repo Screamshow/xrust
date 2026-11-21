@@ -12,11 +12,14 @@ use std::time::{Duration, Instant};
 
 use portable_atomic::AtomicU64;
 
+#[cfg(any(feature = "server-inbounds", test))]
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UdpSocket;
 
 use crate::dns::QueryMeta;
-use crate::inbound::{AnyWrite, Target};
+#[cfg(any(feature = "server-inbounds", test))]
+use crate::inbound::AnyWrite;
+use crate::inbound::Target;
 use crate::logging;
 use crate::route::{ConnContext, Decision, Router};
 
@@ -61,6 +64,7 @@ pub(crate) async fn recv_with<R>(
 struct FlowKey {
     source: SocketAddr,
     dest: SocketAddr,
+    #[cfg(any(feature = "server-inbounds", test))]
     hy2_session: Option<(u64, u32)>,
 }
 
@@ -69,6 +73,7 @@ impl FlowKey {
         Self {
             source,
             dest,
+            #[cfg(any(feature = "server-inbounds", test))]
             hy2_session: None,
         }
     }
@@ -280,10 +285,13 @@ pub(crate) enum DatagramFrame {
     Socks,
     /// `[len:u16][payload]`, which is what `vmess.Service`'s `serverPacketConn`
     /// reads and writes for the UDP command
+    #[cfg(any(feature = "server-inbounds", test))]
     LengthPrefixed,
     /// `[len:u16][address][port][payload]` (PacketAddr mode in sing-box / v2fly)
+    #[cfg(any(feature = "server-inbounds", test))]
     PacketAddr,
     /// Xray Mux.Cool Keep/Data reply, addressed by its session ID.
+    #[cfg(any(feature = "server-inbounds", test))]
     Xudp(u16),
 }
 
@@ -298,10 +306,12 @@ impl DatagramFrame {
         match self {
             DatagramFrame::Raw => out.extend_from_slice(payload),
             DatagramFrame::Socks => socks_udp_datagram(dest, payload, out),
+            #[cfg(any(feature = "server-inbounds", test))]
             DatagramFrame::LengthPrefixed => {
                 out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 out.extend_from_slice(payload);
             }
+            #[cfg(any(feature = "server-inbounds", test))]
             DatagramFrame::PacketAddr => {
                 let mut body =
                     Vec::with_capacity(crate::outbound::packet::MAX_ADDR_PORT + payload.len());
@@ -311,6 +321,7 @@ impl DatagramFrame {
                 out.extend_from_slice(&(body.len() as u16).to_be_bytes());
                 out.extend_from_slice(&body);
             }
+            #[cfg(any(feature = "server-inbounds", test))]
             DatagramFrame::Xudp(id) => {
                 let meta_len = if dest.is_ipv4() { 12u16 } else { 24u16 };
                 out.extend_from_slice(&meta_len.to_be_bytes());
@@ -342,6 +353,7 @@ pub(crate) struct TunReply {
     pub payload: Vec<u8>,
 }
 
+#[cfg(any(feature = "server-inbounds", test))]
 pub(crate) struct Hy2Reply {
     pub session_id: u32,
     pub src: SocketAddr,
@@ -358,11 +370,13 @@ pub(crate) enum Reply {
     /// reload gets `EADDRINUSE` (issue #5). The inbound owns the only strong
     /// handle, so aborting `serve` closes the port.
     Socket(Weak<UdpSocket>),
+    #[cfg(any(feature = "server-inbounds", test))]
     Stream(Arc<tokio::sync::Mutex<AnyWrite>>),
     #[allow(dead_code)]
     Tun {
         sender: tokio::sync::mpsc::Sender<TunReply>,
     },
+    #[cfg(any(feature = "server-inbounds", test))]
     Hy2 {
         connection_id: u64,
         session_id: u32,
@@ -379,14 +393,18 @@ fn live(socket: &Weak<UdpSocket>) -> io::Result<Arc<UdpSocket>> {
 
 impl Reply {
     fn flow_key(&self, source: SocketAddr, dest: SocketAddr) -> FlowKey {
-        let mut key = FlowKey::network(source, dest);
+        let key = FlowKey::network(source, dest);
+        #[cfg(any(feature = "server-inbounds", test))]
         if let Self::Hy2 {
             connection_id,
             session_id,
             ..
         } = self
         {
-            key.hy2_session = Some((*connection_id, *session_id));
+            return FlowKey {
+                hy2_session: Some((*connection_id, *session_id)),
+                ..key
+            };
         }
         key
     }
@@ -399,6 +417,7 @@ impl Reply {
     ) -> std::io::Result<()> {
         match self {
             Reply::Socket(socket) => live(socket)?.send_to(framed, source).await.map(|_| ()),
+            #[cfg(any(feature = "server-inbounds", test))]
             Reply::Stream(writer) => {
                 let mut writer = writer.lock().await;
                 writer.write_all(framed).await
@@ -411,6 +430,7 @@ impl Reply {
                 })
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "tun reply channel closed")),
+            #[cfg(any(feature = "server-inbounds", test))]
             Reply::Hy2 {
                 session_id, sender, ..
             } => sender
@@ -1090,6 +1110,7 @@ impl UdpHub {
 /// and no address in either direction, because the head carried it. The
 /// reference's vless and trojan inbounds wrap this the same way, and their
 /// inbounds listen on TCP only: there is no second socket to bind.
+#[cfg(any(feature = "server-inbounds", test))]
 pub(crate) async fn relay_stream_datagrams<S>(
     mut reader: S,
     writer: Arc<tokio::sync::Mutex<AnyWrite>>,
@@ -1127,6 +1148,7 @@ where
 
 /// The destination a UDP command's head has to name: an address, because the
 /// datagrams that follow carry none.
+#[cfg(any(feature = "server-inbounds", test))]
 pub(crate) fn udp_destination(destination: &Target) -> std::io::Result<SocketAddr> {
     match destination {
         Target::Ip(addr) => Ok(*addr),

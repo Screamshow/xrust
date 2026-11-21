@@ -14,13 +14,18 @@ use crate::logging;
 use crate::route::{ConnContext, Decision, Router, hijack_dns};
 
 pub mod direct;
+#[cfg(any(feature = "server-inbounds", test))]
 pub mod hysteria2;
 pub mod mixed;
+#[cfg(any(feature = "server-inbounds", test))]
 pub mod mux;
+#[cfg(any(feature = "server-inbounds", test))]
 pub mod proxy;
 pub mod redirect;
+#[cfg(any(feature = "server-inbounds", test))]
 pub mod tls;
 pub mod tproxy;
+#[cfg(any(feature = "server-inbounds", test))]
 pub(crate) mod transport;
 pub mod tun;
 pub(crate) mod udp;
@@ -127,6 +132,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + std::any::Any> ProxyStream for T
     }
 }
 pub type AnyStream = Box<dyn ProxyStream>;
+#[cfg(any(feature = "server-inbounds", test))]
 pub type AnyWrite = Box<dyn AsyncWrite + Send + Unpin>;
 
 /// Vision's peer can stop outer TLS encryption independently of our writes.
@@ -263,6 +269,7 @@ pub fn stream_alpn(stream: &AnyStream) -> Option<&[u8]> {
     if let Some(a) = any.downcast_ref::<AlpnStream>() {
         return a.alpn();
     }
+    #[cfg(any(feature = "server-inbounds", test))]
     if let Some(t) = any.downcast_ref::<crate::inbound::tls::TlsStream<tokio::net::TcpStream>>() {
         return t.alpn.as_deref();
     }

@@ -36,7 +36,11 @@ jobs:
           # Historical unsigned releases predate MIPS; keep backfill possible.
           cpus=aarch64,x86_64
           if [ -f "binaries/rust-x-mipsel-v$VERSION" ]; then cpus="$cpus,mipsel"; fi
-          sudo env SOURCE_DATE_EPOCH=0 python3 scripts/package_openwrt.py --binaries binaries --cpus "$cpus" --output dist --apk-tool "$APK_TOOL" --version "$VERSION" --source-commit "$BINARY_COMMIT"
+          layout=()
+          if ! git show "$BINARY_COMMIT:scripts/package_openwrt.py" 2>/dev/null | grep -Fx 'MINIMUM_FORKOP_MAJOR = 3' >/dev/null; then
+            layout+=(--legacy-layout)
+          fi
+          sudo env SOURCE_DATE_EPOCH=0 python3 scripts/package_openwrt.py --binaries binaries --cpus "$cpus" --output dist --apk-tool "$APK_TOOL" --version "$VERSION" --source-commit "$BINARY_COMMIT" "${layout[@]}"
           tar -czf dist/openwrt-packaging-source.tar.gz scripts/package_openwrt.py scripts/sign_openwrt.py scripts/openwrt_apk_tool.sh packaging
           cat binaries/SHA256SUMS dist/OPENWRT-SHA256SUMS | sort -u > dist/SHA256SUMS
           (cd dist && sha256sum openwrt-manifest.json openwrt-packaging-source.tar.gz >> SHA256SUMS)

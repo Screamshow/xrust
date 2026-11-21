@@ -17,10 +17,13 @@ mod tcp_window;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
@@ -35,7 +38,7 @@ use smoltcp::socket::tcp::{
 };
 use smoltcp::time::{Duration as SmolDuration, Instant as SmolInstant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address, Ipv6Address};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
@@ -486,8 +489,6 @@ impl WireGuard {
         let dst = resolve_target(target).await?;
         let shared = self.shared().await?;
         let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (local, remote) = tokio::io::duplex(CALLER_BUF);
-        let (caller_read, caller_write) = tokio::io::split(local);
         let (to_caller_tx, to_caller_rx) = mpsc::channel(REPLY_QUEUE);
         let (resp_tx, resp_rx) = oneshot::channel();
         let stalled = Arc::new(AtomicBool::new(false));
@@ -506,24 +507,29 @@ impl WireGuard {
 
         // caller → stack: forward reads as TCP data chunks.
         let cmd_tx = Arc::clone(&shared).cmd_tx.clone();
+        let reader = TcpReader {
+            replies: to_caller_rx,
+            pending: Vec::new(),
+            offset: 0,
+            read_burst: 0,
+            stalled,
+            wake: Arc::clone(&shared.wake),
+        };
+
         if let Some(receive_feedback) = shared.receive_feedback.clone() {
+            let (send, mut blocks) = mpsc::channel(CALLER_BUF / SCRATCH_BUF);
             tokio::spawn(async move {
-                let mut read = caller_read;
-                let mut buf = vec![0u8; SCRATCH_BUF];
                 let mut in_flight = handoff::InFlight::new(receive_feedback);
                 loop {
                     // Back-pressure persists while smoltcp has outstanding writes.
                     if in_flight.wait_for_room().await.is_err() {
                         return;
                     }
-                    let n = match read.read(&mut buf).await {
-                        Ok(n) if n != 0 => n,
-                        _ => {
-                            if in_flight.drain().await.is_ok() {
-                                let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
-                            }
-                            return;
+                    let Some(bytes) = blocks.recv().await else {
+                        if in_flight.drain().await.is_ok() {
+                            let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
                         }
+                        return;
                     };
                     // Both reads and channel permits can suspend the pump. Apply
                     // the latest feedback after both, dropping the permit before
@@ -542,7 +548,7 @@ impl WireGuard {
                         let (consumed, accepted) = oneshot::channel();
                         permit.send(Cmd::TcpData {
                             id,
-                            bytes: buf[..n].to_vec(),
+                            bytes,
                             consumed,
                         });
                         in_flight.push(accepted);
@@ -550,74 +556,55 @@ impl WireGuard {
                     }
                 }
             });
-        } else {
-            tokio::spawn(async move {
-                let mut read = caller_read;
-                let mut buf = vec![0u8; SCRATCH_BUF];
-                loop {
-                    match read.read(&mut buf).await {
-                        Ok(0) => {
-                            let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
+            let writer = BufferedUpload {
+                send: Some(send),
+                reserve: None,
+            };
+            wait_for_tcp_connect(resp_rx).await?;
+            return Ok(Box::new(tokio::io::join(reader, writer)));
+        }
+
+        // Dropping caller_write must wake the upload pump with EOF,
+        // including when the connect future is cancelled.
+        let (caller_read, caller_write) = tokio::io::duplex(CALLER_BUF);
+        tokio::spawn(async move {
+            let mut read = caller_read;
+            let mut buf = vec![0u8; SCRATCH_BUF];
+            loop {
+                match read.read(&mut buf).await {
+                    Ok(0) => {
+                        let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
+                        break;
+                    }
+                    Ok(n) => {
+                        let (consumed, accepted) = oneshot::channel();
+                        if cmd_tx
+                            .send(Cmd::TcpData {
+                                id,
+                                bytes: buf[..n].to_vec(),
+                                consumed,
+                            })
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
-                        Ok(n) => {
-                            let (consumed, accepted) = oneshot::channel();
-                            if cmd_tx
-                                .send(Cmd::TcpData {
-                                    id,
-                                    bytes: buf[..n].to_vec(),
-                                    consumed,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            // Do not keep draining the caller into an unbounded
-                            // per-socket queue while smoltcp's send buffer is full.
-                            if accepted.await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => {
-                            let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
+                        // Do not keep draining the caller into an unbounded
+                        // per-socket queue while smoltcp's send buffer is full.
+                        if accepted.await.is_err() {
                             break;
                         }
                     }
+                    Err(_) => {
+                        let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
+                        break;
+                    }
                 }
-            });
-        }
-
-        // stack → caller: pump replies with per-connection backpressure.
-        let wake = Arc::clone(&shared.wake);
-        tokio::spawn(async move {
-            let mut write = caller_write;
-            let mut replies = to_caller_rx;
-            while let Some(bytes) = replies.recv().await {
-                // A slot is free again. If the stack had to hold data back
-                // for want of one, its receive window is shut and only it can
-                // reopen it: wake it now rather than at the peer's next
-                // zero-window probe, which backs off to tens of seconds.
-                if stalled.swap(false, Ordering::SeqCst) {
-                    wake.notify_one();
-                }
-                if write.write_all(&bytes).await.is_err() {
-                    break;
-                }
-                let _ = write.flush().await;
             }
-            let _ = write.shutdown().await;
         });
 
-        match tokio::time::timeout(CONNECT_TIMEOUT, resp_rx).await {
-            Ok(Ok(Ok(()))) => Ok(Box::new(remote)),
-            Ok(Ok(Err(e))) => Err(io::Error::other(format!("wireguard: {e}"))),
-            Ok(Err(_)) => Err(io::Error::other("wireguard: stack task stopped")),
-            Err(_) => Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "wireguard: connect timeout",
-            )),
-        }
+        wait_for_tcp_connect(resp_rx).await?;
+        Ok(Box::new(tokio::io::join(reader, caller_write)))
     }
 
     pub async fn connect_udp(&self, target: &Target) -> io::Result<UdpSocket> {
@@ -668,6 +655,126 @@ impl WireGuard {
         });
 
         Ok(local)
+    }
+}
+
+async fn wait_for_tcp_connect(resp: oneshot::Receiver<Result<(), String>>) -> io::Result<()> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, resp).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => Err(io::Error::other(format!("wireguard: {e}"))),
+        Ok(Err(_)) => Err(io::Error::other("wireguard: stack task stopped")),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "wireguard: connect timeout",
+        )),
+    }
+}
+
+type BlockPermit = Result<mpsc::OwnedPermit<Vec<u8>>, mpsc::error::SendError<()>>;
+
+struct BufferedUpload {
+    send: Option<mpsc::Sender<Vec<u8>>>,
+    reserve: Option<Pin<Box<dyn Future<Output = BlockPermit> + Send>>>,
+}
+
+impl AsyncWrite for BufferedUpload {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let Some(send) = &self.send else {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        };
+        if bytes.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        let len = bytes.len().min(SCRATCH_BUF);
+        if self.reserve.is_none() {
+            match send.clone().try_reserve_owned() {
+                Ok(permit) => {
+                    permit.send(bytes[..len].to_vec());
+                    return Poll::Ready(Ok(len));
+                }
+                Err(mpsc::error::TrySendError::Full(send)) => {
+                    self.reserve = Some(Box::pin(send.reserve_owned()));
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                }
+            }
+        }
+        let result = ready!(
+            self.reserve
+                .as_mut()
+                .expect("block reservation")
+                .as_mut()
+                .poll(cx)
+        );
+        self.reserve = None;
+        let permit = result.map_err(|_| io::ErrorKind::BrokenPipe)?;
+        permit.send(bytes[..len].to_vec());
+        Poll::Ready(Ok(len))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.reserve = None;
+        self.send = None;
+        Poll::Ready(Ok(()))
+    }
+}
+
+const TCP_READ_BURST: usize = 64 * 1024;
+
+struct TcpReader {
+    replies: mpsc::Receiver<Vec<u8>>,
+    pending: Vec<u8>,
+    offset: usize,
+    read_burst: usize,
+    stalled: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
+}
+
+impl AsyncRead for TcpReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        // A continuously readable bulk stream must leave a turn for
+        // other connections sharing the relay's Tokio worker.
+        if self.read_burst >= TCP_READ_BURST {
+            self.read_burst = 0;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        if self.offset == self.pending.len() {
+            let Some(bytes) = ready!(self.replies.poll_recv(cx)) else {
+                return Poll::Ready(Ok(()));
+            };
+            self.pending = bytes;
+            self.offset = 0;
+            // The stack can reopen a full receive window as soon as a slot
+            // becomes free, without waiting for the peer's zero-window probe.
+            if self.stalled.swap(false, Ordering::SeqCst) {
+                self.wake.notify_one();
+            }
+        }
+
+        let len = buf.remaining().min(self.pending.len() - self.offset);
+        buf.put_slice(&self.pending[self.offset..self.offset + len]);
+        self.offset += len;
+        self.read_burst += len;
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -1323,10 +1430,16 @@ impl Stack {
                     return;
                 }
                 let handle = self.sockets.add(socket);
+                let limit_short_rtt = self
+                    .cfg
+                    .awg
+                    .as_ref()
+                    .and_then(|profile| profile.content_padding)
+                    .is_some_and(|(_, max)| max > 0);
                 self.tcp.insert(
                     id,
                     TcpConn {
-                        receive_window: tcp_window::ReceiveWindow::default(),
+                        receive_window: tcp_window::ReceiveWindow::new(limit_short_rtt),
                         send_window: tcp_window::SendWindow::default(),
                         handle,
                         dst,
@@ -2876,6 +2989,54 @@ mod tests {
             .retry_at
             .duration_since(Instant::now());
         assert!(delay >= Duration::from_secs(49) && delay < Duration::from_secs(51));
+    }
+
+    #[tokio::test]
+    async fn upload_shutdown_releases_a_pending_reservation_and_drains_accepted_data() {
+        use tokio::io::AsyncWriteExt;
+
+        let (send, mut blocks) = mpsc::channel(1);
+        let mut writer = BufferedUpload {
+            send: Some(send),
+            reserve: None,
+        };
+        assert_eq!(writer.write(b"accepted").await.unwrap(), 8);
+        let mut queued = Box::pin(writer.write(b"cancelled"));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(queued.as_mut().poll(cx).is_pending())).await
+        );
+        drop(queued);
+        writer.shutdown().await.unwrap();
+        assert_eq!(blocks.recv().await.unwrap().as_slice(), b"accepted");
+        assert!(blocks.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tcp_reader_wakes_stack_and_drains_partial_chunk_before_eof() {
+        let (tx, replies) = mpsc::channel(1);
+        let stalled = Arc::new(AtomicBool::new(true));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let mut reader = TcpReader {
+            replies,
+            pending: Vec::new(),
+            offset: 0,
+            read_burst: 0,
+            stalled: Arc::clone(&stalled),
+            wake: Arc::clone(&wake),
+        };
+        tx.try_send(b"first".to_vec()).unwrap();
+        let mut prefix = [0; 2];
+        reader.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"fi");
+        assert!(!stalled.load(Ordering::SeqCst));
+        tokio::time::timeout(Duration::from_secs(1), wake.notified())
+            .await
+            .unwrap();
+        tx.try_send(b"second".to_vec()).unwrap();
+        drop(tx);
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"rstsecond");
     }
 
     #[tokio::test]

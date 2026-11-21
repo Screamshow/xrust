@@ -51,6 +51,7 @@ pub struct FlowControl {
     /// the peer's window is smaller than that), as Go's x/net http2 does
     /// with its 4 KiB `inflowMinRefresh`, instead of a fraction of the window
     min_refresh: Option<WindowSize>,
+    fixed_refresh: bool,
 }
 
 impl FlowControl {
@@ -59,12 +60,23 @@ impl FlowControl {
             window_size: Window(0),
             available: Window(0),
             min_refresh: None,
+            fixed_refresh: false,
         }
     }
 
     /// xrust: see `min_refresh`.
     pub fn set_min_refresh(&mut self, min_refresh: Option<WindowSize>) {
         self.min_refresh = min_refresh;
+    }
+
+    pub fn set_grpc_refresh(&mut self, limit: WindowSize) {
+        self.min_refresh = Some(limit / 4);
+        self.fixed_refresh = true;
+    }
+
+    pub fn unclaimed_force(&self) -> Option<WindowSize> {
+        (self.available.0 > self.window_size.0)
+            .then(|| (self.available.0 - self.window_size.0) as u32)
     }
 
     /// Returns the window size as known by the peer
@@ -110,6 +122,7 @@ impl FlowControl {
 
         let unclaimed = available.0 - self.window_size.0;
         let threshold = match self.min_refresh {
+            Some(min) if self.fixed_refresh => min as i32,
             Some(min) => (min as i32).min(self.window_size.0.max(0)),
             None => self.window_size.0 / UNCLAIMED_DENOMINATOR * UNCLAIMED_NUMERATOR,
         };

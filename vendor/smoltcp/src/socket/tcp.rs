@@ -759,6 +759,13 @@ impl<'a> Socket<'a> {
         self.timeout
     }
 
+    /// Return the smoothed RTT estimate after the first usable sample.
+    pub fn smoothed_rtt(&self) -> Option<Duration> {
+        self.rtte
+            .have_measurement
+            .then(|| Duration::from_millis(u64::from(self.rtte.srtt)))
+    }
+
     /// Return the ACK delay duration.
     ///
     /// See also the [set_ack_delay](#method.set_ack_delay) method.

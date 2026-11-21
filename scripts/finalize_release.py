@@ -24,6 +24,9 @@ def validate(directory, version, signed=False):
     manifest = json.loads((directory / 'openwrt-manifest.json').read_text())
     if manifest['version'] != version:
         raise ValueError('Unexpected manifest version')
+    if ('minimum_forkop_major' in manifest and
+            (type(manifest['minimum_forkop_major']) is not int or manifest['minimum_forkop_major'] != 3)):
+        raise ValueError('Unexpected minimum Forkop version for a native Xrust package')
     assets = manifest['assets']
     required = {'x86_64', 'aarch64_cortex-a53'}
     supported = required | {'aarch64_cortex-a73', 'aarch64_generic', 'mipsel_24kc'}
@@ -93,8 +96,9 @@ def main():
         for name in names:
             run(*scp, f'{HOST}:{remote}/{name}', str(args.output / name))
         final = validate(args.output, version, signed=True)
-        if final['binary_source_commit'] != source:
-            raise ValueError('Source changed during signing')
+        if (final['binary_source_commit'] != source or
+                final.get('minimum_forkop_major') != manifest.get('minimum_forkop_major')):
+            raise ValueError('Source or package compatibility changed during signing')
         checksum = args.output / 'SHA256SUMS'
         checksum.write_text(''.join(f'{a["sha256"]}  {a["file"]}\n' for a in final['assets']))
         run('gh', 'release', 'upload', args.tag, '--repo', REPO, '--clobber',
@@ -108,7 +112,8 @@ def main():
             if remote_asset['size'] != local.stat().st_size or remote_asset.get('digest') != 'sha256:' + hashlib.sha256(local.read_bytes()).hexdigest():
                 raise ValueError(f'Uploaded asset verification failed: {name}')
         if args.publish:
-            run('gh', 'release', 'edit', args.tag, '--repo', REPO, '--draft=false')
+            latest = ('--latest=false',) if final.get('minimum_forkop_major') == 3 else ()
+            run('gh', 'release', 'edit', args.tag, '--repo', REPO, '--draft=false', *latest)
         print('Signed packages verified; ' + ('release published' if args.publish else 'release remains a draft'))
 
 

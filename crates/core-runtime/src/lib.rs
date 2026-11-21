@@ -394,6 +394,7 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));
             }
+            #[cfg(feature = "server-inbounds")]
             "vless" => {
                 let inbound = inbound::proxy::Vless::bind(obj, Arc::clone(&router))
                     .await
@@ -410,6 +411,7 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));
             }
+            #[cfg(feature = "server-inbounds")]
             "hysteria2" => {
                 let inbound = inbound::hysteria2::Hysteria2::bind(obj, Arc::clone(&router))
                     .await
@@ -417,6 +419,12 @@ async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::R
                 let addr = inbound.local_addr()?;
                 inbounds.push((tag.clone(), addr));
                 tasks.push(tokio::spawn(inbound.serve()));
+            }
+            #[cfg(not(feature = "server-inbounds"))]
+            "vless" | "hysteria2" | "hysteria" | "cloudflared" => {
+                anyhow::bail!(
+                    "inbounds[{i}]: inbound type {ty:?} is unavailable without server inbounds"
+                );
             }
             other => anyhow::bail!("inbounds[{i}]: inbound type {other:?} not implemented yet"),
         }
@@ -460,8 +468,13 @@ pub async fn run_str(raw: &str) -> anyhow::Result<()> {
 }
 
 fn checked_config(raw: &str) -> anyhow::Result<Value> {
-    core_config::check_str(raw).map_err(anyhow::Error::msg)?;
-    serde_json::from_str(raw).context("decode config")
+    let value = serde_json::from_str(raw).map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    for warning in
+        core_config::validate::validate_with_warnings(&value).map_err(anyhow::Error::msg)?
+    {
+        eprintln!("WARN[0000] {warning}");
+    }
+    Ok(value)
 }
 
 /// The full check of a reloaded file, except that local rule-set files the

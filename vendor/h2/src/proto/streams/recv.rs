@@ -15,6 +15,7 @@ use std::time::Instant;
 pub(super) struct Recv {
     /// xrust: see `FlowControl::set_min_refresh`
     min_refresh: Option<WindowSize>,
+    grpc: Option<Box<super::grpc::GrpcRecv>>,
 
     /// Initial window size of remote initiated streams
     init_window_sz: WindowSize,
@@ -120,10 +121,21 @@ impl Recv {
             .expect("invalid initial remote window size");
         flow.assign_capacity(DEFAULT_INITIAL_WINDOW_SIZE).unwrap();
         flow.set_min_refresh(config.recv_min_refresh);
+        if config.grpc_client.is_some() {
+            flow.set_grpc_refresh(DEFAULT_INITIAL_WINDOW_SIZE);
+        }
 
         Recv {
-            min_refresh: config.recv_min_refresh,
-            init_window_sz: DEFAULT_INITIAL_WINDOW_SIZE,
+            grpc: config
+                .grpc_client
+                .map(|(dynamic, limit)| Box::new(super::grpc::GrpcRecv::new(dynamic, limit))),
+            min_refresh: config
+                .grpc_client
+                .map(|(_, limit)| limit / 4)
+                .or(config.recv_min_refresh),
+            init_window_sz: config
+                .grpc_client
+                .map_or(DEFAULT_INITIAL_WINDOW_SIZE, |(_, limit)| limit),
             flow,
             in_flight_data: 0 as WindowSize,
             next_stream_id: Ok(next_stream_id.into()),
@@ -146,6 +158,12 @@ impl Recv {
     /// xrust: see `FlowControl::set_min_refresh`
     pub fn min_refresh(&self) -> Option<WindowSize> {
         self.min_refresh
+    }
+
+    pub fn grpc_configure_stream(&self, stream: &mut Stream) {
+        if self.grpc.is_some() {
+            stream.recv_flow.set_grpc_refresh(self.init_window_sz);
+        }
     }
 
     pub fn has_exact_credits(&self) -> bool {
@@ -522,6 +540,9 @@ impl Recv {
             self.in_flight_data,
         );
 
+        if self.grpc.is_some() {
+            return;
+        }
         // Decrement in-flight data
         self.in_flight_data -= capacity;
 
@@ -557,12 +578,30 @@ impl Recv {
 
         // Assign capacity to stream
         // TODO: proper error handling
-        let _res = stream.recv_flow.assign_capacity(capacity);
+        let repay = if self.grpc.is_some() {
+            let extra = capacity.min(stream.grpc_delta);
+            stream.grpc_delta -= extra;
+            capacity - extra
+        } else {
+            capacity
+        };
+        let _res = stream.recv_flow.assign_capacity(repay);
         debug_assert!(_res.is_ok());
 
         if stream.recv_flow.unclaimed_capacity().is_some() {
-            // Queue the stream for sending the WINDOW_UPDATE frame.
-            self.pending_window_updates.push(stream);
+            if let Some(grpc) = &mut self.grpc {
+                // grpc-go fixes the increment when onRead crosses limit/4,
+                // rather than coalescing it later with other application reads.
+                let n = stream.recv_flow.unclaimed_capacity().unwrap();
+                stream
+                    .recv_flow
+                    .inc_window(n)
+                    .expect("valid consumed credit");
+                grpc.controls
+                    .push_back(super::grpc::Control::Credit(stream.id, n));
+            } else {
+                self.pending_window_updates.push(stream);
+            }
 
             if let Some(task) = task.take() {
                 task.wake();
@@ -705,6 +744,10 @@ impl Recv {
         //
         // Update the flow controller with the difference between the new
         // target and the current target.
+        if let Some(grpc) = &mut self.grpc {
+            grpc.conn_limit = target;
+            self.flow.set_grpc_refresh(target);
+        }
         let current = self
             .flow
             .available()
@@ -739,6 +782,9 @@ impl Recv {
         if let Some(target) = settings.initial_window_size() {
             let old_sz = self.init_window_sz;
             self.init_window_sz = target;
+            if self.grpc.is_some() {
+                self.min_refresh = Some(target / 4);
+            }
 
             tracing::trace!("update_initial_window_size; new={}; old={}", target, old_sz,);
 
@@ -758,6 +804,9 @@ impl Recv {
             // flow-controlled frames until it receives WINDOW_UPDATE frames that
             // cause the flow-control window to become positive.
 
+            if self.grpc.is_some() {
+                store.for_each(|mut stream| stream.recv_flow.set_grpc_refresh(target));
+            }
             match target.cmp(&old_sz) {
                 Ordering::Less => {
                     // We must decrease the (local) window on every open stream.
@@ -937,6 +986,134 @@ impl Recv {
         Ok(())
     }
 
+    fn grpc_received(&mut self, size: WindowSize) {
+        let grpc = self.grpc.as_mut().expect("gRPC receive policy");
+        let ping = grpc.add(size);
+        let credit = if ping {
+            self.flow.unclaimed_force()
+        } else {
+            self.flow.unclaimed_capacity()
+        };
+        if let Some(n) = credit {
+            self.flow.inc_window(n).expect("repaid connection capacity");
+            grpc.controls
+                .push_back(super::grpc::Control::Credit(StreamId::ZERO, n));
+        }
+        if ping {
+            grpc.controls.push_back(super::grpc::Control::Ping);
+        }
+    }
+
+    pub fn grpc_pong(&mut self, payload: [u8; 8], store: &mut Store) -> Result<(), proto::Error> {
+        let Some(target) = self.grpc.as_mut().and_then(|g| g.pong(payload)) else {
+            return Ok(());
+        };
+        let grpc = self.grpc.as_mut().expect("gRPC receive policy");
+        // Growth is separate from unacked receive credit, as in trInFlow.newLimit.
+        let delta = target.saturating_sub(grpc.conn_limit);
+        if delta > 0 {
+            self.flow
+                .assign_capacity(delta)
+                .map_err(proto::Error::library_go_away)?;
+            self.flow
+                .inc_window(delta)
+                .map_err(proto::Error::library_go_away)?;
+            grpc.conn_limit = target;
+            self.flow.set_grpc_refresh(target);
+            grpc.controls
+                .push_back(super::grpc::Control::Credit(StreamId::ZERO, delta));
+        }
+        let mut settings = frame::Settings::default();
+        settings.set_initial_window_size(Some(target));
+        self.apply_local_settings(&settings, store)?;
+        self.grpc
+            .as_mut()
+            .unwrap()
+            .controls
+            .push_back(super::grpc::Control::Settings(target));
+        Ok(())
+    }
+
+    pub fn grpc_prepare_message(
+        &mut self,
+        size: WindowSize,
+        stream: &mut store::Ptr,
+        task: &mut Option<Waker>,
+    ) -> Result<(), Reason> {
+        if self.grpc.is_none() {
+            return Ok(());
+        }
+        let n = size.min(MAX_WINDOW_SIZE);
+        let untransmitted = i64::from(n) - i64::from(stream.in_flight_recv_data);
+        if untransmitted <= i64::from(stream.recv_flow.window_size()) {
+            return Ok(());
+        }
+        let delta = n.min(MAX_WINDOW_SIZE - self.init_window_sz);
+        if delta == 0 {
+            return Ok(());
+        }
+        // Validate atomically before accepting untrusted message length credit.
+        let mut flow = stream.recv_flow;
+        flow.assign_capacity(delta)?;
+        flow.inc_window(delta)?;
+        stream.recv_flow = flow;
+        stream.grpc_delta = delta;
+        self.grpc
+            .as_mut()
+            .unwrap()
+            .controls
+            .push_back(super::grpc::Control::Credit(stream.id, delta));
+        if let Some(task) = task.take() {
+            task.wake();
+        }
+        Ok(())
+    }
+
+    pub fn grpc_pending(&self) -> bool {
+        self.grpc
+            .as_ref()
+            .is_some_and(|g| g.flushing || !g.controls.is_empty())
+    }
+
+    pub fn grpc_flushed(&mut self) {
+        if let Some(g) = &mut self.grpc {
+            g.flushing = false;
+        }
+    }
+
+    pub fn buffer_grpc<T, B>(
+        &mut self,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> io::Result<BufferStatus>
+    where
+        T: AsyncWrite + Unpin,
+        B: Buf,
+    {
+        let Some(g) = &mut self.grpc else {
+            return Ok(BufferStatus::Complete);
+        };
+        while !g.controls.is_empty() {
+            if !dst.has_send_capacity() {
+                return Ok(BufferStatus::CodecFull);
+            }
+            let frame = match g.controls.pop_front().unwrap() {
+                super::grpc::Control::Credit(id, n) => frame::WindowUpdate::new(id, n).into(),
+                super::grpc::Control::Ping => {
+                    g.sent();
+                    frame::Ping::new(super::grpc::BDP_PING).into()
+                }
+                super::grpc::Control::Settings(n) => {
+                    let mut s = frame::Settings::default();
+                    s.set_initial_window_size(Some(n));
+                    s.into()
+                }
+            };
+            dst.buffer(frame).expect("valid gRPC control frame");
+            g.flushing = true;
+        }
+        Ok(BufferStatus::Complete)
+    }
+
     pub fn ignore_data(&mut self, sz: WindowSize) -> Result<(), Error> {
         // Ensure that there is enough capacity on the connection...
         self.consume_connection_window(sz)?;
@@ -968,6 +1145,13 @@ impl Recv {
 
         // Track the data as in-flight
         self.in_flight_data += sz;
+        if self.grpc.is_some() {
+            self.in_flight_data -= sz;
+            self.flow
+                .assign_capacity(sz)
+                .map_err(proto::Error::library_go_away)?;
+            self.grpc_received(sz);
+        }
         Ok(())
     }
 
@@ -1298,6 +1482,9 @@ impl Recv {
         T: AsyncWrite + Unpin,
         B: Buf,
     {
+        if self.buffer_grpc(dst)? == BufferStatus::CodecFull {
+            return Ok(BufferStatus::CodecFull);
+        }
         // A normal send/receive progress turn follows each pair. A continuously
         // refilled credit queue must not starve upload DATA or other streams.
         if self.exact_yield_to_send {
@@ -1545,6 +1732,7 @@ mod tests {
             local_max_error_reset_streams: None,
             data_frame_budget: DEFAULT_DATA_FRAME_BUDGET,
             recv_min_refresh: None,
+            grpc_client: None,
             pseudo_order: crate::frame::PseudoOrder::default(),
         };
         let mut recv = Recv::new(peer::Dyn::Server, &config);

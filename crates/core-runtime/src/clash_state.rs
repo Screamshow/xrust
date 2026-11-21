@@ -36,39 +36,36 @@ struct Shared {
     start: Instant,
     upload: AtomicU64,
     download: AtomicU64,
-    closed: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+    close: CloseSignal,
 }
 
 /// Cloneable close signal: the relay loop waits on it, the controller sets it.
 #[derive(Clone)]
-pub struct CloseSignal {
-    closed: Arc<AtomicBool>,
-    notify: Arc<Notify>,
+pub struct CloseSignal(Arc<CloseState>);
+
+struct CloseState {
+    closed: AtomicBool,
+    notify: Notify,
 }
 
 impl CloseSignal {
     pub(crate) fn close(&self) {
-        trigger(&self.closed, &self.notify);
+        self.0.closed.store(true, Ordering::Release);
+        self.0.notify.notify_waiters();
     }
 
     /// Resolves once the connection is marked closed.
     pub async fn wait(&self) {
         loop {
-            let notified = self.notify.notified();
+            let notified = self.0.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.closed.load(Ordering::Acquire) {
+            if self.0.closed.load(Ordering::Acquire) {
                 return;
             }
             notified.await;
         }
     }
-}
-
-fn trigger(closed: &AtomicBool, notify: &Notify) {
-    closed.store(true, Ordering::Release);
-    notify.notify_waiters();
 }
 
 fn registry() -> &'static Mutex<HashMap<u64, Arc<Shared>>> {
@@ -115,8 +112,10 @@ impl ConnHandle {
             start: Instant::now(),
             upload: AtomicU64::new(0),
             download: AtomicU64::new(0),
-            closed: Arc::new(AtomicBool::new(false)),
-            notify: Arc::new(Notify::new()),
+            close: CloseSignal(Arc::new(CloseState {
+                closed: AtomicBool::new(false),
+                notify: Notify::new(),
+            })),
         });
         if let Ok(mut guard) = registry().lock() {
             guard.insert(id, Arc::clone(&shared));
@@ -130,14 +129,11 @@ impl ConnHandle {
 
     /// Close signal for `select!` in the relay loop.
     pub fn close_signal(&self) -> CloseSignal {
-        CloseSignal {
-            closed: Arc::clone(&self.shared.closed),
-            notify: Arc::clone(&self.shared.notify),
-        }
+        self.shared.close.clone()
     }
 
     pub fn is_closed(&self) -> bool {
-        self.shared.closed.load(Ordering::Acquire)
+        self.shared.close.0.closed.load(Ordering::Acquire)
     }
 
     pub fn add_upload(&self, bytes: u64) {
@@ -207,7 +203,7 @@ pub fn close(id: u64) -> bool {
         .and_then(|guard| guard.get(&id).cloned());
     match entry {
         Some(entry) => {
-            trigger(&entry.closed, &entry.notify);
+            entry.close.close();
             true
         }
         None => false,
@@ -233,7 +229,7 @@ pub(crate) fn switch_group(
             entry.scope.as_ref().is_some_and(|s| Arc::ptr_eq(s, &scope))
                 && entry.meta.chains.iter().any(|tag| tag == group)
         }) {
-            trigger(&entry.closed, &entry.notify);
+            entry.close.close();
         }
     }
 }
@@ -245,7 +241,7 @@ pub fn close_all() -> usize {
         .map(|guard| guard.values().cloned().collect())
         .unwrap_or_default();
     for entry in &entries {
-        trigger(&entry.closed, &entry.notify);
+        entry.close.close();
     }
     entries.len()
 }

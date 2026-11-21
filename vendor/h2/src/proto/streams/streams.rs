@@ -184,6 +184,32 @@ where
         }
     }
 
+    pub fn poll_grpc_control<T>(
+        &mut self,
+        cx: &mut Context,
+        dst: &mut Codec<T, Prioritized<B>>,
+    ) -> Poll<io::Result<()>>
+    where
+        T: AsyncWrite + Unpin,
+    {
+        loop {
+            let (status, pending) = {
+                let mut me = self.inner.lock().unwrap();
+                let status = me.actions.recv.buffer_grpc(dst)?;
+                (status, me.actions.recv.grpc_pending())
+            };
+            if status == BufferStatus::CodecFull {
+                ready!(dst.poll_ready(cx))?;
+                continue;
+            }
+            if !pending {
+                return Poll::Ready(Ok(()));
+            }
+            ready!(dst.flush(cx))?;
+            self.inner.lock().unwrap().actions.recv.grpc_flushed();
+        }
+    }
+
     pub fn clear_expired_reset_streams(&mut self) {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
@@ -350,6 +376,7 @@ where
         stream
             .recv_flow
             .set_min_refresh(me.actions.recv.min_refresh());
+        me.actions.recv.grpc_configure_stream(&mut stream);
 
         if *request.method() == Method::HEAD {
             stream.content_length = ContentLength::Head;
@@ -438,6 +465,12 @@ impl<B> DynStreams<'_, B> {
     pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         me.recv_data(self.peer, self.send_buffer, frame)
+    }
+
+    pub fn grpc_pong(&mut self, payload: [u8; 8]) -> Result<(), Error> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        me.actions.recv.grpc_pong(payload, &mut me.store)
     }
 
     pub fn recv_reset(&mut self, frame: frame::Reset) -> Result<(), Error> {
@@ -1223,6 +1256,44 @@ where
 // ===== impl StreamRef =====
 
 impl<B> StreamRef<B> {
+    pub fn poll_send_bytes(
+        &mut self,
+        cx: &Context,
+        data: &mut Bytes,
+    ) -> Poll<Option<Result<usize, UserError>>>
+    where
+        B: Buf + From<Bytes>,
+    {
+        if data.is_empty() {
+            return Poll::Ready(Some(Ok(0)));
+        }
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+        let mut stream = me.store.resolve(self.opaque.key);
+        me.actions.send.reserve_capacity(
+            data.len().min(0x7fff_ffff) as WindowSize,
+            &mut stream,
+            &mut me.counts,
+        );
+        let mut available = me.actions.send.capacity(&mut stream);
+        if available == 0 {
+            available = match me.actions.send.poll_capacity(cx, &mut stream) {
+                Poll::Ready(Some(Ok(n))) => n,
+                other => return other.map(|r| r.map(|r| r.map(|n| n as usize))),
+            };
+        }
+        let n = data.len().min(available as usize);
+        let frame = frame::Data::new(stream.id, B::from(data.split_to(n)));
+        let actions = &mut me.actions;
+        let mut send_buffer = self.send_buffer.inner.lock().unwrap();
+        let result = me.counts.transition(stream, |counts, stream| {
+            actions
+                .send
+                .send_data(frame, &mut send_buffer, stream, counts, &mut actions.task)
+        });
+        Poll::Ready(Some(result.map(|()| n)))
+    }
+
     pub fn send_data(&mut self, data: B, end_stream: bool) -> Result<(), UserError>
     where
         B: Buf,
@@ -1451,6 +1522,27 @@ impl<B> StreamRef<B> {
         me.actions.send.capacity(&mut stream)
     }
 
+    /// The reserve/current-credit/wait sequence under one store lock. This
+    /// keeps the same queue bound and wakes as the separate public operations.
+    pub fn poll_reserve_capacity(
+        &mut self,
+        cx: &Context,
+        requested: WindowSize,
+    ) -> Poll<Option<Result<WindowSize, UserError>>> {
+        let mut me = self.opaque.inner.lock().unwrap();
+        let me = &mut *me;
+        let mut stream = me.store.resolve(self.opaque.key);
+        me.actions
+            .send
+            .reserve_capacity(requested, &mut stream, &mut me.counts);
+        let available = me.actions.send.capacity(&mut stream);
+        if available != 0 {
+            Poll::Ready(Some(Ok(available)))
+        } else {
+            me.actions.send.poll_capacity(cx, &mut stream)
+        }
+    }
+
     /// Request to be notified when the stream's capacity increases
     pub fn poll_capacity(&mut self, cx: &Context) -> Poll<Option<Result<WindowSize, UserError>>> {
         let mut me = self.opaque.inner.lock().unwrap();
@@ -1602,6 +1694,32 @@ impl OpaqueStreamRef {
 
     /// Releases recv capacity back to the peer. This may result in sending
     /// WINDOW_UPDATE frames on both the stream and connection.
+    pub fn grpc_start_message(
+        &mut self,
+        header: WindowSize,
+        body: WindowSize,
+    ) -> Result<(), crate::Error> {
+        let mut me = self.inner.lock().unwrap();
+        let me = &mut *me;
+        let mut stream = me.store.resolve(self.key);
+        if header < 5 || header > stream.in_flight_recv_data {
+            return Err(UserError::ReleaseCapacityTooBig.into());
+        }
+        // One store lock, preserving header -> body grant -> protobuf-header
+        // consumption order and the exact WINDOW_UPDATE increments.
+        me.actions
+            .recv
+            .release_capacity(5, &mut stream, &mut me.actions.task)?;
+        me.actions
+            .recv
+            .grpc_prepare_message(body, &mut stream, &mut me.actions.task)
+            .map_err(proto::Error::library_go_away)?;
+        me.actions
+            .recv
+            .release_capacity(header - 5, &mut stream, &mut me.actions.task)?;
+        Ok(())
+    }
+
     pub fn release_capacity(&mut self, capacity: WindowSize) -> Result<(), UserError> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;

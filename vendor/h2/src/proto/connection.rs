@@ -47,6 +47,7 @@ where
 
     /// Ping/pong handler
     ping_pong: PingPong,
+    grpc_client: bool,
 
     /// Connection settings
     settings: Settings,
@@ -86,6 +87,7 @@ pub(crate) struct Config {
     pub data_frame_budget: usize,
     /// xrust: see `FlowControl::set_min_refresh`
     pub recv_min_refresh: Option<WindowSize>,
+    pub grpc_client: Option<(bool, WindowSize)>,
     /// xrust: see `frame::PseudoOrder`
     pub pseudo_order: frame::PseudoOrder,
 }
@@ -134,7 +136,8 @@ where
                 initial_max_send_streams: config.initial_max_send_streams,
                 local_max_buffer_size: config.max_send_buffer_size,
                 local_next_stream_id: config.next_stream_id,
-                local_push_enabled: config.settings.is_push_enabled().unwrap_or(true),
+                local_push_enabled: config.grpc_client.is_none()
+                    && config.settings.is_push_enabled().unwrap_or(true),
                 extended_connect_protocol_enabled: config
                     .settings
                     .is_extended_connect_protocol_enabled()
@@ -150,6 +153,7 @@ where
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
                 data_frame_budget: config.data_frame_budget,
                 recv_min_refresh: config.recv_min_refresh,
+                grpc_client: config.grpc_client,
                 pseudo_order: config.pseudo_order,
             }
         }
@@ -163,7 +167,8 @@ where
                 error: None,
                 go_away: GoAway::new(),
                 ping_pong: PingPong::new(),
-                settings: Settings::new(config.settings),
+                grpc_client: config.grpc_client.is_some(),
+                settings: Settings::new(config.settings, config.grpc_client.is_some()),
                 streams,
                 span,
                 _phantom: PhantomData,
@@ -219,6 +224,9 @@ where
         let _e = span.enter();
         // The order of these calls don't really matter too much
         ready!(self.inner.ping_pong.send_pending_pong(cx, &mut self.codec))?;
+        if self.inner.grpc_client {
+            ready!(self.inner.streams.poll_grpc_control(cx, &mut self.codec))?;
+        }
         ready!(self.inner.ping_pong.send_pending_ping(cx, &mut self.codec))?;
         ready!(self
             .inner
@@ -294,6 +302,10 @@ where
     /// xrust: see `FramedWrite::set_frame_per_write`.
     pub(crate) fn set_frame_per_write(&mut self, on: bool) {
         self.codec.set_frame_per_write(on);
+    }
+
+    pub(crate) fn set_grpc_buffered(&mut self) {
+        self.codec.set_grpc_buffered();
     }
 
     pub(crate) fn take_user_pings(&mut self) -> Option<UserPings> {
@@ -589,6 +601,9 @@ where
             }
             Some(Ping(frame)) => {
                 tracing::trace!(?frame, "recv PING");
+                if frame.is_ack() {
+                    self.streams.grpc_pong(*frame.payload())?;
+                }
                 let status = self.ping_pong.recv_ping(frame);
                 if status.is_shutdown() {
                     assert!(

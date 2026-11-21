@@ -8,7 +8,7 @@ TARGET_TRIPLE="${TARGET_TRIPLE:-x86_64-unknown-linux-musl}"
 FULL_LIMIT=12582912    # 12 MiB
 
 echo "=== Building xrust (release) ==="
-cargo build --workspace --no-default-features --features rust-x --release --target "$TARGET_TRIPLE"
+cargo build --locked -p core-cli --no-default-features --features forkop-client --release --target "$TARGET_TRIPLE"
 FULL_BIN="$TARGET_DIR/$TARGET_TRIPLE/release/xrust"
 
 if [[ ! -f "$FULL_BIN" ]]; then

@@ -18,6 +18,22 @@ use serde_json::json;
 /// the whole run more than a test that fails.
 const STARTUP: Duration = Duration::from_secs(30);
 
+#[test]
+fn tailscale_capabilities_are_available() {
+    for command in [
+        "tailscale-native-capability",
+        "tailscale-exit-capability",
+        "tailscale-ssh-capability",
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
+            .arg(command)
+            .output()
+            .expect("query Tailscale capability");
+        assert!(output.status.success(), "{command}");
+        assert_eq!(output.stdout, b"1\n", "{command}");
+    }
+}
+
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("a free port")
@@ -127,6 +143,31 @@ fn check_accepts_what_run_takes() {
     );
 }
 
+#[cfg(all(feature = "forkop-client", not(feature = "full")))]
+#[test]
+fn forkop_client_rejects_remote_inbounds() {
+    for kind in ["vless", "hysteria2", "hysteria", "cloudflared"] {
+        let path = write_config(
+            &format!("forkop-client-{}-{kind}", std::process::id()),
+            &json!({"inbounds": [{"type": kind}]}),
+        );
+        for command in ["check", "run"] {
+            let output = Command::new(env!("CARGO_BIN_EXE_xrust"))
+                .args([command, "-c"])
+                .arg(&path)
+                .output()
+                .expect("run xrust");
+            assert!(!output.status.success(), "{command} accepted {kind}");
+            let expected = format!(
+                "inbounds[0]: inbound type {kind:?} is unavailable without server inbounds"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(&expected), "{command}: {stderr}");
+        }
+        std::fs::remove_file(path).expect("remove test config");
+    }
+}
+
 /// A config that does not exist is an error with a message, not a silent success
 /// and not a panic.
 #[test]
@@ -158,38 +199,9 @@ fn version_is_the_shape_forkop_parses() {
         .expect("run version");
     assert!(output.status.success());
     let said = String::from_utf8_lossy(&output.stdout);
-    let expected = env!("CARGO_PKG_VERSION");
-    assert!(
-        said.contains(expected),
-        "`version` said {said:?}, which does not carry {expected}"
-    );
-}
-
-/// Run as `sing-box`, as the OpenWrt package installs it, the binary prints
-/// the block Forkop X parses: the version line with the configuration
-/// baseline and the `-rust-x.` suffix, then the features and tags lines.
-#[test]
-fn version_as_sing_box_is_the_block_forkop_parses() {
-    let dir = std::env::temp_dir().join(format!("xrust-as-sing-box-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    let link = dir.join("sing-box");
-    let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_xrust"), &link).expect("symlink");
-    let output = Command::new(&link)
-        .arg("version")
-        .output()
-        .expect("run version");
-    let _ = std::fs::remove_file(&link);
-    let _ = std::fs::remove_dir(&dir);
-    assert!(output.status.success());
-    let said = String::from_utf8_lossy(&output.stdout);
     let version = env!("CARGO_PKG_VERSION");
     let lines: Vec<&str> = said.lines().collect();
-    assert_eq!(
-        lines[0],
-        format!("sing-box version 1.14.2-rust-x.{version}"),
-        "{said}"
-    );
+    assert_eq!(lines[0], format!("xrust version {version}"), "{said}");
     // Forkop X turns features on by these tokens: the order is kept and new
     // ones go at the end
     assert!(
@@ -198,7 +210,10 @@ fn version_as_sing_box_is_the_block_forkop_parses() {
         ),
         "{said}"
     );
-    assert!(lines.iter().any(|l| l.starts_with("Tags:")), "{said}");
+    assert!(
+        lines.contains(&"Tags: with_utls,with_clash_api,with_tailscale"),
+        "{said}"
+    );
 }
 
 #[test]

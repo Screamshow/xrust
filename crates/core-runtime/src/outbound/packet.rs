@@ -124,6 +124,7 @@ pub(crate) fn put_addr_port(out: &mut Vec<u8>, target: &Target) -> io::Result<()
 }
 
 /// `AddressSerializer.ReadAddrPort`
+#[cfg(any(feature = "server-inbounds", test))]
 pub(crate) fn take_addr_port(buf: &[u8]) -> io::Result<(Target, &[u8])> {
     let Some(&ty) = buf.first() else {
         return Err(io::Error::other("packet encoding: truncated address"));

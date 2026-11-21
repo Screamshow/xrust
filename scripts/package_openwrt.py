@@ -24,6 +24,23 @@ TARGETS = [
     ('mipsel', 'mipsel_24kc', 1, 8),
 ]
 
+NATIVE_BINARY = 'usr/bin/xrust'
+MINIMUM_FORKOP_MAJOR = 3
+# Published 2.7.6 verifies the pinned core through this exact command before
+# it installs the new Forkop backend. There is no legacy run or check path.
+VERSION_HANDOFF = b"""#!/bin/sh
+[ "$#" -eq 1 ] && [ "$1" = version ] || exit 1
+banner="$(/usr/bin/xrust version)" || exit 1
+first="${banner%%'
+'*}"
+case "$first" in
+    'xrust version '*) version="${first#xrust version }" ;;
+    *) exit 1 ;;
+esac
+case "$version" in ''|*[!0-9.]*) exit 1 ;; esac
+printf 'sing-box version 1.14.2-rust-x.%s\\n' "$version"
+"""
+
 
 def validate_elf(binary, cpu, elf_class, machine):
     if (len(binary) < 52 or binary[:6] != b'\x7fELF' + bytes([elf_class, 1]) or
@@ -60,7 +77,7 @@ if [ -x /etc/init.d/forkop ] && /etc/init.d/forkop status >/dev/null 2>&1; then
 fi
 exit 0
 '''
-NATIVE_START = b'''#!/bin/sh
+LEGACY_START = b'''#!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
 if [ -f /var/run/forkop/rust-x-package-restart ] && [ -x /etc/init.d/forkop ]; then
     /etc/init.d/forkop start && rm -f /var/run/forkop/rust-x-package-restart
@@ -71,6 +88,35 @@ if [ -f /etc/forkop-tailscale/enabled ] && [ -x /etc/init.d/forkop-tailscale ] &
 fi
 exit 0
 '''
+
+NATIVE_START = b'''#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+# The native package is installed before the Forkop 3 backend during migration.
+[ -f /usr/lib/forkop/xrust/binary.uc ] || exit 0
+if [ -f /var/run/forkop/rust-x-package-restart ] && [ -x /etc/init.d/forkop ]; then
+    /etc/init.d/forkop start && rm -f /var/run/forkop/rust-x-package-restart
+fi
+if [ -f /etc/forkop-tailscale/enabled ] && [ -x /etc/init.d/forkop-tailscale ]; then
+    /etc/init.d/forkop-tailscale start || true
+fi
+exit 0
+'''
+
+def package_payload(binary, metadata, legacy_layout):
+    if legacy_layout:
+        metadata['configuration_baseline'] = '1.14.2'
+        files = [('usr/lib/rust-x/sing-box', binary, 0o755),
+                 ('usr/bin/sing-box', b'#!/bin/sh\nexec /usr/lib/rust-x/sing-box "$@"\n', 0o755)]
+        for path in ['etc/init.d/sing-box', 'etc/config/sing-box']:
+            mode = 0o755 if 'init.d' in path else 0o644
+            files.append((path, (ROOT/'packaging/files'/path).read_bytes(), mode))
+    else:
+        metadata['minimum_forkop_major'] = MINIMUM_FORKOP_MAJOR
+        files = [(NATIVE_BINARY, binary, 0o755), ('usr/bin/sing-box', VERSION_HANDOFF, 0o755)]
+    metadata['packed'] = False
+    files.append(('usr/share/rust-x/build.json', (json.dumps(metadata, indent=2)+'\n').encode(), 0o644))
+    return files
+
 
 def tar_bytes(files):
     stream = io.BytesIO()
@@ -93,6 +139,8 @@ def main():
     p.add_argument('--version', required=True)
     p.add_argument('--revision', type=int, default=1)
     p.add_argument('--source-commit', required=True)
+    p.add_argument('--legacy-layout', action='store_true',
+                   help='preserve the package layout for historical unsigned binary releases')
     p.add_argument('--cpus', default='aarch64,x86_64,mipsel',
                    help='comma-separated subset of aarch64,x86_64,mipsel (default: all)')
     a = p.parse_args(); a.output.mkdir(parents=True, exist_ok=True)
@@ -107,17 +155,10 @@ def main():
         dependencies = DEPENDENCIES + (['libc', 'libgcc'] if cpu == 'mipsel' else [])
         metadata = dict(package='rust-x', version=a.version, package_revision=a.revision,
                         architecture=arch, source_commit=a.source_commit,
-                        binary_bytes=len(binary), binary_sha256=hashlib.sha256(binary).hexdigest(),
-                        configuration_baseline='1.14.2', packed=False)
-        # The binary, installed under the sing-box name, prints the version
-        # block Forkop X reads itself.
-        wrapper = b'''#!/bin/sh
-exec /usr/lib/rust-x/sing-box "$@"
-'''
-        files = [('usr/lib/rust-x/sing-box', binary, 0o755), ('usr/bin/sing-box', wrapper, 0o755),
-                 ('usr/share/rust-x/build.json', (json.dumps(metadata, indent=2)+'\n').encode(), 0o644)]
-        for path in ['etc/init.d/sing-box', 'etc/config/sing-box']:
-            files.append((path, (ROOT/'packaging/files'/path).read_bytes(), 0o755 if 'init.d' in path else 0o644))
+                        binary_bytes=len(binary), binary_sha256=hashlib.sha256(binary).hexdigest())
+        files = package_payload(binary, metadata, a.legacy_layout)
+        postinst = LEGACY_START if a.legacy_layout else NATIVE_START
+        provides = 'Provides: sing-box\n' if a.legacy_layout else ''
         size = sum(len(data) for _, data, _ in files)
         control = f'''Package: rust-x
 Version: {a.version}-{a.revision}
@@ -125,16 +166,19 @@ Architecture: {arch}
 Installed-Size: {size}
 Depends: {', '.join(dependencies)}
 Conflicts: {', '.join(CONFLICTS)}
-Provides: sing-box
-Section: net
+{provides}Section: net
 License: GPL-3.0-only
 Maintainer: Screamshow
 Source: https://github.com/Screamshow/xrust
 Description: Xrust router core for Forkop
 '''
+        control_files = [('control', control.encode(), 0o644), ('prerm', NATIVE_STOP, 0o755),
+                         ('postinst', postinst, 0o755)]
+        if a.legacy_layout:
+            control_files.append(('conffiles', b'/etc/config/sing-box\n', 0o644))
         ipk = a.output/f'rust-x_{a.version}-{a.revision}_{arch}.ipk'
         ipk.write_bytes(tar_bytes([('debian-binary', b'2.0\n', 0o644),
-            ('control.tar.gz', tar_bytes([('control', control.encode(), 0o644), ('conffiles', b'/etc/config/sing-box\n', 0o644), ('prerm', NATIVE_STOP, 0o755), ('postinst', NATIVE_START, 0o755)]), 0o644),
+            ('control.tar.gz', tar_bytes(control_files), 0o644),
             ('data.tar.gz', tar_bytes(files), 0o644)]))
         apk = a.output/f'rust-x_{a.version}-r{a.revision}_{arch}.apk'
         with tempfile.TemporaryDirectory(prefix='rust-x-package-') as temp:
@@ -143,14 +187,15 @@ Description: Xrust router core for Forkop
                 f = payload/name; f.parent.mkdir(parents=True, exist_ok=True); f.write_bytes(data); f.chmod(mode)
             meta = payload/'lib/apk/packages'; meta.mkdir(parents=True)
             (meta/'rust-x.list').write_text(''.join('/'+n+'\n' for n, _, _ in files))
-            for suffix in ['conffiles', 'conffiles_static']:
-                (meta/f'rust-x.{suffix}').write_text('/etc/config/sing-box\n')
+            if a.legacy_layout:
+                for suffix in ['conffiles', 'conffiles_static']:
+                    (meta/f'rust-x.{suffix}').write_text('/etc/config/sing-box\n')
             for f in [payload, *payload.rglob('*')]:
                 if f.is_dir(): f.chmod(0o755)
                 elif f.parent == meta: f.chmod(0o644)
                 os.utime(f, (0, 0))
             cmd = [a.apk_tool, 'mkpkg', '--files', str(payload), '--output', str(apk.resolve())]
-            for hook, content in [('pre-upgrade', NATIVE_STOP), ('pre-deinstall', NATIVE_STOP), ('post-upgrade', NATIVE_START), ('post-install', NATIVE_START)]:
+            for hook, content in [('pre-upgrade', NATIVE_STOP), ('pre-deinstall', NATIVE_STOP), ('post-upgrade', postinst), ('post-install', postinst)]:
                 script = Path(temp)/hook
                 script.write_bytes(content)
                 script.chmod(0o755)
@@ -158,7 +203,9 @@ Description: Xrust router core for Forkop
             fields = dict(name='rust-x', version=f'{a.version}-r{a.revision}', arch=arch,
                           description='Xrust router core for Forkop', license='GPL-3.0-only',
                           origin='rust-x', maintainer='Screamshow', url='https://github.com/Screamshow/xrust',
-                          depends=' '.join(dependencies + ['!'+c for c in CONFLICTS]), provides='sing-box')
+                          depends=' '.join(dependencies + ['!'+c for c in CONFLICTS]))
+            if a.legacy_layout:
+                fields['provides'] = 'sing-box'
             for key, value in fields.items(): cmd += ['-I', f'{key}:{value}']
             if os.geteuid() == 0:
                 for f in [payload, *payload.rglob('*')]: os.chown(f, 0, 0)
@@ -174,8 +221,12 @@ Description: Xrust router core for Forkop
                 architecture=arch, format=package.suffix[1:], file=package.name,
                 size=package.stat().st_size, installed_size=installed_size, binary_bytes=len(binary),
                 sha256=hashlib.sha256(package.read_bytes()).hexdigest(), dependencies=dependencies))
-    (a.output/'openwrt-manifest.json').write_text(json.dumps(dict(version=a.version, binary_source_commit=a.source_commit,
-        packaging_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), apk_signed=False, assets=assets), indent=2)+'\n')
+    manifest = dict(version=a.version, binary_source_commit=a.source_commit,
+                    packaging_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    apk_signed=False, assets=assets)
+    if not a.legacy_layout:
+        manifest['minimum_forkop_major'] = MINIMUM_FORKOP_MAJOR
+    (a.output/'openwrt-manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
     (a.output/'OPENWRT-SHA256SUMS').write_text(''.join(f'{x["sha256"]}  {x["file"]}\n' for x in assets))
 
 if __name__ == '__main__': main()

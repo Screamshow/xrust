@@ -564,6 +564,11 @@ impl Transport {
             Kind::Grpc { .. } => h2io::grpc_client_builder(),
             _ => h2io::client_builder(),
         };
+        let stream = if matches!(self.kind, Kind::Grpc { .. }) {
+            h2io::grpc_buffered(stream)
+        } else {
+            stream
+        };
         h2io::h2_handshake(stream, &builder, label).await
     }
 
@@ -1353,6 +1358,7 @@ impl WsStream {
     /// The server end: same codec, no mask on the way out. Frames coming *in* are
     /// masked either way, and the reader has always known how to unmask them, so
     /// one codec serves both directions and the handshake is the only difference.
+    #[cfg(any(feature = "server-inbounds", test))]
     pub(crate) fn server(inner: AnyStream) -> Self {
         Self::with_masking(inner, false)
     }

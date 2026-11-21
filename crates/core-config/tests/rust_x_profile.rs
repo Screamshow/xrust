@@ -1,6 +1,19 @@
 use core_config::check_str;
 
 #[test]
+#[cfg(not(feature = "full"))]
+fn forkop_client_rejects_endpoints_it_cannot_start() {
+    for protocol in ["openvpn-server", "openconnect"] {
+        let config = serde_json::json!({"endpoints": [{"type": protocol}]});
+        let error = check_str(&config.to_string()).unwrap_err();
+        assert!(
+            error.contains("unavailable in the Forkop client"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn reality_pq_preference_passes_the_full_config_check() {
     let mut config = serde_json::json!({"outbounds":[{"type":"vless","tag":"node",
         "server":"127.0.0.1","server_port":443,"uuid":"00000000-0000-0000-0000-000000000001",

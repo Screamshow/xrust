@@ -336,6 +336,7 @@ pub struct Builder {
 
     /// xrust: write like Go's x/net http2 client, see `go_client_writes`
     go_client_writes: bool,
+    grpc_client: Option<bool>,
 
     /// xrust: see `window_update_min_refresh`
     recv_min_refresh: Option<u32>,
@@ -676,6 +677,7 @@ impl Builder {
             initial_max_send_streams: usize::MAX,
             settings: Default::default(),
             go_client_writes: false,
+            grpc_client: None,
             recv_min_refresh: None,
             pseudo_order: crate::frame::PseudoOrder::default(),
             stream_id: 1.into(),
@@ -1140,6 +1142,15 @@ impl Builder {
         self
     }
 
+    /// Use grpc-go client receive flow control and BDP probing. Other h2
+    /// clients retain their existing policy. `dynamic` is false for explicit
+    /// static-window overrides. This does not enable idle keepalive PINGs.
+    pub fn grpc_client_profile(&mut self, dynamic: bool) -> &mut Self {
+        self.grpc_client = Some(dynamic);
+        self.go_client_writes = true;
+        self
+    }
+
     /// xrust: send a WINDOW_UPDATE as soon as `bytes` of received data are
     /// released (or the peer's window drops below that), for the connection
     /// and every stream, like Go's x/net http2 (`inflowMinRefresh`, 4 KiB),
@@ -1402,6 +1413,12 @@ where
             .buffer(builder.settings.clone().into())
             .expect("invalid SETTINGS frame");
 
+        let grpc_client = builder.grpc_client.map(|dynamic| {
+            (
+                dynamic,
+                builder.settings.initial_window_size().unwrap_or(65_535),
+            )
+        });
         let inner = proto::Connection::new(
             codec,
             proto::Config {
@@ -1417,6 +1434,7 @@ where
                     .data_frame_budget
                     .resolve(builder.initial_target_connection_window_size),
                 recv_min_refresh: builder.recv_min_refresh,
+                grpc_client,
                 pseudo_order: builder.pseudo_order,
             },
         );
@@ -1436,7 +1454,12 @@ where
             std::future::poll_fn(|cx| connection.inner.poll_flush_handshake(cx))
                 .await
                 .map_err(crate::Error::from)?;
-            connection.inner.set_frame_per_write(true);
+            connection
+                .inner
+                .set_frame_per_write(builder.grpc_client.is_none());
+            if builder.grpc_client.is_some() {
+                connection.inner.set_grpc_buffered();
+            }
         }
 
         Ok((send_request, connection))

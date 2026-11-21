@@ -40,6 +40,8 @@ const EGRESS_BUF_MAX: usize = 1 << 20;
 
 /// Packets taken off the queue per flush round.
 const LEG_BATCH_MAX: usize = 32;
+/// Bound the work between caller command and timer checks.
+const H3_INGRESS_BATCH_MAX: usize = 32;
 
 /// Stack tunables for a CONNECT-IP tunnel.
 pub(crate) struct StackCfg {
@@ -66,14 +68,20 @@ impl Leg {
         }
     }
 
-    /// Write a batch packet by packet. Takes the batch by value: H3/H2 need
-    /// mutable access per packet, the caller refills its queue after.
+    fn try_read_h3_packet(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Leg::H3(conn) => conn.try_read_packet(),
+            Leg::H2(_) => None,
+        }
+    }
+
+    /// Write a batch packet by packet, collecting local ICMP replies.
     async fn write_packets(&mut self, pkts: Vec<Vec<u8>>) -> io::Result<Vec<Vec<u8>>> {
         match self {
             Leg::H3(conn) => {
                 let mut icmp = Vec::new();
-                for mut pkt in pkts {
-                    if let Some(reply) = conn.write_packet(&mut pkt).await? {
+                for pkt in pkts {
+                    if let Some(reply) = conn.write_packet(&pkt)? {
                         icmp.push(reply);
                     }
                 }
@@ -479,7 +487,7 @@ impl Stack {
     }
 
     fn maintain_tcp(&mut self) -> bool {
-        let mut drained_receive_window = false;
+        let mut needs_egress = false;
         let ids: Vec<u32> = self.tcp.keys().copied().collect();
         for id in ids {
             let Some(mut conn) = self.tcp.remove(&id) else {
@@ -514,11 +522,13 @@ impl Stack {
                     match sock.send_slice(front) {
                         Ok(0) => break,
                         Ok(n) if n >= front.len() => {
+                            needs_egress = true;
                             if let Some((_, consumed)) = conn.from_caller.pop_front() {
                                 let _ = consumed.send(());
                             }
                         }
                         Ok(n) => {
+                            needs_egress = true;
                             let rest = front.split_off(n);
                             *front = rest;
                         }
@@ -537,7 +547,7 @@ impl Stack {
                         match sock.recv_slice(&mut rbuf) {
                             Ok(0) => break,
                             Ok(n) => {
-                                drained_receive_window = true;
+                                needs_egress = true;
                                 if let Some(to_caller) = &conn.to_caller {
                                     match to_caller.try_send(rbuf[..n].to_vec()) {
                                         Ok(()) => {}
@@ -561,7 +571,9 @@ impl Stack {
                 // FIN follows every accepted byte, including data still queued
                 // behind smoltcp's full send ring. Reading the reply stays open.
                 if conn.caller_eof && conn.from_caller.is_empty() {
+                    let before = sock.state();
                     sock.close();
+                    needs_egress |= before != sock.state();
                 }
                 sock.state()
             };
@@ -615,7 +627,7 @@ impl Stack {
                 self.tcp.insert(id, conn);
             }
         }
-        drained_receive_window
+        needs_egress
     }
 
     fn idle_expired(&self) -> bool {
@@ -624,7 +636,7 @@ impl Stack {
             .is_some_and(|d| self.last_activity.elapsed() >= d)
     }
 
-    fn next_deadline(&self) -> tokio::time::Instant {
+    fn next_deadline(&mut self) -> tokio::time::Instant {
         let now = Instant::now();
         let mut best: Option<Instant> = None;
         let mut consider = |t: Instant| {
@@ -644,6 +656,13 @@ impl Stack {
         }
         if let Some(idle) = self.cfg.idle_timeout {
             consider(self.last_activity + idle);
+        }
+        // Delayed ACKs, retransmissions and other socket timers can become
+        // due while both the tunnel and the caller are waiting for input.
+        if let Some(delay) = self.iface.poll_delay(SmolInstant::now(), &self.sockets) {
+            consider(
+                now + Duration::from_micros(delay.total_micros()).max(Duration::from_millis(1)),
+            );
         }
         let deadline = match best {
             Some(t) if t <= now => now + Duration::from_millis(50),
@@ -710,6 +729,13 @@ pub(crate) async fn run(
     };
 
     loop {
+        for _ in 0..H3_INGRESS_BATCH_MAX - 1 {
+            let Some(pkt) = leg.try_read_h3_packet() else {
+                break;
+            };
+            stack.on_tunnel_packet(pkt);
+            stack.last_activity = Instant::now();
+        }
         while let Ok(cmd) = rx.try_recv() {
             stack.process_cmd(cmd);
             stack.last_activity = Instant::now();
@@ -717,9 +743,14 @@ pub(crate) async fn run(
         stack.maintain_tcp();
         stack.poll_stack();
         if stack.maintain_tcp() {
-            stack
+            // An incoming ACK may have made room for another upload block.
+            // Flush everything newly queued, including window updates and FIN.
+            let now = SmolInstant::now();
+            while stack
                 .iface
-                .poll_egress(SmolInstant::now(), &mut stack.device, &mut stack.sockets);
+                .poll_egress(now, &mut stack.device, &mut stack.sockets)
+                != PollResult::None
+            {}
         }
         stack.flush_leg(&mut leg).await?;
         if stack.idle_expired() {
@@ -1074,6 +1105,25 @@ mod tests {
                 .expect("caller command queue closed");
             self.stack.process_cmd(command);
         }
+    }
+
+    #[tokio::test]
+    async fn upload_progress_and_tcp_timers_keep_the_stack_running() {
+        let (mut pair, _caller) = TcpPair::new();
+        let (consumed, mut accepted) = oneshot::channel();
+        pair.stack.process_cmd(Cmd::TcpData {
+            id: 1,
+            bytes: b"upload awaiting ACK".to_vec(),
+            consumed,
+        });
+        assert!(pair.stack.maintain_tcp(), "new upload must trigger egress");
+        accepted.try_recv().unwrap();
+        // smoltcp has writable data. Its deadline must preempt the
+        // one-second fallback even if no more commands or packets arrive.
+        let started = tokio::time::Instant::now();
+        assert!(pair.stack.next_deadline() < started + Duration::from_millis(100));
+        pair.stack.poll_stack();
+        assert!(!pair.stack.device.tx.is_empty());
     }
 
     #[tokio::test]

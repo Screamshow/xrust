@@ -3,7 +3,11 @@ use crate::tunnel_session_tests as fixture;
 use serde_json::json;
 
 fn client(peer: &fixture::Peer) -> WireGuard {
-    let value = json!({
+    client_for(peer, false)
+}
+
+fn client_for(peer: &fixture::Peer, awg: bool) -> WireGuard {
+    let mut value = json!({
         "private_key": fixture::b64(fixture::CLIENT_KEY),
         "address": ["10.66.66.2/24"],
         "udp_timeout": "1s",
@@ -13,6 +17,11 @@ fn client(peer: &fixture::Peer) -> WireGuard {
             "allowed_ips": ["0.0.0.0/0"]
         }]
     });
+    if awg {
+        // An AWG timeout enables its send path while leaving the fixture's
+        // standard message types and padding interoperable.
+        value["keepalive_timeout"] = json!(13);
+    }
     WireGuard::build(value.as_object().unwrap(), "session-test").unwrap()
 }
 
@@ -112,6 +121,7 @@ async fn reserved_bytes_reach_the_handshake_socket() {
         )
         .unwrap(),
     );
+    let shared = wg.shared().await.unwrap();
     let task = tokio::spawn(async move {
         wg.connect(&Target::Ip("10.66.66.1:4321".parse().unwrap()))
             .await
@@ -122,17 +132,33 @@ async fn reserved_bytes_reach_the_handshake_socket() {
         .unwrap()
         .unwrap()
         .0;
+    assert_eq!(shared.cmd_tx.strong_count(), 2);
     task.abort();
+    assert!(matches!(task.await, Err(err) if err.is_cancelled()));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while shared.cmd_tx.strong_count() != 1 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("cancelling connect must release the upload pump's command sender");
     assert_eq!(received, noise::INITIATION_LEN);
     assert_eq!(&wire[1..4], &[19, 81, 203]);
 }
 
 #[tokio::test]
 async fn tcp_fin_delivers_all_bytes_and_preserves_the_write_half() {
-    for (local_fin, size) in [(false, 17), (true, 17), (false, 2 * 1024 * 1024)] {
+    for (awg, local_fin, size) in [
+        (false, false, 17),
+        (false, true, 17),
+        (false, false, 2 * 1024 * 1024),
+        (true, false, 2 * 1024 * 1024),
+        (true, true, 17),
+    ] {
         let response: Vec<_> = (0..size).map(|n| (n % 251) as u8).collect();
         let peer = fixture::peer("10.66.66.1", local_fin, response.clone()).await;
-        let wg = client(&peer);
+        let wg = client_for(&peer, awg);
+        assert_eq!(wg.cfg.awg.is_some(), awg);
         let stream = connect(&wg).await;
         fixture::tcp_eof(stream, &peer, local_fin, &response).await;
     }

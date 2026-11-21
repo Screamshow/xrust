@@ -53,41 +53,6 @@ pub fn default_tsrs_cache_path(tag: &str) -> std::path::PathBuf {
     }
 }
 
-/// Cache directory of releases before the rename. Its images are rebuilt
-/// under the new path, so the old ones only hold tmpfs RAM until a reboot.
-#[cfg(unix)]
-const LEGACY_TSRS_CACHE_DIR: &str = "/tmp/tachyon-rulesets";
-
-/// Drop the cache directory older releases left in tmpfs. Best effort: only
-/// regular `.tsrs`/`.tmp` files go, and a symlinked directory is left alone.
-pub fn remove_legacy_tsrs_cache() {
-    #[cfg(unix)]
-    remove_tsrs_cache_dir(std::path::Path::new(LEGACY_TSRS_CACHE_DIR));
-}
-
-#[cfg(unix)]
-fn remove_tsrs_cache_dir(dir: &std::path::Path) {
-    if !std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let cache_image = matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("tsrs" | "tmp")
-        );
-        if cache_image && entry.file_type().is_ok_and(|kind| kind.is_file()) {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-    if std::fs::remove_dir(dir).is_ok() {
-        logging::info(format_args!("removed old rule-set cache {}", dir.display()));
-    }
-}
-
 /// Reference default: 24h when `update_interval` is absent.
 const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -810,41 +775,6 @@ pub(crate) fn write_tsrs_if_changed(path: &std::path::Path, bytes: &[u8]) -> io:
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(unix)]
-    #[test]
-    fn legacy_cache_removal_takes_only_cache_images() {
-        let root = std::env::temp_dir().join(format!("xrust-legacy-cache-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let only_images = root.join("images");
-        std::fs::create_dir_all(&only_images).unwrap();
-        std::fs::write(only_images.join("a.tsrs"), b"TSRS").unwrap();
-        std::fs::write(only_images.join("a.tmp"), b"TSRS").unwrap();
-        remove_tsrs_cache_dir(&only_images);
-        assert!(!only_images.exists(), "an images-only directory is removed");
-
-        let mixed = root.join("mixed");
-        std::fs::create_dir_all(&mixed).unwrap();
-        std::fs::write(mixed.join("b.tsrs"), b"TSRS").unwrap();
-        std::fs::write(mixed.join("keep.txt"), b"other").unwrap();
-        remove_tsrs_cache_dir(&mixed);
-        assert!(!mixed.join("b.tsrs").exists());
-        assert!(mixed.join("keep.txt").exists(), "foreign files stay");
-
-        let target = root.join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("c.tsrs"), b"TSRS").unwrap();
-        let link = root.join("link");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        remove_tsrs_cache_dir(&link);
-        assert!(
-            target.join("c.tsrs").exists(),
-            "a symlinked directory is not followed"
-        );
-
-        remove_tsrs_cache_dir(&root.join("missing"));
-        std::fs::remove_dir_all(&root).unwrap();
-    }
 
     #[cfg(unix)]
     #[test]

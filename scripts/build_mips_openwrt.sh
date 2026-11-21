@@ -13,5 +13,5 @@ fi
 # Stable Rust ships the target specification but no prebuilt std for MIPS.
 # Enable only cargo's build-std with the exact rust-src belonging to rustc.
 export RUSTC_BOOTSTRAP=1
-cargo build --locked -Z build-std=std,panic_abort --workspace \
-    --no-default-features --features rust-x --release --target mipsel-unknown-linux-musl "$@"
+cargo build --locked -Z build-std=std,panic_abort -p core-cli \
+    --no-default-features --features forkop-client --release --target mipsel-unknown-linux-musl "$@"
