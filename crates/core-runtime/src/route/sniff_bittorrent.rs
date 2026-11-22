@@ -329,20 +329,72 @@ fn http_query(query: &str) -> bool {
     })
 }
 
-pub(super) fn http(method: &str, target: &str, _headers: &str) -> bool {
-    // Require tracker parameters together, rather than matching arbitrary text
-    // containing "torrent", magnet links, or a generic /announce endpoint.
-    if method == "GET"
-        && let Some((_, query)) = target.split_once('?')
-    {
-        return http_query(query);
+fn http_scrape(path: &str, query: &str) -> bool {
+    if !matches!(path.rsplit_once('/'), Some((_, "scrape" | "scrape.php"))) {
+        return false;
     }
-    false
+    // Absolute-form HTTP requests must have a path, not just a host named scrape.
+    if !path.starts_with('/')
+        && !path
+            .parse::<http::Uri>()
+            .is_ok_and(|uri| uri.scheme_str() == Some("http") && uri.path() != "/")
+    {
+        return false;
+    }
+
+    // BEP 48 allows repeated info_hash fields. Also allow pre-existing tracker
+    // query parameters, but keep ambiguous announce and web seed fields out.
+    let mut has_hash = false;
+    for parameter in query.split('&') {
+        match parameter.split_once('=').unwrap_or((parameter, "")) {
+            ("info_hash", value) if binary_info_hash(value) => has_hash = true,
+            ("info_hash" | "peer_id" | "port" | "piece", _) => return false,
+            _ => {}
+        }
+    }
+    has_hash
+}
+
+pub(super) fn http(method: &str, target: &str, _headers: &str) -> bool {
+    if method != "GET" {
+        return false;
+    }
+    let Some((path, query)) = target.split_once('?') else {
+        return false;
+    };
+    http_query(query) || http_scrape(path, query)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrape_requires_a_tracker_path_and_valid_hashes() {
+        let hash = "abcdefghijklmnopqrst";
+        for target in [
+            format!("/scrape?info_hash={hash}"),
+            format!("http://tracker.test/private/scrape.php?passkey=fixture&info_hash={hash}"),
+        ] {
+            assert!(http("GET", &target, ""), "{target}");
+            assert!(!http("POST", &target, ""), "{target}");
+        }
+        for target in [
+            "/scrape".into(),
+            "/scrape?passkey=fixture".into(),
+            "/scrape?info_hash=".into(),
+            format!("/scrape?info_hash={hash}x"),
+            format!("/scrape?info_hash={hash}&info_hash"),
+            format!("/scrape?info_hash=%xx&info_hash={hash}"),
+            format!("/scrape?info_hash={hash}&port=65536"),
+            format!("/scrape.json?info_hash={hash}"),
+            format!("/lookalike-scrape?info_hash={hash}"),
+            format!("http://scrape?info_hash={hash}"),
+            format!("https://tracker.test/scrape?info_hash={hash}"),
+        ] {
+            assert!(!http("GET", &target, ""), "{target}");
+        }
+    }
 
     #[test]
     fn dht_requires_a_complete_krpc_message() {

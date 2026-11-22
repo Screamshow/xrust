@@ -40,6 +40,8 @@ async fn split_tcp_is_classified_and_preserved_before_direct() {
         for payload in [
             b"\x13BitTorrent protocol".as_slice(),
             b"GET /announce?info_hash=abcdefghijklmnopqrst&peer_id=-qB5000-abcdefghijkl&port=6881 HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
+            b"GET /scrape?info_hash=abcdefghijklmnopqrst HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
+            b"GET /tracker/scrape.php?passkey=fixture&info_hash=abcdefghijklmnopqrst&info_hash=%00%ffCDEFGHIJKLMNOPQRST HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
             b"GET /seed?info_hash=abcdefghijklmnopqrst&piece=0 HTTP/1.1\r\nHost: seed.test\r\n\r\n",
         ] {
             for split in [1, payload.len() / 2, payload.len() - 1] {
@@ -98,6 +100,10 @@ async fn ordinary_http_and_disabled_extension_keep_normal_routing() {
         ),
         (
             false,
+            b"GET /scrape?info_hash=abcdefghijklmnopqrst HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
+        ),
+        (
+            false,
             b"GET /file HTTP/1.1\r\nHost: seed.test\r\nUser-Agent: BiglyBT/1\r\n\r\n",
         ),
         (
@@ -142,6 +148,8 @@ async fn invalid_http_and_lookalikes_do_not_get_direct_exception() {
         b"GET /search?info_hash=document123&piece=0 HTTP/1.1\r\nHost: example.test\r\n\r\n",
         b"GET /search?info_hash=document&peer_id=browser&port=banana HTTP/1.1\r\nHost: example.test\r\n\r\n",
         b"GET /announce?info_hash=abcdefghijklmnopqrst&peer_id=-qB5000-abcdefghijkl&port=65536&piece=0 HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
+        b"GET /scrape?info_hash=abcdefghijklmnopqrst&info_hash=%xx HTTP/1.1\r\nHost: tracker.test\r\n\r\n",
+        b"GET /search?info_hash=abcdefghijklmnopqrst HTTP/1.1\r\nHost: example.test\r\n\r\n",
     ] {
         for ipv6 in [false, true] {
             let (mut tx, mut rx) = duplex(4096);
