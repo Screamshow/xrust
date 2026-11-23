@@ -1095,18 +1095,25 @@ impl DnsService {
         host: &str,
         depth: u8,
     ) -> std::io::Result<Vec<IpAddr>> {
-        if resolver.kind == Kind::Hosts {
-            return Ok(resolver
-                .hosts
-                .as_ref()
-                .map(|sources| sources.lookup(host))
-                .unwrap_or_default());
-        }
-        if matches!(resolver.kind, Kind::Local | Kind::Dhcp | Kind::Resolved) {
-            return Ok(match self.neighbor_lookup(resolver, host) {
-                Some(addresses) => addresses,
-                None => system_lookup(host).await,
-            });
+        let local_addresses = match resolver.kind {
+            Kind::Hosts => Some(
+                resolver
+                    .hosts
+                    .as_ref()
+                    .map(|sources| sources.lookup(host))
+                    .unwrap_or_default(),
+            ),
+            Kind::Local | Kind::Dhcp | Kind::Resolved => {
+                Some(match self.neighbor_lookup(resolver, host) {
+                    Some(addresses) => addresses,
+                    None => system_lookup(host).await,
+                })
+            }
+            _ => None,
+        };
+        if let Some(mut addresses) = local_addresses {
+            addresses.retain(is_usable_resolved_ip);
+            return Ok(addresses);
         }
         let addr = self.resolve_server_addr(resolver, depth).await?;
         let mut tasks = tokio::task::JoinSet::new();
@@ -1218,7 +1225,7 @@ async fn collect_families(
         };
         match result {
             Ok(Ok(ips)) => {
-                addresses.extend(ips);
+                addresses.extend(ips.into_iter().filter(is_usable_resolved_ip));
                 if !addresses.is_empty() && grace.is_none() {
                     grace = Some(tokio::time::Instant::now() + Duration::from_millis(50));
                 }
@@ -1234,6 +1241,11 @@ async fn collect_families(
     } else {
         Ok(addresses)
     }
+}
+
+/// An unspecified DNS answer can send a Linux connect back to the local host.
+pub(crate) fn is_usable_resolved_ip(ip: &IpAddr) -> bool {
+    !ip.to_canonical().is_unspecified()
 }
 
 /// Reference `TransportManager.Start`: every group member must exist, must be

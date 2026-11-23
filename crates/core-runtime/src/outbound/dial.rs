@@ -659,6 +659,7 @@ pub async fn resolve_with(
     let addrs: Vec<IpAddr> = tokio::net::lookup_host((host, port))
         .await?
         .map(|addr| addr.ip())
+        .filter(crate::dns::is_usable_resolved_ip)
         .collect();
     // the system resolver has no strategy of its own, so ordering and the
     // one-family cases are applied here

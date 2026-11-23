@@ -1,6 +1,6 @@
 //! Routing engine integration: rule walk, actions, sniff, hijack-dns.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -45,7 +45,7 @@ async fn spawn_echo() -> SocketAddr {
     addr
 }
 
-async fn spawn_udp_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
+async fn spawn_udp_dns(answer_ips: Vec<IpAddr>) -> (SocketAddr, Hits) {
     let sock = UdpSocket::bind("127.0.0.1:0").await.expect("bind udp");
     let addr = sock.local_addr().expect("udp addr");
     let hits = Arc::new(AtomicUsize::new(0));
@@ -60,7 +60,7 @@ async fn spawn_udp_dns(answer_ip: Ipv4Addr) -> (SocketAddr, Hits) {
                 continue;
             };
             hits2.fetch_add(1, Ordering::SeqCst);
-            let resp = codec::synth_address(&query, answer_ip.into(), 60).expect("answer");
+            let resp = codec::synth_addresses(&query, &answer_ips, 60).expect("answer");
             if sock.send_to(&resp, from).await.is_err() {
                 return;
             }
@@ -448,7 +448,7 @@ async fn tls_sniff_routes_by_sni() {
 #[tokio::test]
 async fn hijack_dns_answers_queries() {
     let _g = test_guard().await;
-    let mock = spawn_udp_dns(Ipv4Addr::new(9, 9, 9, 9)).await;
+    let mock = spawn_udp_dns(vec![Ipv4Addr::new(9, 9, 9, 9).into()]).await;
     let cfg = json!({
         "log": {"level": "warn"},
         "dns": {
@@ -564,8 +564,8 @@ async fn default_domain_resolver_resolves_outbound_hostnames() {
     let echo_ip = v4_of(echo);
     // Upstream answers 10.0.0.9 (blackhole); the default resolver answers
     // the real echo IP. A successful CONNECT proves ddr was used.
-    let (dead_addr, _dead_hits) = spawn_udp_dns(Ipv4Addr::new(10, 0, 0, 9)).await;
-    let (good_addr, good_hits) = spawn_udp_dns(echo_ip).await;
+    let (dead_addr, _dead_hits) = spawn_udp_dns(vec![Ipv4Addr::new(10, 0, 0, 9).into()]).await;
+    let (good_addr, good_hits) = spawn_udp_dns(vec![echo_ip.into()]).await;
     let cfg = json!({
         "log": {"level": "error"},
         "inbounds": [
@@ -610,4 +610,47 @@ async fn default_domain_resolver_resolves_outbound_hostnames() {
         "absent route.default_domain_resolver clears the global tag"
     );
     cleared.shutdown();
+}
+
+#[tokio::test]
+async fn unspecified_dns_answers_do_not_open_a_connection() {
+    let _g = test_guard().await;
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind target");
+    let target = listener.local_addr().expect("target address");
+    let blocked_ips = vec![Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()];
+    let (blocked_addr, blocked_hits) = spawn_udp_dns(blocked_ips.clone()).await;
+    let mut mixed_ips = blocked_ips;
+    mixed_ips.push(target.ip());
+    let (mixed_addr, _) = spawn_udp_dns(mixed_ips).await;
+    let mut cfg = box_cfg(
+        json!([{"type": "direct", "tag": "out"}]),
+        json!({"final": "out", "default_domain_resolver": "blocked"}),
+    );
+    cfg["dns"] = json!({
+        "servers": [
+            {"type": "udp", "tag": "blocked", "server": "127.0.0.1", "server_port": blocked_addr.port()},
+            {"type": "udp", "tag": "mixed", "server": "127.0.0.1", "server_port": mixed_addr.port()}
+        ],
+        "final": "mixed"
+    });
+    let (instance, inbound) = start_box(cfg).await;
+
+    let destination = Target::Domain("blocked.test".into(), target.port());
+    let (_, code) = socks_connect(inbound, destination).await;
+    assert_ne!(code, 0x00, "blocking DNS answer must fail CONNECT");
+    assert_eq!(blocked_hits.load(Ordering::SeqCst), 2);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "the local listener must not receive a connection"
+    );
+
+    let dns = core_runtime::dns::current().expect("DNS service");
+    let addresses = dns
+        .resolve("mixed.test")
+        .await
+        .expect("resolve mixed answers");
+    assert_eq!(addresses, vec![target.ip()]);
+    instance.shutdown();
 }
