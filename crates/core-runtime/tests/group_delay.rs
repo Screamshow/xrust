@@ -187,6 +187,42 @@ async fn group_keeps_success_when_another_leaf_times_out() {
 }
 
 #[tokio::test]
+async fn a_timed_out_selector_keeps_the_successful_sibling_history() {
+    let (slow, slow_task) = proxy(5000, Arc::new(AtomicUsize::new(0))).await;
+    let (fast, fast_task) = proxy(5, Arc::new(AtomicUsize::new(0))).await;
+    let instance = core_runtime::start(&json!({
+        "experimental":{"clash_api":{"external_controller":"127.0.0.1:0"}},
+        "outbounds":[
+            {"type":"http","tag":"slow","server":"127.0.0.1","server_port":slow},
+            {"type":"http","tag":"fast","server":"127.0.0.1","server_port":fast},
+            {"type":"selector","tag":"group","outbounds":["slow","fast"],"default":"slow"}
+        ],"route":{"final":"group"}
+    }))
+    .await
+    .unwrap();
+    let addr = instance.clash_api_addr().unwrap();
+    assert_eq!(
+        api(
+            addr,
+            "/proxies/group/delay?timeout=500&url=http://example.test/"
+        )
+        .await
+        .0,
+        504
+    );
+    assert_eq!(api(addr, "/proxies/slow").await.1["history"], json!([]));
+    assert!(
+        !api(addr, "/proxies/fast").await.1["history"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    instance.shutdown_wait().await;
+    slow_task.abort();
+    fast_task.abort();
+}
+
+#[tokio::test]
 async fn group_limits_parallel_probes_to_eight() {
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));

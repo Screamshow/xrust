@@ -13,28 +13,23 @@ use std::time::{Duration, Instant};
 
 use lru::LruCache;
 
-use super::codec::ResponseMeta;
-
-/// Arc'd fields: the key is cloned into the inflight map, the refresh set
-/// and the cache itself, and a `String` clone per hop is what that costs.
-#[derive(Clone)]
+/// The transaction ID is replaced for each caller. Every other query byte
+/// can affect the upstream response, including EDNS options and question case.
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
-    pub tag: Arc<str>,
-    pub name: Arc<str>,
-    pub qtype: u16,
+    tag: Arc<str>,
+    query: [u8; 32],
+    rewrite_ttl: Option<u32>,
 }
 
-impl PartialEq for CacheKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.tag == other.tag && self.name == other.name && self.qtype == other.qtype
-    }
-}
-impl Eq for CacheKey {}
-impl std::hash::Hash for CacheKey {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.tag.hash(state);
-        self.name.hash(state);
-        self.qtype.hash(state);
+impl CacheKey {
+    pub fn new(tag: &str, query_without_id: &[u8], rewrite_ttl: Option<u32>) -> Self {
+        use sha2::{Digest, Sha256};
+        Self {
+            tag: tag.into(),
+            query: Sha256::digest(query_without_id).into(),
+            rewrite_ttl,
+        }
     }
 }
 
@@ -85,10 +80,9 @@ impl Cache {
         &mut self,
         key: CacheKey,
         raw: impl Into<Arc<[u8]>>,
-        meta: &ResponseMeta,
+        ttl_secs: u32,
         optimistic_timeout: Option<Duration>,
     ) {
-        let ttl_secs = meta.min_answer_ttl.unwrap_or(60).max(1);
         let inserted = Instant::now();
         let optimistic_until = optimistic_timeout.map(|window| inserted + window);
         self.entries.put(
@@ -125,21 +119,9 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hickory_proto::op::ResponseCode;
-
-    fn meta(ttl: Option<u32>) -> ResponseMeta {
-        ResponseMeta {
-            rcode: ResponseCode::NoError,
-            min_answer_ttl: ttl,
-        }
-    }
 
     fn key() -> CacheKey {
-        CacheKey {
-            tag: "t".into(),
-            name: "a.test".into(),
-            qtype: 1,
-        }
+        CacheKey::new("t", b"a.test", None)
     }
 
     #[test]
@@ -147,7 +129,7 @@ mod tests {
         let mut cache = Cache::new(16);
         let before = Instant::now();
         assert!(cache.get(&key(), before).is_none());
-        cache.insert(key(), b"resp".to_vec(), &meta(Some(60)), None);
+        cache.insert(key(), b"resp".to_vec(), 60, None);
         // `insert` reads the clock itself, so the instant this test measures
         // from has to be taken after it: sampling before leaves the entry's own
         // timestamp a hair later, and the 61-second probe then lands just under
@@ -160,12 +142,7 @@ mod tests {
     #[test]
     fn optimistic_window() {
         let mut cache = Cache::new(16);
-        cache.insert(
-            key(),
-            b"resp".to_vec(),
-            &meta(Some(1)),
-            Some(Duration::from_secs(300)),
-        );
+        cache.insert(key(), b"resp".to_vec(), 1, Some(Duration::from_secs(300)));
         let now = Instant::now();
         assert!(matches!(cache.get(&key(), now), Some(CacheHit::Fresh(..))));
         assert!(matches!(
@@ -179,17 +156,12 @@ mod tests {
     fn evicts_oldest_over_capacity() {
         let mut cache = Cache::new(16);
         for i in 0..17 {
-            let mut k = key();
-            k.name = format!("h{i}.test").into();
+            let k = CacheKey::new("t", format!("h{i}.test").as_bytes(), None);
             std::thread::sleep(Duration::from_millis(2));
-            cache.insert(k, vec![i as u8], &meta(Some(60)), None);
+            cache.insert(k, vec![i as u8], 60, None);
         }
         assert_eq!(cache.entries.len(), 16);
-        let oldest = CacheKey {
-            tag: "t".into(),
-            name: "h0.test".into(),
-            qtype: 1,
-        };
+        let oldest = CacheKey::new("t", b"h0.test", None);
         assert!(cache.get(&oldest, Instant::now()).is_none());
     }
 
@@ -200,23 +172,17 @@ mod tests {
     fn a_read_keeps_an_entry_alive_across_eviction() {
         let mut cache = Cache::new(16);
         for i in 0..16 {
-            let mut k = key();
-            k.name = format!("h{i}.test").into();
-            cache.insert(k, vec![i as u8], &meta(Some(60)), None);
+            let k = CacheKey::new("t", format!("h{i}.test").as_bytes(), None);
+            cache.insert(k, vec![i as u8], 60, None);
         }
-        let probe = |name: &str| CacheKey {
-            tag: "t".into(),
-            name: name.into(),
-            qtype: 1,
-        };
+        let probe = |name: &str| CacheKey::new("t", name.as_bytes(), None);
         // touch the oldest insert
         assert!(matches!(
             cache.get(&probe("h0.test"), Instant::now()),
             Some(CacheHit::Fresh(..))
         ));
-        let mut newest = key();
-        newest.name = "h16.test".into();
-        cache.insert(newest, vec![16], &meta(Some(60)), None);
+        let newest = probe("h16.test");
+        cache.insert(newest, vec![16], 60, None);
         assert!(
             cache.get(&probe("h0.test"), Instant::now()).is_some(),
             "the touched entry survives"

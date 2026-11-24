@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# scripts/size.sh — verifies binary size budget for xrust (<= 12 MiB).
+# scripts/size.sh â€” verifies binary size budget for xrust for a single target.
 set -euo pipefail
 
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 TARGET_TRIPLE="${TARGET_TRIPLE:-x86_64-unknown-linux-musl}"
 
-FULL_LIMIT=12582912    # 12 MiB
+FULL_LIMIT=$(bash "$(dirname "$0")/openwrt_size_budget.sh" "$TARGET_TRIPLE")
 
 echo "=== Building xrust (release) ==="
 cargo build --locked -p core-cli --no-default-features --features forkop-client --release --target "$TARGET_TRIPLE"
@@ -29,12 +29,12 @@ FULL_STATUS="PASS"
 if [[ "$FULL_SIZE" -gt "$FULL_LIMIT" ]]; then
     FULL_STATUS="FAIL"
 fi
-printf "| %-12s | %-12d | %-10s | %-10s | %-8s |\n" "release" "$FULL_SIZE" "${FULL_MIB}M" "<= 12.00M" "$FULL_STATUS"
+printf "| %-12s | %-12d | %-10s | %-10s | %-8s |\n" "release" "$FULL_SIZE" "${FULL_MIB}M" "<= $((FULL_LIMIT / 1048576)) MiB" "$FULL_STATUS"
 echo "================================================================="
 echo ""
 
 if [[ "$FULL_STATUS" == "FAIL" ]]; then
-    echo "ERROR: binary size ($FULL_SIZE bytes) exceeds 12 MiB budget!" >&2
+    echo "ERROR: binary size ($FULL_SIZE bytes) exceeds $FULL_LIMIT byte budget!" >&2
     exit 1
 fi
 

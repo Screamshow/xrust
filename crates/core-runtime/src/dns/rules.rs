@@ -346,6 +346,7 @@ impl Rule {
             crate::inbound::Target::Domain(query.name.clone(), 0),
             "udp",
         );
+        context.query_type = Some(u16::from(query.qtype));
         if self.match_response {
             context.domain = Some(query.name.clone());
             return ips.unwrap_or_default().iter().any(|ip| {
@@ -746,6 +747,31 @@ mod tests {
         rule.domain_keyword.push("allowed".into());
         assert!(!rule.matches(&meta, &info("www.example.com", RecordType::A)));
         assert!(rule.matches(&meta, &info("allowed.example.com", RecordType::A)));
+    }
+
+    #[test]
+    fn headless_query_type_matches_alone_and_with_a_domain() {
+        let meta = QueryMeta::default();
+        for (source, allows_other) in [
+            (json!({"query_type":"AAAA"}), true),
+            (json!({"query_type":28,"domain":"example.com"}), false),
+        ] {
+            let mut rule = Rule::build(&json!({"action":"reject"}), "rule").unwrap();
+            let rules = vec![source];
+            assert_eq!(
+                crate::route::mmap_set::tsrs_unsupported(&rules),
+                Some("query_type")
+            );
+            rule.rule_sets.push(std::sync::Arc::new(
+                crate::route::rule_set::RuleSet::new(vec!["records".into()], rules).unwrap(),
+            ));
+            assert!(rule.matches(&meta, &info("example.com", RecordType::AAAA)));
+            assert!(!rule.matches(&meta, &info("example.com", RecordType::A)));
+            assert_eq!(
+                rule.matches(&meta, &info("other.test", RecordType::AAAA)),
+                allows_other
+            );
+        }
     }
 
     #[test]

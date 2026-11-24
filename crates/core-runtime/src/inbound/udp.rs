@@ -26,6 +26,14 @@ use crate::route::{ConnContext, Decision, Router};
 /// Idle timeout for an outbound UDP flow (sing-box `C.UDPTimeout` family;
 /// route-options `udp_timeout` is applied per-flow when present).
 pub(crate) const DEFAULT_UDP_TIMEOUT: Duration = Duration::from_secs(120);
+
+pub(super) fn effective_udp_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        DEFAULT_UDP_TIMEOUT
+    } else {
+        timeout
+    }
+}
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Open flows one hub keeps; a new flow past it closes the one idle the
@@ -60,12 +68,12 @@ pub(crate) async fn recv_with<R>(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct FlowKey {
     source: SocketAddr,
     dest: SocketAddr,
     #[cfg(any(feature = "server-inbounds", test))]
-    hy2_session: Option<(u64, u32)>,
+    hy2_session: Option<(u64, u32, Arc<str>)>,
 }
 
 impl FlowKey {
@@ -356,7 +364,7 @@ pub(crate) struct TunReply {
 #[cfg(any(feature = "server-inbounds", test))]
 pub(crate) struct Hy2Reply {
     pub session_id: u32,
-    pub src: SocketAddr,
+    pub src: Arc<str>,
     pub payload: Vec<u8>,
 }
 
@@ -380,6 +388,7 @@ pub(crate) enum Reply {
     Hy2 {
         connection_id: u64,
         session_id: u32,
+        destination: Arc<str>,
         sender: tokio::sync::mpsc::Sender<Hy2Reply>,
     },
 }
@@ -398,11 +407,12 @@ impl Reply {
         if let Self::Hy2 {
             connection_id,
             session_id,
+            destination,
             ..
         } = self
         {
             return FlowKey {
-                hy2_session: Some((*connection_id, *session_id)),
+                hy2_session: Some((*connection_id, *session_id, Arc::clone(destination))),
                 ..key
             };
         }
@@ -432,11 +442,14 @@ impl Reply {
                 .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "tun reply channel closed")),
             #[cfg(any(feature = "server-inbounds", test))]
             Reply::Hy2 {
-                session_id, sender, ..
+                session_id,
+                sender,
+                destination,
+                ..
             } => sender
                 .send(Hy2Reply {
                     session_id: *session_id,
-                    src: remote,
+                    src: Arc::clone(destination),
                     payload: framed.to_vec(),
                 })
                 .await
@@ -481,7 +494,7 @@ impl FlowOpener {
         loop {
             let payload = match next.take() {
                 Some(payload) => payload,
-                None => match self.hub.next_pending(self.key, self.id) {
+                None => match self.hub.next_pending(&self.key, self.id) {
                     Some(payload) => payload,
                     None => return Ok(()),
                 },
@@ -520,7 +533,7 @@ impl FlowOpener {
 
 impl Drop for FlowOpener {
     fn drop(&mut self) {
-        self.hub.release_pending(self.key, self.id);
+        self.hub.release_pending(&self.key, self.id);
     }
 }
 
@@ -541,7 +554,7 @@ pub(crate) struct UdpHub {
     /// [`MAX_DNS_HIJACKS`] permits, one per running `hijack-dns` exchange
     dns_slots: Arc<tokio::sync::Semaphore>,
     next_opener: AtomicU64,
-    reverse_tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    reverse_tasks: Mutex<tokio::task::JoinSet<()>>,
     timeout: Duration,
     /// [`MAX_UDP_FLOWS`] unless the inbound sets `udp_nat_max`
     max_flows: usize,
@@ -569,12 +582,8 @@ impl UdpHub {
             pending_count: AtomicUsize::new(0),
             dns_slots: Arc::new(tokio::sync::Semaphore::new(MAX_DNS_HIJACKS)),
             next_opener: AtomicU64::new(0),
-            reverse_tasks: Mutex::new(Vec::new()),
-            timeout: if timeout.is_zero() {
-                DEFAULT_UDP_TIMEOUT
-            } else {
-                timeout
-            },
+            reverse_tasks: Mutex::new(tokio::task::JoinSet::new()),
+            timeout: effective_udp_timeout(timeout),
             max_flows: max_flows.max(1),
             frame,
         });
@@ -593,9 +602,10 @@ impl UdpHub {
 
     /// Release per-flow reply sockets when a transparent listener is stopped.
     pub fn stop(&self) {
-        for task in self.reverse_tasks.lock().expect("reverse tasks").drain(..) {
-            task.abort();
-        }
+        self.reverse_tasks
+            .lock()
+            .expect("reverse tasks")
+            .abort_all();
         self.flows.write().expect("flows").clear();
         self.held.lock().expect("held").clear();
         let mut pending = self.pending.lock().expect("pending");
@@ -627,7 +637,7 @@ impl UdpHub {
             .as_ref()
             .is_some_and(|tracker| tracker.is_closed())
         {
-            self.remove_flow(key, sock);
+            self.remove_flow(&key, sock);
             return false;
         }
         // while a writer is draining the backlog, new packets go behind it:
@@ -668,7 +678,7 @@ impl UdpHub {
     ) -> Option<FlowOpener> {
         let key = FlowKey::network(source, dest);
         // a flow still draining its queue keeps later datagrams behind it
-        if self.pending_count.load(Ordering::Acquire) != 0 && self.queue_pending(key, payload) {
+        if self.pending_count.load(Ordering::Acquire) != 0 && self.queue_pending(&key, payload) {
             return None;
         }
         if self.try_existing(source, dest, payload) {
@@ -684,7 +694,7 @@ impl UdpHub {
         }
         let id = self.next_opener.fetch_add(1, Ordering::Relaxed);
         pending.insert(
-            key,
+            key.clone(),
             PendingFlow {
                 id,
                 queue: VecDeque::new(),
@@ -700,8 +710,8 @@ impl UdpHub {
     }
 
     /// Queue behind an opening flow; `false` when the flow is not opening.
-    fn queue_pending(&self, key: FlowKey, payload: &[u8]) -> bool {
-        match self.pending.lock().expect("pending").get_mut(&key) {
+    fn queue_pending(&self, key: &FlowKey, payload: &[u8]) -> bool {
+        match self.pending.lock().expect("pending").get_mut(key) {
             Some(entry) => {
                 entry.push(payload);
                 true
@@ -713,21 +723,21 @@ impl UdpHub {
     /// The next queued datagram of opener `id`, or release its entry when
     /// the queue is empty. Both happen under one lock, so a datagram either
     /// lands in the queue before the release or finds the flow open after it.
-    fn next_pending(&self, key: FlowKey, id: u64) -> Option<Vec<u8>> {
+    fn next_pending(&self, key: &FlowKey, id: u64) -> Option<Vec<u8>> {
         let mut pending = self.pending.lock().expect("pending");
-        let entry = pending.get_mut(&key).filter(|entry| entry.id == id)?;
+        let entry = pending.get_mut(key).filter(|entry| entry.id == id)?;
         if let Some(payload) = entry.queue.pop_front() {
             return Some(payload);
         }
-        pending.remove(&key);
+        pending.remove(key);
         self.pending_count.store(pending.len(), Ordering::Release);
         None
     }
 
-    fn release_pending(&self, key: FlowKey, id: u64) {
+    fn release_pending(&self, key: &FlowKey, id: u64) {
         let mut pending = self.pending.lock().expect("pending");
-        if pending.get(&key).is_some_and(|entry| entry.id == id) {
-            pending.remove(&key);
+        if pending.get(key).is_some_and(|entry| entry.id == id) {
+            pending.remove(key);
             self.pending_count.store(pending.len(), Ordering::Release);
         }
     }
@@ -751,8 +761,8 @@ impl UdpHub {
             .await
     }
 
-    /// Preserve a named proxy destination in routing even though the flow key
-    /// and the datagram reply use its resolved socket address.
+    /// Preserve a proxy destination in routing independently of the socket
+    /// address used by transports that require IP framing.
     #[allow(clippy::too_many_arguments)]
     pub async fn handle_routed(
         self: &Arc<Self>,
@@ -785,12 +795,12 @@ impl UdpHub {
         target: &Target,
     ) -> std::io::Result<Option<Arc<Flow>>> {
         let key = reply.flow_key(source, dest);
-        if let Some(flow) = self.live_flow(key) {
+        if let Some(flow) = self.live_flow(&key) {
             flow.touch();
             return Ok(Some(flow));
         }
-        let _gate = self.gate(key).lock_owned().await;
-        if let Some(existing) = self.live_flow(key) {
+        let _gate = self.gate(&key).lock_owned().await;
+        if let Some(existing) = self.live_flow(&key) {
             existing.touch();
             return Ok(Some(existing));
         }
@@ -804,11 +814,11 @@ impl UdpHub {
         held.push(payload.to_vec());
         let force = held.len() >= MAX_SNIFF_DATAGRAMS;
         match self
-            .open_flow(reply.clone(), key, tag, target, &held, force)
+            .open_flow(reply.clone(), &key, tag, target, &held, force)
             .await?
         {
             Opened::Wait(timeout) => {
-                self.held.lock().expect("held").insert(key, held);
+                self.held.lock().expect("held").insert(key.clone(), held);
                 if first {
                     self.route_held_after(key, timeout, reply, tag, target);
                 }
@@ -826,11 +836,11 @@ impl UdpHub {
         }
     }
 
-    fn live_flow(&self, key: FlowKey) -> Option<Arc<Flow>> {
+    fn live_flow(&self, key: &FlowKey) -> Option<Arc<Flow>> {
         self.flows
             .read()
             .expect("flows")
-            .get(&key)
+            .get(key)
             .filter(|flow| {
                 !flow
                     .tracker
@@ -842,14 +852,14 @@ impl UdpHub {
 
     /// The opening gate of one tuple: first datagrams share it, so a burst
     /// cannot create multiple proxy sessions whose idle tasks race each other.
-    fn gate(&self, key: FlowKey) -> Arc<tokio::sync::Mutex<()>> {
+    fn gate(&self, key: &FlowKey) -> Arc<tokio::sync::Mutex<()>> {
         let mut opening = self.opening.lock().expect("opening");
         opening.retain(|_, gate| gate.strong_count() != 0);
-        match opening.get(&key).and_then(Weak::upgrade) {
+        match opening.get(key).and_then(Weak::upgrade) {
             Some(gate) => gate,
             None => {
                 let gate = Arc::new(tokio::sync::Mutex::new(()));
-                opening.insert(key, Arc::downgrade(&gate));
+                opening.insert(key.clone(), Arc::downgrade(&gate));
                 gate
             }
         }
@@ -893,13 +903,13 @@ impl UdpHub {
                 return;
             };
             let FlowKey { source, dest, .. } = key;
-            let _gate = hub.gate(key).lock_owned().await;
+            let _gate = hub.gate(&key).lock_owned().await;
             // a later datagram may have completed the sniff meanwhile
             let Some(held) = hub.held.lock().expect("held").remove(&key) else {
                 return;
             };
             let flow = match hub
-                .open_flow(reply.clone(), key, &tag, &target, &held, true)
+                .open_flow(reply.clone(), &key, &tag, &target, &held, true)
                 .await
             {
                 Ok(Opened::Flow(flow)) => flow,
@@ -926,7 +936,7 @@ impl UdpHub {
     async fn open_flow(
         self: &Arc<Self>,
         reply: Reply,
-        key: FlowKey,
+        key: &FlowKey,
         tag: &str,
         target: &Target,
         datagrams: &[Vec<u8>],
@@ -984,19 +994,19 @@ impl UdpHub {
                         .scope(policy, self.router.connect_udp_index(idx, target)) => result?,
                 };
                 let sock = Arc::new(sock);
-                let task = spawn_reverse(
+                let reverse = reverse_flow(
                     Arc::clone(&sock),
                     reply,
                     self.frame,
-                    tag,
+                    tag.to_owned(),
                     timeout,
                     Arc::clone(self),
-                    key,
+                    key.clone(),
                     Some(Arc::clone(&tracker)),
                 );
                 let mut tasks = self.reverse_tasks.lock().expect("reverse tasks");
-                tasks.retain(|task| !task.is_finished());
-                tasks.push(task);
+                while tasks.try_join_next().is_some() {}
+                tasks.spawn(reverse);
                 Flow {
                     tracker: Some(tracker),
                     kind: FlowKind::Outbound { sock },
@@ -1011,15 +1021,15 @@ impl UdpHub {
         let flow = Arc::new(flow);
         let evicted = {
             let mut flows = self.flows.write().expect("flows");
-            let oldest = if flows.len() >= self.max_flows && !flows.contains_key(&key) {
+            let oldest = if flows.len() >= self.max_flows && !flows.contains_key(key) {
                 flows
                     .iter()
                     .min_by_key(|(_, flow)| flow.last_ms.load(Ordering::Relaxed))
-                    .map(|(oldest, _)| *oldest)
+                    .map(|(oldest, _)| oldest.clone())
             } else {
                 None
             };
-            flows.insert(key, Arc::clone(&flow));
+            flows.insert(key.clone(), Arc::clone(&flow));
             oldest.and_then(|oldest| flows.remove(&oldest))
         };
         // the close signal ends its reverse task and releases the socket
@@ -1045,6 +1055,7 @@ impl UdpHub {
             network: Some("udp".to_string()),
         };
         let resp = dns.exchange(&meta, payload, true).await?;
+        let resp = crate::dns::codec::udp_answer(payload, resp)?;
         logging::debug(format_args!(
             "udp hijack-dns {tag} {source} -> {dest}: {}B reply",
             resp.len()
@@ -1059,9 +1070,9 @@ impl UdpHub {
         Ok(())
     }
 
-    fn touch_flow(&self, key: FlowKey, socket: &Arc<UdpSocket>) -> bool {
+    fn touch_flow(&self, key: &FlowKey, socket: &Arc<UdpSocket>) -> bool {
         let flows = self.flows.read().expect("flows");
-        let Some(flow) = flows.get(&key) else {
+        let Some(flow) = flows.get(key) else {
             return false;
         };
         if let FlowKind::Outbound { sock } = &flow.kind
@@ -1073,11 +1084,11 @@ impl UdpHub {
         false
     }
 
-    fn flow_is_active(&self, key: FlowKey, socket: &Arc<UdpSocket>) -> bool {
+    fn flow_is_active(&self, key: &FlowKey, socket: &Arc<UdpSocket>) -> bool {
         self.flows
             .read()
             .expect("flows")
-            .get(&key)
+            .get(key)
             .is_some_and(|flow| {
                 matches!(&flow.kind, FlowKind::Outbound {sock} if Arc::ptr_eq(sock, socket))
                     && flow.idle() < flow.timeout
@@ -1092,12 +1103,12 @@ impl UdpHub {
             .is_some_and(|flow| flow.idle() < flow.timeout)
     }
 
-    fn remove_flow(&self, key: FlowKey, socket: &Arc<UdpSocket>) {
+    fn remove_flow(&self, key: &FlowKey, socket: &Arc<UdpSocket>) {
         let mut flows = self.flows.write().expect("flows");
-        if flows.get(&key).is_some_and(
+        if flows.get(key).is_some_and(
             |flow| matches!(&flow.kind, FlowKind::Outbound {sock} if Arc::ptr_eq(sock, socket)),
         ) {
-            flows.remove(&key);
+            flows.remove(key);
         }
     }
 }
@@ -1184,84 +1195,102 @@ fn socks_udp_datagram(dest: SocketAddr, payload: &[u8], out: &mut Vec<u8>) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_reverse(
+async fn reverse_flow(
     outbound: Arc<UdpSocket>,
     reply: Reply,
     frame: DatagramFrame,
-    tag: &str,
+    tag: String,
     idle: Duration,
     hub: Arc<UdpHub>,
     key: FlowKey,
     tracker: Option<Arc<crate::clash_state::ConnHandle>>,
-) -> tokio::task::AbortHandle {
-    let tag = tag.to_string();
+) {
     let FlowKey { source, dest, .. } = key;
-    tokio::spawn(async move {
-        // the datagram being replied, as large as the largest so far
-        let mut datagram = Vec::new();
-        // framing buffer for non-Raw frames, kept across datagrams so the
-        // capacity survives; Raw replies borrow `datagram` directly and never
-        // touch it
-        let mut out = Vec::new();
-        loop {
-            let recv = tokio::select! {
-                result = tokio::time::timeout(idle, recv_with(&outbound, |bytes| {
-                    datagram.clear();
-                    datagram.extend_from_slice(bytes);
-                    bytes.len()
-                })) => result,
-                _ = async {
-                    if let Some(tracker) = &tracker { tracker.close_signal().wait().await; }
-                    else { std::future::pending::<()>().await; }
-                } => {
-                    hub.remove_flow(key, &outbound);
+    // the datagram being replied, as large as the largest so far
+    let mut datagram = Vec::new();
+    // framing buffer for non-Raw frames, kept across datagrams so the
+    // capacity survives; Raw replies borrow `datagram` directly and never
+    // touch it
+    let mut out = Vec::new();
+    loop {
+        let recv = tokio::select! {
+            result = tokio::time::timeout(idle, recv_with(&outbound, |bytes| {
+                datagram.clear();
+                datagram.extend_from_slice(bytes);
+                bytes.len()
+            })) => result,
+            _ = async {
+                if let Some(tracker) = &tracker { tracker.close_signal().wait().await; }
+                else { std::future::pending::<()>().await; }
+            } => {
+                hub.remove_flow(&key, &outbound);
+                return;
+            }
+        };
+        match recv {
+            Ok(Ok(n)) => {
+                // Both directions count as activity. A receive-only media
+                // flow must keep its established proxy/NAT session.
+                if !hub.touch_flow(&key, &outbound) {
                     return;
                 }
-            };
-            match recv {
-                Ok(Ok(n)) => {
-                    // Both directions count as activity. A receive-only media
-                    // flow must keep its established proxy/NAT session.
-                    if !hub.touch_flow(key, &outbound) {
-                        return;
-                    }
-                    if let Some(tracker) = &tracker {
-                        tracker.add_download(n as u64);
-                    }
-                    let framed: &[u8] = if frame == DatagramFrame::Raw {
-                        &datagram
-                    } else {
-                        frame.apply_into(dest, &datagram, &mut out);
-                        &out
-                    };
-                    if let Err(err) = reply.send(framed, source, dest).await {
-                        logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
-                        hub.remove_flow(key, &outbound);
-                        return;
-                    }
+                if let Some(tracker) = &tracker {
+                    tracker.add_download(n as u64);
                 }
-                Ok(Err(err)) => {
+                let framed: &[u8] = if frame == DatagramFrame::Raw {
+                    &datagram
+                } else {
+                    frame.apply_into(dest, &datagram, &mut out);
+                    &out
+                };
+                if let Err(err) = reply.send(framed, source, dest).await {
                     logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
-                    hub.remove_flow(key, &outbound);
-                    return;
-                }
-                Err(_) => {
-                    // Sending without replies is also a live UDP session.
-                    if hub.flow_is_active(key, &outbound) {
-                        continue;
-                    }
-                    // Idle timeout â€” drop the flow (reference udpnat purge).
-                    hub.remove_flow(key, &outbound);
+                    hub.remove_flow(&key, &outbound);
                     return;
                 }
             }
+            Ok(Err(err)) => {
+                logging::debug(format_args!("udp reverse {tag} {source}: {err}"));
+                hub.remove_flow(&key, &outbound);
+                return;
+            }
+            Err(_) => {
+                // Sending without replies is also a live UDP session.
+                if hub.flow_is_active(&key, &outbound) {
+                    continue;
+                }
+                // Idle timeout â€” drop the flow (reference udpnat purge).
+                hub.remove_flow(&key, &outbound);
+                return;
+            }
         }
-    })
-    .abort_handle()
+    }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn hy2_named_destinations_share_a_session_but_keep_distinct_keys_and_reply_addresses() {
+        let (sender, mut replies) = tokio::sync::mpsc::channel(2);
+        let reply = |destination| Reply::Hy2 {
+            connection_id: 1,
+            session_id: 2,
+            destination: Arc::from(destination),
+            sender: sender.clone(),
+        };
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let socket_address = "0.0.0.0:443".parse().unwrap();
+        let first = reply("one.invalid:443");
+        let second = reply("two.invalid:443");
+        assert!(first.flow_key(peer, socket_address) != second.flow_key(peer, socket_address));
+        for (route, expected) in [(first, "one.invalid:443"), (second, "two.invalid:443")] {
+            route.send(b"answer", peer, socket_address).await.unwrap();
+            let received = replies.recv().await.unwrap();
+            assert_eq!(&*received.src, expected);
+            assert_eq!(received.session_id, 2);
+        }
+    }
 
     #[test]
     fn fakeip_activity_refreshes_the_current_pool_with_a_bounded_lock_rate() {
@@ -1610,7 +1639,7 @@ mod tests {
             "127.0.0.1:30001".parse().expect("dest"),
         );
         hub.flows.write().expect("flows").insert(
-            key,
+            key.clone(),
             Arc::new(Flow {
                 tracker: None,
                 kind: FlowKind::Outbound { sock: replacement },
@@ -1621,18 +1650,19 @@ mod tests {
                 fakeip: None,
             }),
         );
-        let task = spawn_reverse(
+        let reverse = reverse_flow(
             old,
             Reply::Socket(Arc::downgrade(&reply)),
             DatagramFrame::Raw,
-            "test",
+            "test".to_owned(),
             Duration::from_millis(20),
             Arc::clone(&hub),
-            key,
+            key.clone(),
             None,
         );
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert!(task.is_finished(), "old reverse task must finish");
+        tokio::time::timeout(Duration::from_secs(1), reverse)
+            .await
+            .expect("old reverse task must finish");
         assert!(
             hub.flows.read().expect("flows").contains_key(&key),
             "old timeout removed a newer flow with the same tuple"

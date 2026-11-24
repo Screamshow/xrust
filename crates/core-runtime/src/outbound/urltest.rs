@@ -9,6 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use core_config::probe_url::ProbeUrl;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
@@ -27,17 +28,12 @@ struct Shared {
     members: Vec<String>,
     resolved: OnceLock<Vec<usize>>,
     current: AtomicUsize,
-    latencies: Mutex<Vec<Option<u64>>>,
-    probe: UrlProbe,
+    last_active: Mutex<Instant>,
+    activity: tokio::sync::Notify,
+    idle_timeout: Duration,
+    probe: ProbeUrl,
     interval: Duration,
     tolerance_ms: u64,
-}
-
-struct UrlProbe {
-    tls: bool,
-    host: String,
-    port: u16,
-    path: String,
 }
 
 impl Urltest {
@@ -56,17 +52,19 @@ impl Urltest {
         if members.is_empty() {
             anyhow::bail!("{at}: missing tags");
         }
-        let probe = parse_probe_url(
+        let probe = ProbeUrl::parse(
             obj.get("url")
                 .and_then(Value::as_str)
                 .unwrap_or("https://www.gstatic.com/generate_204"),
-            at,
-        )?;
+        )
+        .ok_or_else(|| anyhow::anyhow!("{at}: invalid HTTP probe URL"))?;
         let interval = parse_duration(
             obj.get("interval"),
             Duration::from_secs(180),
             format!("{at}: interval").as_str(),
         )?;
+        let idle_default = Duration::from_secs(30 * 60);
+        let idle_timeout = parse_duration(obj.get("idle_timeout"), idle_default, "idle_timeout")?;
         let tolerance_ms = obj.get("tolerance").and_then(Value::as_u64).unwrap_or(50);
         Ok(Self {
             shared: Arc::new(Shared {
@@ -82,9 +80,19 @@ impl Urltest {
                 members,
                 resolved: OnceLock::new(),
                 current: AtomicUsize::new(0),
-                latencies: Mutex::new(Vec::new()),
+                last_active: Mutex::new(Instant::now()),
+                activity: tokio::sync::Notify::new(),
+                idle_timeout: if idle_timeout.is_zero() {
+                    idle_default
+                } else {
+                    idle_timeout
+                },
                 probe,
-                interval,
+                interval: if interval.is_zero() {
+                    Duration::from_secs(180)
+                } else {
+                    interval
+                },
                 tolerance_ms,
             }),
         })
@@ -99,16 +107,21 @@ impl Urltest {
             })?;
             resolved.push(index);
         }
-        let _ = self
-            .shared
-            .latencies
-            .lock()
-            .map(|mut l| *l = vec![None; resolved.len()]);
         let _ = self.shared.resolved.set(resolved);
         Ok(())
     }
 
+    fn touch(&self) {
+        *self
+            .shared
+            .last_active
+            .lock()
+            .expect("urltest activity lock") = Instant::now();
+        self.shared.activity.notify_one();
+    }
+
     pub async fn connect(&self, router: &Router, target: &Target) -> io::Result<Conn> {
+        self.touch();
         let members = self
             .shared
             .resolved
@@ -126,6 +139,7 @@ impl Urltest {
         router: &Router,
         target: &Target,
     ) -> io::Result<tokio::net::UdpSocket> {
+        self.touch();
         let members = self
             .shared
             .resolved
@@ -161,21 +175,6 @@ impl Urltest {
         }
     }
 
-    /// Copy measured latencies from an earlier urltest group if member tags match.
-    pub fn copy_latencies_from(&self, old: &Urltest) {
-        let old_latencies = old.shared.latencies.lock().expect("old latencies lock");
-        let mut new_latencies = self.shared.latencies.lock().expect("new latencies lock");
-        for (new_pos, member) in self.shared.members.iter().enumerate() {
-            if let Some(old_pos) = old.shared.members.iter().position(|m| m == member)
-                && let Some(Some(latency)) = old_latencies.get(old_pos)
-                && new_pos < new_latencies.len()
-            {
-                new_latencies[new_pos] = Some(*latency);
-            }
-        }
-    }
-
-    /// Spawn the background probe loop (called once the router is shared).
     pub(crate) fn apply_probe_results(
         &self,
         router: &Router,
@@ -197,6 +196,15 @@ impl Urltest {
             loop {
                 probe_all(&shared, &router).await;
                 tokio::time::sleep(shared.interval).await;
+                while shared
+                    .last_active
+                    .lock()
+                    .expect("urltest activity lock")
+                    .elapsed()
+                    >= shared.idle_timeout
+                {
+                    shared.activity.notified().await;
+                }
             }
         })
     }
@@ -243,9 +251,6 @@ async fn probe_all(shared: &Arc<Shared>, router: &Arc<Router>) {
 }
 
 fn apply_results(shared: &Shared, router: &Router, results: Vec<Option<u64>>) {
-    let mut latencies = shared.latencies.lock().expect("latencies lock");
-    latencies.clone_from(&results);
-
     let Some((best_pos, best_ms)) = results
         .iter()
         .enumerate()
@@ -447,7 +452,7 @@ async fn probe_once(shared: &Shared, router: &Router, member: usize, attempt: u8
         let tls_at = start.elapsed();
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-            shared.probe.path, shared.probe.host
+            shared.probe.path, shared.probe.authority
         );
         if stream.write_all(request.as_bytes()).await.is_err() {
             return ProbeAttempt::Retry;
@@ -501,38 +506,6 @@ async fn probe_once(shared: &Shared, router: &Router, member: usize, attempt: u8
         ProbeAttempt::Done(head_at.saturating_sub(tls_at).as_millis() as u64)
     };
     probe.await
-}
-
-fn parse_probe_url(url: &str, at: &str) -> anyhow::Result<UrlProbe> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("{at}: url missing scheme"))?;
-    let tls = match scheme {
-        "http" => false,
-        "https" => true,
-        other => anyhow::bail!("{at}: url scheme {other:?} not supported"),
-    };
-    let (authority, path) = match rest.split_once('/') {
-        Some((authority, path)) => (authority, format!("/{path}")),
-        None => (rest, "/".to_string()),
-    };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (
-            host,
-            port.parse()
-                .map_err(|_| anyhow::anyhow!("{at}: url port invalid"))?,
-        ),
-        None => (authority, if tls { 443 } else { 80 }),
-    };
-    if host.is_empty() {
-        anyhow::bail!("{at}: url host missing");
-    }
-    Ok(UrlProbe {
-        tls,
-        host: host.to_string(),
-        port,
-        path,
-    })
 }
 
 /// badoption.Duration: Go `time.ParseDuration` strings (`1m30s`, `1.5h`,
@@ -680,21 +653,108 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[tokio::test]
+    async fn idle_group_suspends_then_wakes_on_tcp_and_udp() {
+        use tokio::net::TcpListener;
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let config = json!({"outbounds":[
+            {"type":"direct", "tag":"live"},
+            {"type":"urltest", "tag":"group", "outbounds":["live"],
+             "url":format!("http://{addr}?health=1"), "interval":"30ms", "idle_timeout":"90ms"}
+        ]});
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = server.accept().await {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(
+                    request.starts_with(&format!("GET /?health=1 HTTP/1.1\r\nHost: {addr}\r\n"))
+                );
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .unwrap();
+                tx.send(()).unwrap();
+            }
+        });
+        let router = Router::new(&config).unwrap();
+        let group = router.index_of("group").unwrap();
+        let target = Target::Ip(
+            TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap()
+                .local_addr()
+                .unwrap(),
+        );
+        for network in ["tcp", "udp"] {
+            tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            while rx.try_recv().is_ok() {}
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                    .await
+                    .is_err()
+            );
+            match network {
+                "tcp" => {
+                    let _ = router.connect_index(group, &target).await;
+                }
+                _ => {
+                    let _ = router.connect_udp_index(group, &target).await;
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+    }
+
+    #[test]
+    fn check_and_runtime_agree_on_probe_urls() {
+        for (url, valid) in [
+            ("http://[::1]/health", true),
+            ("http://[::1]oops", false),
+            ("http://host:65536", false),
+        ] {
+            let outbound = json!({"type":"urltest","tag":"group","outbounds":["direct"],"url":url});
+            let root = json!({"outbounds":[{"type":"direct","tag":"direct"},outbound]});
+            assert_eq!(
+                core_config::check_str(&root.to_string()).is_ok(),
+                valid,
+                "{url}"
+            );
+            assert_eq!(
+                Urltest::build(outbound.as_object().unwrap(), "test").is_ok(),
+                valid,
+                "{url}"
+            );
+        }
+    }
+
     #[test]
     fn probe_url_parsing() {
-        let p = parse_probe_url("https://www.gstatic.com/generate_204", "t").expect("parse");
+        let p = ProbeUrl::parse("https://www.gstatic.com/generate_204").expect("parse");
         assert!(p.tls);
         assert_eq!(p.host, "www.gstatic.com");
         assert_eq!(p.port, 443);
         assert_eq!(p.path, "/generate_204");
 
-        let p = parse_probe_url("http://127.0.0.1:8123/", "t").expect("parse");
+        let p = ProbeUrl::parse("http://127.0.0.1:8123/").expect("parse");
         assert!(!p.tls);
         assert_eq!(p.port, 8123);
         assert_eq!(p.path, "/");
 
-        assert!(parse_probe_url("ftp://x/", "t").is_err());
-        assert!(parse_probe_url("nonsense", "t").is_err());
+        assert!(ProbeUrl::parse("ftp://x/").is_none());
+        assert!(ProbeUrl::parse("nonsense").is_none());
     }
 
     #[test]

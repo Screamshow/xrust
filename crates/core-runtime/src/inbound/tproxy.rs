@@ -7,7 +7,8 @@ use serde_json::Value;
 use tokio::net::{TcpListener, UdpSocket};
 
 use crate::inbound::udp::{
-    DEFAULT_UDP_TIMEOUT, DatagramFrame, MAX_UDP_FLOWS, Reply, UdpHub, recv_with,
+    DEFAULT_UDP_TIMEOUT, DatagramFrame, MAX_UDP_FLOWS, Reply, StopHub, UdpHub,
+    effective_udp_timeout, recv_with,
 };
 use crate::inbound::{Target, drive_transparent, network_includes_udp, parse_listen};
 use crate::logging;
@@ -50,7 +51,11 @@ impl Tproxy {
         let addr = SocketAddr::new(ip, port);
 
         let listener = if want_tcp {
-            Some(bind_tproxy(addr).map_err(|err| anyhow::anyhow!("{at}: {err}"))?)
+            let fast_open = obj
+                .get("tcp_fast_open")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            Some(bind_tproxy(addr, fast_open).map_err(|err| anyhow::anyhow!("{at}: {err}"))?)
         } else {
             None
         };
@@ -65,11 +70,11 @@ impl Tproxy {
         } else {
             None
         };
-        let udp_timeout = parse_duration(
+        let udp_timeout = effective_udp_timeout(parse_duration(
             obj.get("udp_timeout"),
             DEFAULT_UDP_TIMEOUT,
             &format!("{at}: udp_timeout"),
-        )?;
+        )?);
         // sing-box `udp_nat_max`; 0 or absent keeps the default
         let udp_nat_max = obj
             .get("udp_nat_max")
@@ -169,6 +174,7 @@ impl Tproxy {
             let _stop_hub = StopHub(Arc::clone(&hub));
             let mut flows = tokio::task::JoinSet::new();
             let mut reply_sockets = HashMap::<_, std::sync::Weak<UdpSocket>>::new();
+            let recheck = udp_timeout.min(std::time::Duration::from_secs(30));
             let listen_port = sock.local_addr().map_or(0, |addr| addr.port());
             let fallback = Target::Ip(match sock.local_addr() {
                 Ok(a) => a,
@@ -181,7 +187,18 @@ impl Tproxy {
                 #[cfg(target_os = "linux")]
                 let received = tokio::select! {
                     packet = recv_datagram(&sock, &mut buf, &mut oob) => packet,
-                    _ = flows.join_next(), if !flows.is_empty() => continue,
+                    completed = flows.join_next(), if !flows.is_empty() => {
+                        match completed {
+                            Some(Ok(key)) => {
+                                if reply_sockets.get(&key).is_some_and(|socket| socket.strong_count() == 0) {
+                                    reply_sockets.remove(&key);
+                                }
+                            }
+                            Some(Err(_)) => reply_sockets.retain(|_, socket| socket.strong_count() != 0),
+                            None => {}
+                        }
+                        continue;
+                    }
                 };
                 #[cfg(not(target_os = "linux"))]
                 let received: io::Result<(usize, SocketAddr, Option<SocketAddr>)> = {
@@ -214,7 +231,6 @@ impl Tproxy {
                             continue;
                         };
                         let tag = tag.clone();
-                        reply_sockets.retain(|_, socket| socket.strong_count() != 0);
                         if let Some(socket) = reply_sockets
                             .get(&(source, dest))
                             .and_then(std::sync::Weak::upgrade)
@@ -225,6 +241,7 @@ impl Tproxy {
                                 let _ = opener
                                     .run(Reply::Socket(Arc::downgrade(&socket)), &tag)
                                     .await;
+                                (source, dest)
                             });
                             continue;
                         }
@@ -245,12 +262,11 @@ impl Tproxy {
                             let reply = Reply::Socket(Arc::downgrade(&socket));
                             if let Err(err) = opener.run(reply, &tag).await {
                                 logging::debug(format_args!("tproxy[{tag}] udp {source}: {err}"));
-                                return;
+                                return (source, dest);
                             }
                             // Linux prefers this connected transparent socket
                             // over the listener for subsequent client packets.
                             // An evicted flow frees this socket within a recheck.
-                            let recheck = udp_timeout.min(std::time::Duration::from_secs(30));
                             loop {
                                 let received =
                                     recv_with(&socket, |payload| hub.offer(source, dest, payload));
@@ -268,6 +284,7 @@ impl Tproxy {
                                     break;
                                 }
                             }
+                            (source, dest)
                         });
                     }
                 }
@@ -297,14 +314,6 @@ fn targets_own_listener(destination: SocketAddr, listen_port: u16) -> bool {
                 .iter()
                 .any(|interface| interface.ip().to_canonical() == ip)
         })
-}
-
-struct StopHub(Arc<UdpHub>);
-
-impl Drop for StopHub {
-    fn drop(&mut self) {
-        self.0.stop();
-    }
 }
 
 #[cfg(target_os = "linux")]
@@ -354,7 +363,7 @@ fn bind_reply(_remote: SocketAddr, _client: SocketAddr) -> io::Result<UdpSocket>
 }
 
 #[cfg(target_os = "linux")]
-fn bind_tproxy(addr: SocketAddr) -> io::Result<TcpListener> {
+fn bind_tproxy(addr: SocketAddr, fast_open: bool) -> io::Result<TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 
     let domain = if addr.is_ipv4() {
@@ -370,6 +379,9 @@ fn bind_tproxy(addr: SocketAddr) -> io::Result<TcpListener> {
         socket.set_ip_transparent_v6(true)?;
     }
     socket.bind(&addr.into())?;
+    if fast_open {
+        set_raw_int(&socket, libc::IPPROTO_TCP, libc::TCP_FASTOPEN, 128)?;
+    }
     socket.listen(128)?;
     socket.set_nonblocking(true)?;
     let std_listener: std::net::TcpListener = socket.into();
@@ -393,10 +405,10 @@ fn bind_tproxy_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
     socket.set_reuse_address(true)?;
     if addr.is_ipv4() {
         socket.set_ip_transparent_v4(true)?;
-        set_raw_int(&socket, libc::IPPROTO_IP, IP_RECVORIGDSTADDR)?;
+        set_raw_int(&socket, libc::IPPROTO_IP, IP_RECVORIGDSTADDR, 1)?;
     } else {
         socket.set_ip_transparent_v6(true)?;
-        set_raw_int(&socket, libc::IPPROTO_IPV6, IPV6_RECVORIGDSTADDR)?;
+        set_raw_int(&socket, libc::IPPROTO_IPV6, IPV6_RECVORIGDSTADDR, 1)?;
     }
     socket.bind(&addr.into())?;
     socket.set_nonblocking(true)?;
@@ -406,15 +418,19 @@ fn bind_tproxy_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
 
 /// socket2 0.6 dropped `set_raw_opt`; use libc setsockopt on the raw fd.
 #[cfg(target_os = "linux")]
-fn set_raw_int(socket: &socket2::Socket, level: libc::c_int, name: libc::c_int) -> io::Result<()> {
+fn set_raw_int(
+    socket: &socket2::Socket,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) -> io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    let yes: libc::c_int = 1;
     let rc = unsafe {
         libc::setsockopt(
             socket.as_raw_fd(),
             level,
             name,
-            &yes as *const _ as *const libc::c_void,
+            &value as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
@@ -537,7 +553,7 @@ fn extract_orig_dst(msg: &libc::msghdr) -> io::Result<Option<SocketAddr>> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn bind_tproxy(_addr: SocketAddr) -> io::Result<TcpListener> {
+fn bind_tproxy(_addr: SocketAddr, _fast_open: bool) -> io::Result<TcpListener> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "tproxy is only supported on Linux",
@@ -556,6 +572,43 @@ fn bind_tproxy_udp(_addr: SocketAddr) -> io::Result<UdpSocket> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn bind_applies_fast_open_and_normalizes_zero_udp_timeout() {
+        use std::os::fd::AsRawFd;
+        let probe =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        if let Err(err) = probe.set_ip_transparent_v4(true) {
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+            eprintln!("transparent listener test skipped: {err}");
+            return;
+        }
+        let router =
+            Router::new(&serde_json::json!({"outbounds": [{"type": "direct", "tag": "direct"}]}))
+                .unwrap();
+        for fast_open in [false, true] {
+            let config = serde_json::json!({
+                "listen": "127.0.0.1", "listen_port": 0, "network": "tcp",
+                "tcp_fast_open": fast_open, "udp_timeout": "0s"
+            });
+            let inbound = Tproxy::bind(&config, Arc::clone(&router)).await.unwrap();
+            assert_eq!(inbound.udp_timeout, DEFAULT_UDP_TIMEOUT);
+            let listener = inbound.listener.unwrap();
+            let mut depth: libc::c_int = 0;
+            let mut len = std::mem::size_of_val(&depth) as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    listener.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_FASTOPEN,
+                    (&raw mut depth).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+            assert_eq!(depth > 0, fast_open);
+        }
+    }
 
     #[tokio::test]
     async fn raw_udp_preserves_peer_and_yields_after_queue_drain() {

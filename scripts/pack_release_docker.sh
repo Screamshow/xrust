@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd /src
+cd "$(dirname "$0")/.."
 mkdir -p dist
-VER="v0.0.1"
+VER="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+test "$VER" != v
 
 echo "=== Packaging x86_64-unknown-linux-musl ==="
 cp target/x86_64-unknown-linux-musl/release/xrust dist/xrust-x86_64-musl

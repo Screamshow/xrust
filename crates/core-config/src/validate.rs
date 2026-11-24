@@ -6349,6 +6349,11 @@ fn validate_outbound(
             }
         }
         "urltest" => {
+            if let Some(url) = obj.get("url").and_then(Value::as_str)
+                && crate::probe_url::ProbeUrl::parse(url).is_none()
+            {
+                return Err(format!("{at}: invalid HTTP probe URL"));
+            }
             if let Some(Value::String(s)) = obj.get("mode")
                 && !matches!(s.as_str(), "" | "least_test" | "round_robin")
             {

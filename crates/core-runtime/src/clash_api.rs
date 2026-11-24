@@ -207,7 +207,6 @@ impl ClashApi {
             Ok(response) if response.status == 200 => {
                 if let Err(err) = zip::extract(&response.body, std::path::Path::new(dir)) {
                     logging::warn(format_args!("external_ui: {err}"));
-                    clear_directory(dir);
                 } else {
                     logging::info(format_args!("external_ui: installed into {dir}"));
                 }
@@ -217,11 +216,9 @@ impl ClashApi {
                     "external_ui: downloading {url} failed: HTTP {}",
                     response.status
                 ));
-                clear_directory(dir);
             }
             Err(err) => {
                 logging::warn(format_args!("external_ui: downloading {url} failed: {err}"));
-                clear_directory(dir);
             }
         }
     }
@@ -355,17 +352,6 @@ fn download_client(detour: Option<&str>) -> anyhow::Result<crate::http_client::H
         Some(&Value::Object(wrapper)),
         "experimental.clash_api.external_ui_download_detour",
     )
-}
-
-/// Reference `removeAllInDirectory`: a failed download must not leave a
-/// half-unpacked bundle behind, or the next start would think it is current.
-fn clear_directory(dir: &str) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let _ = std::fs::remove_dir_all(entry.path());
-    }
 }
 
 async fn serve(listener: TcpListener, api: Arc<ClashApi>, router: Arc<Router>) {
@@ -1292,7 +1278,8 @@ async fn handle_proxy_route(
     query: &[(String, String)],
     cors: &[String],
 ) -> std::io::Result<bool> {
-    let Some(index) = router.index_of(name) else {
+    let inner = router.inner();
+    let Some(index) = inner.index_of(name) else {
         respond_json(stream, 404, "Not Found", &not_found(), cors).await?;
         return Ok(true);
     };
@@ -1307,7 +1294,7 @@ async fn handle_proxy_route(
         ("GET", false) => {
             // Reference writes the proxy info via `w.Write` — Go sniffs the
             // JSON body as `text/plain`.
-            let info = proxy_info(router, index, name);
+            let info = proxy_info_outbound(&inner, index, &inner.outbounds[index], name);
             respond_text(
                 stream,
                 200,
@@ -1379,7 +1366,7 @@ async fn handle_proxy_route(
             // Reference `getGroupDelay`: `/group` serves groups only.
             if group
                 && !matches!(
-                    router.inner().outbounds[index],
+                    inner.outbounds[index],
                     Outbound::Selector(_) | Outbound::Urltest(_)
                 )
             {
@@ -1395,7 +1382,7 @@ async fn handle_proxy_route(
             if url.is_empty() {
                 url = DEFAULT_DELAY_URL.to_string();
             }
-            delay_test(stream, router, index, &url, timeout, group, cors).await?;
+            delay_test(stream, router, inner, index, &url, timeout, group, cors).await?;
             Ok(true)
         }
         _ => {
@@ -1438,25 +1425,22 @@ fn proxies_view(router: &Router) -> Value {
         } else {
             tag.clone()
         };
-        proxies.insert(key, proxy_info_outbound(router, i, outbound, &tag));
+        proxies.insert(key, proxy_info_outbound(&inner, i, outbound, &tag));
     }
     json!({"proxies": Value::Object(proxies)})
 }
 
-fn proxy_info(router: &Router, index: usize, tag: &str) -> Value {
-    let inner = router.inner();
-    match inner.outbound_table().find(|(i, ..)| *i == index) {
-        Some((_, _, outbound)) => proxy_info_outbound(router, index, outbound, tag),
-        None => json!({}),
-    }
-}
-
-fn proxy_info_outbound(router: &Router, index: usize, outbound: &Outbound, tag: &str) -> Value {
+fn proxy_info_outbound(
+    inner: &crate::route::RouterInner,
+    index: usize,
+    outbound: &Outbound,
+    tag: &str,
+) -> Value {
     let mut info = serde_json::Map::new();
     info.insert("type".into(), json!(clash_type_name(outbound)));
     info.insert("name".into(), json!(tag));
     info.insert("udp".into(), json!(udp_capable(outbound)));
-    let history = match router.delay_history(index) {
+    let history = match inner.delay_history(index) {
         Some((time, delay)) => json!([{ "time": time, "delay": delay }]),
         None => json!([]),
     };
@@ -1507,9 +1491,11 @@ fn udp_capable(outbound: &Outbound) -> bool {
 /// `group` (`/group/{name}/delay`) answers like the reference `getGroupDelay`:
 /// `200` with `{member: delay}` for the members that answered in time (a
 /// nested group reports the delay of its selected member), never `{"delay"}`.
+#[allow(clippy::too_many_arguments)]
 async fn delay_test(
     stream: &mut TcpStream,
     router: &Arc<Router>,
+    inner: Arc<crate::route::RouterInner>,
     index: usize,
     url: &str,
     timeout: i16,
@@ -1518,7 +1504,7 @@ async fn delay_test(
 ) -> std::io::Result<()> {
     let deadline = Duration::from_millis(timeout.max(0) as u64);
     crate::logging::debug(format_args!("delay[{index}]: start probing {url}"));
-    let inner = router.inner();
+    let probe_router = router.probe_snapshot(Arc::clone(&inner));
     fn visit(
         inner: &crate::route::RouterInner,
         index: usize,
@@ -1566,7 +1552,7 @@ async fn delay_test(
             ) {
                 continue;
             }
-            let router = router.clone();
+            let router = Arc::clone(&probe_router);
             let url = url.to_string();
             let sem = sem.clone();
             tasks.spawn(async move {
@@ -1606,7 +1592,7 @@ async fn delay_test(
             // member's reason for having no answer
             let source = match &inner.outbounds[node] {
                 Outbound::Urltest(group) => {
-                    group.apply_probe_results(router, &results);
+                    group.apply_probe_results(&probe_router, &results);
                     inner.index_of(group.now())
                 }
                 Outbound::Selector(group) => inner.index_of(group.now()),
@@ -1649,13 +1635,9 @@ async fn delay_test(
     match test.await {
         Outcome::Members(map) => respond_json(stream, 200, "OK", &map, cors).await,
         Outcome::Timeout => {
-            for node in order {
-                inner.clear_delay(node);
-            }
             respond_json(stream, 504, "Gateway Timeout", &timeout_err(), cors).await
         }
         Outcome::Failed(fail) => {
-            router.clear_delay(index);
             respond_json(
                 stream,
                 503,
@@ -1666,7 +1648,6 @@ async fn delay_test(
             .await
         }
         Outcome::Delay(delay) => {
-            router.record_delay(index, delay.into());
             respond_json(stream, 200, "OK", &json!({"delay": delay}), cors).await
         }
     }
@@ -1706,7 +1687,13 @@ impl ProbeFail {
 }
 
 async fn probe_delay(router: &Router, index: usize, url: &str) -> Result<u16, ProbeFail> {
-    let (tls, host, port, authority, path) = parse_link(url).ok_or(ProbeFail::Url)?;
+    let core_config::probe_url::ProbeUrl {
+        tls,
+        host,
+        port,
+        authority,
+        path,
+    } = core_config::probe_url::ProbeUrl::parse(url).ok_or(ProbeFail::Url)?;
     let target = Target::Domain(host.clone(), port);
     let mut start = Instant::now();
     let dialled = router.connect_index(index, &target).await;
@@ -1774,49 +1761,6 @@ fn delay_ms(elapsed: Duration) -> Result<u16, ProbeFail> {
     u16::try_from(elapsed.as_millis())
         .map(|ms| ms.max(1))
         .map_err(|_| ProbeFail::TooSlow)
-}
-
-/// Minimal URL split: `(tls, host, port, authority, path-with-query)`.
-fn parse_link(url: &str) -> Option<(bool, String, u16, String, String)> {
-    let (scheme, rest) = url.split_once("://")?;
-    let tls = match scheme {
-        "https" => true,
-        "http" => false,
-        _ => return None,
-    };
-    let (authority, tail) = match rest.find(['/', '?']) {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, "/"),
-    };
-    if authority.is_empty() {
-        return None;
-    }
-    let path = if tail.starts_with('?') {
-        format!("/{tail}")
-    } else {
-        tail.to_string()
-    };
-    let (host, port) = split_authority(authority, tls)?;
-    Some((tls, host, port, authority.to_string(), path))
-}
-
-fn split_authority(authority: &str, tls: bool) -> Option<(String, u16)> {
-    let default_port = if tls { 443 } else { 80 };
-    if let Some(rest) = authority.strip_prefix('[') {
-        let (host, tail) = rest.split_once(']')?;
-        let port = match tail.strip_prefix(':') {
-            Some(p) => p.parse().ok()?,
-            None => return Some((host.to_string(), default_port)),
-        };
-        Some((host.to_string(), port))
-    } else if let Some((host, port)) = authority.rsplit_once(':') {
-        if host.is_empty() || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        Some((host.to_string(), port.parse().ok()?))
-    } else {
-        Some((authority.to_string(), default_port))
-    }
 }
 
 fn header_get<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -2209,31 +2153,6 @@ mod tests {
             external_ui_download_url: None,
             external_ui_download_detour: None,
         }
-    }
-
-    #[test]
-    fn parse_link_shapes() {
-        let (tls, host, port, authority, path) =
-            parse_link("https://example.com:8443/a?b=1").expect("parse");
-        assert!(tls);
-        assert_eq!(
-            (host.as_str(), port, authority.as_str(), path.as_str()),
-            ("example.com", 8443, "example.com:8443", "/a?b=1")
-        );
-        let (tls, host, port, authority, path) = parse_link("http://example.com/x").expect("parse");
-        assert!(!tls);
-        assert_eq!(
-            (host.as_str(), port, authority.as_str(), path.as_str()),
-            ("example.com", 80, "example.com", "/x")
-        );
-        let (tls, host, port, authority, path) = parse_link("https://h?x=1").expect("parse");
-        assert!(tls);
-        assert_eq!(
-            (host.as_str(), port, authority.as_str(), path.as_str()),
-            ("h", 443, "h", "/?x=1")
-        );
-        assert!(parse_link("ftp://x/").is_none());
-        assert!(parse_link("https:///x").is_none());
     }
 
     #[test]

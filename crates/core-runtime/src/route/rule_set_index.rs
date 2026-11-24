@@ -329,6 +329,7 @@ struct PlainRule {
     has_dest_ports: bool,
     has_source_ports: bool,
     has_network: bool,
+    query_types: Vec<u16>,
     domains: HashSet<Box<str>>,
     /// Kept as a list and tested with the interpreter's own
     /// `domain_suffix_match`: the label boundary, the leading-dot form and
@@ -363,6 +364,12 @@ impl PlainRule {
             has_source_ports: object.contains_key("source_port")
                 || object.contains_key("source_port_range"),
             has_network: object.contains_key("network"),
+            query_types: object
+                .get("query_type")
+                .map(core_config::srs::query_types)
+                .transpose()
+                .map_err(anyhow::Error::msg)?
+                .unwrap_or_default(),
             ..PlainRule::default()
         };
         for entry in take_list(object.remove("domain")) {
@@ -411,6 +418,13 @@ impl PlainRule {
 
     fn matches(&self, ctx: &ConnContext) -> bool {
         // Destination criteria (domain or IP)
+        if !self.query_types.is_empty()
+            && !ctx
+                .query_type
+                .is_some_and(|qtype| self.query_types.contains(&qtype))
+        {
+            return self.inverted;
+        }
         if self.has_domains || self.has_dest_ip {
             let mut dest_matched = false;
             for host in domain_hosts(ctx).filter(|_| self.has_domains) {
@@ -486,6 +500,9 @@ impl PlainRule {
 /// tree. A rule with no constraint at all is not a rule the pools can
 /// express -- it matches everything, and only the plain fallback says so.
 fn poolable(object: &serde_json::Map<String, Value>) -> bool {
+    if object.contains_key("query_type") {
+        return false;
+    }
     const GROUPS: [&[&str]; 5] = [
         &[
             "domain",

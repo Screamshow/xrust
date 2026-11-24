@@ -52,57 +52,42 @@ impl Url {
     pub fn parse(raw: &str) -> io::Result<Self> {
         let (scheme, rest) = raw
             .split_once("://")
-            .ok_or_else(|| io::Error::other(format!("invalid URL {raw:?}")))?;
-        let secure = match scheme.to_ascii_lowercase().as_str() {
-            "http" => false,
-            "https" => true,
-            other => {
-                return Err(io::Error::other(format!(
-                    "unsupported URL scheme {other:?}"
-                )));
-            }
+            .ok_or_else(|| io::Error::other("invalid URL"))?;
+        let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let stripped;
+        let raw = if let Some((_, authority)) = rest[..end].rsplit_once('@') {
+            stripped = format!("{scheme}://{authority}{}", &rest[end..]);
+            &stripped
+        } else {
+            raw
         };
-        let (authority, path) = match rest.find(['/', '?', '#']) {
-            Some(at) => (&rest[..at], &rest[at..]),
-            None => (rest, ""),
-        };
-        // strip userinfo and the fragment; the path is kept verbatim
-        let authority = match authority.rsplit_once('@') {
-            Some((_, host)) => host,
-            None => authority,
-        };
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((host, port)) if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => (
-                host.to_string(),
-                port.parse()
-                    .map_err(|_| io::Error::other(format!("invalid port in URL {raw:?}")))?,
-            ),
-            _ => (authority.to_string(), if secure { 443 } else { 80 }),
-        };
-        if host.is_empty() {
-            return Err(io::Error::other(format!("invalid URL {raw:?}")));
-        }
-        let path = match path.find('#') {
-            Some(at) => &path[..at],
-            None => path,
-        };
-        let path = if path.is_empty() { "/" } else { path };
+        let parsed = core_config::probe_url::ProbeUrl::parse(raw)
+            .ok_or_else(|| io::Error::other("invalid HTTP URL"))?;
         Ok(Self {
-            secure,
-            host: host.trim_matches(['[', ']']).to_string(),
-            port,
-            path: path.to_string(),
+            secure: parsed.tls,
+            host: parsed.host,
+            port: parsed.port,
+            path: parsed.path,
         })
     }
 
-    /// `host[:port]` for the `Host` header (the default port stays implicit).
     pub fn authority(&self) -> String {
-        let default = if self.secure { 443 } else { 80 };
-        if self.port == default {
-            self.host.clone()
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
         } else {
-            format!("{}:{}", self.host, self.port)
+            self.host.clone()
+        };
+        if self.port == if self.secure { 443 } else { 80 } {
+            host
+        } else {
+            format!("{host}:{}", self.port)
         }
+    }
+
+    fn same_origin(&self, other: &Self) -> bool {
+        self.secure == other.secure
+            && self.port == other.port
+            && self.host.eq_ignore_ascii_case(&other.host)
     }
 
     /// Resolve a `Location` header against this URL.
@@ -117,8 +102,17 @@ impl Url {
         if location.starts_with('/') {
             return Url::parse(&format!("{base}://{}{location}", self.authority()));
         }
-        let directory = match self.path.rfind('/') {
-            Some(at) => &self.path[..=at],
+        if location.starts_with(['?', '#']) || location.is_empty() {
+            let path = if location.starts_with('?') {
+                self.path.split('?').next().unwrap_or("/")
+            } else {
+                &self.path
+            };
+            return Url::parse(&format!("{base}://{}{path}{location}", self.authority()));
+        }
+        let base_path = self.path.split('?').next().unwrap_or("/");
+        let directory = match base_path.rfind('/') {
+            Some(at) => &base_path[..=at],
             None => "/",
         };
         Url::parse(&format!(
@@ -188,15 +182,35 @@ impl HttpClient {
         url: &str,
         extra_headers: &[(String, String)],
     ) -> io::Result<Response> {
+        self.get_with_budget(router, url, extra_headers, CONNECT_TIMEOUT + IO_TIMEOUT)
+            .await
+    }
+
+    async fn get_with_budget(
+        &self,
+        router: &crate::route::Router,
+        url: &str,
+        extra_headers: &[(String, String)],
+        budget: Duration,
+    ) -> io::Result<Response> {
+        let deadline = tokio::time::Instant::now() + budget;
         let mut current = Url::parse(url)?;
+        let mut forward_headers = true;
         for _ in 0..=MAX_REDIRECTS {
-            let response = self.request(router, &current, extra_headers).await?;
+            let response = tokio::time::timeout_at(
+                deadline,
+                self.request(router, &current, extra_headers, forward_headers),
+            )
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP request timed out"))??;
             match response.status {
                 301 | 302 | 303 | 307 | 308 => {
                     let Some(location) = response.header("location") else {
                         return Ok(response);
                     };
-                    current = current.join(location)?;
+                    let next = current.join(location)?;
+                    forward_headers &= current.same_origin(&next);
+                    current = next;
                 }
                 _ => return Ok(response),
             }
@@ -211,6 +225,7 @@ impl HttpClient {
         router: &crate::route::Router,
         url: &Url,
         extra_headers: &[(String, String)],
+        forward_headers: bool,
     ) -> io::Result<Response> {
         let host = url.host.clone();
         let target = Target::Domain(host, url.port);
@@ -242,8 +257,10 @@ impl HttpClient {
             url.authority(),
             env!("CARGO_PKG_VERSION")
         );
-        for (key, value) in self.headers.iter().chain(extra_headers) {
-            head.push_str(&format!("{key}: {value}\r\n"));
+        if forward_headers {
+            for (key, value) in self.headers.iter().chain(extra_headers) {
+                head.push_str(&format!("{key}: {value}\r\n"));
+            }
         }
         head.push_str("Connection: close\r\n\r\n");
 
@@ -568,6 +585,11 @@ mod tests {
         assert_eq!(url("http://1.2.3.4:8080").authority(), "1.2.3.4:8080");
         assert_eq!(url("https://[::1]:8443/x").host, "::1");
         assert_eq!(url("https://host").path, "/");
+        assert_eq!(url("https://[::1]:8443?q=v").authority(), "[::1]:8443");
+        assert_eq!(url("https://h?q=v").path, "/?q=v");
+        assert!(url("https://h/a").same_origin(&url("https://H:443/b")));
+        assert!(!url("https://h/a").same_origin(&url("http://h/b")));
+        assert!(!url("https://h/a").same_origin(&url("https://other/b")));
         assert!(Url::parse("ftp://host/x").is_err());
         assert!(Url::parse("host/x").is_err());
     }
@@ -1064,6 +1086,60 @@ mod tests {
             .expect("get");
         server.await.ok();
         assert_eq!(response.body, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn handshake_respects_the_fetch_budget() {
+        let router = test_router().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/", listener.local_addr().unwrap());
+        // The TCP listener accepts connections but never sends ServerHello.
+        let client = HttpClient::default();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.get_with_budget(&router, &url, &[], Duration::from_millis(100)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn cross_origin_redirect_omits_custom_headers() {
+        let router = test_router().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = listener.local_addr().unwrap();
+        let (url, first) = serve_once(format!("HTTP/1.1 302 Found{CRLF}Location: http://{destination}/{CRLF}Content-Length: 0{CRLF}{CRLF}")).await;
+        let second = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while find_head_end(&request).is_none() {
+                let read = socket.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buf[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let client = HttpClient {
+            headers: vec![("Authorization".into(), "fixture".into())],
+            ..HttpClient::default()
+        };
+        assert_eq!(
+            client
+                .get(&router, &url, &[("X-Private".into(), "fixture".into())])
+                .await
+                .unwrap()
+                .status,
+            204
+        );
+        first.await.unwrap();
+        let request = second.await.unwrap();
+        assert!(!request.contains("fixture"));
     }
 
     #[tokio::test]

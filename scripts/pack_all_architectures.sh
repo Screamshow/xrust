@@ -10,7 +10,8 @@ for cpu in x86_64 aarch64 mipsel; do
     binary="target/$cpu-unknown-linux-musl/release/xrust"
     name="rust-x-$cpu-v$version"
     test -f "$binary"
-    test "$(wc -c < "$binary")" -le 12582912
+    budget=$(bash scripts/openwrt_size_budget.sh "$cpu-unknown-linux-musl")
+    test "$(wc -c < "$binary")" -le "$budget"
     cp "$binary" "$output/$name"
     chmod +x "$output/$name"
     tar -czf "$output/$name.tar.gz" -C "$output" "$name"

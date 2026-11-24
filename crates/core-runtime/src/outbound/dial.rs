@@ -558,7 +558,6 @@ pub async fn connect_tcp(host: &str, port: u16, options: &DialOptions) -> io::Re
     }
     // no detour and no TCP fast open is exactly when the reference races the
     // families itself; either of those hands the dial to something that cannot
-    let prefer_ipv6 = options.domain_strategy == Some(crate::dns::Strategy::PreferIPv6);
     let parallel = options.parallel;
     let fallback_delay = options.fallback_delay();
     let dial_options = options.clone();
@@ -567,7 +566,7 @@ pub async fn connect_tcp(host: &str, port: u16, options: &DialOptions) -> io::Re
         async move { connect_one(addr, &options).await }
     };
     if parallel {
-        return dial_fast_fallback(&addrs, prefer_ipv6, fallback_delay, one).await;
+        return dial_fast_fallback(addrs, fallback_delay, one).await;
     }
     dial_serial(addrs, one).await
 }
@@ -707,13 +706,10 @@ where
 }
 
 /// One address at a time, in order, until one connects (sing's `DialSerial`).
-/// The list is owned because a racer holds it inside a spawned task, and a
-/// borrow of the caller's slice would not be `Send`.
 async fn dial_serial<F, Fut, T>(addrs: Vec<SocketAddr>, mut dial: F) -> io::Result<T>
 where
-    F: FnMut(SocketAddr) -> Fut + Send + 'static,
+    F: FnMut(SocketAddr) -> Fut + Send,
     Fut: Future<Output = io::Result<T>> + Send,
-    T: Send + 'static,
 {
     let mut last = None;
     for addr in addrs {
@@ -734,101 +730,44 @@ where
 /// The dialer is a parameter so the race can be tested without a network that
 /// answers half the time.
 pub(crate) async fn dial_fast_fallback<F, Fut, T>(
-    addrs: &[SocketAddr],
-    prefer_ipv6: bool,
+    addrs: Vec<SocketAddr>,
     fallback_delay: Duration,
     dial: F,
 ) -> io::Result<T>
 where
-    // one dialer per racer: Go hands the same Dialer to both, and it is safe to
-    // call from several goroutines, which a clone is the Rust spelling of
-    F: Fn(SocketAddr) -> Fut + Clone + Send + Sync + 'static,
+    F: Fn(SocketAddr) -> Fut + Clone + Send,
     Fut: Future<Output = io::Result<T>> + Send,
-    T: Send + 'static,
 {
-    let (primaries, fallbacks): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs
-        .iter()
-        .cloned()
+    let prefer_ipv6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (primaries, fallbacks): (Vec<_>, Vec<_>) = addrs
+        .into_iter()
         .partition(|addr| addr.is_ipv6() == prefer_ipv6);
-    // one family only: nothing to race, and that is the reference's own check
-    if primaries.is_empty() || fallbacks.is_empty() {
-        return dial_serial(addrs.to_vec(), dial).await;
+    if fallbacks.is_empty() {
+        return dial_serial(primaries, dial).await;
     }
-    let mut fallbacks = Some(fallbacks);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(bool, io::Result<T>)>();
-    // `tx` is borrowed for the whole race, which also keeps the channel open:
-    // every racer reports before the loop can run out of results
-    let start = |addrs: Option<Vec<SocketAddr>>,
-                 primary: bool,
-                 racers: &mut Vec<tokio::task::JoinHandle<()>>| {
-        let Some(addrs) = addrs else {
-            return;
-        };
-        let tx = tx.clone();
-        let dial = dial.clone();
-        racers.push(tokio::spawn(async move {
-            let result = dial_serial(addrs, dial).await;
-            let _ = tx.send((primary, result));
-        }));
-    };
+    let primary = dial_serial(primaries, dial.clone());
+    tokio::pin!(primary);
+    tokio::select! {
+        result = &mut primary => return match result {
+            Ok(stream) => Ok(stream),
+            Err(err) => dial_serial(fallbacks, dial).await.or(Err(err)),
+        },
+        _ = tokio::time::sleep(fallback_delay) => {}
+    }
 
-    let mut racers = Vec::new();
-    start(Some(primaries), true, &mut racers);
-    let mut primary: Option<io::Result<T>> = None;
-    let mut fallback: Option<io::Result<T>> = None;
-    let wait = tokio::time::sleep(fallback_delay);
-    tokio::pin!(wait);
-    let mut fallback_started = false;
-    loop {
-        tokio::select! {
-            _ = &mut wait, if !fallback_started => {
-                fallback_started = true;
-                start(fallbacks.take(), false, &mut racers);
-            }
-            result = rx.recv() => {
-                let Some((is_primary, result)) = result else {
-                    break;
-                };
-                if result.is_ok() {
-                    for racer in racers {
-                        racer.abort();
-                    }
-                    return result;
-                }
-                if is_primary {
-                    primary = Some(result);
-                    // the head start is over: bring the other family forward
-                    if !fallback_started {
-                        fallback_started = true;
-                        start(fallbacks.take(), false, &mut racers);
-                    }
-                } else {
-                    fallback = Some(result);
-                }
-                // both are failures and both have reported: the preferred
-                // family's error is what the caller hears
-                if primary.is_some() && fallback.is_some() {
-                    for racer in racers {
-                        racer.abort();
-                    }
-                    // `take` only here: taking inside the `if let` pattern would
-                    // drop the result whenever the other side has not reported,
-                    // and the race would then wait for a result that was thrown
-                    // away
-                    return match primary.take() {
-                        Some(result) => result,
-                        None => Err(io::Error::other("dial race: no primary result")),
-                    };
-                }
-            }
+    // Both racers belong to this future, so cancellation drops both sockets.
+    let fallback = dial_serial(fallbacks, dial);
+    tokio::pin!(fallback);
+    tokio::select! {
+        result = &mut primary => match result {
+            Ok(stream) => Ok(stream),
+            Err(err) => fallback.await.or(Err(err)),
+        },
+        result = &mut fallback => match result {
+            Ok(stream) => Ok(stream),
+            Err(_) => primary.await,
         }
-    }
-    match primary.or(fallback) {
-        // unreachable: a success has already returned above
-        Some(Ok(_)) => Err(io::Error::other("dial race reported no error")),
-        Some(Err(err)) => Err(err),
-        None => Err(io::Error::other("no address to dial")),
     }
 }
 
@@ -1106,8 +1045,7 @@ mod tests {
         let record = Arc::new(Mutex::new(Vec::new()));
         let started = Instant::now();
         let won = dial_fast_fallback(
-            &[addr(false, 1), addr(true, 3)],
-            false,
+            vec![addr(false, 1), addr(true, 3)],
             Duration::from_millis(120),
             fake_dialer(Arc::clone(&record)),
         )
@@ -1135,14 +1073,44 @@ mod tests {
     async fn prefer_ipv6_swaps_which_family_leads() {
         let record = Arc::new(Mutex::new(Vec::new()));
         let won = dial_fast_fallback(
-            &[addr(false, 3), addr(true, 1)],
-            true,
+            vec![addr(true, 1), addr(false, 3)],
             Duration::from_millis(50),
-            fake_dialer(record),
+            fake_dialer(Arc::clone(&record)),
         )
         .await
         .expect("the v4 address answers");
+        assert_eq!(record.lock().unwrap()[0], addr(true, 1));
         assert_eq!(won, 3);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_dual_stack_dial_drops_both_racers() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let dial = move |_| {
+            let tx = tx.clone();
+            async move {
+                let (guard, dropped) = tokio::sync::oneshot::channel::<()>();
+                tx.send(dropped).unwrap();
+                std::future::pending::<()>().await;
+                drop(guard);
+                Ok(())
+            }
+        };
+        let task = tokio::spawn(dial_fast_fallback(
+            vec![addr(true, 1), addr(false, 1)],
+            Duration::ZERO,
+            dial,
+        ));
+        let first = rx.recv().await.unwrap();
+        let second = rx.recv().await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        for mut dropped in [first, second] {
+            assert_eq!(
+                dropped.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            );
+        }
     }
 
     /// An early failure does not wait out the head start: the other family is
@@ -1152,8 +1120,7 @@ mod tests {
         let record = Arc::new(Mutex::new(Vec::new()));
         let started = Instant::now();
         let won = dial_fast_fallback(
-            &[addr(false, 2), addr(true, 3)],
-            false,
+            vec![addr(false, 2), addr(true, 3)],
             Duration::from_secs(30),
             fake_dialer(record),
         )
@@ -1172,8 +1139,7 @@ mod tests {
     async fn both_families_failing_reports_the_preferred_one() {
         let record = Arc::new(Mutex::new(Vec::new()));
         let err = dial_fast_fallback(
-            &[addr(false, 2), addr(true, 2)],
-            false,
+            vec![addr(false, 2), addr(true, 2)],
             Duration::from_millis(20),
             fake_dialer(record),
         )
@@ -1188,8 +1154,7 @@ mod tests {
     async fn one_family_is_a_plain_serial_walk() {
         let record = Arc::new(Mutex::new(Vec::new()));
         let won = dial_fast_fallback(
-            &[addr(false, 2), addr(false, 3)],
-            true,
+            vec![addr(false, 2), addr(false, 3)],
             Duration::from_secs(30),
             fake_dialer(record),
         )

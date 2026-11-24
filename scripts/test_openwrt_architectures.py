@@ -1,6 +1,9 @@
 import hashlib
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +13,53 @@ finalizer = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(finalizer)
 
 class OpenWrtArchitectures(unittest.TestCase):
+    def test_restart_failure_remains_visible_and_retryable(self):
+        if os.name != "posix":
+            self.skipTest("OpenWrt postinst needs a POSIX shell")
+        import package_openwrt as packager
+        for hook in [packager.LEGACY_START, packager.NATIVE_START]:
+            with tempfile.TemporaryDirectory() as work:
+                root = Path(work)
+                marker = root / "restart"
+                marker.touch()
+                service = root / "forkop"
+                service.write_text("#!/bin/sh\nexit 7\n")
+                service.chmod(0o755)
+                script = hook.decode().replace("/etc/init.d/forkop", str(service)).replace(
+                    "/var/run/forkop/rust-x-package-restart", str(marker)).replace(
+                    "/usr/lib/forkop/xrust/binary.uc", str(service))
+                self.assertEqual(subprocess.run(["sh", "-c", script]).returncode, 7)
+                self.assertTrue(marker.exists())
+                service.write_text("#!/bin/sh\nexit 0\n")
+                self.assertEqual(subprocess.run(["sh", "-c", script]).returncode, 0)
+                self.assertFalse(marker.exists())
+
+    def test_release_size_budgets(self):
+        if not shutil.which("bash"):
+            self.skipTest("requires bash")
+        script = Path(__file__).with_name("openwrt_size_budget.sh")
+        for cpu, mib in [("x86_64", 13), ("aarch64", 12), ("mipsel", 12)]:
+            actual = subprocess.check_output(["bash", str(script), f"{cpu}-unknown-linux-musl"])
+            self.assertEqual(int(actual), mib << 20)
+
+    @unittest.skipUnless(os.name == "posix", "Unix packaging script")
+    def test_docker_archives_use_the_workspace_version(self):
+        with tempfile.TemporaryDirectory() as work:
+            root = Path(work)
+            (root / "scripts").mkdir()
+            (root / "openwrt").mkdir()
+            (root / "Cargo.toml").write_text('[workspace.package]\nversion = "9.8.7"\n')
+            script = Path(__file__).with_name("pack_release_docker.sh")
+            shutil.copy(script, root / "scripts" / script.name)
+            for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]:
+                out = root / "target" / target / "release"
+                out.mkdir(parents=True)
+                (out / "xrust").write_bytes(b"fixture")
+            subprocess.run(["bash", str(root / "scripts" / script.name)], check=True, stdout=subprocess.DEVNULL)
+            archives = list((root / "dist").glob("*.tar.gz"))
+            self.assertEqual(len(archives), 4)
+            self.assertTrue(all(path.name.endswith("-v9.8.7.tar.gz") for path in archives))
+
     def check_assets(self, pairs):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

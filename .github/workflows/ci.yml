@@ -18,6 +18,17 @@ env:
   SB_REF_VERSION: v1.14.2-lx.11
 
 jobs:
+  forkop-msrv:
+    name: Forkop client (minimum Rust)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check router profile with the declared minimum compiler
+        run: |
+          msrv=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["rust-version"])')
+          rustup toolchain install "$msrv" --profile minimal
+          cargo +"$msrv" check --locked -p core-cli --no-default-features --features forkop-client
+
   test:
     name: Test (Linux)
     runs-on: ubuntu-24.04
@@ -72,11 +83,8 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            budget: 13631488
           - target: aarch64-unknown-linux-musl
-            budget: 12582912
           - target: mipsel-unknown-linux-musl
-            budget: 12582912
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -108,7 +116,7 @@ jobs:
         run: |
           size=$(stat -c%s "target/${{ matrix.target }}/release/xrust")
           echo "size=$size bytes"
-          test "$size" -le ${{ matrix.budget }}
+          test "$size" -le "$(bash scripts/openwrt_size_budget.sh '${{ matrix.target }}')"
       - uses: actions/upload-artifact@v4
         with:
           name: xrust-${{ matrix.target }}

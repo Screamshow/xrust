@@ -43,6 +43,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use std::io;
 use std::os::unix::io::RawFd;
 use std::sync::{Mutex, OnceLock};
@@ -95,6 +96,7 @@ pub fn disable_for_process() -> bool {
 struct Conn {
     parent: RawFd,
     child: RawFd,
+    ciphertext: Vec<u8>,
 }
 
 impl Conn {
@@ -160,15 +162,23 @@ impl Conn {
             return Err(close_err(parent, io::Error::last_os_error()));
         }
 
-        Ok(Conn { parent, child })
+        Ok(Conn {
+            parent,
+            child,
+            ciphertext: Vec::new(),
+        })
     }
 
     /// Encrypt `buf` in place, return the tag. Sendmsg gets
     /// `aad || pt`; recvmsg gets `aad || ct || tag` back.
-    fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> io::Result<[u8; 16]> {
+    fn encrypt(&mut self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> io::Result<[u8; 16]> {
         self.send(true, nonce, aad, buf, &[])?;
         let mut tag = [0u8; 16];
-        recv_payload(self.child, aad.len(), buf, Some(&mut tag))?;
+        // recvmsg may write a partial result before reporting a short record.
+        // Commit only a complete ciphertext so software can retry the plaintext.
+        self.ciphertext.resize(buf.len(), 0);
+        recv_payload(self.child, aad.len(), &mut self.ciphertext, Some(&mut tag))?;
+        buf.copy_from_slice(&self.ciphertext);
         Ok(tag)
     }
 
@@ -270,7 +280,7 @@ fn close_err(fd: RawFd, e: io::Error) -> io::Error {
 /// records (the kernel's own `ctx->write` guard only rejects a concurrent
 /// send with `EBUSY`).
 pub struct AfalgGcm {
-    conn: Mutex<Conn>,
+    conn: Mutex<Option<Conn>>,
     /// Payloads below this go to the embedded software cipher; `0` routes
     /// everything to the kernel (how tests and calibration build one).
     threshold: usize,
@@ -291,7 +301,7 @@ impl AfalgGcm {
     pub fn new(key: &[u8], threshold: usize) -> io::Result<Self> {
         let conn = Conn::new(key)?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Mutex::new(Some(conn)),
             threshold,
             sw: Box::new(crate::fastgcm::Gcm::new_software(key)),
         })
@@ -301,8 +311,15 @@ impl AfalgGcm {
         if buf.len() < self.threshold {
             return self.sw.seal(nonce, aad, buf);
         }
-        let conn = self.lock();
-        conn.encrypt(nonce, aad, buf).expect("afalg seal")
+        let mut slot = self.lock();
+        if let Some(conn) = slot.as_mut() {
+            match conn.encrypt(nonce, aad, buf) {
+                Ok(tag) => return tag,
+                Err(_) => *slot = None,
+            }
+        }
+        drop(slot);
+        self.sw.seal(nonce, aad, buf)
     }
 
     /// On any failure (the tag check, or a broken socket) nothing of the
@@ -311,7 +328,15 @@ impl AfalgGcm {
         if buf.len() < self.threshold {
             return self.sw.open(nonce, aad, buf, tag);
         }
-        let conn = self.lock();
+        let slot = self.lock();
+        let Some(conn) = slot.as_ref() else {
+            drop(slot);
+            let verified = self.sw.open(nonce, aad, buf, tag);
+            if !verified {
+                buf.fill(0);
+            }
+            return verified;
+        };
         match conn.decrypt(nonce, aad, buf, tag) {
             Ok(()) => true,
             Err(_) => {
@@ -324,7 +349,7 @@ impl AfalgGcm {
     /// A poisoned mutex means a sibling thread panicked mid-record; the
     /// socket itself is fine, so carry on rather than poison every later
     /// connection.
-    fn lock(&self) -> std::sync::MutexGuard<'_, Conn> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Conn>> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -550,6 +575,9 @@ fn calibrate() -> usize {
             core::hint::black_box(tag);
         }
         let t_alg = t0.elapsed();
+        if alg.lock().is_none() {
+            return 0;
+        }
 
         let t0 = std::time::Instant::now();
         for _ in 0..iters {
@@ -584,7 +612,7 @@ fn self_test() -> bool {
 
             let mut buf = plain;
             let got_tag = alg.seal(&nonce, aad, &mut buf);
-            if buf != expect || got_tag != want_tag {
+            if alg.lock().is_none() || buf != expect || got_tag != want_tag {
                 return false;
             }
             if !alg.open(&nonce, aad, &mut buf, &want_tag) || buf != plain {
@@ -646,6 +674,33 @@ mod tests {
                 eprintln!("afalg: unavailable ({e}), skipping kernel-path tests");
                 None
             }
+        }
+    }
+
+    #[test]
+    fn seal_error_retires_the_socket_and_preserves_the_record() {
+        let key = [7; 16];
+        // An invalid descriptor gives a deterministic kernel error on any Linux host.
+        let cipher = AfalgGcm {
+            conn: Mutex::new(Some(Conn {
+                parent: -1,
+                child: -1,
+                ciphertext: vec![0xcc; 64],
+            })),
+            threshold: 0,
+            sw: Box::new(crate::fastgcm::Gcm::new_software(&key)),
+        };
+        for n in [1, 2] {
+            let nonce = [n; 12];
+            let mut buf = [0xab; 64];
+            let mut expected = buf;
+            let expected_tag = oracle_seal(&key, &nonce, b"header", &mut expected);
+            let tag = cipher.seal(&nonce, b"header", &mut buf);
+            assert_eq!(tag, expected_tag);
+            assert_eq!(buf, expected);
+            assert!(cipher.lock().is_none());
+            assert!(cipher.open(&nonce, b"header", &mut buf, &tag));
+            assert_eq!(buf, [0xab; 64]);
         }
     }
 

@@ -98,7 +98,7 @@ pub struct DnsService {
     router: RwLock<Option<Arc<crate::route::Router>>>,
     /// `dns.reverse_mapping`: ip → domain learned from A/AAAA answers, present
     /// only when the option is on (the reference leaves its LRU nil).
-    reverse: Option<RwLock<HashMap<IpAddr, ReverseEntry>>>,
+    reverse: Option<RwLock<lru::LruCache<IpAddr, ReverseEntry>>>,
     /// `dns.client_subnet`: the EDNS0 client subnet every upstream query
     /// carries, already masked, with its prefix length.
     client_subnet: Option<(IpAddr, u8)>,
@@ -285,7 +285,8 @@ impl DnsService {
             server_addrs: std::sync::Mutex::new(HashMap::new()),
             server_addr_inflight: std::sync::Mutex::new(HashMap::new()),
             router: RwLock::new(None),
-            reverse: reverse_mapping.then(|| RwLock::new(HashMap::new())),
+            reverse: reverse_mapping
+                .then(|| RwLock::new(lru::LruCache::new(REVERSE_CAPACITY.try_into().unwrap()))),
             client_subnet,
         })))
     }
@@ -311,9 +312,9 @@ impl DnsService {
         if let (Some(old_rev_lock), Some(new_rev_lock)) = (&old.reverse, &self.reverse)
             && let (Ok(old_rev), Ok(mut new_rev)) = (old_rev_lock.read(), new_rev_lock.write())
         {
-            for (ip, entry) in old_rev.iter() {
+            for (ip, entry) in old_rev.iter().rev() {
                 if entry.expires > now {
-                    new_rev.insert(*ip, entry.clone());
+                    new_rev.put(*ip, entry.clone());
                 }
             }
         }
@@ -392,20 +393,13 @@ impl DnsService {
         let Ok(mut map) = reverse.write() else {
             return;
         };
-        map.retain(|_, entry| entry.expires > now);
-        if map.len() >= REVERSE_CAPACITY {
-            // ponytail: the reference is an LRU of 1024; dropping the whole
-            // map at the cap holds the same memory ceiling without the
-            // recency bookkeeping. Replace with an LRU if it ever bites.
-            map.clear();
-        }
         for answer in &message.answers {
             let ip = match &answer.data {
                 RData::A(a) => IpAddr::V4(a.0),
                 RData::AAAA(aaaa) => IpAddr::V6(aaaa.0),
                 _ => continue,
             };
-            map.insert(
+            map.put(
                 ip,
                 ReverseEntry {
                     domain: codec::normalize_name(&answer.name.to_string()),
@@ -418,9 +412,13 @@ impl DnsService {
     /// Reference `LookupReverseMapping`: the domain an IP was last answered
     /// under, while that answer's TTL still holds.
     pub fn reverse_domain(&self, ip: IpAddr) -> Option<String> {
-        let map = self.reverse.as_ref()?.read().ok()?;
+        let mut map = self.reverse.as_ref()?.write().ok()?;
         let entry = map.get(&ip)?;
-        (entry.expires > Instant::now()).then(|| entry.domain.clone())
+        if entry.expires <= Instant::now() {
+            map.pop(&ip);
+            return None;
+        }
+        Some(entry.domain.clone())
     }
 
     /// Run the rule walk and produce the raw response for `query`.
@@ -644,25 +642,18 @@ impl DnsService {
         }
 
         let use_cache = !self.disable_cache && !opts.disable_cache;
-        let key = CacheKey {
-            tag: target.tag.clone().into(),
-            name: info.name.clone().into(),
-            qtype: u16::from(info.qtype),
-        };
-        let optimistic = if self.optimistic_timeout.is_some() && use_cache {
-            self.optimistic_timeout
-        } else {
-            None
-        };
+        // Health probes must neither consult the cache nor wait for an active exchange.
+        if !use_cache {
+            let raw = self.fetch(&target, query, opts.rewrite_ttl, None).await?;
+            return codec::set_id(&raw, info.id);
+        }
+        let key = CacheKey::new(&target.tag, &query[2..], opts.rewrite_ttl);
 
-        if use_cache && !skip_cache_read {
+        if !skip_cache_read {
             let now = std::time::Instant::now();
             // write, not read: a hit bumps the entry's place in the eviction
             // order (see dns::cache)
             let hit = self.cache.write().expect("dns cache").get(&key, now);
-            // reverse mapping was already recorded when this answer went into
-            // the cache; re-recording identical bytes per hit cost a full
-            // message parse. Just stamp the client id.
             match hit {
                 Some(CacheHit::Fresh(raw, remaining)) => {
                     return self.cached_answer(&raw, remaining, info.id);
@@ -676,14 +667,6 @@ impl DnsService {
             }
         }
 
-        // reference `beginExchange`: only a cached exchange waits for one in
-        // flight; an uncached one (the dns_failover probes) asks on its own
-        if !use_cache {
-            let raw = self
-                .fetch(&target, query, opts.rewrite_ttl, false, &key, optimistic)
-                .await?;
-            return codec::set_id(&raw, info.id);
-        }
         let flight = {
             let mut inflight = self.inflight.lock().expect("dns inflight");
             inflight.retain(|_, weak| weak.strong_count() > 0);
@@ -710,8 +693,7 @@ impl DnsService {
                             return self.cached_answer(&raw, remaining, 0).map(Arc::from);
                         }
                     }
-                    self.fetch(target, query, rewrite_ttl, true, key, optimistic)
-                        .await
+                    self.fetch(target, query, rewrite_ttl, Some(key)).await
                 }
                 .await
                 .map_err(|err| (err.kind(), err.to_string()));
@@ -732,15 +714,13 @@ impl DnsService {
         codec::set_id(&raw, info.id)
     }
 
-    /// One upstream exchange, stored in the cache when `use_cache` allows.
+    /// One upstream exchange, optionally stored under the caller's key.
     async fn fetch(
         self: &Arc<Self>,
         target: &ServerConfig,
         query: &[u8],
         rewrite_ttl: Option<u32>,
-        use_cache: bool,
-        key: &CacheKey,
-        optimistic: Option<Duration>,
+        key: Option<&CacheKey>,
     ) -> std::io::Result<Arc<[u8]>> {
         let response = self.exchange_remote(target, query).await?;
         let rewritten: Arc<[u8]> = match rewrite_ttl {
@@ -749,29 +729,23 @@ impl DnsService {
         };
         // Reverse mapping is recorded only when the walk returns this answer.
 
-        if use_cache && let Ok(meta_resp) = codec::response_meta(&rewritten) {
+        if let Some(key) = key
+            && let Ok(meta_resp) = codec::response_meta(&rewritten)
+        {
             // a truncated answer is a partial one: never serve it from cache
             let cacheable = matches!(
                 meta_resp.rcode,
                 hickory_proto::op::ResponseCode::NoError
                     | hickory_proto::op::ResponseCode::NXDomain
             ) && !transport::is_truncated(&rewritten);
-            if cacheable {
+            if cacheable && let Some(ttl) = meta_resp.cache_ttl.filter(|ttl| *ttl > 0) {
                 let mut cache = self.cache.write().expect("dns cache");
-                // disable_expire pins entries (ttl checked against optimistic window only).
-                let meta_for_insert = if self.disable_expire {
-                    codec::ResponseMeta {
-                        rcode: meta_resp.rcode,
-                        min_answer_ttl: Some(u32::MAX),
-                    }
-                } else {
-                    meta_resp
-                };
+                let ttl = if self.disable_expire { u32::MAX } else { ttl };
                 cache.insert(
                     key.clone(),
                     Arc::clone(&rewritten),
-                    &meta_for_insert,
-                    optimistic,
+                    ttl,
+                    self.optimistic_timeout,
                 );
             }
         }
@@ -785,10 +759,7 @@ impl DnsService {
         if self.disable_expire {
             return codec::set_id(raw, id);
         }
-        // the bytes decoded once when they were cached; should a re-encode
-        // fail all the same, the answer as stored beats no answer
-        let raw = codec::rewrite_ttl(raw, remaining).unwrap_or_else(|_| raw.to_vec());
-        codec::set_id(&raw, id)
+        codec::cached_answer(raw, remaining, id)
     }
 
     fn spawn_refresh(
@@ -874,7 +845,7 @@ impl DnsService {
         // reference `prepareExchangeMessage`: `client_subnet` rides along on
         // every query we send upstream
         let query = match self.client_subnet {
-            Some((subnet, bits)) => codec::set_client_subnet(query, subnet, bits),
+            Some((subnet, bits)) => codec::set_client_subnet(query, subnet, bits)?,
             None => query.to_vec(),
         };
         let raw = transport::exchange(cfg, addr, &query, &self.dialer()).await?;
@@ -2104,6 +2075,80 @@ mod tests {
             }
         });
         (port, count, worker)
+    }
+
+    #[tokio::test]
+    async fn query_flags_and_edns_separate_cached_and_inflight_answers() {
+        use std::sync::atomic::Ordering;
+
+        let (port, count, worker) = muted_upstream(0).await;
+        let svc = Arc::new(
+            DnsService::build(&serde_json::json!({"dns":{
+                "servers":[{"type":"udp","tag":"real","server":"127.0.0.1","server_port":port}],
+                "final":"real"
+            }}))
+            .unwrap()
+            .unwrap(),
+        );
+        let plain = codec::build_query(1, "flags.test", RecordType::A).unwrap();
+        let mut checking_disabled = plain.clone();
+        checking_disabled[3] |= 0x10;
+        let mut dnssec = plain.clone();
+        dnssec[11] = 1;
+        // Root name, OPT, payload size 1232, DO flag, empty options.
+        dnssec.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 128, 0, 0, 0]);
+        let subnet = |network| {
+            let mut query = plain.clone();
+            query[11] = 1;
+            // EDNS client subnet: IPv4, /24, three address octets.
+            query.extend_from_slice(&[
+                0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 11, 0, 8, 0, 7, 0, 1, 24, 0, 10, network, 0,
+            ]);
+            query
+        };
+        let east = subnet(1);
+        let west = subnet(2);
+        let meta = QueryMeta::default();
+        let replies = tokio::try_join!(
+            svc.exchange(&meta, &plain, true),
+            svc.exchange(&meta, &checking_disabled, true),
+            svc.exchange(&meta, &dnssec, true),
+            svc.exchange(&meta, &east, true),
+            svc.exchange(&meta, &west, true),
+        );
+        replies.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 5);
+        for mut query in [plain, checking_disabled, dnssec, east, west] {
+            query[..2].copy_from_slice(&42u16.to_be_bytes());
+            let raw = svc.exchange(&meta, &query, true).await.unwrap();
+            assert_eq!(codec::parse_message(&raw).unwrap().id, 42);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 5);
+        worker.abort();
+    }
+
+    #[test]
+    fn reverse_mapping_evicts_only_the_least_recently_used_address() {
+        let svc = DnsService::build(&serde_json::json!({"dns":{
+            "servers":[{"type":"local","tag":"local"}],"reverse_mapping":true
+        }}))
+        .unwrap()
+        .unwrap();
+        let wire = codec::build_query(1, "reverse.example", RecordType::A).unwrap();
+        let (query, _) = codec::parse_query(&wire).unwrap();
+        let ip = |i: usize| IpAddr::from(std::net::Ipv4Addr::from(0x0a000001 + i as u32));
+        let record = |i| {
+            let raw = codec::synth_address(&query, ip(i), 600).unwrap();
+            svc.record_reverse(&raw, false);
+        };
+        for i in 0..REVERSE_CAPACITY {
+            record(i);
+        }
+        assert!(svc.reverse_domain(ip(0)).is_some());
+        record(REVERSE_CAPACITY);
+        assert!(svc.reverse_domain(ip(0)).is_some());
+        assert!(svc.reverse_domain(ip(1)).is_none());
+        assert!(svc.reverse_domain(ip(REVERSE_CAPACITY)).is_some());
     }
 
     #[tokio::test]

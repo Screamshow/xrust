@@ -80,7 +80,8 @@ exit 0
 LEGACY_START = b'''#!/bin/sh
 [ -n "$IPKG_INSTROOT" ] && exit 0
 if [ -f /var/run/forkop/rust-x-package-restart ] && [ -x /etc/init.d/forkop ]; then
-    /etc/init.d/forkop start && rm -f /var/run/forkop/rust-x-package-restart
+    /etc/init.d/forkop start || exit $?
+    rm -f /var/run/forkop/rust-x-package-restart || exit $?
 fi
 if [ -f /etc/forkop-tailscale/enabled ] && [ -x /etc/init.d/forkop-tailscale ] &&
    [ "$(cat /etc/forkop/sing-box-variant 2>/dev/null)" = rust-x ]; then
@@ -94,7 +95,8 @@ NATIVE_START = b'''#!/bin/sh
 # The native package is installed before the Forkop 3 backend during migration.
 [ -f /usr/lib/forkop/xrust/binary.uc ] || exit 0
 if [ -f /var/run/forkop/rust-x-package-restart ] && [ -x /etc/init.d/forkop ]; then
-    /etc/init.d/forkop start && rm -f /var/run/forkop/rust-x-package-restart
+    /etc/init.d/forkop start || exit $?
+    rm -f /var/run/forkop/rust-x-package-restart || exit $?
 fi
 if [ -f /etc/forkop-tailscale/enabled ] && [ -x /etc/init.d/forkop-tailscale ]; then
     /etc/init.d/forkop-tailscale start || true

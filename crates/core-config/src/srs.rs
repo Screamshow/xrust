@@ -8,8 +8,11 @@
 //! guarantees wire compatibility of the payload, not of the container:
 //! a file written here is read by the reference and the other way round.
 
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 
+use hickory_proto::rr::RecordType;
 use serde_json::{Map, Value};
 
 pub const MAGIC: [u8; 3] = [0x53, 0x52, 0x53];
@@ -199,7 +202,10 @@ fn read_default_rule(
                 let values = reader.u16_vec()?;
                 let names: Vec<Value> = values
                     .into_iter()
-                    .map(|value| Value::String(query_type_name(value).to_string()))
+                    .map(|value| match RecordType::from(value) {
+                        RecordType::Unknown(_) => Value::from(value),
+                        known => Value::String(known.to_string()),
+                    })
                     .collect();
                 rule.insert("query_type".into(), Value::Array(names));
             }
@@ -320,16 +326,6 @@ fn read_default_rule(
     }
 }
 
-fn query_type_name(value: u16) -> &'static str {
-    match value {
-        1 => "A",
-        2 => "AAAA",
-        28 => "HTTPS",
-        65 => "HTTPS",
-        _ => "A",
-    }
-}
-
 fn network_type_name(value: u8) -> &'static str {
     match value {
         0 => "wifi",
@@ -447,11 +443,7 @@ fn write_default_rule(
     version: u8,
 ) -> Result<(), String> {
     if let Some(values) = rule.get("query_type") {
-        let mut encoded = Vec::new();
-        for value in strings(values)? {
-            encoded.push(query_type_code(&value)?);
-        }
-        writer.item_u16_vec(ITEM_QUERY_TYPE, &encoded);
+        writer.item_u16_vec(ITEM_QUERY_TYPE, &query_types(values)?);
     }
     if let Some(values) = rule.get("network") {
         writer.item_str_vec(ITEM_NETWORK, &strings(values)?);
@@ -469,10 +461,10 @@ fn write_default_rule(
         writer.item_str_vec(ITEM_DOMAIN_REGEX, &strings(values)?);
     }
     if let Some(values) = rule.get("source_ip_cidr") {
-        writer.item_ip_set(ITEM_SOURCE_IP_CIDR, &strings(values)?);
+        writer.item_ip_set(ITEM_SOURCE_IP_CIDR, &strings(values)?)?;
     }
     if let Some(values) = rule.get("ip_cidr") {
-        writer.item_ip_set(ITEM_IP_CIDR, &strings(values)?);
+        writer.item_ip_set(ITEM_IP_CIDR, &strings(values)?)?;
     }
     if let Some(values) = rule.get("source_port") {
         writer.item_u16_vec(ITEM_SOURCE_PORT, &ports(values)?);
@@ -597,30 +589,28 @@ fn write_domain_matcher(
     legacy: bool,
 ) -> Result<(), String> {
     let mut list: Vec<String> = Vec::new();
-    let mut seen: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
     for suffix in suffixes {
-        if seen.iter().any(|entry| entry == suffix) {
+        if !seen.insert(Cow::Borrowed(suffix.as_str())) {
             continue;
         }
-        seen.push(suffix.clone());
         if suffix.starts_with('.') {
             list.push(reverse_domain(&format!("{}{suffix}", PREFIX_LABEL as char)));
         } else if legacy {
             list.push(reverse_domain(suffix));
             let dotted = format!(".{suffix}");
-            if !seen.contains(&dotted) {
-                seen.push(dotted.clone());
+            if !seen.contains(dotted.as_str()) {
                 list.push(reverse_domain(&format!("{}{dotted}", PREFIX_LABEL as char)));
+                seen.insert(Cow::Owned(dotted));
             }
         } else {
             list.push(reverse_domain(&format!("{}{suffix}", ROOT_LABEL as char)));
         }
     }
     for domain in domains {
-        if seen.iter().any(|entry| entry == domain) {
+        if !seen.insert(Cow::Borrowed(domain.as_str())) {
             continue;
         }
-        seen.push(domain.clone());
         list.push(reverse_domain(domain));
     }
     list.sort();
@@ -973,23 +963,18 @@ fn range_to_prefixes(from: &std::net::IpAddr, to: &std::net::IpAddr) -> Vec<Stri
 fn blocks(mut start: u128, end: u128, width: u32) -> Vec<(u128, u32)> {
     let mut out = Vec::new();
     while start <= end {
-        // the largest block that is aligned at `start`
-        let max_size = if start == 0 {
-            1u128 << width
-        } else {
-            1u128 << start.trailing_zeros().min(width)
+        // The full IPv6 address space has 2^128 addresses. Work with
+        // exponents so the largest block never needs a u129 cardinality.
+        let room_bits = (end - start).checked_add(1).map_or(128, u128::ilog2);
+        let host_bits = start.trailing_zeros().min(width).min(room_bits);
+        out.push((start, width - host_bits));
+        let Some(next) = 1u128
+            .checked_shl(host_bits)
+            .and_then(|size| start.checked_add(size))
+        else {
+            break;
         };
-        let room = (end - start) + 1;
-        let mut size = max_size;
-        while size > room {
-            size >>= 1;
-        }
-        let bits = width - size.trailing_zeros();
-        out.push((start, bits.min(width)));
-        match start.checked_add(size) {
-            Some(next) => start = next,
-            None => break,
-        }
+        start = next;
     }
     out
 }
@@ -997,13 +982,20 @@ fn blocks(mut start: u128, end: u128, width: u32) -> Vec<(u128, u32)> {
 fn split_prefix(prefix: &str) -> Result<(std::net::IpAddr, u8), String> {
     let (addr, bits) = prefix
         .split_once('/')
-        .ok_or_else(|| format!("invalid prefix: {prefix}"))?;
+        .map_or((prefix, None), |(addr, bits)| (addr, Some(bits)));
     let addr: std::net::IpAddr = addr
         .parse()
         .map_err(|_| format!("invalid prefix address: {addr}"))?;
-    let bits: u8 = bits
-        .parse()
-        .map_err(|_| format!("invalid prefix bits: {bits}"))?;
+    let width = if addr.is_ipv4() { 32 } else { 128 };
+    let bits: u8 = match bits {
+        Some(bits) => bits
+            .parse()
+            .map_err(|_| format!("invalid prefix bits: {bits}"))?,
+        None => width,
+    };
+    if bits > width {
+        return Err(format!("invalid prefix bits: {bits}"));
+    }
     Ok((addr, bits))
 }
 
@@ -1076,13 +1068,33 @@ fn port_values(values: Vec<u16>) -> Value {
     Value::Array(values.into_iter().map(Value::from).collect())
 }
 
-fn query_type_code(name: &str) -> Result<u16, String> {
-    match name {
-        "A" | "1" => Ok(1),
-        "AAAA" | "28" => Ok(28),
-        "HTTPS" | "65" => Ok(65),
-        other => Err(format!("unsupported query_type: {other}")),
-    }
+/// Names and numeric codes in a sing-box listable query_type field.
+pub fn query_types(value: &Value) -> Result<Vec<u16>, String> {
+    let values = match value {
+        Value::Null => return Ok(Vec::new()),
+        Value::Array(values) => values.as_slice(),
+        one => std::slice::from_ref(one),
+    };
+    values
+        .iter()
+        .map(|value| {
+            let code = match value {
+                Value::String(name) => name.parse::<u16>().ok().or_else(|| {
+                    let name = name.to_ascii_uppercase();
+                    // Hickory displays these known wire types but omits them from FromStr.
+                    match name.as_str() {
+                        "ZERO" => Some(0),
+                        "OPT" => Some(41),
+                        "IXFR" => Some(251),
+                        _ => name.parse::<RecordType>().ok().map(u16::from),
+                    }
+                }),
+                Value::Number(number) => number.as_u64().and_then(|n| u16::try_from(n).ok()),
+                _ => None,
+            };
+            code.ok_or_else(|| format!("unsupported query_type: {value}"))
+        })
+        .collect()
 }
 
 fn network_type_code(name: &str) -> Result<u8, String> {
@@ -1181,88 +1193,56 @@ impl Writer {
         self.u16_vec(values);
     }
 
-    fn item_ip_set(&mut self, item: u8, prefixes: &[String]) {
+    fn item_ip_set(&mut self, item: u8, prefixes: &[String]) -> Result<(), String> {
         if prefixes.is_empty() {
-            return;
+            return Ok(());
         }
         self.u8(item);
-        let ranges = merge_prefixes(prefixes);
+        let ranges = merge_prefixes(prefixes)?;
         self.u8(1);
         self.u64(ranges.len() as u64);
         for (from, to) in ranges {
             write_addr(self, &from);
             write_addr(self, &to);
         }
+        Ok(())
     }
 }
 
 /// Cover the given prefixes with the minimal set of aligned ranges, the shape
 /// `netipx.IPSet` stores.
-fn merge_prefixes(prefixes: &[String]) -> Vec<(std::net::IpAddr, std::net::IpAddr)> {
-    let mut v4: Vec<(u32, u8)> = Vec::new();
-    let mut v6: Vec<(u128, u8)> = Vec::new();
+fn merge_prefixes(
+    prefixes: &[String],
+) -> Result<Vec<(std::net::IpAddr, std::net::IpAddr)>, String> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    let mut ranges = Vec::with_capacity(prefixes.len());
     for prefix in prefixes {
-        let Ok((addr, bits)) = split_prefix(prefix) else {
-            continue;
+        let (addr, bits) = split_prefix(prefix)?;
+        let (width, value) = match addr {
+            IpAddr::V4(ip) => (32, u128::from(u32::from(ip))),
+            IpAddr::V6(ip) => (128, u128::from(ip)),
         };
-        match addr {
-            std::net::IpAddr::V4(addr) => {
-                let value = u32::from(addr);
-                let start = value & (!0u32 << (32 - bits.min(32)));
-                v4.push((start, bits.min(32)));
-            }
-            std::net::IpAddr::V6(addr) => {
-                let value = u128::from(addr);
-                let start = if bits >= 128 {
-                    value
-                } else {
-                    value & (!0u128 << (128 - bits))
-                };
-                v6.push((start, bits));
-            }
-        }
+        let host_bits = width - u32::from(bits);
+        let host_mask = u128::MAX.checked_shr(128 - host_bits).unwrap_or(0);
+        ranges.push((width, value & !host_mask, value | host_mask));
     }
-    let mut out = Vec::new();
-    v4.sort_unstable();
-    let mut index = 0usize;
-    while index < v4.len() {
-        let (start, bits) = v4[index];
-        let size = 1u32 << (32 - bits);
-        let end = start.saturating_add(size.saturating_sub(1));
-        let mut next = index + 1;
-        while next < v4.len() && v4[next].0 <= end.saturating_add(1) {
-            let (other, other_bits) = v4[next];
-            let other_end = other.saturating_add((1u32 << (32 - other_bits)).saturating_sub(1));
-            let end = end.max(other_end);
-            let _ = end;
-            next += 1;
+    ranges.sort_unstable();
+    let mut merged = Vec::new();
+    let mut iter = ranges.into_iter().peekable();
+    while let Some((width, start, mut end)) = iter.next() {
+        while let Some((_, _, next_end)) = iter.next_if(|&(next_width, next_start, _)| {
+            next_width == width && next_start <= end.saturating_add(1)
+        }) {
+            end = end.max(next_end);
         }
-        out.push((
-            std::net::IpAddr::V4(std::net::Ipv4Addr::from(start)),
-            std::net::IpAddr::V4(std::net::Ipv4Addr::from(end)),
-        ));
-        index = next;
+        let address = |raw: u128| match width {
+            32 => IpAddr::V4(Ipv4Addr::from(raw as u32)),
+            _ => IpAddr::V6(Ipv6Addr::from(raw)),
+        };
+        merged.push((address(start), address(end)));
     }
-    v6.sort_unstable();
-    let mut index = 0usize;
-    while index < v6.len() {
-        let (start, bits) = v6[index];
-        let size = 1u128 << (128 - bits.min(128));
-        let mut end = start.saturating_add(size.saturating_sub(1));
-        let mut next = index + 1;
-        while next < v6.len() && v6[next].0 <= end.saturating_add(1) {
-            let (other, other_bits) = v6[next];
-            let other_end = other.saturating_add((1u128 << (128 - other_bits)).saturating_sub(1));
-            end = end.max(other_end);
-            next += 1;
-        }
-        out.push((
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(start)),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(end)),
-        ));
-        index = next;
-    }
-    out
+    Ok(merged)
 }
 
 /// What is left of the decoded-size allowance of one file.
@@ -1476,6 +1456,52 @@ mod tests {
         assert_eq!(out["rules"][1]["source_ip_cidr"], json!(["2001:db8::/32"]));
         assert_eq!(out["rules"][1]["source_port"], json!([1000]));
         assert_eq!(out["rules"][1]["port_range"], json!(["8000-9000"]));
+    }
+
+    #[test]
+    fn adjacent_prefixes_and_full_address_families_round_trip() {
+        let source = json!({"rules": [
+            {"ip_cidr": ["192.0.2.0/25", "192.0.2.128/25"]},
+            {"ip_cidr": ["0.0.0.0/0", "::/0"]},
+            {"source_ip_cidr": ["::/96"]},
+            {"ip_cidr": ["192.0.2.12", "2001:db8::a"]},
+        ]});
+        let out = round_trip(source, 3);
+        assert_eq!(out["rules"][0]["ip_cidr"], json!(["192.0.2.0/24"]));
+        assert_eq!(out["rules"][1]["ip_cidr"], json!(["0.0.0.0/0", "::/0"]));
+        assert_eq!(out["rules"][2]["source_ip_cidr"], json!(["::/96"]));
+        assert_eq!(
+            out["rules"][3]["ip_cidr"],
+            json!(["192.0.2.12/32", "2001:db8::a/128"])
+        );
+        for bad in ["::/129", "192.0.2.1/33", "invalid"] {
+            assert!(compile(&json!({"rules":[{"ip_cidr":[bad]}]}), 3).is_err());
+        }
+    }
+
+    #[test]
+    fn full_ipv6_range_in_an_external_srs_image() {
+        let mut body = vec![1];
+        body.extend_from_slice(&1u64.to_be_bytes());
+        body.push(16);
+        body.extend_from_slice(&[0; 16]);
+        body.push(16);
+        body.extend_from_slice(&[255; 16]);
+        let rules = read(&container(&one_item(ITEM_IP_CIDR, &body), 3)).unwrap();
+        assert_eq!(rules[0]["ip_cidr"], json!(["::/0"]));
+    }
+
+    #[test]
+    fn query_types_preserve_wire_codes_and_unknown_values() {
+        let types = json!([
+            "A", "NS", "AAAA", "HTTPS", "MX", "IXFR", "OPT", "ZERO", 65280
+        ]);
+        let out = round_trip(json!({"rules":[{"query_type":types}]}), 3);
+        assert_eq!(out["rules"][0]["query_type"], types);
+        assert_eq!(
+            query_types(&types).unwrap(),
+            [1, 2, 28, 65, 15, 251, 41, 0, 65280]
+        );
     }
 
     #[test]

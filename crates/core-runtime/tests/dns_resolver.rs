@@ -431,8 +431,8 @@ async fn spawn_udp_dns_capture(
     (addr, seen)
 }
 
-/// The OPT record the reference builds for `client_subnet`: payload size 0,
-/// no DO bit, and a single SUBNET option carrying the masked address.
+/// A newly added OPT advertises the legacy payload limit and carries only
+/// the prefix octets required by RFC 7871.
 fn subnet_record(family: u16, netmask: u8, address: &[u8]) -> Vec<u8> {
     let mut rdata = Vec::new();
     rdata.extend_from_slice(&8u16.to_be_bytes());
@@ -443,7 +443,7 @@ fn subnet_record(family: u16, netmask: u8, address: &[u8]) -> Vec<u8> {
     rdata.extend_from_slice(address);
     let mut record = vec![0x00];
     record.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT
-    record.extend_from_slice(&0u16.to_be_bytes()); // CLASS
+    record.extend_from_slice(&512u16.to_be_bytes()); // UDP payload size
     record.extend_from_slice(&0u32.to_le_bytes()); // TTL
     record.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
     record.extend_from_slice(&rdata);
@@ -578,7 +578,8 @@ async fn client_subnet_rides_along_on_upstream_queries() {
         "the query still resolves"
     );
     let raw = seen.lock().expect("captured").clone();
-    let want = subnet_record(1, 24, &[1, 2, 3, 0]);
+    assert_eq!(u16::from_be_bytes([raw[10], raw[11]]), 1);
+    let want = subnet_record(1, 24, &[1, 2, 3]);
     assert_eq!(
         &raw[raw.len() - want.len()..],
         want.as_slice(),
@@ -600,7 +601,7 @@ async fn a_bare_client_subnet_is_a_host_prefix() {
 }
 
 #[tokio::test]
-async fn an_ipv6_client_subnet_is_carried_whole() {
+async fn an_ipv6_client_subnet_carries_only_prefix_octets() {
     let (addr, seen) = spawn_udp_dns_capture(Ipv4Addr::new(10, 0, 0, 7)).await;
     let mut config = udp_service_config(addr.port());
     config["dns"]["client_subnet"] = json!("2001:db8::/48");
@@ -608,12 +609,7 @@ async fn an_ipv6_client_subnet_is_carried_whole() {
 
     exchange_ok(&svc, &query("v6.test", "A")).await;
     let raw = seen.lock().expect("captured").clone();
-    let mut address = [0u8; 16];
-    address[0] = 0x20;
-    address[1] = 0x01;
-    address[2] = 0x0d;
-    address[3] = 0xb8;
-    let want = subnet_record(2, 48, &address);
+    let want = subnet_record(2, 48, &[0x20, 1, 0x0d, 0xb8, 0, 0]);
     assert_eq!(&raw[raw.len() - want.len()..], want.as_slice());
 }
 

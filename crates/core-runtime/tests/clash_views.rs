@@ -246,6 +246,41 @@ async fn data_views_answer_over_http() {
 }
 
 #[tokio::test]
+async fn reloading_switches_log_output_timestamp_and_default_level() {
+    let _guard = guard().lock().await;
+    let dir = std::env::temp_dir().join(format!("xrust-log-reload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let first = dir.join("first.log");
+    let second = dir.join("second.log");
+    let mut root = api_config();
+    root["log"] = serde_json::json!({"output":first,"level":"warn"});
+    let mut instance = core_runtime::start(&root).await.unwrap();
+    core_runtime::logging::warn(format_args!("before-reload"));
+    root["log"] = serde_json::json!({"output":second,"timestamp":true});
+    instance.reload_in_place(&root).await.unwrap();
+    core_runtime::logging::info(format_args!("after-reload"));
+    let before = std::fs::read_to_string(&first).unwrap();
+    assert!(
+        before
+            .lines()
+            .any(|line| line.starts_with("WARN[") && line.ends_with("before-reload"))
+    );
+    assert!(!before.contains("after-reload"));
+    let after = std::fs::read_to_string(&second).unwrap();
+    assert!(
+        after
+            .lines()
+            .any(|line| line.contains(" +0000 INFO[") && line.ends_with("after-reload"))
+    );
+    root.as_object_mut().unwrap().remove("log");
+    instance.reload_in_place(&root).await.unwrap();
+    instance.shutdown_wait().await;
+    std::fs::remove_file(first).unwrap();
+    std::fs::remove_file(second).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
+#[tokio::test]
 async fn applied_config_is_authenticated_and_acknowledges_complete_reload() {
     let _guard = guard().lock().await;
     let mut root = api_config();

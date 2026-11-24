@@ -172,7 +172,7 @@ async fn handle_hy2_connection(
     let peer = conn.remote_address();
 
     // Authenticate via HTTP/3 session
-    let user_name =
+    let (user_name, h3_driver) =
         match tokio::time::timeout(DEFAULT_AUTH_TIMEOUT, authenticate_hy2(&conn, &users)).await {
             Ok(Ok(name)) => name,
             Ok(Err(e)) => {
@@ -198,11 +198,10 @@ async fn handle_hy2_connection(
     let reply_handle = tokio::spawn(async move {
         let packet_counter = AtomicU32::new(0);
         while let Some(reply) = reply_rx.recv().await {
-            let src_str = reply.src.to_string();
             let _ = send_hy2_datagram(
                 &conn_udp_send,
                 reply.session_id,
-                &src_str,
+                &reply.src,
                 &reply.payload,
                 &packet_counter,
             );
@@ -298,26 +297,25 @@ async fn handle_hy2_connection(
                     Some(t) => t,
                     None => continue,
                 };
-                let dest_addr = match target {
-                    Target::Ip(a) => a,
-                    Target::Domain(h, p) => {
-                        match crate::outbound::quic::resolve_host(&h, p).await {
-                            Ok(a) => a,
-                            Err(_) => continue,
-                        }
-                    }
+                let dest_addr = match &target {
+                    Target::Ip(a) => *a,
+                    // Raw HY2 replies and flow keys carry the full named destination.
+                    // Only socket-based inbounds need a concrete IP for framing.
+                    Target::Domain(_, port) => SocketAddr::from(([0, 0, 0, 0], *port)),
                 };
                 let _ = hub_dg
-                    .handle(
+                    .handle_routed(
                         Reply::Hy2 {
                             connection_id,
                             session_id,
+                            destination: Arc::from(dest),
                             sender: reply_tx.clone(),
                         },
                         peer,
                         dest_addr,
                         &pkt,
                         &tag_dg,
+                        &target,
                     )
                     .await;
             }
@@ -326,6 +324,7 @@ async fn handle_hy2_connection(
 
     // Wait until connection closes
     let _ = conn.closed().await;
+    drop(h3_driver);
     bi_handle.abort();
     dg_handle.abort();
     reply_handle.abort();
@@ -335,7 +334,10 @@ async fn handle_hy2_connection(
 async fn authenticate_hy2(
     conn: &quinn::Connection,
     users: &HashMap<String, String>,
-) -> io::Result<String> {
+) -> io::Result<(
+    String,
+    h3::server::Connection<h3_quinn::Connection, bytes::Bytes>,
+)> {
     let h3 = h3_quinn::Connection::new(conn.clone());
     let mut h3_conn: h3::server::Connection<_, bytes::Bytes> = h3::server::builder()
         .build(h3)
@@ -384,10 +386,8 @@ async fn authenticate_hy2(
     // In Hysteria 2, HTTP/3 is only used for the initial handshake; proxy data is sent
     // over raw QUIC bi-streams and datagrams. If `h3_conn` is dropped, its Drop impl sends
     // an ApplicationClose (H3_NO_ERROR) frame over the entire QUIC connection.
-    // Forgetting the HTTP/3 connection driver keeps the underlying QUIC transport alive.
-    std::mem::forget(h3_conn);
-
-    Ok(user_name)
+    // The session owns the driver until the transport has closed.
+    Ok((user_name, h3_conn))
 }
 
 fn parse_target_str(s: &str) -> Option<Target> {
@@ -451,7 +451,11 @@ mod tests {
         });
 
         let router = Router::new(&serde_json::json!({
-            "outbounds": [{ "type": "direct", "tag": "direct" }]
+            "outbounds": [{ "type": "direct", "tag": "direct" }],
+            "route": {"rules": [
+                {"domain": "hy2-target.invalid", "outbound": "direct", "override_address": "127.0.0.1"},
+                {"network": "udp", "action": "reject"}
+            ]}
         }))
         .unwrap();
 
@@ -483,5 +487,26 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = stream.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello hy2");
+
+        // The first rule permits the hostname. Losing it before routing
+        // would hit the following UDP rejection even for this local endpoint.
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::Domain(
+            "hy2-target.invalid".to_owned(),
+            receiver.local_addr().unwrap().port(),
+        );
+        let sender = client.connect_udp(&target).await.unwrap();
+        sender.send(b"named datagram").await.unwrap();
+        let (n, peer) = tokio::time::timeout(Duration::from_secs(3), receiver.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"named datagram");
+        receiver.send_to(b"named reply", peer).await.unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(3), sender.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buf[..n], b"named reply");
     }
 }

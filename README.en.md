@@ -18,7 +18,7 @@ the inherited documentation below describes upstream capabilities and measuremen
 ![Xrust Banner](assets/readme/hero.svg)
 
 [![Stars](https://img.shields.io/github/stars/Dushnilin/tachyon-core?style=for-the-badge&color=00F0FF)](https://github.com/Dushnilin/tachyon-core/stargazers)
-[![Rust](https://img.shields.io/badge/Rust-1.89+_(2024)-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.91+_(2024)-DEA584?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Binary Size](https://img.shields.io/badge/Binary-10.0_--_12.8_MiB-38BDF8?style=for-the-badge&logo=target)](https://github.com/Dushnilin/tachyon-core/releases/tag/v0.0.1)
 [![RAM RSS](https://img.shields.io/badge/RAM_RSS-4.2_MiB_idle-10B981?style=for-the-badge&logo=speedtest)](https://github.com/Dushnilin/tachyon-core)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-36%2F39_Wins-10B981?style=for-the-badge&logo=speedtest)](BENCHMARK.md)
@@ -189,7 +189,7 @@ xrust rule-set compile rules.json -o rules.srs                    # SRS v5, both
 
 ## 🚀 Building
 
-Requires Rust 1.89+ (edition 2024).
+Requires Rust 1.91+ (edition 2024).
 
 ```bash
 # Release build (all protocols, Clash API, DNS groups, Tailscale, mmap, ~11 MiB)

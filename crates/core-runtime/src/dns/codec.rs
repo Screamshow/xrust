@@ -354,6 +354,22 @@ pub fn rewrite_ttl(raw: &[u8], ttl: u32) -> io::Result<Vec<u8>> {
     encode(&msg)
 }
 
+/// Set the caller ID and cap record lifetimes in a single encode. A cached
+/// negative response communicates its remaining lifetime in the authority SOA.
+pub fn cached_answer(raw: &[u8], remaining: u32, id: u16) -> io::Result<Vec<u8>> {
+    let mut msg = parse_message(raw)?;
+    msg.metadata.id = id;
+    for record in msg
+        .answers
+        .iter_mut()
+        .chain(&mut msg.authorities)
+        .chain(&mut msg.additionals)
+    {
+        record.ttl = record.ttl.min(remaining);
+    }
+    encode(&msg)
+}
+
 /// All A/AAAA addresses in the answer section.
 pub fn answer_ips(raw: &[u8]) -> io::Result<Vec<IpAddr>> {
     let msg = parse_message(raw)?;
@@ -372,15 +388,44 @@ pub fn answer_ips(raw: &[u8]) -> io::Result<Vec<IpAddr>> {
 #[derive(Debug, Clone, Copy)]
 pub struct ResponseMeta {
     pub rcode: ResponseCode,
-    /// Smallest answer TTL; `None` when there are no answers.
-    pub min_answer_ttl: Option<u32>,
+    /// Negative responses require an authority SOA (RFC 2308).
+    pub cache_ttl: Option<u32>,
 }
 
 pub fn response_meta(raw: &[u8]) -> io::Result<ResponseMeta> {
     let msg = parse_message(raw)?;
+    // We cache the complete wire response. Expire it when any included RR
+    // expires, so a short-lived glue record cannot be renewed on cache hits.
+    let packet_ttl = msg
+        .answers
+        .iter()
+        .chain(&msg.authorities)
+        .chain(&msg.additionals)
+        .map(|record| record.ttl)
+        .min();
+    let soa_ttl = msg
+        .authorities
+        .iter()
+        .filter_map(|record| match &record.data {
+            RData::SOA(soa) => Some(record.ttl.min(soa.minimum)),
+            _ => None,
+        })
+        .min();
+    // A CNAME chain may terminate in NXDOMAIN or NODATA. Retain the minimum
+    // lifetime of the chain and its negative terminal answer.
+    let has_requested_type = msg.queries.first().is_some_and(|query| {
+        msg.answers.iter().any(|record| {
+            query.query_type() == RecordType::ANY || record.data.record_type() == query.query_type()
+        })
+    });
+    let cache_ttl = if msg.metadata.response_code == ResponseCode::NXDomain || !has_requested_type {
+        soa_ttl.map(|ttl| ttl.min(packet_ttl.unwrap_or(ttl)))
+    } else {
+        packet_ttl
+    };
     Ok(ResponseMeta {
         rcode: msg.metadata.response_code,
-        min_answer_ttl: msg.answers.iter().map(|r| r.ttl).min(),
+        cache_ttl,
     })
 }
 
@@ -402,35 +447,40 @@ pub fn set_id(raw: &[u8], id: u16) -> io::Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Attach the configured client subnet to a query, the shape the reference
-/// puts on the wire: an OPT record with payload size 0 and no DO bit, whose
-/// only option is EDNS0 SUBNET with the configured netmask (RFC 7871).
-///
-/// ponytail: the query is always ours — `build_query` sets no EDNS — and there
-/// is no DNS server inbound, so nothing can arrive with an OPT already on it;
-/// the reference instead replaces an existing SUBNET option. Revisit with the
-/// server inbound.
-pub fn set_client_subnet(query: &[u8], addr: IpAddr, bits: u8) -> Vec<u8> {
-    let (family, octets): (u16, Vec<u8>) = match addr {
-        IpAddr::V4(v4) => (1, v4.octets().to_vec()),
-        IpAddr::V6(v6) => (2, v6.octets().to_vec()),
-    };
-    let mut rdata = Vec::with_capacity(8 + octets.len());
-    rdata.extend_from_slice(&8u16.to_be_bytes()); // option code: EDNS0 SUBNET
-    rdata.extend_from_slice(&((4 + octets.len()) as u16).to_be_bytes());
-    rdata.extend_from_slice(&family.to_be_bytes());
-    rdata.push(bits); // source prefix length
-    rdata.push(0); // scope prefix length
-    rdata.extend_from_slice(&octets);
+/// Replace ECS while retaining the client's other EDNS options and flags.
+pub fn set_client_subnet(query: &[u8], addr: IpAddr, bits: u8) -> io::Result<Vec<u8>> {
+    use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
+    let mut msg = parse_message(query)?;
+    let options = msg
+        .edns
+        .get_or_insert_with(hickory_proto::op::Edns::new)
+        .options_mut();
+    options.remove(EdnsCode::Subnet);
+    options.insert(EdnsOption::Subnet(ClientSubnet::new(addr, bits, 0)));
+    encode(&msg)
+}
 
-    let mut out = query.to_vec();
-    out.push(0); // root name
-    out.extend_from_slice(&41u16.to_be_bytes()); // TYPE = OPT
-    out.extend_from_slice(&0u16.to_be_bytes()); // CLASS = requestor payload size
-    out.extend_from_slice(&0u32.to_be_bytes()); // TTL: no extended flags, no DO
-    out.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-    out.extend_from_slice(&rdata);
-    out
+/// Truncate only on the last UDP hop. The cache and TCP clients retain the
+/// complete upstream response.
+pub fn udp_answer(query: &[u8], response: Vec<u8>) -> io::Result<Vec<u8>> {
+    if response.len() <= 512 {
+        return Ok(response);
+    }
+    let limit = usize::from(parse_message(query)?.max_payload()).min(65507);
+    if response.len() <= limit {
+        return Ok(response);
+    }
+    let mut truncated = parse_message(&response)?.truncate();
+    // Do not echo large options (e.g. padding) in a truncated answer.
+    if let Some(edns) = &mut truncated.edns {
+        edns.options_mut().options.clear();
+    }
+    let raw = encode(&truncated)?;
+    if raw.len() <= limit {
+        return Ok(raw);
+    }
+    truncated.queries.clear();
+    encode(&truncated)
 }
 
 pub fn parse_record_type(raw: &str) -> Option<RecordType> {
@@ -458,7 +508,7 @@ mod tests {
         let resp = synth_address(&query, "198.18.0.1".parse().unwrap(), 600).unwrap();
         let meta = response_meta(&resp).unwrap();
         assert_eq!(meta.rcode, ResponseCode::NoError);
-        assert_eq!(meta.min_answer_ttl, Some(600));
+        assert_eq!(meta.cache_ttl, Some(600));
         assert_eq!(
             answer_ips(&resp).unwrap(),
             vec!["198.18.0.1".parse::<IpAddr>().unwrap()]
@@ -484,12 +534,118 @@ mod tests {
     }
 
     #[test]
+    fn negative_responses_expire_with_the_soa_and_age_its_ttl() {
+        use hickory_proto::rr::{Name, rdata::SOA};
+        let query = parse_message(&build_query(7, "missing.test", RecordType::A).unwrap()).unwrap();
+        for code in [ResponseCode::NXDomain, ResponseCode::NoError] {
+            let mut msg = parse_message(&name_error(&query).unwrap()).unwrap();
+            msg.metadata.response_code = code;
+            assert_eq!(
+                response_meta(&encode(&msg).unwrap()).unwrap().cache_ttl,
+                None
+            );
+            let soa = SOA::new(Name::root(), Name::root(), 1, 60, 60, 60, 5);
+            msg.authorities
+                .push(Record::from_rdata(Name::root(), 60, RData::SOA(soa)));
+            let raw = encode(&msg).unwrap();
+            assert_eq!(response_meta(&raw).unwrap().cache_ttl, Some(5));
+            let hit = parse_message(&cached_answer(&raw, 2, 99).unwrap()).unwrap();
+            assert_eq!(hit.metadata.id, 99);
+            assert_eq!(hit.authorities[0].ttl, 2);
+            msg.authorities[0].ttl = 0;
+            assert_eq!(
+                response_meta(&encode(&msg).unwrap()).unwrap().cache_ttl,
+                Some(0)
+            );
+        }
+    }
+
+    #[test]
+    fn udp_reply_obeys_the_query_limit_and_preserves_the_full_answer() {
+        let plain = build_query(42, "large.test", RecordType::A).unwrap();
+        let mut request = parse_message(&plain).unwrap();
+        let ips = (1..65)
+            .map(|last| IpAddr::from([192, 0, 2, last]))
+            .collect::<Vec<_>>();
+        let raw = synth_addresses(&request, &ips, 60).unwrap();
+        assert!(raw.len() > 768 && raw.len() < 4096);
+        let short = udp_answer(&plain, raw.clone()).unwrap();
+        let reply = parse_message(&short).unwrap();
+        assert!(short.len() <= 512 && reply.metadata.truncation);
+        assert_eq!(reply.queries, request.queries);
+        assert_eq!(reply.metadata.id, 42);
+        request
+            .edns
+            .get_or_insert_with(hickory_proto::op::Edns::new)
+            .set_max_payload(768);
+        assert!(
+            parse_message(&udp_answer(&encode(&request).unwrap(), raw.clone()).unwrap())
+                .unwrap()
+                .metadata
+                .truncation
+        );
+        request.edns.as_mut().unwrap().set_max_payload(4096);
+        assert_eq!(
+            udp_answer(&encode(&request).unwrap(), raw.clone()).unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn positive_cache_lifetime_accounts_for_glue_and_authority_records() {
+        let query = parse_message(&build_query(7, "glue.test", RecordType::A).unwrap()).unwrap();
+        let raw = synth_address(&query, "192.0.2.1".parse().unwrap(), 300).unwrap();
+        let mut msg = parse_message(&raw).unwrap();
+        let mut short = msg.answers[0].clone();
+        short.ttl = 5;
+        msg.additionals.push(short.clone());
+        assert_eq!(
+            response_meta(&encode(&msg).unwrap()).unwrap().cache_ttl,
+            Some(5)
+        );
+        msg.additionals.clear();
+        msg.authorities.push(short);
+        assert_eq!(
+            response_meta(&encode(&msg).unwrap()).unwrap().cache_ttl,
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn client_subnet_replaces_only_ecs_and_encodes_prefix_bytes() {
+        use hickory_proto::rr::rdata::opt::{ClientSubnet, EdnsCode, EdnsOption};
+        let plain = build_query(7, "ecs.test", RecordType::A).unwrap();
+        let mut msg =
+            parse_message(&set_client_subnet(&plain, "192.0.2.0".parse().unwrap(), 24).unwrap())
+                .unwrap();
+        let edns = msg.edns.as_mut().unwrap();
+        edns.set_dnssec_ok(true).set_max_payload(1232);
+        edns.options_mut()
+            .insert(EdnsOption::Unknown(65000, vec![17]));
+        let ip = "2001:db8:1234::".parse().unwrap();
+        let wire = set_client_subnet(&encode(&msg).unwrap(), ip, 48).unwrap();
+        assert_eq!(&wire[10..12], &[0, 1]);
+        let edns = parse_message(&wire).unwrap().edns.unwrap();
+        assert!(edns.flags().dnssec_ok);
+        assert_eq!(edns.max_payload(), 1232);
+        assert_eq!(
+            edns.options().get_all(EdnsCode::Subnet),
+            vec![&EdnsOption::Subnet(ClientSubnet::new(ip, 48, 0))]
+        );
+        assert_eq!(
+            edns.option(EdnsCode::Unknown(65000)),
+            Some(&EdnsOption::Unknown(65000, vec![17]))
+        );
+        assert!(wire.windows(4).any(|field| field == [0, 8, 0, 10]));
+    }
+
+    #[test]
     fn ttl_rewrite() {
         let raw = build_query(1, "t.test", RecordType::A).unwrap();
         let (query, _) = parse_query(&raw).unwrap();
         let resp = synth_address(&query, "10.0.0.1".parse().unwrap(), 600).unwrap();
         let rewritten = rewrite_ttl(&resp, 60).unwrap();
-        assert_eq!(response_meta(&rewritten).unwrap().min_answer_ttl, Some(60));
+        assert_eq!(response_meta(&rewritten).unwrap().cache_ttl, Some(60));
     }
 
     #[test]

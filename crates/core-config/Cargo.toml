@@ -17,6 +17,7 @@ server-inbounds = []
 [dependencies]
 base64.workspace = true
 flate2.workspace = true
+hickory-proto.workspace = true
 # the reference compiles every `*_regex` matcher while it parses a rule
 regex = { workspace = true, optional = true }
 serde.workspace = true

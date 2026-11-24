@@ -2,7 +2,6 @@
 import http.server
 import json
 import socket
-import struct
 import subprocess
 import sys
 import tempfile
@@ -11,7 +10,7 @@ import time
 from pathlib import Path
 
 binary = str(Path(sys.argv[1]).resolve())
-removed = ['naive', 'vmess', 'trojan', 'shadowsocks', 'tuic', 'anytls',
+removed = ['naive', 'vmess', 'shadowsocks', 'tuic', 'anytls',
            'snell', 'shadowtls', 'fptn', 'openvpn', 'openvpn-client']
 with tempfile.TemporaryDirectory() as work:
     config = Path(work) / 'config.json'
@@ -20,6 +19,12 @@ with tempfile.TemporaryDirectory() as work:
             config.write_text(json.dumps({section: [{'type': protocol}]}))
             result = subprocess.run([binary, 'check', '-c', str(config)], capture_output=True)
             assert result.returncode and b'excluded from Rust X' in result.stderr + result.stdout, (protocol, result)
+    config.write_text(json.dumps({"outbounds": [{"type": "trojan", "tag": "test", "server": "localhost",
+        "server_port": 443, "password": "fixture", "tls": {"enabled": True}}]}))
+    subprocess.run([binary, "check", "-c", str(config)], check=True)
+    for section in ['inbounds', 'endpoints']:
+        config.write_text(json.dumps({section: [{"type": "trojan"}]}))
+        assert subprocess.run([binary, "check", "-c", str(config)], capture_output=True).returncode
     config.write_text('{"outbounds":[{"type":"socks"}]}')
     assert subprocess.run([binary, 'check', '-c', str(config)], capture_output=True).returncode
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), http.server.SimpleHTTPRequestHandler)
@@ -47,15 +52,9 @@ with tempfile.TemporaryDirectory() as work:
             url = f'http://127.0.0.1:{server.server_port}/'
             subprocess.run(curl + ['--socks5-hostname', f'127.0.0.1:{port}', url], check=True, stdout=subprocess.DEVNULL)
             subprocess.run(curl + ['--proxy', f'http://127.0.0.1:{port}', url], check=True, stdout=subprocess.DEVNULL)
-            with socket.create_connection(('127.0.0.1', port), timeout=2) as client:
-                client.sendall(b'\x04\x01' + struct.pack('!H', server.server_port) + socket.inet_aton('127.0.0.1') + b'\x00')
-                try:
-                    response = client.recv(8)
-                except ConnectionResetError:
-                    response = b''
-                assert len(response) < 2 or response[1] != 0x5a, 'SOCKS4 unexpectedly accepted'
+            subprocess.run(curl + ['--socks4', f'127.0.0.1:{port}', url], check=True, stdout=subprocess.DEVNULL)
         finally:
             process.terminate()
             process.wait(timeout=5)
             server.shutdown()
-print('PASS: removed protocols rejected; DirectProxy SOCKS5/HTTP works; SOCKS4 rejected')
+print('PASS: removed protocols rejected; Trojan client accepted; DirectProxy SOCKS4/SOCKS5/HTTP traffic passed')

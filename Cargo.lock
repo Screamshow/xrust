@@ -308,6 +308,7 @@ version = "0.0.49"
 dependencies = [
  "base64",
  "flate2",
+ "hickory-proto",
  "regex",
  "serde",
  "serde_json",

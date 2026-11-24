@@ -1,6 +1,7 @@
 pub mod asn1_x509;
 pub mod go_regex;
 pub mod netip_parse;
+pub mod probe_url;
 pub mod srs;
 pub mod validate;
 pub mod vless_enc;

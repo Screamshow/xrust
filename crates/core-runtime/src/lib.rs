@@ -145,6 +145,7 @@ impl BoxInstance {
             _ => None,
         };
         warn_unhonored_options(new_root);
+        let log = LogSettings::read(new_root)?;
 
         // 1. Build and validate new router inner BEFORE mutating anything running
         let prepared = Router::prepare(new_root, &self.router)?;
@@ -187,16 +188,7 @@ impl BoxInstance {
         self.dns = new_dns;
 
         // 7. Hot-apply log settings
-        let log = new_root.get("log");
-        let level = log.and_then(|l| l.get("level")).and_then(Value::as_str);
-        let disabled = log
-            .and_then(|l| l.get("disabled"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if let Some(lvl) = level {
-            logging::set_level(lvl);
-        }
-        logging::set_enabled(!disabled);
+        log.apply();
         if previous_direct.is_some() && next_direct.is_none() {
             if let Some(handle) = self.direct_proxy_task.take()
                 && let Some(index) = self.tasks.iter().position(|task| task.id() == handle.id())
@@ -264,28 +256,41 @@ pub async fn start(root: &Value) -> anyhow::Result<BoxInstance> {
     result
 }
 
+struct LogSettings<'a> {
+    level: &'a str,
+    output: Option<&'a str>,
+    timestamp: bool,
+    disabled: bool,
+}
+
+impl<'a> LogSettings<'a> {
+    fn read(root: &'a Value) -> anyhow::Result<Self> {
+        let log = &root["log"];
+        let level = log["level"].as_str().unwrap_or("info");
+        anyhow::ensure!(
+            logging::Level::parse(level).is_some(),
+            "unknown log level: {level}"
+        );
+        Ok(Self {
+            level,
+            output: log["output"].as_str(),
+            timestamp: log["timestamp"].as_bool().unwrap_or(false),
+            disabled: log["disabled"].as_bool().unwrap_or(false),
+        })
+    }
+
+    fn apply(&self) {
+        logging::init(self.output, Some(self.level), self.timestamp);
+        if self.disabled {
+            logging::set_disabled();
+        }
+    }
+}
+
 async fn start_inner(root: &Value, tasks: &mut Vec<JoinHandle<()>>) -> anyhow::Result<BoxInstance> {
     core_tls::install_default_provider();
     warn_unhonored_options(root);
-    let log = root.get("log");
-    let level = log.and_then(|l| l.get("level")).and_then(Value::as_str);
-    let output = log.and_then(|l| l.get("output")).and_then(Value::as_str);
-    let timestamp = log
-        .and_then(|l| l.get("timestamp"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let disabled = log
-        .and_then(|l| l.get("disabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if !logging::init(output, level, timestamp)
-        && let Some(raw) = level
-    {
-        anyhow::bail!("unknown log level: {raw}");
-    }
-    if disabled {
-        logging::set_disabled();
-    }
+    LogSettings::read(root)?.apply();
 
     // network_namespaces: every namespace has to be enterable before the first
     // dial asks for one, which is where the reference starts them too

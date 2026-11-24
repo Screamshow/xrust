@@ -1849,30 +1849,7 @@ impl Stack {
             self.recycle(plain);
             return;
         };
-        let allowed = match src_ip {
-            IpAddr::V4(v4) => {
-                let src_u32 = u32::from(v4);
-                self.peers[pi]
-                    .endpoint
-                    .allowed_ips_v4
-                    .iter()
-                    .any(|&(net, bits)| {
-                        bits == 0 || (src_u32 >> (32 - bits as u32)) == (net >> (32 - bits as u32))
-                    })
-            }
-            IpAddr::V6(v6) => {
-                let src_u128 = u128::from(v6);
-                self.peers[pi]
-                    .endpoint
-                    .allowed_ips_v6
-                    .iter()
-                    .any(|&(net, bits)| {
-                        bits == 0
-                            || (src_u128 >> (128 - bits as u32)) == (net >> (128 - bits as u32))
-                    })
-            }
-        };
-        if !allowed {
+        if self.lpm(src_ip) != Some(pi) {
             logging::debug(format_args!(
                 "wireguard[{}]: cryptokey routing dropped packet with src {src_ip} from peer {pi}",
                 self.cfg.tag
@@ -3167,6 +3144,30 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn received_sources_belong_to_the_longest_matching_peer() {
+        let (mut stack, sender) = compat_stack(json!({})).await;
+        let source = sender.local_addr().unwrap();
+        let v4 = Ipv4Addr::new(10, 66, 66, 1);
+        let v6: Ipv6Addr = "fd00::1".parse().unwrap();
+        let local6: Ipv6Addr = "fd00::2".parse().unwrap();
+        Arc::make_mut(&mut stack.cfg).local_addr_v6 = Some(local6);
+        stack.peers[0].endpoint.allowed_ips_v6 = vec![(0, 0)];
+        let mut specific = stack.peers[0].endpoint.clone();
+        specific.allowed_ips_v4 = vec![(u32::from(v4), 32)];
+        specific.allowed_ips_v6 = vec![(u128::from(v6), 128)];
+        stack.peers.push(PeerRt::new(specific));
+        for packet in [
+            build_ipv4_udp(v4, stack.cfg.local_addr_v4.unwrap(), 53, 50000, b"v4"),
+            build_ipv6_udp(v6, local6, 53, 50000, b"v6"),
+        ] {
+            stack.accepted_transport(0, packet.len(), source, packet.clone());
+            assert!(stack.device.rx.is_empty());
+            stack.accepted_transport(1, packet.len(), source, packet.clone());
+            assert_eq!(stack.device.rx.pop_front(), Some(packet));
         }
     }
 

@@ -64,6 +64,8 @@ pub struct ConnContext {
     pub destination: Target,
     pub origin_destination: Option<Target>,
     pub network: &'static str,
+    /// DNS question type when matching a DNS query against a headless rule.
+    pub query_type: Option<u16>,
     pub protocol: Option<String>,
     pub domain: Option<String>,
     /// Original DNS name recovered from FakeIP; sniff/resolve may replace the other names.
@@ -106,6 +108,7 @@ impl Default for ConnContext {
             )),
             origin_destination: None,
             network: "tcp",
+            query_type: None,
             protocol: None,
             domain: None,
             fakeip_domain: None,
@@ -1254,6 +1257,18 @@ impl Router {
         self.inner.read().expect("router inner lock").clone()
     }
 
+    /// Manual probes use numeric outbound IDs, including in nested detours.
+    /// Keep every lookup within the generation that assigned those IDs.
+    #[cfg(feature = "clash-api")]
+    pub(crate) fn probe_snapshot(&self, inner: Arc<RouterInner>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::RwLock::new(inner),
+            connection_scope: Arc::clone(&self.connection_scope),
+            applied_config: std::sync::Mutex::new(Value::Null),
+            selection_cache: std::sync::RwLock::new(None),
+        })
+    }
+
     /// Restore only selections that still belong to the same named group.
     /// Keep the handle on the Router so in-place reloads retain persistence.
     pub fn attach_selection_cache(&self, cache: Option<crate::cache_file::SharedCacheFile>) {
@@ -1537,7 +1552,7 @@ impl Router {
             }
         }
 
-        // 2. Preserve selector and urltest selections and latencies
+        // 2. Preserve selector and urltest selections
         for (tag, &old_idx) in &old_inner.tags {
             if let Some(Outbound::Selector(old_sel)) = old_inner.outbounds.get(old_idx)
                 && let Some(&new_idx) = new_inner.tags.get(tag)
@@ -1549,7 +1564,6 @@ impl Router {
                 && let Some(Outbound::Urltest(new_url)) = new_inner.outbounds.get(new_idx)
             {
                 let _ = new_url.select(old_url.now());
-                new_url.copy_latencies_from(old_url);
             }
         }
 
@@ -2001,6 +2015,26 @@ mod tests {
         assert!(router.delay_history(sel).is_none());
         router.record_delay(d1, 701);
         assert_eq!(router.delay_history(sel).unwrap().1, 701, "recovery");
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "clash-api")]
+    async fn probe_snapshot_keeps_its_indices_when_reload_removes_a_member() {
+        let router = Router::new(&json!({"outbounds":[{"type":"direct","tag":"primary"},
+            {"type":"direct","tag":"removed"}]}))
+        .unwrap();
+        let inner = router.inner();
+        let index = inner.index_of("removed").unwrap();
+        let probe = router.probe_snapshot(inner);
+        router
+            .reload(&json!({"outbounds":[{"type":"direct","tag":"primary"}]}))
+            .await
+            .unwrap();
+        assert_eq!(probe.index_of("removed"), Some(index));
+        assert!(router.index_of("removed").is_none());
+        probe.record_delay(index, 23);
+        assert_eq!(probe.delay_history(index).unwrap().1, 23);
+        assert!(router.delay_history(index).is_none());
     }
 
     #[tokio::test]

@@ -137,10 +137,55 @@ fn single_top_directory(entries: &[Entry]) -> bool {
 
 /// Unpack `bytes` into `dest`, creating the directory when it is missing.
 pub fn extract(bytes: &[u8], dest: &Path) -> io::Result<()> {
+    extract_limited(bytes, dest, 32 << 20, 128 << 20)
+}
+
+fn extract_limited(bytes: &[u8], dest: &Path, file_limit: u64, total_limit: u64) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
     let entries = entries(bytes)?;
-    let trim = single_top_directory(&entries);
-    std::fs::create_dir_all(dest)?;
-    for entry in &entries {
+    let parent = dest
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let staging = loop {
+        let path = parent.join(format!(
+            ".xrust-ui-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => break path,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result =
+        extract_entries(bytes, &entries, &staging, file_limit, total_limit).and_then(|()| {
+            // Windows cannot rename over an empty directory. remove_dir refuses
+            // a nonempty destination, preserving an independent installation.
+            #[cfg(windows)]
+            if dest.exists() {
+                std::fs::remove_dir(dest)?;
+            }
+            std::fs::rename(&staging, dest)
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(staging);
+    }
+    result
+}
+
+fn extract_entries(
+    bytes: &[u8],
+    entries: &[Entry],
+    dest: &Path,
+    file_limit: u64,
+    mut remaining: u64,
+) -> io::Result<()> {
+    let trim = single_top_directory(entries);
+    for entry in entries {
         let mut parts: Vec<&str> = entry.path.split('/').collect();
         if trim {
             parts.remove(0);
@@ -174,24 +219,25 @@ pub fn extract(bytes: &[u8], dest: &Path) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, payload(bytes, entry)?)?;
+        let stored = slice(bytes, entry.data_offset, entry.compressed)?;
+        let reader: Box<dyn Read + '_> = match entry.method {
+            METHOD_STORED => Box::new(stored),
+            METHOD_DEFLATE => Box::new(flate2::read::DeflateDecoder::new(stored)),
+            other => {
+                return Err(io::Error::other(format!(
+                    "zip: unsupported compression method {other}"
+                )));
+            }
+        };
+        let budget = file_limit.min(remaining);
+        let mut file = std::fs::File::create(path)?;
+        let written = io::copy(&mut reader.take(budget + 1), &mut file)?;
+        if written > budget {
+            return Err(io::Error::other("zip: unpacked size limit exceeded"));
+        }
+        remaining -= written;
     }
     Ok(())
-}
-
-fn payload(bytes: &[u8], entry: &Entry) -> io::Result<Vec<u8>> {
-    let stored = slice(bytes, entry.data_offset, entry.compressed)?;
-    match entry.method {
-        METHOD_STORED => Ok(stored.to_vec()),
-        METHOD_DEFLATE => {
-            let mut out = Vec::new();
-            flate2::read::DeflateDecoder::new(stored).read_to_end(&mut out)?;
-            Ok(out)
-        }
-        other => Err(io::Error::other(format!(
-            "zip: unsupported compression method {other}"
-        ))),
-    }
 }
 
 #[cfg(test)]
@@ -309,6 +355,31 @@ mod tests {
             "the shared top directory is trimmed"
         );
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn size_limits_leave_the_destination_empty() {
+        let archive = build(&[
+            TestEntry {
+                name: "a",
+                data: vec![0; 8],
+                deflate: true,
+            },
+            TestEntry {
+                name: "b",
+                data: vec![1; 8],
+                deflate: false,
+            },
+        ]);
+        let dir = scratch("budget");
+        std::fs::create_dir(&dir).unwrap();
+        for (file, total) in [(7, 16), (8, 15)] {
+            assert!(extract_limited(&archive, &dir, file, total).is_err());
+            assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        }
+        extract_limited(&archive, &dir, 8, 16).unwrap();
+        assert_eq!(std::fs::read(dir.join("b")).unwrap(), [1; 8]);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

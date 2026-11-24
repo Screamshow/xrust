@@ -65,12 +65,12 @@ enum Sink {
     Stdout,
     /// File path from `log.output`; console gets nothing (reference
     /// `log.New` sets `logWriter = io.Discard` for non-stream outputs).
-    File(Mutex<File>),
+    File(File),
 }
 
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 static START: OnceLock<Instant> = OnceLock::new();
-static SINK: OnceLock<Sink> = OnceLock::new();
+static SINK: Mutex<Sink> = Mutex::new(Sink::Stderr);
 static TIMESTAMP: AtomicU8 = AtomicU8::new(0);
 
 /// Recent lines kept in memory for `GET /logs` (reference `log_buffer`).
@@ -168,16 +168,10 @@ pub fn passes(level: Level) -> bool {
 /// * `output` — `""`/`"stderr"`/`"stdout"` or a file path.
 /// * unknown level returns false (caller must bail like `start()` does).
 pub fn init(output: Option<&str>, level: Option<&str>, timestamp: bool) -> bool {
-    let parsed = match level {
-        None => Some(Level::Info),
-        Some(raw) => Level::parse(raw),
-    };
-    let Some(level) = parsed else {
+    let Some(level) = Level::parse(level.unwrap_or("info")) else {
         return false;
     };
-    LEVEL.store(level as u8, Ordering::Relaxed);
-    TIMESTAMP.store(u8::from(timestamp), Ordering::Relaxed);
-    let _ = SINK.get_or_init(|| match output.unwrap_or("") {
+    let sink = match output.unwrap_or("") {
         "" | "stderr" => Sink::Stderr,
         "stdout" => Sink::Stdout,
         path => match OpenOptions::new()
@@ -185,13 +179,16 @@ pub fn init(output: Option<&str>, level: Option<&str>, timestamp: bool) -> bool 
             .append(true)
             .open(Path::new(path))
         {
-            Ok(file) => Sink::File(Mutex::new(file)),
+            Ok(file) => Sink::File(file),
             Err(err) => {
                 eprintln!("log.output: open {path}: {err}");
                 Sink::Stderr
             }
         },
-    });
+    };
+    *SINK.lock().unwrap_or_else(|err| err.into_inner()) = sink;
+    LEVEL.store(level as u8, Ordering::Relaxed);
+    TIMESTAMP.store(u8::from(timestamp), Ordering::Relaxed);
     true
 }
 
@@ -235,18 +232,14 @@ fn emit(level: Level, msg: fmt::Arguments) {
         start.elapsed().as_secs(),
         text
     );
-    match SINK.get() {
-        Some(Sink::Stderr) => eprintln!("{line}"),
-        Some(Sink::Stdout) => println!("{line}"),
-        Some(Sink::File(file)) => {
-            if let Ok(mut guard) = file.lock()
-                && let Err(err) = writeln!(guard, "{line}")
-            {
-                drop(guard);
+    match &mut *SINK.lock().unwrap_or_else(|err| err.into_inner()) {
+        Sink::Stderr => eprintln!("{line}"),
+        Sink::Stdout => println!("{line}"),
+        Sink::File(file) => {
+            if let Err(err) = writeln!(file, "{line}") {
                 eprintln!("log.output: write: {err}");
             }
         }
-        None => eprintln!("{line}"),
     }
 }
 

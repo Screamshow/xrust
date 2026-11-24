@@ -27,13 +27,10 @@ jobs:
         include:
           - name: x86_64-musl
             target: x86_64-unknown-linux-musl
-            budget: 13631488
           - name: aarch64-musl
             target: aarch64-unknown-linux-musl
-            budget: 12582912
           - name: mipsel-musl
             target: mipsel-unknown-linux-musl
-            budget: 12582912
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,7 +53,7 @@ jobs:
             cargo build --locked -p core-cli --no-default-features --features forkop-client --release --target ${{ matrix.target }}
           fi
       - name: Size budget (13 MiB x86_64, 12 MiB ARM64)
-        run: test "$(stat -c%s target/${{ matrix.target }}/release/xrust)" -le ${{ matrix.budget }}
+        run: test "$(stat -c%s target/${{ matrix.target }}/release/xrust)" -le "$(bash scripts/openwrt_size_budget.sh '${{ matrix.target }}')"
       - name: Architecture check
         run: file target/${{ matrix.target }}/release/xrust
       - name: Pack

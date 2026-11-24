@@ -14,7 +14,8 @@ use crate::route::rule_set::{list, ports};
 /// destination port per set. Anything else would be dropped or turned from
 /// AND into OR, so such a set stays on the in-memory matcher.
 pub fn tsrs_unsupported(rules: &[Value]) -> Option<&'static str> {
-    const NOT_HELD: [&str; 5] = [
+    const NOT_HELD: [&str; 6] = [
+        "query_type",
         "domain_regex",
         "source_ip_cidr",
         "source_port",
