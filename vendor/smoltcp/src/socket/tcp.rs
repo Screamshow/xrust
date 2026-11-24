@@ -189,6 +189,8 @@ struct RttEstimator {
     rttvar: u32,
     /// Retransmission Time-Out
     rto: u32,
+    /// Lower bound applied to RTO estimates from RTT samples, in milliseconds.
+    rto_min: u32,
     timestamp: Option<(Instant, TcpSeqNumber)>,
     max_seq_sent: Option<TcpSeqNumber>,
     rto_count: u8,
@@ -201,6 +203,7 @@ impl Default for RttEstimator {
             srtt: 0,   // ignored, will be overwritten on first measurement.
             rttvar: 0, // ignored, will be overwritten on first measurement.
             rto: RTTE_INITIAL_RTO,
+            rto_min: RTTE_MIN_RTO,
             timestamp: None,
             max_seq_sent: None,
             rto_count: 0,
@@ -211,6 +214,10 @@ impl Default for RttEstimator {
 impl RttEstimator {
     fn retransmission_timeout(&self) -> Duration {
         Duration::from_millis(self.rto as _)
+    }
+
+    fn zero_window_probe_delay(&self) -> Duration {
+        Duration::from_millis(u64::from(self.rto.max(RTTE_MIN_RTO)))
     }
 
     #[cfg(feature = "socket-tcp-cubic")]
@@ -233,7 +240,7 @@ impl RttEstimator {
 
         // RFC 6298 (2.2), (2.3)
         let margin = RTTE_MIN_MARGIN.max(self.rttvar * RTTE_K);
-        self.rto = (self.srtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
+        self.rto = (self.srtt + margin).clamp(self.rto_min, RTTE_MAX_RTO);
 
         self.rto_count = 0;
 
@@ -294,6 +301,58 @@ impl RttEstimator {
             tcp_trace!("rtte: abort sampling due to retransmit");
         }
         self.timestamp = None;
+    }
+}
+
+#[derive(Debug)]
+struct ReplaySack {
+    end: TcpSeqNumber,
+    waits_for_ack: bool,
+    blocks: [Option<(TcpSeqNumber, TcpSeqNumber)>; 3],
+}
+
+impl ReplaySack {
+    fn update(&mut self, ack: TcpSeqNumber, ranges: [Option<(u32, u32)>; 3]) {
+        let blocks = ranges.map(|range| {
+            let (left, right) = range?;
+            let left = TcpSeqNumber(left as i32);
+            let right = TcpSeqNumber(right as i32);
+            (ack < left && left < right && right <= self.end).then_some((left, right))
+        });
+        if blocks.iter().any(Option::is_some) {
+            self.blocks = blocks;
+        } else {
+            for block in &mut self.blocks {
+                if block.is_some_and(|(left, _)| left <= ack) {
+                    *block = None;
+                }
+            }
+        }
+    }
+
+    fn skip(&self, mut seq: TcpSeqNumber) -> TcpSeqNumber {
+        // The three reported ranges need not be in sequence order.
+        for _ in 0..self.blocks.len() {
+            let old = seq;
+            for &(left, right) in self.blocks.iter().flatten() {
+                if left <= seq && seq < right {
+                    seq = right;
+                }
+            }
+            if seq == old {
+                break;
+            }
+        }
+        seq
+    }
+
+    fn limit_at(&self, seq: TcpSeqNumber) -> usize {
+        self.blocks
+            .iter()
+            .flatten()
+            .filter_map(|&(left, _)| (left > seq).then(|| left - seq))
+            .min()
+            .unwrap_or(usize::MAX)
     }
 }
 
@@ -490,6 +549,8 @@ pub struct Socket<'a> {
     state: State,
     timer: Timer,
     rtte: RttEstimator,
+    selective_rto_replay: bool,
+    replay_sack: Option<ReplaySack>,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
@@ -614,6 +675,8 @@ impl<'a> Socket<'a> {
             state: State::Closed,
             timer: Timer::new(),
             rtte: RttEstimator::default(),
+            selective_rto_replay: false,
+            replay_sack: None,
             assembler: Assembler::new(),
             tx_buffer,
             rx_buffer,
@@ -764,6 +827,12 @@ impl<'a> Socket<'a> {
         self.rtte
             .have_measurement
             .then(|| Duration::from_millis(u64::from(self.rtte.srtt)))
+    }
+
+    /// Set the lower bound for retransmission timeouts computed from future RTT samples.
+    /// The initial timeout and the minimum zero-window probe interval are independent.
+    pub fn set_minimum_retransmission_timeout(&mut self, minimum: Duration) {
+        self.rtte.rto_min = minimum.total_millis().clamp(1, u64::from(RTTE_MAX_RTO)) as u32;
     }
 
     /// Return the ACK delay duration.
@@ -934,13 +1003,45 @@ impl<'a> Socket<'a> {
         self.state
     }
 
+    /// Use selective retransmission after a timeout if the peer negotiated SACK.
+    pub fn set_selective_rto_replay(&mut self, enabled: bool) {
+        self.selective_rto_replay = enabled;
+    }
+
+    fn replay_waits_for_ack(&self) -> bool {
+        self.replay_sack
+            .as_ref()
+            .is_some_and(|sack| sack.waits_for_ack)
+    }
+
+    fn replay_cursor(&self) -> TcpSeqNumber {
+        if let Some(sack) = &self.replay_sack
+            && !sack.waits_for_ack
+            && self.remote_last_seq > self.local_seq_no
+        {
+            sack.skip(self.remote_last_seq)
+        } else {
+            self.remote_last_seq
+        }
+    }
+
+    fn replay_payload_limit(&self, seq: TcpSeqNumber) -> usize {
+        self.replay_sack
+            .as_ref()
+            .map_or(usize::MAX, |sack| sack.limit_at(seq))
+    }
+
     fn reset(&mut self) {
+        self.replay_sack = None;
         let rx_cap_log2 =
             mem::size_of::<usize>() * 8 - self.receive_capacity_limit.leading_zeros() as usize;
 
         self.state = State::Closed;
         self.timer = Timer::new();
-        self.rtte = RttEstimator::default();
+        self.rtte = RttEstimator {
+            rto_min: self.rtte.rto_min,
+            ..RttEstimator::default()
+        };
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
         self.rx_buffer.clear();
@@ -1415,7 +1516,7 @@ impl<'a> Socket<'a> {
             // if remote win is zero and we go from having no data to some data pending to
             // send, start the zero window probe timer.
             if self.remote_win_len == 0 && self.timer.is_idle() {
-                let delay = self.rtte.retransmission_timeout();
+                let delay = self.rtte.zero_window_probe_delay();
                 tcp_trace!("starting zero-window-probe timer for t+{}", delay);
 
                 // We don't have access to the current time here, so use Instant::ZERO instead.
@@ -1562,6 +1663,15 @@ impl<'a> Socket<'a> {
             .inner()
             .window()
             .saturating_sub(self.flight_size())
+    }
+
+    fn send_credit(&self, effective_mss: usize) -> usize {
+        let credit = self.cwnd_remaining();
+        if self.state == State::Established && self.replay_waits_for_ack() {
+            credit.min(effective_mss.saturating_sub(self.flight_size()))
+        } else {
+            credit
+        }
     }
 
     /// Return the amount of octets queued in the receive buffer. This value can be larger than
@@ -2281,7 +2391,7 @@ impl<'a> Socket<'a> {
                         }
                     );
 
-                    if self.local_rx_dup_acks == 3 {
+                    if self.local_rx_dup_acks == 3 && !self.replay_waits_for_ack() {
                         self.timer.set_for_fast_retransmit();
                         net_debug!("started fast retransmit");
                     }
@@ -2319,6 +2429,14 @@ impl<'a> Socket<'a> {
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
             self.local_seq_no = ack_number;
+            if let Some(sack) = &mut self.replay_sack {
+                if ack_number >= sack.end {
+                    self.replay_sack = None;
+                } else if ack_len > 0 || !sack.waits_for_ack {
+                    sack.waits_for_ack = false;
+                    sack.update(ack_number, repr.sack_ranges);
+                }
+            }
 
             // During retransmission, if an earlier segment got lost but later was
             // successfully received, self.local_seq_no can move past self.remote_last_seq.
@@ -2359,7 +2477,7 @@ impl<'a> Socket<'a> {
             && !self.tx_buffer.is_empty()
             && (self.timer.is_idle() || ack_len > 0)
         {
-            let delay = self.rtte.retransmission_timeout();
+            let delay = self.rtte.zero_window_probe_delay();
             tcp_trace!("starting zero-window-probe timer for t+{}", delay);
             self.timer.set_for_zero_window_probe(cx.now(), delay);
         }
@@ -2497,14 +2615,15 @@ impl<'a> Socket<'a> {
             self.local_seq_no + core::cmp::min(self.remote_win_len, self.tx_buffer.len());
 
         // Max amount of octets we can send.
-        let capped_send_seq = if max_send_seq >= self.remote_last_seq {
-            max_send_seq - self.remote_last_seq
+        let cursor = self.replay_cursor();
+        let capped_send_seq = if max_send_seq >= cursor {
+            max_send_seq - cursor
         } else {
             0
         };
 
         // compare max bytes allowed by cwnd with max bytes allowed by remote
-        let max_send = capped_send_seq.min(self.cwnd_remaining());
+        let max_send = capped_send_seq.min(self.send_credit(effective_mss));
 
         // Can we send at least 1 octet?
         let mut can_send = max_send != 0;
@@ -2649,6 +2768,23 @@ impl<'a> Socket<'a> {
                     .inner_mut()
                     .on_rto(cx.now(), in_flight);
 
+                // Let the first repair elicit a cumulative ACK before replaying the flight.
+                // If the repair itself is lost, the normal timer still backs off and retries it.
+                // Previous SACK blocks are advisory and cannot survive another RTO.
+                self.replay_sack = if self.selective_rto_replay
+                    && self.state == State::Established
+                    && self.remote_has_sack
+                    && !self.tx_buffer.is_empty()
+                {
+                    self.rtte.max_seq_sent.map(|end| ReplaySack {
+                        end,
+                        waits_for_ack: true,
+                        blocks: [None; 3],
+                    })
+                } else {
+                    None
+                };
+
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue
                 // to be sent again.
@@ -2682,6 +2818,10 @@ impl<'a> Socket<'a> {
         #[cfg(feature = "socket-tcp-pause-synack")]
         if matches!(self.state, State::SynReceived) && self.synack_paused {
             return Ok(());
+        }
+
+        if self.replay_sack.is_some() {
+            self.remote_last_seq = self.replay_cursor();
         }
 
         // Decide whether we're sending a packet.
@@ -2799,7 +2939,9 @@ impl<'a> Socket<'a> {
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
                 let offset = if self.pending_fast_retransmit {
-                    let size = effective_mss.min(self.tx_buffer.len());
+                    let size = effective_mss
+                        .min(self.tx_buffer.len())
+                        .min(self.replay_payload_limit(self.local_seq_no));
                     repr.seq_number = self.local_seq_no;
                     repr.payload = self.tx_buffer.get_allocated(0, size);
 
@@ -2869,7 +3011,10 @@ impl<'a> Socket<'a> {
                         // the remote got lost.
                         win_limit.min(device_limit)
                     } else {
-                        win_limit.min(device_limit).min(self.cwnd_remaining())
+                        win_limit
+                            .min(device_limit)
+                            .min(self.send_credit(effective_mss))
+                            .min(self.replay_payload_limit(self.remote_last_seq))
                     };
 
                     let offset = self.flight_size();
@@ -9750,6 +9895,148 @@ mod test {
             r.sample(2000);
             assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
         }
+    }
+
+    #[test]
+    fn test_retransmission_floor_keeps_initial_timeout_and_rtt_variation() {
+        let mut s = socket_established();
+        s.set_minimum_retransmission_timeout(Duration::from_millis(200));
+        s.reset();
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_secs(1));
+
+        s.rtte.sample(20);
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(200));
+        assert_eq!(s.rtte.zero_window_probe_delay(), Duration::from_secs(1));
+        s.rtte.sample(400);
+        assert!(s.rtte.retransmission_timeout() > Duration::from_millis(400));
+    }
+
+    #[test]
+    fn test_data_loss_uses_configured_floor_and_backs_off() {
+        let mut s = socket_established();
+        s.set_minimum_retransmission_timeout(Duration::from_millis(200));
+        s.rtte.sample(20);
+        s.send_slice(b"tail").unwrap();
+
+        let data = TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"tail",
+            ..RECV_TEMPL
+        };
+        recv!(s, time 1000, Ok(data));
+        recv_nothing!(s, time 1199);
+        recv!(s, time 1200, Ok(data));
+        recv_nothing!(s, time 1599);
+        recv!(s, time 1600, Ok(data));
+    }
+
+    #[test]
+    fn test_rto_replay_sends_one_segment_until_cumulative_ack() {
+        let mut s = socket_established();
+        s.set_minimum_retransmission_timeout(Duration::from_millis(200));
+        s.set_selective_rto_replay(true);
+        s.set_congestion_control(CongestionControl::None);
+        s.remote_mss = 4;
+        s.remote_has_sack = true;
+        s.rtte.sample(20);
+        s.send_slice(b"aaaabbbbcccc").unwrap();
+
+        let first = TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload: b"aaaa",
+            ..RECV_TEMPL
+        };
+        recv!(s, time 1000, Ok(first));
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 5,
+            payload: b"bbbb",
+            ..first
+        }));
+        recv!(s, time 1000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 9,
+            payload: b"cccc",
+            ..first
+        }));
+
+        recv_nothing!(s, time 1199);
+        recv!(s, time 1200, Ok(first));
+        recv_nothing!(s, time 1201);
+        recv_nothing!(s, time 1599);
+        recv!(s, time 1600, Ok(first));
+        recv_nothing!(s, time 1601);
+
+        send!(s, time 1620, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 13),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.send_queue(), 0);
+        assert!(s.replay_sack.is_none());
+        s.send_slice(b"ddddeeee").unwrap();
+        recv!(s, time 1620, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 13,
+            payload: b"dddd",
+            ..first
+        }));
+        recv!(s, time 1620, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 17,
+            payload: b"eeee",
+            ..first
+        }));
+    }
+
+    #[test]
+    fn test_rto_replay_uses_fresh_sack_and_discards_it_on_timeout() {
+        let mut s = socket_established();
+        s.set_minimum_retransmission_timeout(Duration::from_millis(200));
+        s.set_selective_rto_replay(true);
+        s.set_congestion_control(CongestionControl::None);
+        s.remote_mss = 4;
+        s.remote_has_sack = true;
+        s.rtte.sample(20);
+        let data = b"aaaabbbbccccddddeeee";
+        s.send_slice(data).unwrap();
+        let start = LOCAL_SEQ + 1;
+        let remote = REMOTE_SEQ + 1;
+        let first = TcpRepr {
+            seq_number: start,
+            ack_number: Some(remote),
+            payload: &data[..4],
+            ..RECV_TEMPL
+        };
+        for offset in (0..data.len()).step_by(4) {
+            recv!(s, time 1000, Ok(TcpRepr {
+                seq_number: start + offset,
+                payload: &data[offset..offset+4],
+                ..first
+            }));
+        }
+        recv!(s, time 1200, Ok(first));
+        send!(s, time 1220, TcpRepr {
+            seq_number: remote,
+            ack_number: Some(start + 4),
+            sack_ranges: [Some(((start+8).0 as u32, (start+16).0 as u32)), None, None],
+            ..SEND_TEMPL
+        });
+        let second = TcpRepr {
+            seq_number: start + 4,
+            payload: b"bbbb",
+            ..first
+        };
+        recv!(s, time 1220, Ok(second));
+        recv!(s, time 1220, Ok(TcpRepr {
+            seq_number: start + 16,
+            payload: b"eeee",
+            ..first
+        }));
+        recv_nothing!(s, time 1221);
+
+        // No ACK arrived. The next timeout starts a fresh repair and discards SACK.
+        recv!(s, time 1620, Ok(second));
+        assert_eq!(s.replay_sack.as_ref().unwrap().blocks, [None; 3]);
+        recv_nothing!(s, time 1621);
     }
 
     #[test]
