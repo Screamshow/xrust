@@ -1500,12 +1500,9 @@ impl Stack {
                     .set_receive_capacity_limit(tcp_window::LARGE)
                     .expect("bounded receive capacity on a new TCP socket");
                 socket.set_nagle_enabled(false);
-                if self.cfg.awg.is_some() {
-                    // A learned one-second floor prolongs AWG upload stalls when
-                    // too few later segments arrive to trigger fast retransmit.
-                    socket.set_minimum_retransmission_timeout(SmolDuration::from_millis(200));
-                    socket.set_selective_rto_replay(true);
-                }
+                // Shorten the wait when too few later segments arrive to trigger fast retransmit.
+                socket.set_minimum_retransmission_timeout(SmolDuration::from_millis(200));
+                socket.set_selective_rto_replay(true);
                 socket.set_timeout(Some(SmolDuration::from_millis(
                     CONNECT_TIMEOUT.as_millis() as u64
                 )));
