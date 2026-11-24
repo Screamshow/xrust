@@ -4,6 +4,8 @@
 //! Pure crypto/state machine: no sockets, no timers — the driver lives in
 //! `mod.rs`. Initiator only; we never answer handshakes.
 
+use std::sync::Arc;
+
 use blake2::digest::typenum::U16;
 use blake2::digest::{KeyInit, Mac};
 use blake2::{Blake2s256, Blake2sMac, Digest};
@@ -364,8 +366,8 @@ pub fn process_response(
     Ok(Session {
         local_index: hs.sender_index,
         remote_index,
-        send_cipher: ChaChaPoly::new(&send_key),
-        recv_cipher: ChaChaPoly::new(&recv_key),
+        send_cipher: Arc::new(ChaChaPoly::new(&send_key)),
+        recv_cipher: Arc::new(ChaChaPoly::new(&recv_key)),
         send_counter: 0,
         recv_max: 0,
         recv_any: false,
@@ -517,8 +519,8 @@ pub fn build_response(
     let session = Session {
         local_index: r_sender_index,
         remote_index: init_res.sender_index,
-        send_cipher: ChaChaPoly::new(&recv_key_initiator),
-        recv_cipher: ChaChaPoly::new(&send_key_initiator),
+        send_cipher: Arc::new(ChaChaPoly::new(&recv_key_initiator)),
+        recv_cipher: Arc::new(ChaChaPoly::new(&send_key_initiator)),
         send_counter: 0,
         recv_max: 0,
         recv_any: false,
@@ -536,8 +538,8 @@ const RECV_WINDOW: u64 = 2048;
 pub struct Session {
     pub local_index: u32,
     pub remote_index: u32,
-    send_cipher: ChaChaPoly,
-    recv_cipher: ChaChaPoly,
+    send_cipher: Arc<ChaChaPoly>,
+    pub(super) recv_cipher: Arc<ChaChaPoly>,
     send_counter: u64,
     /// Highest accepted receive counter; bit `i` = counter `recv_max - i`.
     recv_max: u64,
@@ -545,6 +547,58 @@ pub struct Session {
     recv_bitmap: [u64; 32],
     /// AWG magic-header range for transport type words (plain WG: `4..=4`).
     awg_transport: HeaderRange,
+}
+
+struct TransportHeader {
+    counter: u64,
+    kind: u32,
+    remote_index: u32,
+}
+
+impl TransportHeader {
+    fn seal(
+        &self,
+        cipher: &ChaChaPoly,
+        packet: &[u8],
+        padded_len: usize,
+        prefix_len: usize,
+        msg: &mut Vec<u8>,
+    ) {
+        debug_assert!(padded_len >= packet.len());
+        let payload_start = prefix_len + TRANSPORT_HEADER_LEN;
+        msg.clear();
+        msg.reserve(payload_start + padded_len + 16);
+        msg.resize(prefix_len, 0);
+        msg.extend_from_slice(&self.kind.to_le_bytes());
+        msg.extend_from_slice(&self.remote_index.to_le_bytes());
+        msg.extend_from_slice(&self.counter.to_le_bytes());
+        msg.extend_from_slice(packet);
+        msg.resize(payload_start + padded_len, 0);
+        let mut nonce = [0u8; 12];
+        nonce[4..].copy_from_slice(&self.counter.to_le_bytes());
+        let tag = cipher.seal(&nonce, &[], &mut msg[payload_start..]);
+        msg.extend_from_slice(&tag);
+    }
+}
+
+/// An assigned transport nonce and its immutable key for exactly one seal.
+/// The endpoint retains all session/rekey state.
+pub(super) struct PreparedSeal {
+    header: TransportHeader,
+    cipher: Arc<ChaChaPoly>,
+}
+
+impl PreparedSeal {
+    pub(super) fn seal(
+        self,
+        packet: &[u8],
+        padded_len: usize,
+        prefix_len: usize,
+        msg: &mut Vec<u8>,
+    ) {
+        self.header
+            .seal(&self.cipher, packet, padded_len, prefix_len, msg);
+    }
 }
 
 impl Session {
@@ -569,28 +623,36 @@ impl Session {
         prefix_len: usize,
         msg: &mut Vec<u8>,
     ) -> bool {
-        if self.send_counter > REJECT_AFTER_MESSAGES {
+        let Some(header) = self.reserve_transport() else {
             return false;
+        };
+        header.seal(&self.send_cipher, packet, padded_len, prefix_len, msg);
+        true
+    }
+
+    pub(super) fn can_seal_transport(&self) -> bool {
+        self.send_counter <= REJECT_AFTER_MESSAGES
+    }
+
+    fn reserve_transport(&mut self) -> Option<TransportHeader> {
+        if !self.can_seal_transport() {
+            return None;
         }
-        debug_assert!(padded_len >= packet.len());
         let counter = self.send_counter;
         self.send_counter += 1;
-        let payload_start = prefix_len + TRANSPORT_HEADER_LEN;
-        msg.clear();
-        msg.reserve(payload_start + padded_len + 16);
-        msg.resize(prefix_len, 0);
-        msg.extend_from_slice(&gen_type(self.awg_transport).to_le_bytes());
-        msg.extend_from_slice(&self.remote_index.to_le_bytes());
-        msg.extend_from_slice(&counter.to_le_bytes());
-        msg.extend_from_slice(packet);
-        msg.resize(payload_start + padded_len, 0);
-        let mut nonce = [0u8; 12];
-        nonce[4..].copy_from_slice(&counter.to_le_bytes());
-        let tag = self
-            .send_cipher
-            .seal(&nonce, &[], &mut msg[payload_start..]);
-        msg.extend_from_slice(&tag);
-        true
+        Some(TransportHeader {
+            counter,
+            kind: gen_type(self.awg_transport),
+            remote_index: self.remote_index,
+        })
+    }
+
+    pub(super) fn reserve_seal(&mut self) -> Option<PreparedSeal> {
+        let header = self.reserve_transport()?;
+        Some(PreparedSeal {
+            cipher: Arc::clone(&self.send_cipher),
+            header,
+        })
     }
 
     /// Open a transport message addressed to us; enforces the replay window.
@@ -605,40 +667,41 @@ impl Session {
     /// On success `out` holds the plaintext; on failure its contents are
     /// unspecified (zeroed after a bad tag).
     pub fn open_into(&mut self, msg: &[u8], out: &mut Vec<u8>) -> bool {
-        if msg.len() < TRANSPORT_HEADER_LEN + 16 {
+        let Some((counter, ciphertext, tag)) = self.transport_parts(msg) else {
             return false;
-        }
-        let word = match type_word(msg) {
-            Some(word) => word,
-            None => return false,
         };
+        out.clear();
+        out.extend_from_slice(ciphertext);
+        authenticate_transport(&self.recv_cipher, counter, out, tag) && self.accept_counter(counter)
+    }
+
+    pub(super) fn transport_parts<'a>(
+        &self,
+        msg: &'a [u8],
+    ) -> Option<(u64, &'a [u8], &'a [u8; 16])> {
+        if msg.len() < TRANSPORT_HEADER_LEN + 16 {
+            return None;
+        }
+        let word = type_word(msg)?;
         let (lo, hi) = self.awg_transport;
         if word < lo || word > hi {
-            return false;
+            return None;
         }
         let receiver = u32::from_le_bytes(msg[4..8].try_into().unwrap());
         if receiver != self.local_index {
-            return false;
+            return None;
         }
         let counter = u64::from_le_bytes(msg[8..16].try_into().unwrap());
         if counter > REJECT_AFTER_MESSAGES {
-            return false;
+            return None;
         }
         let body = &msg[TRANSPORT_HEADER_LEN..];
         let (ciphertext, tag) = body.split_at(body.len() - 16);
         let tag: &[u8; 16] = tag.try_into().expect("16-byte tag");
-        // The one copy that is not going away: the plaintext must outlive
-        // the recv buffer, and the AEAD opens in place.
-        out.clear();
-        out.extend_from_slice(ciphertext);
-        let mut nonce = [0u8; 12];
-        nonce[4..].copy_from_slice(&counter.to_le_bytes());
-        let authenticated = self.recv_cipher.open(&nonce, &[], out, tag);
-        // The replay window only moves for authenticated packets.
-        authenticated && self.accept_counter(counter)
+        Some((counter, ciphertext, tag))
     }
 
-    fn accept_counter(&mut self, counter: u64) -> bool {
+    pub(super) fn accept_counter(&mut self, counter: u64) -> bool {
         if !self.recv_any {
             self.recv_any = true;
             self.recv_max = counter;
@@ -689,6 +752,17 @@ impl Session {
         }
         self.recv_bitmap = new;
     }
+}
+
+pub(super) fn authenticate_transport(
+    cipher: &ChaChaPoly,
+    counter: u64,
+    plaintext: &mut [u8],
+    tag: &[u8; 16],
+) -> bool {
+    let mut nonce = [0u8; 12];
+    nonce[4..].copy_from_slice(&counter.to_le_bytes());
+    cipher.open(&nonce, &[], plaintext, tag)
 }
 
 /// Decrypt a cookie reply; returns the mac2 key cookie.
@@ -808,8 +882,8 @@ mod tests {
         let mut a = Session {
             local_index: 1,
             remote_index: 2,
-            send_cipher: ChaChaPoly::new(&[1u8; 32]),
-            recv_cipher: ChaChaPoly::new(&[2u8; 32]),
+            send_cipher: Arc::new(ChaChaPoly::new(&[1u8; 32])),
+            recv_cipher: Arc::new(ChaChaPoly::new(&[2u8; 32])),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -819,8 +893,8 @@ mod tests {
         let mut b = Session {
             local_index: 2,
             remote_index: 1,
-            send_cipher: ChaChaPoly::new(&[2u8; 32]),
-            recv_cipher: ChaChaPoly::new(&[1u8; 32]),
+            send_cipher: Arc::new(ChaChaPoly::new(&[2u8; 32])),
+            recv_cipher: Arc::new(ChaChaPoly::new(&[1u8; 32])),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -843,12 +917,29 @@ mod tests {
         assert!(b.open(&other).is_none());
     }
 
+    #[test]
+    fn reserved_transport_uses_its_original_epoch_and_counter() {
+        let mut sender = test_session(1, 2, [1; 32], [2; 32]);
+        let mut peer = test_session(2, 1, [2; 32], [1; 32]);
+        sender.send_counter = REJECT_AFTER_MESSAGES;
+        let work = sender.reserve_seal().unwrap();
+        assert!(sender.reserve_seal().is_none());
+        drop(sender);
+        let mut wire = Vec::new();
+        work.seal(b"old", 16, 0, &mut wire);
+        assert_eq!(&wire[8..16], &REJECT_AFTER_MESSAGES.to_le_bytes());
+        assert_eq!(&peer.open(&wire).unwrap()[..3], b"old");
+        assert!(peer.open(&wire).is_none());
+        let mut other = test_session(2, 1, [2; 32], [7; 32]);
+        assert!(other.open(&wire).is_none());
+    }
+
     fn test_session(local: u32, remote: u32, send: [u8; 32], recv: [u8; 32]) -> Session {
         Session {
             local_index: local,
             remote_index: remote,
-            send_cipher: ChaChaPoly::new(&send),
-            recv_cipher: ChaChaPoly::new(&recv),
+            send_cipher: Arc::new(ChaChaPoly::new(&send)),
+            recv_cipher: Arc::new(ChaChaPoly::new(&recv)),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -953,8 +1044,8 @@ mod tests {
         let mut s = Session {
             local_index: 1,
             remote_index: 2,
-            send_cipher: ChaChaPoly::new(&[0u8; 32]),
-            recv_cipher: ChaChaPoly::new(&[0u8; 32]),
+            send_cipher: Arc::new(ChaChaPoly::new(&[0u8; 32])),
+            recv_cipher: Arc::new(ChaChaPoly::new(&[0u8; 32])),
             send_counter: 0,
             recv_max: 0,
             recv_any: false,
@@ -1334,8 +1425,8 @@ mod mtu_padding_wire_tests {
                 let mut sender = Session {
                     local_index: 7,
                     remote_index: 9,
-                    send_cipher: ChaChaPoly::new(&key),
-                    recv_cipher: ChaChaPoly::new(&[0x33; 32]),
+                    send_cipher: Arc::new(ChaChaPoly::new(&key)),
+                    recv_cipher: Arc::new(ChaChaPoly::new(&[0x33; 32])),
                     send_counter: 0,
                     recv_max: 0,
                     recv_any: false,

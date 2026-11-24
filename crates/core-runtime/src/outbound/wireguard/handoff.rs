@@ -31,6 +31,10 @@ impl ReceiveActivity {
         }
     }
 
+    pub(super) fn active(&self) -> bool {
+        self.signal.load(Ordering::Relaxed)
+    }
+
     pub(super) fn observe(&mut self, now: Instant, received: usize, queued: usize, stalled: bool) {
         if self
             .window_start

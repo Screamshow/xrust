@@ -8,12 +8,15 @@
 pub mod awg;
 pub(crate) mod awg_masque;
 pub(crate) mod awg_quic;
+mod direct_upload;
 mod handoff;
 pub mod noise;
 mod reserved;
+mod rx_batch;
 #[cfg(test)]
 mod session_tests;
 mod tcp_window;
+mod tx_pipeline;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -199,6 +202,7 @@ enum Cmd {
 
 #[derive(Debug)]
 struct WgShared {
+    threaded_upload: bool,
     cmd_tx: mpsc::Sender<Cmd>,
     receive_feedback: Option<Arc<AtomicBool>>,
     next_id: AtomicU32,
@@ -463,18 +467,46 @@ impl WireGuard {
         ) || (self.cfg.awg.is_none()
             && crate::env_var("WG_HANDOFF").as_deref() != Some("one")))
         .then(|| Arc::new(AtomicBool::new(false)));
+        let handle = tokio::runtime::Handle::current();
+        // Use the measured ARM path only when both the executor and OS have
+        // the concurrency it needs. Other endpoints retain their upload pump.
+        let threaded_upload = cfg!(all(target_os = "linux", target_arch = "aarch64"))
+            && self.cfg.awg.is_none()
+            && self.cfg.peers.len() == 1
+            && receive_feedback.is_some()
+            && handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            && handle.metrics().num_workers() >= 4
+            && std::thread::available_parallelism().is_ok_and(|n| n.get() >= 4);
         let shared = Arc::new(WgShared {
+            threaded_upload,
             cmd_tx: tx,
             receive_feedback: receive_feedback.clone(),
             next_id: AtomicU32::new(1),
             wake: Arc::clone(&wake),
         });
         let cfg = Arc::new(self.cfg.clone());
-        tokio::spawn(async move {
-            if let Err(e) = run(cfg, Arc::new(sock), sock_v6, rx, wake, receive_feedback).await {
+        let task = async move {
+            if let Err(e) = run(
+                cfg,
+                Arc::new(sock),
+                sock_v6,
+                rx,
+                wake,
+                receive_feedback,
+                threaded_upload,
+            )
+            .await
+            {
                 logging::error(format_args!("wireguard stack exited: {e}"));
             }
-        });
+        };
+        if threaded_upload {
+            std::thread::Builder::new()
+                .name("xrust-wg".into())
+                .spawn(move || handle.block_on(task))?;
+        } else {
+            tokio::spawn(task);
+        }
         *guard = Some(Arc::clone(&shared));
         Ok(shared)
     }
@@ -517,6 +549,13 @@ impl WireGuard {
             wake: Arc::clone(&shared.wake),
         };
 
+        if shared.threaded_upload
+            && let Some(signal) = shared.receive_feedback.clone()
+        {
+            let writer = direct_upload::Writer::new(id, cmd_tx, signal);
+            wait_for_tcp_connect(resp_rx).await?;
+            return Ok(Box::new(tokio::io::join(reader, writer)));
+        }
         if let Some(receive_feedback) = shared
             .receive_feedback
             .clone()
@@ -594,12 +633,11 @@ impl WireGuard {
                 let pipeline = receive_feedback
                     .as_ref()
                     .is_some_and(|busy| !busy.load(Ordering::Acquire));
-                if !pipeline || !matches!(result, Ok(n) if n > 0) {
-                    if let Some(older) = previous.take() {
-                        if older.await.is_err() {
-                            break;
-                        }
-                    }
+                if (!pipeline || !matches!(result, Ok(n) if n > 0))
+                    && let Some(older) = previous.take()
+                    && older.await.is_err()
+                {
+                    break;
                 }
                 match result {
                     Ok(0) => {
@@ -622,10 +660,10 @@ impl WireGuard {
                         // Do not keep draining the caller into an unbounded
                         // per-socket queue while smoltcp's send buffer is full.
                         if pipeline {
-                            if let Some(older) = previous.replace(accepted) {
-                                if older.await.is_err() {
-                                    break;
-                                }
+                            if let Some(older) = previous.replace(accepted)
+                                && older.await.is_err()
+                            {
+                                break;
                             }
                         } else if accepted.await.is_err() {
                             break;
@@ -1120,6 +1158,9 @@ struct Stack {
     udp: HashMap<u16, UdpSess>,
     next_port: u16,
     /// Transport datagrams sealed during one device flush, sent together.
+    threaded_upload: bool,
+    tx_load: tx_pipeline::Load,
+    tx_sender: Option<tx_pipeline::Sender>,
     outbox: Vec<(SocketAddr, Vec<u8>)>,
     wire_buffers: Vec<Vec<u8>>,
     udp_gso: UdpGso,
@@ -1146,6 +1187,9 @@ impl Stack {
     }
 
     fn send_raw_class(&self, pi: usize, bytes: &[u8], class: Option<u8>) {
+        if let Some(sender) = &self.tx_sender {
+            sender.fence();
+        }
         let Some(addr) = self.peers[pi].resolved else {
             return;
         };
@@ -1223,6 +1267,9 @@ impl Stack {
     }
 
     fn send_handshake_resp(&self, pi: usize, resp: &[u8], src: SocketAddr) {
+        if let Some(sender) = &self.tx_sender {
+            sender.fence();
+        }
         let sock = match src {
             SocketAddr::V6(_) => self.sock_v6.as_ref(),
             SocketAddr::V4(_) => Some(&self.sock),
@@ -1772,12 +1819,22 @@ impl Stack {
             self.recycle(plain);
             return;
         }
+        self.accepted_transport(pi, msg.len(), src, plain);
+    }
+
+    fn accepted_transport(
+        &mut self,
+        pi: usize,
+        wire_len: usize,
+        src: SocketAddr,
+        mut plain: Vec<u8>,
+    ) {
         let s4 = self
             .cfg
             .awg
             .as_ref()
             .map_or(0, |a| a.padding(awg::TRANSPORT));
-        self.peers[pi].udp_window = self.peers[pi].udp_window.max((s4 + msg.len()) as u32);
+        self.peers[pi].udp_window = self.peers[pi].udp_window.max((s4 + wire_len) as u32);
         self.peers[pi].last_recv = Some(Instant::now());
         self.peers[pi].resolved = Some(src);
         if plain.is_empty() {
@@ -1873,6 +1930,13 @@ impl Stack {
     }
 
     async fn flush_device_tx(&mut self) {
+        while self.offload_transport() {}
+        if self.device.tx.is_empty() {
+            return;
+        }
+        if let Some(sender) = &self.tx_sender {
+            sender.fence();
+        }
         // A poll hands over a run of packets at once: they are sealed one by
         // one as before and leave in batches, one syscall per batch rather
         // than per datagram. The datagrams and their order are unchanged.
@@ -2316,6 +2380,7 @@ async fn run(
     mut rx: mpsc::Receiver<Cmd>,
     wake: Arc<tokio::sync::Notify>,
     receive_feedback: Option<Arc<AtomicBool>>,
+    threaded_upload: bool,
 ) -> io::Result<()> {
     let mtu = cfg.mtu;
     let mut device = WgDevice::new(mtu);
@@ -2355,6 +2420,9 @@ async fn run(
         tcp: HashMap::new(),
         udp: HashMap::new(),
         next_port: EPHEMERAL_BASE,
+        threaded_upload,
+        tx_load: Default::default(),
+        tx_sender: None,
         outbox: Vec::new(),
         wire_buffers: Vec::new(),
         udp_gso,
@@ -2366,14 +2434,24 @@ async fn run(
 
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut buf_v6 = vec![0u8; MAX_DATAGRAM];
+    let mut batch_rx = threaded_upload.then(rx_batch::Receiver::new);
     loop {
         // Bound each producer's batch so sustained traffic cannot starve
         // commands, TCP polling, or replies in this single-owner stack task.
-        for _ in 0..64 {
-            let Ok((n, src)) = stack.sock.try_recv_from(&mut buf) else {
-                break;
-            };
-            stack.process_inbound(&buf[..n], src);
+        if let Some(receiver) = batch_rx.as_mut().filter(|_| {
+            stack
+                .receive_activity
+                .as_ref()
+                .is_some_and(handoff::ReceiveActivity::active)
+        }) {
+            receiver.drain_ready(&mut stack, &mut buf).await?;
+        } else {
+            for _ in 0..64 {
+                let Ok((n, src)) = stack.sock.try_recv_from(&mut buf) else {
+                    break;
+                };
+                stack.process_inbound(&buf[..n], src);
+            }
         }
         let s6_recv = stack.sock_v6.clone();
         if let Some(s6) = &s6_recv {
@@ -2797,7 +2875,179 @@ fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
 
-    async fn compat_stack(extra: Value) -> (Stack, UdpSocket) {
+    #[tokio::test]
+    async fn parallel_rx_commits_in_arrival_order_after_authentication() {
+        let (mut stack, sender) = compat_stack(json!({})).await;
+        let mut peer = compat_session(&mut stack);
+        let mut probe = rx_batch::Receiver::new();
+        let (tx, rx) = oneshot::channel();
+        stack.process_cmd(Cmd::UdpOpen {
+            target: "10.66.66.1:1234".parse().unwrap(),
+            resp: tx,
+        });
+        let (port, mut delivered) = rx.await.unwrap().unwrap();
+        let mut packets = Vec::new();
+        for i in 0u8..9 {
+            let inner = build_ipv4_udp(
+                Ipv4Addr::new(10, 66, 66, 1),
+                Ipv4Addr::new(10, 66, 66, 2),
+                1234,
+                port,
+                &[i],
+            );
+            let mut wire = Vec::new();
+            assert!(peer.seal_into(&inner, inner.len().next_multiple_of(16), 0, &mut wire));
+            packets.push(wire);
+        }
+        let mut invalid = packets[3].clone();
+        *invalid.last_mut().unwrap() ^= 1;
+        // Nonzero reserved bytes take the ordinary path and must flush the prefix first.
+        packets[8][1..4].copy_from_slice(&[9, 8, 7]);
+        let order = [
+            &packets[0],
+            &packets[2],
+            &invalid,
+            &packets[1],
+            &packets[3],
+            &packets[2],
+            &packets[4],
+            &packets[8],
+            &packets[7],
+            &packets[6],
+            &packets[5],
+        ];
+        for data in order {
+            sender
+                .send_to(data, stack.sock.local_addr().unwrap())
+                .await
+                .unwrap();
+        }
+        stack.sock.readable().await.unwrap();
+        probe
+            .drain_ready(&mut stack, &mut vec![0; 65536])
+            .await
+            .unwrap();
+        for i in [0u8, 2, 1, 3, 4, 8, 7, 6, 5] {
+            assert_eq!(delivered.try_recv().unwrap().as_slice(), &[i]);
+        }
+        assert!(delivered.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn awg_parallel_rx_commits_after_authentication_with_s4_and_h4() {
+        let (mut stack, sender) = compat_stack(json!({"s4":16,"h4":44040404})).await;
+        let mut peer = compat_session(&mut stack);
+        peer.set_awg_transport((44040404, 44040404));
+        let mut probe = rx_batch::Receiver::new();
+        let (tx, rx) = oneshot::channel();
+        stack.process_cmd(Cmd::UdpOpen {
+            target: "10.66.66.1:1234".parse().unwrap(),
+            resp: tx,
+        });
+        let (port, mut delivered) = rx.await.unwrap().unwrap();
+        let mut packets = Vec::new();
+        for i in 0u8..9 {
+            let inner = build_ipv4_udp(
+                Ipv4Addr::new(10, 66, 66, 1),
+                Ipv4Addr::new(10, 66, 66, 2),
+                1234,
+                port,
+                &[i],
+            );
+            let mut wire = Vec::new();
+            assert!(peer.seal_into(&inner, inner.len().next_multiple_of(16), 16, &mut wire));
+            packets.push(wire);
+        }
+        let mut invalid = packets[3].clone();
+        *invalid.last_mut().unwrap() ^= 1;
+        // An AWG junk packet breaks the batch and must preserve delivery order.
+        let junk = vec![0x33; 55];
+        let order = [
+            &packets[0],
+            &packets[2],
+            &invalid,
+            &packets[1],
+            &packets[3],
+            &packets[2],
+            &packets[4],
+            &junk,
+            &packets[8],
+            &packets[7],
+            &packets[6],
+            &packets[5],
+        ];
+        for data in order {
+            sender
+                .send_to(data, stack.sock.local_addr().unwrap())
+                .await
+                .unwrap();
+        }
+        stack.sock.readable().await.unwrap();
+        probe
+            .drain_ready(&mut stack, &mut vec![0; 65536])
+            .await
+            .unwrap();
+        for i in [0u8, 2, 1, 3, 4, 8, 7, 6, 5] {
+            assert_eq!(delivered.try_recv().unwrap().as_slice(), &[i]);
+        }
+        assert!(delivered.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn byte_gate_large_ready_prefix_and_short_tail_preserve_delivery() {
+        for awg in [false, true] {
+            let extra = if awg {
+                json!({"s4":16,"h4":44040404})
+            } else {
+                json!({})
+            };
+            let (mut stack, sender) = compat_stack(extra).await;
+            let mut peer = compat_session(&mut stack);
+            if awg {
+                peer.set_awg_transport((44040404, 44040404));
+            }
+            let mut probe = rx_batch::Receiver::new();
+            let (tx, rx) = oneshot::channel();
+            stack.process_cmd(Cmd::UdpOpen {
+                target: "10.66.66.1:1234".parse().unwrap(),
+                resp: tx,
+            });
+            let (port, mut delivered) = rx.await.unwrap().unwrap();
+            for amount in [20u8, 1] {
+                for i in 0..amount {
+                    let payload = vec![i; 1200];
+                    let ip = build_ipv4_udp(
+                        Ipv4Addr::new(10, 66, 66, 1),
+                        Ipv4Addr::new(10, 66, 66, 2),
+                        1234,
+                        port,
+                        &payload,
+                    );
+                    let mut wire = Vec::new();
+                    assert!(peer.seal_into(
+                        &ip,
+                        ip.len().next_multiple_of(16),
+                        if awg { 16 } else { 0 },
+                        &mut wire
+                    ));
+                    sender
+                        .send_to(&wire, stack.sock.local_addr().unwrap())
+                        .await
+                        .unwrap();
+                }
+                stack.sock.readable().await.unwrap();
+                probe
+                    .drain_ready(&mut stack, &mut vec![0; 65536])
+                    .await
+                    .unwrap();
+                for i in 0..amount {
+                    assert_eq!(delivered.try_recv().unwrap(), vec![i; 1200]);
+                }
+                assert!(delivered.try_recv().is_err());
+            }
+        }
+    }
+    pub(super) async fn compat_stack(extra: Value) -> (Stack, UdpSocket) {
         use base64::Engine;
         let mut obj = wg_obj(extra);
         let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([2; 32]));
@@ -2827,6 +3077,9 @@ mod tests {
             tcp: HashMap::new(),
             udp: HashMap::new(),
             next_port: EPHEMERAL_BASE,
+            threaded_upload: false,
+            tx_load: Default::default(),
+            tx_sender: None,
             outbox: Vec::new(),
             wire_buffers: Vec::new(),
             udp_gso: UdpGso::Equal,
@@ -2835,7 +3088,7 @@ mod tests {
         (stack, sink)
     }
 
-    fn compat_session(stack: &mut Stack) -> noise::Session {
+    pub(super) fn compat_session(stack: &mut Stack) -> noise::Session {
         assert!(stack.start_hs(0));
         let hs = &stack.peers[0].hs.as_ref().unwrap().hs;
         let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([2; 32]));
