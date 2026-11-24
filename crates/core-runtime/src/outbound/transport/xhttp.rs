@@ -46,6 +46,7 @@ pub(crate) type Dialer =
 /// receive-window overrides remain authoritative.
 fn xhttp_h2_builder() -> h2::client::Builder {
     let mut builder = super::h2io::client_builder();
+    builder.recycle_received_data(true);
     apply_xhttp_h2_settings(&mut builder, crate::env_var("H2_CONN_WINDOW").is_some());
     builder
 }

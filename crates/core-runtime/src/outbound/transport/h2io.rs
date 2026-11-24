@@ -153,7 +153,9 @@ pub(crate) fn client_builder() -> h2::client::Builder {
 /// own order (`createHeaderFields`), not `net/http`'s.
 pub(crate) fn grpc_client_builder() -> h2::client::Builder {
     let mut builder = base_client_builder();
-    builder.pseudo_header_order(h2::PseudoOrder::MethodSchemePathAuthority);
+    builder
+        .pseudo_header_order(h2::PseudoOrder::MethodSchemePathAuthority)
+        .recycle_received_data(true);
     builder
 }
 

@@ -340,6 +340,9 @@ pub struct Builder {
     /// xrust: see `window_update_min_refresh`
     recv_min_refresh: Option<u32>,
 
+    /// xrust: see `recycle_received_data`
+    recycle_received_data: bool,
+
     /// xrust: see `pseudo_header_order`
     pseudo_order: crate::frame::PseudoOrder,
 
@@ -677,6 +680,7 @@ impl Builder {
             settings: Default::default(),
             go_client_writes: false,
             recv_min_refresh: None,
+            recycle_received_data: false,
             pseudo_order: crate::frame::PseudoOrder::default(),
             stream_id: 1.into(),
             local_max_error_reset_streams: Some(proto::DEFAULT_LOCAL_RESET_COUNT_MAX),
@@ -1140,6 +1144,14 @@ impl Builder {
         self
     }
 
+    /// Copy received DATA payloads up to 256 KiB into bounded, reusable
+    /// storage. Detached payloads let the decoder reuse its read buffer
+    /// while the application is still consuming the previous frame.
+    pub fn recycle_received_data(&mut self, enabled: bool) -> &mut Self {
+        self.recycle_received_data = enabled;
+        self
+    }
+
     /// xrust: send a WINDOW_UPDATE as soon as `bytes` of received data are
     /// released (or the peer's window drops below that), for the connection
     /// and every stream, like Go's x/net http2 (`inflowMinRefresh`, 4 KiB),
@@ -1384,6 +1396,7 @@ where
 
         // Create the codec
         let mut codec = Codec::new(io);
+        codec.set_recycle_data(builder.recycle_received_data);
         if builder.go_client_writes {
             // the preface goes out in one write with SETTINGS, below
             codec.buffer_raw(PREFACE);

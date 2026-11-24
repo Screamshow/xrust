@@ -1,6 +1,7 @@
 mod error;
 mod framed_read;
 mod framed_write;
+mod payload_pool;
 
 pub use self::error::{SendError, UserError};
 
@@ -61,6 +62,10 @@ where
 }
 
 impl<T, B> Codec<T, B> {
+    pub(crate) fn set_recycle_data(&mut self, enabled: bool) {
+        self.inner.set_recycle_data(enabled);
+    }
+
     /// Updates the max received frame size.
     ///
     /// The change takes effect the next time a frame is decoded. In other

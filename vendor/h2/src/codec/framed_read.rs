@@ -1,3 +1,4 @@
+use super::payload_pool;
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
@@ -33,6 +34,7 @@ pub struct FramedRead<T> {
     max_continuation_frames: usize,
 
     partial: Option<Partial>,
+    recycle_data: bool,
 }
 
 /// Partially loaded headers frame
@@ -64,7 +66,12 @@ impl<T> FramedRead<T> {
             max_header_list_size,
             max_continuation_frames,
             partial: None,
+            recycle_data: false,
         }
+    }
+
+    pub(crate) fn set_recycle_data(&mut self, enabled: bool) {
+        self.recycle_data = enabled;
     }
 
     pub fn get_ref(&self) -> &T {
@@ -125,6 +132,7 @@ fn decode_frame(
     max_continuation_frames: usize,
     partial_inout: &mut Option<Partial>,
     mut bytes: BytesMut,
+    recycle_data: bool,
 ) -> Result<Option<Frame>, Error> {
     let span = tracing::trace_span!("FramedRead::decode_frame", offset = bytes.len());
     let _e = span.enter();
@@ -234,7 +242,12 @@ fn decode_frame(
         }
         Kind::Data => {
             bytes.advance(frame::HEADER_LEN);
-            let res = frame::Data::load(head, bytes.freeze());
+            let payload = if recycle_data {
+                payload_pool::detach(bytes)
+            } else {
+                bytes.freeze()
+            };
+            let res = frame::Data::load(head, payload);
 
             // TODO: Should this always be connection level? Probably not...
             res.map_err(|e| {
@@ -406,6 +419,7 @@ where
                 max_header_list_size,
                 ref mut partial,
                 max_continuation_frames,
+                recycle_data,
                 ..
             } = *self;
             if let Some(frame) = decode_frame(
@@ -414,6 +428,7 @@ where
                 max_continuation_frames,
                 partial,
                 bytes,
+                recycle_data,
             )? {
                 tracing::debug!(?frame, "received");
                 return Poll::Ready(Some(Ok(frame)));
