@@ -457,10 +457,11 @@ impl WireGuard {
         }
         let (tx, rx) = mpsc::channel(CMD_QUEUE);
         let wake = Arc::new(tokio::sync::Notify::new());
-        let receive_feedback = handoff::adaptive_enabled(
+        let receive_feedback = (handoff::adaptive_enabled(
             self.cfg.awg.is_some(),
             crate::env_var("WG_HANDOFF").as_deref(),
-        )
+        ) || (self.cfg.awg.is_none()
+            && crate::env_var("WG_HANDOFF").as_deref() != Some("one")))
         .then(|| Arc::new(AtomicBool::new(false)));
         let shared = Arc::new(WgShared {
             cmd_tx: tx,
@@ -516,7 +517,11 @@ impl WireGuard {
             wake: Arc::clone(&shared.wake),
         };
 
-        if let Some(receive_feedback) = shared.receive_feedback.clone() {
+        if let Some(receive_feedback) = shared
+            .receive_feedback
+            .clone()
+            .filter(|_| self.cfg.awg.is_some())
+        {
             let (send, mut blocks) = mpsc::channel(CALLER_BUF / SCRATCH_BUF);
             tokio::spawn(async move {
                 let mut in_flight = handoff::InFlight::new(receive_feedback);
@@ -566,12 +571,37 @@ impl WireGuard {
 
         // Dropping caller_write must wake the upload pump with EOF,
         // including when the connect future is cancelled.
+        let receive_feedback = shared.receive_feedback.clone();
         let (caller_read, caller_write) = tokio::io::duplex(CALLER_BUF);
         tokio::spawn(async move {
+            let mut previous: Option<oneshot::Receiver<()>> = None;
             let mut read = caller_read;
             let mut buf = vec![0u8; SCRATCH_BUF];
             loop {
-                match read.read(&mut buf).await {
+                let result = if let Some(ack) = previous.as_mut() {
+                    tokio::select! {
+                        biased;
+                        done = ack => {
+                            if done.is_err() { break; }
+                            previous = None;
+                            continue;
+                        }
+                        data = read.read(&mut buf) => data,
+                    }
+                } else {
+                    read.read(&mut buf).await
+                };
+                let pipeline = receive_feedback
+                    .as_ref()
+                    .is_some_and(|busy| !busy.load(Ordering::Acquire));
+                if !pipeline || !matches!(result, Ok(n) if n > 0) {
+                    if let Some(older) = previous.take() {
+                        if older.await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                match result {
                     Ok(0) => {
                         let _ = cmd_tx.send(Cmd::TcpClose { id }).await;
                         break;
@@ -591,7 +621,13 @@ impl WireGuard {
                         }
                         // Do not keep draining the caller into an unbounded
                         // per-socket queue while smoltcp's send buffer is full.
-                        if accepted.await.is_err() {
+                        if pipeline {
+                            if let Some(older) = previous.replace(accepted) {
+                                if older.await.is_err() {
+                                    break;
+                                }
+                            }
+                        } else if accepted.await.is_err() {
                             break;
                         }
                     }
