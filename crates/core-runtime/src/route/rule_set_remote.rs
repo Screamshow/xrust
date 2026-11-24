@@ -155,6 +155,12 @@ impl RemoteRuleSet {
         }
     }
 
+    fn accepts_tsrs(&self) -> bool {
+        self.spec.mmap
+            || self.spec.mode.should_use_mmap()
+            || self.spec.format.as_deref() == Some("tsrs")
+    }
+
     fn publish_mmap(
         &self,
         path: &std::path::Path,
@@ -377,9 +383,17 @@ impl RemoteRuleSet {
             return Ok(false);
         }
         let content = std::mem::take(&mut saved.content);
-        let rules = parse_payload(&content, self.spec.format.as_deref())?;
-        drop(content);
-        self.set.replace_rules(rules).map_err(io::Error::other)?;
+        if content.starts_with(b"TSRS") {
+            if !self.accepts_tsrs() {
+                return Ok(false);
+            }
+            let set = self.publish_mmap(&self.tsrs_cache_path(), &content, true)?;
+            self.set.replace_mmap(Arc::new(set));
+        } else {
+            let rules = parse_payload(&content, self.spec.format.as_deref())?;
+            drop(content);
+            self.set.replace_rules(rules).map_err(io::Error::other)?;
+        }
         self.etag = if saved.last_etag.is_empty() {
             None
         } else {
@@ -497,8 +511,7 @@ impl RemoteRuleSet {
         // or `format: tsrs`). The reference has no such format, so for a
         // `binary`/`source` set (all of Forkop's) the server cannot hand the
         // engine a pre-built table in place of the declared one.
-        let accepts_tsrs = use_mmap || self.spec.format.as_deref() == Some("tsrs");
-        if !accepts_tsrs && response.body.starts_with(b"TSRS") {
+        if !self.accepts_tsrs() && response.body.starts_with(b"TSRS") {
             return Err(io::Error::other(
                 "TSRS rule-set body refused: the set enables neither mmap nor format tsrs",
             ));
@@ -1278,6 +1291,48 @@ mod tests {
             std::fs::remove_file(&path).unwrap();
             std::fs::remove_file(provenance_path(&path)).unwrap();
         }
+    }
+
+    #[test]
+    fn restores_legacy_tsrs_only_from_the_matching_persistent_cache() {
+        use crate::cache_file::{CacheFile, CacheFileOptions};
+
+        let root = std::env::temp_dir().join(format!(
+            "xrust-legacy-tsrs-migration-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("rules.tsrs");
+        let cache = Arc::new(std::sync::Mutex::new(
+            CacheFile::open(CacheFileOptions {
+                enabled: true,
+                path: root.join("cache.db").to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap(),
+        ));
+        let mut remote = remote("migrate", "http://rules.test/data.tsrs");
+        remote.spec.format = Some("tsrs".into());
+        remote.spec.cache_file = Some(path.to_string_lossy().into_owned());
+        let rules = crate::route::mmap_set::RuleSetCompiler::new()
+            .compile(&[json!({"domain": ["kept.test"]})])
+            .unwrap();
+        write_tsrs_if_changed(&path, &rules).unwrap();
+        remote.save_to_cache(&cache, &rules);
+        remote.spec.url = "http://other.test/data.tsrs".into();
+        assert!(!remote.restore_from_cache(&cache).unwrap());
+        assert!(!provenance_path(&path).exists());
+        remote.spec.url = "http://rules.test/data.tsrs".into();
+        assert!(remote.restore_from_cache(&cache).unwrap());
+        assert!(remote.set.mmap().is_some());
+        assert_eq!(
+            cached_digest(&path, &remote.spec.url),
+            Some(sha256_digest(&rules))
+        );
+        drop(remote);
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

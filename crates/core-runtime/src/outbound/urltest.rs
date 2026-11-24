@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use core_config::probe_url::ProbeUrl;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::watch;
 
 use crate::inbound::{AnyStream, Conn, Target};
 use crate::logging;
@@ -22,6 +23,20 @@ pub struct Urltest {
     shared: Arc<Shared>,
 }
 
+const WAKE_PROBE_BUDGET: Duration = Duration::from_secs(3);
+
+#[derive(Clone, Copy, Default)]
+struct WakeProbe {
+    requested: u64,
+    completed: u64,
+}
+
+impl WakeProbe {
+    fn pending(&self) -> bool {
+        self.requested != self.completed
+    }
+}
+
 struct Shared {
     tag: String,
     interrupt: bool,
@@ -29,7 +44,7 @@ struct Shared {
     resolved: OnceLock<Vec<usize>>,
     current: AtomicUsize,
     last_active: Mutex<Instant>,
-    activity: tokio::sync::Notify,
+    wake_probe: watch::Sender<WakeProbe>,
     idle_timeout: Duration,
     probe: ProbeUrl,
     interval: Duration,
@@ -81,7 +96,7 @@ impl Urltest {
                 resolved: OnceLock::new(),
                 current: AtomicUsize::new(0),
                 last_active: Mutex::new(Instant::now()),
-                activity: tokio::sync::Notify::new(),
+                wake_probe: watch::Sender::new(WakeProbe::default()),
                 idle_timeout: if idle_timeout.is_zero() {
                     idle_default
                 } else {
@@ -111,27 +126,51 @@ impl Urltest {
         Ok(())
     }
 
-    fn touch(&self) {
-        *self
-            .shared
-            .last_active
-            .lock()
-            .expect("urltest activity lock") = Instant::now();
-        self.shared.activity.notify_one();
-    }
-
-    pub async fn connect(&self, router: &Router, target: &Target) -> io::Result<Conn> {
-        self.touch();
+    async fn selected_member(&self) -> io::Result<usize> {
         let members = self
             .shared
             .resolved
             .get()
             .ok_or_else(|| io::Error::other("urltest members not resolved"))?;
-        let index = self.shared.current.load(Ordering::Relaxed);
-        let Some(member) = members.get(index) else {
-            return Err(io::Error::other("urltest selection out of range"));
+        let requested = {
+            let mut last_active = self
+                .shared
+                .last_active
+                .lock()
+                .expect("urltest activity lock");
+            if last_active.elapsed() >= self.shared.idle_timeout {
+                self.shared.wake_probe.send_if_modified(|wake| {
+                    if wake.pending() {
+                        return false;
+                    }
+                    wake.requested += 1;
+                    true
+                });
+            }
+            *last_active = Instant::now();
+            let wake = *self.shared.wake_probe.borrow();
+            (members.len() > 1 && wake.pending()).then_some(wake.requested)
         };
-        router.connect_index(*member, target).await
+        if let Some(requested) = requested {
+            // A UDP socket can be created even when its peer is gone, so both
+            // transports wait for the same wake probe before dialing.
+            let mut wake = self.shared.wake_probe.subscribe();
+            let _ = tokio::time::timeout(
+                WAKE_PROBE_BUDGET + Duration::from_secs(1),
+                wake.wait_for(|wake| wake.completed >= requested),
+            )
+            .await;
+        }
+        members
+            .get(self.shared.current.load(Ordering::Relaxed))
+            .copied()
+            .ok_or_else(|| io::Error::other("urltest selection out of range"))
+    }
+
+    pub async fn connect(&self, router: &Router, target: &Target) -> io::Result<Conn> {
+        router
+            .connect_index(self.selected_member().await?, target)
+            .await
     }
 
     pub async fn connect_udp(
@@ -139,17 +178,9 @@ impl Urltest {
         router: &Router,
         target: &Target,
     ) -> io::Result<tokio::net::UdpSocket> {
-        self.touch();
-        let members = self
-            .shared
-            .resolved
-            .get()
-            .ok_or_else(|| io::Error::other("urltest members not resolved"))?;
-        let index = self.shared.current.load(Ordering::Relaxed);
-        let Some(member) = members.get(index) else {
-            return Err(io::Error::other("urltest selection out of range"));
-        };
-        router.connect_udp_index(*member, target).await
+        router
+            .connect_udp_index(self.selected_member().await?, target)
+            .await
     }
 
     /// Member tags and the current selection (clash group view).
@@ -192,25 +223,40 @@ impl Urltest {
 
     pub(crate) fn spawn(&self, router: Arc<Router>) -> tokio::task::JoinHandle<()> {
         let shared = Arc::clone(&self.shared);
+        let mut wake = shared.wake_probe.subscribe();
         tokio::spawn(async move {
             loop {
-                probe_all(&shared, &router).await;
-                tokio::time::sleep(shared.interval).await;
-                while shared
+                let state = *wake.borrow();
+                if state.pending() {
+                    probe_all(&shared, &router, shared.members.len() > 1).await;
+                    shared
+                        .wake_probe
+                        .send_modify(|wake| wake.completed = state.requested);
+                } else {
+                    tokio::select! {
+                        _ = probe_all(&shared, &router, false) => {}
+                        _ = wake.wait_for(WakeProbe::pending) => continue,
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(shared.interval) => {}
+                    _ = wake.wait_for(WakeProbe::pending) => continue,
+                }
+                let idle = shared
                     .last_active
                     .lock()
                     .expect("urltest activity lock")
                     .elapsed()
-                    >= shared.idle_timeout
-                {
-                    shared.activity.notified().await;
+                    >= shared.idle_timeout;
+                if idle {
+                    let _ = wake.wait_for(WakeProbe::pending).await;
                 }
             }
         })
     }
 }
 
-async fn probe_all(shared: &Arc<Shared>, router: &Arc<Router>) {
+async fn probe_all(shared: &Arc<Shared>, router: &Arc<Router>, waking: bool) {
     let Some(members) = shared.resolved.get() else {
         return;
     };
@@ -241,11 +287,26 @@ async fn probe_all(shared: &Arc<Shared>, router: &Arc<Router>) {
             (pos, ms)
         });
     }
-    let mut results: Vec<Option<u64>> = vec![None; members.len()];
-    while let Some(joined) = set.join_next().await {
-        if let Ok((pos, ms)) = joined {
-            results[pos] = ms;
+    let mut results = vec![None; members.len()];
+    let current = shared.current.load(Ordering::Relaxed);
+    let collect = async {
+        let mut current_finished = false;
+        while let Some(joined) = set.join_next().await {
+            if let Ok((pos, ms)) = joined {
+                results[pos] = ms;
+                current_finished |= pos == current;
+                if waking && current_finished && results.iter().any(Option::is_some) {
+                    break;
+                }
+            }
         }
+    };
+    if waking {
+        // Keep the first flow bounded if the previous member or another
+        // probe does not answer. Any completed healthy member can be used.
+        let _ = tokio::time::timeout(WAKE_PROBE_BUDGET, collect).await;
+    } else {
+        collect.await;
     }
     apply_results(shared, router, results);
 }
@@ -643,7 +704,7 @@ mod tests {
                 &ctx,
                 &router,
             );
-            probe_all(&group.shared, &router).await;
+            probe_all(&group.shared, &router, false).await;
             assert_eq!(group.now(), "live");
             assert_eq!(tracker.is_closed(), interrupt);
         }
@@ -716,6 +777,71 @@ mod tests {
             .unwrap()
             .unwrap();
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn idle_group_dials_live_member_on_first_tcp_and_udp_flow() {
+        let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", health.local_addr().unwrap());
+        let health_worker = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = health.accept().await {
+                let mut request = [0; 1024];
+                stream.read(&mut request).await.unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let router = Router::new(&json!({"outbounds":[
+            {"type":"block", "tag":"unavailable"},
+            {"type":"direct", "tag":"live"},
+            {"type":"urltest", "tag":"group", "outbounds":["unavailable","live"],
+             "url":url, "interval":"1h", "idle_timeout":"90ms"}
+        ]}))
+        .unwrap();
+        let index = router.index_of("group").unwrap();
+        let inner = router.inner();
+        let (_, _, crate::route::Outbound::Urltest(group)) = inner
+            .outbound_table()
+            .find(|(i, _, _)| *i == index)
+            .unwrap()
+        else {
+            panic!("urltest");
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while group.now() != "live" {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // Model a cached choice that is now unavailable, while the next
+        // periodic check is far enough away to avoid masking the wake path.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(group.select("unavailable"));
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp_target = Target::Ip(tcp.local_addr().unwrap());
+        let udp_target = Target::Ip(udp.local_addr().unwrap());
+        let (tcp_result, udp_result) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                router.connect_index(index, &tcp_target),
+                router.connect_udp_index(index, &udp_target)
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(tcp_result.unwrap(), Conn::Plain(_)));
+        assert_eq!(group.now(), "live");
+        udp_result.unwrap().send(b"first").await.unwrap();
+        let mut data = [0; 16];
+        let (length, _) = tokio::time::timeout(Duration::from_secs(2), udp.recv_from(&mut data))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&data[..length], b"first");
+        health_worker.abort();
     }
 
     #[test]

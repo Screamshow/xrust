@@ -8769,32 +8769,11 @@ fn decode_base64_std(input: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::STANDARD.decode(input).ok()
 }
 
-/// Raw base64url without padding (Go `base64.RawURLEncoding`).
+/// The runtime accepts only canonical, unpadded base64url keys.
 fn decode_base64_url_raw(input: &str) -> Option<Vec<u8>> {
-    if input.is_empty() || input.len() % 4 == 1 || input.contains('=') {
-        return None;
-    }
-    let mut acc: u32 = 0;
-    let mut bits = 0u32;
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    for &byte in input.as_bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        };
-        acc = (acc << 6) | u32::from(value);
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(input)
+        .ok()
 }
 
 #[cfg(test)]
@@ -9350,6 +9329,7 @@ mod tests {
         );
         assert!(decode_base64_url_raw("AAAA").is_none_or(|v| v.len() != 32));
         assert!(decode_base64_url_raw("AAAA=").is_none());
+        assert!(decode_base64_url_raw("Zh").is_none());
     }
 
     #[test]
