@@ -1,5 +1,6 @@
-//! Bounded WireGuard mesh with direct UDP and DERP. Disco and tailnet filter enforcement
-//! remain separate work; this transport exposes no listeners or LAN forwarding.
+//! Bounded WireGuard mesh with direct UDP, disco and DERP.
+mod tsmp;
+
 use super::control::{PeerObj, parse_key_hex};
 use super::derp_client::RelayManager;
 use crate::outbound::wireguard::noise;
@@ -19,6 +20,7 @@ const RETRY: Duration = Duration::from_secs(5);
 const GIVE_UP: Duration = Duration::from_secs(90);
 const REKEY: Duration = Duration::from_secs(120);
 const EXPIRE: Duration = Duration::from_secs(180);
+const COOKIE_TTL: Duration = Duration::from_secs(115);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Path {
@@ -26,9 +28,21 @@ enum Path {
     Derp(u16),
 }
 
+impl Path {
+    fn is_target(self, endpoints: &[SocketAddr], derp: Option<u16>) -> bool {
+        match self {
+            Self::Udp(endpoint) => endpoints.contains(&endpoint),
+            Self::Derp(region) => derp == Some(region),
+        }
+    }
+}
+
 struct Peer {
     name: Option<String>,
     disco: Option<[u8; 32]>,
+    control_disco: Option<[u8; 32]>,
+    tsmp_disco: Option<[u8; 32]>,
+    wireguard_only: bool,
     addresses: Vec<IpAddr>,
     endpoints: Vec<SocketAddr>,
     active: Option<Path>,
@@ -37,6 +51,7 @@ struct Peer {
     established: Option<Instant>,
     confirmed: bool,
     initiation: Option<noise::Handshake>,
+    cookies: Vec<PathCookie>,
     first_attempt: Option<Instant>,
     last_attempt: Option<Instant>,
     latest_timestamp: Option<[u8; 12]>,
@@ -52,7 +67,39 @@ struct Peer {
     candidate: Option<(SocketAddr, Instant)>,
 }
 
+struct PathCookie {
+    path: Path,
+    key: [u8; 16],
+    expires: Instant,
+}
+
 impl Peer {
+    fn set_active_disco(&mut self, key: Option<[u8; 32]>) {
+        if self.disco != key {
+            self.disco = key;
+            self.probes.clear();
+            self.probe_at = None;
+            self.next_probe = None;
+            self.probe_failures = 0;
+            self.direct_rtt = None;
+            self.candidate = None;
+        }
+    }
+
+    fn set_control_disco(&mut self, key: Option<[u8; 32]>) {
+        let use_tsmp =
+            self.tsmp_disco.is_some() && (self.disco == self.tsmp_disco || key.is_none());
+        self.control_disco = key;
+        self.set_active_disco(if use_tsmp { self.tsmp_disco } else { key });
+    }
+
+    fn disco_advertisement(&self, local: &[IpAddr], secret: &StaticSecret) -> Option<Vec<u8>> {
+        if self.wireguard_only {
+            return None;
+        }
+        tsmp::disco_advertisement(local, &self.addresses, PublicKey::from(secret).to_bytes())
+    }
+
     fn payload(&mut self) {
         if !self.busy() {
             self.next_probe = None;
@@ -344,7 +391,15 @@ impl DirectMesh {
             let addresses: Vec<IpAddr> = node
                 .addresses
                 .iter()
-                .filter_map(|a| a.split('/').next()?.parse().ok())
+                .filter_map(|address| address.parse::<smoltcp::wire::IpCidr>().ok())
+                .filter(|address| {
+                    node.allowed_ips().iter().any(|prefix| {
+                        prefix
+                            .parse::<smoltcp::wire::IpCidr>()
+                            .is_ok_and(|prefix| prefix.contains_addr(&address.address()))
+                    })
+                })
+                .map(|address| address.address().into())
                 .collect();
             let endpoints: Vec<SocketAddr> = node
                 .endpoints
@@ -362,6 +417,9 @@ impl DirectMesh {
             let mut peer = self.peers.remove(&key).unwrap_or(Peer {
                 name: None,
                 disco: None,
+                control_disco: None,
+                tsmp_disco: None,
+                wireguard_only: node.is_wireguard_only,
                 addresses: vec![],
                 endpoints: vec![],
                 active: None,
@@ -370,6 +428,7 @@ impl DirectMesh {
                 established: None,
                 confirmed: false,
                 initiation: None,
+                cookies: vec![],
                 first_attempt: None,
                 last_attempt: None,
                 latest_timestamp: None,
@@ -390,11 +449,18 @@ impl DirectMesh {
             }
             peer.addresses = addresses;
             peer.name = node.name.clone();
-            peer.disco = node.disco_key.as_deref().and_then(|s| {
-                super::control::parse_key_hex(s.strip_prefix("discokey:").unwrap_or(s))
-            });
+            peer.wireguard_only = node.is_wireguard_only;
+            if peer.wireguard_only {
+                peer.tsmp_disco = None;
+            }
+            peer.set_control_disco(
+                node.disco_key
+                    .as_deref()
+                    .and_then(|s| parse_key_hex(s.strip_prefix("discokey:").unwrap_or(s)))
+                    .filter(|key| *key != [0; 32]),
+            );
             peer.endpoints = endpoints;
-            peer.derp_region = node.home_derp.filter(|id| *id != 0).or_else(|| {
+            let region = node.home_derp.filter(|id| *id != 0).or_else(|| {
                 node.derp.as_ref().and_then(|value| {
                     value
                         .as_u64()
@@ -408,6 +474,10 @@ impl DirectMesh {
                         })
                 })
             });
+            if peer.derp_region != region && matches!(peer.active, Some(Path::Derp(_))) {
+                peer.active = region.map(Path::Derp);
+            }
+            peer.derp_region = region;
             next.insert(key, peer);
         }
         self.peers = next;
@@ -514,20 +584,40 @@ impl DirectMesh {
             // as WireGuard's REKEY_TIMEOUT does: a responder drops a repeated
             // timestamp, so resending the first one could never succeed once
             // its response was lost.
-            let handshake = peer.initiation.insert(noise::build_initiation(
+            let mut handshake = noise::build_initiation(
                 &private.to_bytes(),
                 public,
                 key,
                 None,
                 &noise::tai64n_now(),
                 1,
-            ));
+            );
+            let now = Instant::now();
+            peer.cookies.retain(|cookie| {
+                cookie.expires > now && cookie.path.is_target(&peer.endpoints, peer.derp_region)
+            });
             for endpoint in &peer.endpoints {
-                send_datagram(socket, handshake.initiation(), *endpoint).await;
+                if !peer
+                    .cookies
+                    .iter()
+                    .any(|cookie| cookie.path == Path::Udp(*endpoint))
+                {
+                    send_datagram(socket, handshake.initiation(), *endpoint).await;
+                }
             }
-            if let (Some(relay), Some(region)) = (relay.as_mut(), peer.derp_region) {
+            if let (Some(relay), Some(region)) = (relay.as_mut(), peer.derp_region)
+                && !peer
+                    .cookies
+                    .iter()
+                    .any(|cookie| cookie.path == Path::Derp(region))
+            {
                 relay.send(region, *key, handshake.initiation());
             }
+            for cookie in &peer.cookies {
+                handshake.set_cookie(&cookie.key);
+                Self::transmit(socket, relay, cookie.path, *key, handshake.initiation()).await?;
+            }
+            peer.initiation = Some(handshake);
             peer.first_attempt.get_or_insert(Instant::now());
             peer.last_attempt = Some(Instant::now());
         }
@@ -619,14 +709,14 @@ impl DirectMesh {
         for (bytes, endpoint, relay_source) in inbound {
             if bytes.starts_with(b"TS\xf0\x9f\x92\xac") && bytes.len() >= 78 {
                 let source: [u8; 32] = bytes[6..38].try_into().unwrap();
-                let Some((node, peer)) =
-                    self.peers.iter_mut().find(|(_, p)| p.disco == Some(source))
-                else {
+                let Some((node, peer)) = self.peers.iter_mut().find(|(node, peer)| {
+                    relay_source.is_none_or(|sender| sender == **node)
+                        && (peer.disco == Some(source)
+                            || peer.control_disco == Some(source)
+                            || peer.tsmp_disco == Some(source))
+                }) else {
                     continue;
                 };
-                if relay_source.is_some_and(|src| src != *node) {
-                    continue;
-                }
                 if !self
                     .disco
                     .diffie_hellman(&PublicKey::from(source))
@@ -645,6 +735,7 @@ impl DirectMesh {
                     continue;
                 };
                 if plain.len() >= 14 && plain[0..2] == [1, 0] {
+                    peer.set_active_disco(Some(source));
                     let mut response = vec![2, 0];
                     response.extend_from_slice(&plain[2..14]);
                     let observed = match endpoint {
@@ -673,13 +764,22 @@ impl DirectMesh {
                     }
                     let _ = peer;
                     Self::transmit(&self.socket, &mut self.relay, endpoint, node, &packet).await?;
-                } else if plain.len() == 32 && plain[..2] == [2, 0] {
+                } else if plain.len() >= 32 && plain[..2] == [2, 0] {
                     if let Path::Udp(addr) = endpoint {
                         let tx: [u8; 12] = plain[2..14].try_into().unwrap();
-                        if let Some(i) = peer.probes.iter().position(|(id, target, sent)| {
-                            *id == tx && *target == addr && sent.elapsed() < Duration::from_secs(10)
-                        }) {
-                            let (_, _, sent) = peer.probes.remove(i).unwrap();
+                        let answered = peer
+                            .probes
+                            .iter()
+                            .position(|(id, target, sent)| {
+                                *id == tx
+                                    && *target == addr
+                                    && sent.elapsed() < Duration::from_secs(10)
+                            })
+                            .and_then(|index| peer.probes.remove(index));
+                        // A key swap invalidates the remaining probes. Preserve
+                        // the matched transaction so this Pong can confirm its path.
+                        peer.set_active_disco(Some(source));
+                        if let Some((_, _, sent)) = answered {
                             let rtt = sent.elapsed();
                             if !matches!(peer.active,Some(Path::Udp(old)) if old!=addr && peer.direct_seen.is_some_and(|t|t.elapsed()<Duration::from_secs(20)) && peer.direct_rtt.is_some_and(|old|old<=rtt+Duration::from_millis(5)))
                             {
@@ -693,6 +793,7 @@ impl DirectMesh {
                     && (plain.len() - 2) % 18 == 0
                     && plain.len() <= 2 + 32 * 18
                 {
+                    peer.set_active_disco(Some(source));
                     for entry in plain[2..].as_chunks::<18>().0 {
                         let ip = Ipv6Addr::from(<[u8; 16]>::try_from(&entry[..16]).unwrap());
                         if let Some(ip) = ip.to_ipv4_mapped() {
@@ -775,7 +876,10 @@ impl DirectMesh {
                     ) else {
                         continue;
                     };
-                    let confirm = session.seal(&[]).unwrap();
+                    let advertisement = peer.disco_advertisement(&self.local, &self.disco);
+                    let confirm = session
+                        .seal(advertisement.as_deref().unwrap_or_default())
+                        .unwrap();
                     Self::transmit(&self.socket, &mut self.relay, endpoint, *key, &confirm).await?;
                     peer.session = Some(session);
                     peer.established = Some(Instant::now());
@@ -799,11 +903,15 @@ impl DirectMesh {
                     let Some(mut plain) = peer.session.as_mut().unwrap().open(packet) else {
                         continue;
                     };
-                    if !plain.is_empty() {
-                        peer.payload();
-                    }
                     peer.note_path(endpoint);
-                    peer.confirmed = true;
+                    if !std::mem::replace(&mut peer.confirmed, true)
+                        && let Some(advertisement) =
+                            peer.disco_advertisement(&self.local, &self.disco)
+                        && let Some(sealed) = peer.session.as_mut().unwrap().seal(&advertisement)
+                    {
+                        Self::transmit(&self.socket, &mut self.relay, endpoint, *key, &sealed)
+                            .await?;
+                    }
                     if plain.is_empty() {
                         continue;
                     }
@@ -817,18 +925,49 @@ impl DirectMesh {
                                 .any(|r| r.contains_addr(&dest.into())))
                     {
                         plain.truncate(length);
+                        if let Some(payload) = tsmp::payload(&plain)
+                            && (payload.is_empty() || tsmp::is_disco_advertisement(payload))
+                        {
+                            if !peer.wireguard_only
+                                && self.local.contains(&dest)
+                                && let Some(disco) = tsmp::disco_key(payload)
+                                && peer.tsmp_disco != Some(disco)
+                                && self
+                                    .disco
+                                    .diffie_hellman(&PublicKey::from(disco))
+                                    .was_contributory()
+                            {
+                                peer.tsmp_disco = Some(disco);
+                                peer.set_active_disco(Some(disco));
+                            }
+                            continue;
+                        }
+                        peer.payload();
                         packets.push(plain);
                     }
                 }
                 Some(3) if length == noise::COOKIE_REPLY_LEN => {
                     let index = u32::from_le_bytes(packet[4..8].try_into().unwrap());
                     for (key, peer) in &mut self.peers {
-                        if let Some(hs) = &mut peer.initiation
+                        if relay_source.is_none_or(|sender| sender == *key)
+                            && endpoint.is_target(&peer.endpoints, peer.derp_region)
+                            && let Some(hs) = &peer.initiation
                             && hs.sender_index == index
                             && let Ok(cookie) =
                                 noise::decrypt_cookie(packet, key, &hs.mac1(), index)
                         {
-                            hs.set_cookie(&cookie);
+                            let now = Instant::now();
+                            peer.cookies.retain(|old| {
+                                old.path != endpoint
+                                    && old.expires > now
+                                    && old.path.is_target(&peer.endpoints, peer.derp_region)
+                            });
+                            peer.cookies.push(PathCookie {
+                                path: endpoint,
+                                key: cookie,
+                                expires: now + COOKIE_TTL,
+                            });
+                            break;
                         }
                     }
                 }
@@ -950,12 +1089,13 @@ mod tests {
     fn peer(key: [u8; 32], address: &str, port: u16) -> PeerObj {
         PeerObj {
             disco_key: None,
+            is_wireguard_only: false,
             home_derp: None,
             id: 1,
             key: format!("nodekey:{}", super::super::control::to_hex(&key)),
             name: None,
             addresses: vec![format!("{address}/32")],
-            allowed_ips: vec![],
+            allowed_ips: None,
             endpoints: Some(vec![format!("127.0.0.1:{port}")]),
             derp: None,
             online: Some(true),
@@ -1004,6 +1144,115 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_empty_allowed_ips_disables_the_peer_address() {
+        let (mut a, mut b) = pair().await;
+        let mut remote = peer(b.public, "100.64.0.2", b.local_addr().unwrap().port());
+        let payload = packet([100, 64, 0, 1], [100, 64, 0, 2], 42);
+        remote.allowed_ips = Some(vec![]);
+        a.update_peers(std::slice::from_ref(&remote));
+        assert_eq!(
+            a.send(payload.clone()).await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        remote.allowed_ips = None;
+        a.update_peers(&[remote]);
+        a.send(payload.clone()).await.unwrap();
+        assert_eq!(receive(&mut a, &mut b).await, payload);
+    }
+
+    #[tokio::test]
+    async fn established_sessions_exchange_disco_keys_and_keep_them_on_map_refresh() {
+        let (mut a, mut b) = pair().await;
+        let a_disco = a.disco_public();
+        let b_disco = b.disco_public();
+        let payload = packet([100, 64, 0, 1], [100, 64, 0, 2], 42);
+        a.send(payload.clone()).await.unwrap();
+        assert_eq!(receive(&mut a, &mut b).await, payload);
+        assert_eq!(b.peers[&a.public].tsmp_disco, Some(a_disco));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while a.peers[&b.public].tsmp_disco.is_none() {
+                assert!(a.poll().await.unwrap().is_empty());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(a.peers[&b.public].disco, Some(b_disco));
+        let mut node = peer(b.public, "100.64.0.2", b.local_addr().unwrap().port());
+        a.update_peers(std::slice::from_ref(&node));
+        assert_eq!(a.peers[&b.public].disco, Some(b_disco));
+        node.is_wireguard_only = true;
+        a.update_peers(&[node]);
+        assert!(a.peers[&b.public].disco.is_none());
+        assert!(
+            a.peers[&b.public]
+                .disco_advertisement(&a.local, &a.disco)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn wireguard_cookie_is_reused_only_on_the_challenging_udp_path() {
+        use blake2::{Blake2s256, Digest};
+        use chacha20poly1305::{
+            KeyInit, XChaCha20Poly1305, XNonce,
+            aead::{Aead, Payload},
+        };
+
+        let (mut a, b) = pair().await;
+        let alternate = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut node = peer(b.public, "100.64.0.2", b.local_addr().unwrap().port());
+        node.endpoints
+            .as_mut()
+            .unwrap()
+            .push(alternate.local_addr().unwrap().to_string());
+        a.update_peers(&[node]);
+        let data = packet([100, 64, 0, 1], [100, 64, 0, 2], 42);
+        a.send(data).await.unwrap();
+
+        let mut first = [0; noise::INITIATION_LEN];
+        let mut alt = [0; noise::INITIATION_LEN];
+        let (_, a_addr) = b.socket.recv_from(&mut first).await.unwrap();
+        alternate.recv_from(&mut alt).await.unwrap();
+        assert_eq!(alt, first);
+        let handshake = a.peers[&b.public].initiation.as_ref().unwrap();
+        let nonce = [8; 24];
+        let cookie = [9; 16];
+        let cookie_key = Blake2s256::digest([b"cookie--".as_slice(), &b.public].concat());
+        let cipher = XChaCha20Poly1305::new_from_slice(&cookie_key).unwrap();
+        let encrypted = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: &cookie,
+                    aad: &handshake.mac1(),
+                },
+            )
+            .unwrap();
+        let mut reply = 3u32.to_le_bytes().to_vec();
+        reply.extend(handshake.sender_index.to_le_bytes());
+        reply.extend(nonce);
+        reply.extend(encrypted);
+        b.socket.send_to(&reply, a_addr).await.unwrap();
+
+        a.socket.readable().await.unwrap();
+        a.poll().await.unwrap();
+        let state = a.peers.get_mut(&b.public).unwrap();
+        assert_eq!(state.cookies.len(), 1);
+        assert_eq!(state.cookies[0].key, cookie);
+        state.last_attempt = Some(Instant::now() - RETRY);
+        a.poll().await.unwrap();
+        let mut retry = [0; noise::INITIATION_LEN];
+        b.socket.recv_from(&mut retry).await.unwrap();
+        alternate.recv_from(&mut alt).await.unwrap();
+        let mac_offset = noise::INITIATION_LEN - 16;
+        assert_ne!(retry[4..8], first[4..8]);
+        assert_eq!(retry[..mac_offset], alt[..mac_offset]);
+        assert_eq!(alt[mac_offset..], [0; 16]);
+        assert_ne!(retry[mac_offset..], [0; 16]);
     }
 
     #[tokio::test]

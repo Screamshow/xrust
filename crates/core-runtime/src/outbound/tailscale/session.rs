@@ -4,13 +4,19 @@ use super::control::{MapResponse, RegisterRequest, RegisterResponse, parse_key_h
 use super::noise::{CipherState, NoiseIkInitiator};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    fmt, io,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::task::JoinHandle;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-pub const CAPABILITY_VERSION: u32 = 111;
+// TS2021 netmap dialect of Tailscale v1.104.7. The embedded profile uses direct
+// UDP and DERP. Optional upstream Peer Relay and C2N features are disabled.
+pub const CAPABILITY_VERSION: u32 = 148;
 const LIMIT: usize = 1024 * 1024;
 fn map_hostinfo(hostname: &str, routes: &[String], home: Option<u16>) -> serde_json::Value {
     map_network_hostinfo(
@@ -50,6 +56,72 @@ impl Drop for Tasks {
             task.abort();
         }
     }
+}
+
+#[derive(Debug)]
+struct RateLimited {
+    status: http::StatusCode,
+    delay: Duration,
+}
+
+impl fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "tailscale: control HTTP {} (retry after {:?})",
+            self.status.as_u16(),
+            self.delay
+        )
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+pub(crate) fn retry_after(error: &io::Error) -> Option<Duration> {
+    Some(error.get_ref()?.downcast_ref::<RateLimited>()?.delay)
+}
+
+fn retry_delay(header: &str, now: SystemTime) -> Option<Duration> {
+    let delay = if let Ok(seconds) = header.parse::<u64>() {
+        Duration::from_secs(seconds)
+    } else {
+        httpdate::parse_http_date(header)
+            .ok()?
+            .duration_since(now)
+            .ok()?
+    };
+    // The coordination client rejects delays outside this window, then caps
+    // accepted delays for the reconnect loop.
+    (!delay.is_zero() && delay <= Duration::from_secs(3600))
+        .then_some(delay.min(Duration::from_secs(300)))
+}
+
+fn response_status(response: &http::Response<h2::RecvStream>) -> io::Result<()> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let retry = response
+        .headers()
+        .get(http::header::RETRY_AFTER)
+        .filter(|header| !header.is_empty());
+    if status == http::StatusCode::TOO_MANY_REQUESTS
+        || (status == http::StatusCode::SERVICE_UNAVAILABLE && retry.is_some())
+    {
+        let delay = retry
+            .and_then(|header| header.to_str().ok())
+            .and_then(|header| retry_delay(header, SystemTime::now()))
+            .unwrap_or_else(|| {
+                let mut random = [0; 2];
+                let _ = getrandom::fill(&mut random);
+                Duration::from_millis(5000 + u64::from(u16::from_ne_bytes(random)) % 5000)
+            });
+        return Err(io::Error::other(RateLimited { status, delay }));
+    }
+    Err(io::Error::other(format!(
+        "tailscale: control HTTP {}",
+        status.as_u16()
+    )))
 }
 
 pub struct ControlSession {
@@ -94,12 +166,7 @@ pub(crate) async fn tls(
 }
 
 async fn body(response: http::Response<h2::RecvStream>) -> io::Result<Vec<u8>> {
-    if !response.status().is_success() {
-        return Err(io::Error::other(format!(
-            "tailscale: control HTTP {}",
-            response.status().as_u16()
-        )));
-    }
+    response_status(&response)?;
     let mut recv = response.into_body();
     let mut out = Vec::new();
     while let Some(chunk) = recv.data().await {
@@ -224,9 +291,7 @@ impl ControlSession {
             .await
             .map_err(|_| timed_out())?
             .map_err(io::Error::other)?;
-        if !response.status().is_success() {
-            return Err(bad("tailscale: map stream rejected"));
-        }
+        response_status(&response)?;
         Ok(MapStream {
             recv: response.into_body(),
             pending: vec![],
@@ -283,6 +348,7 @@ impl ControlSession {
             let req = http::Request::builder()
                 .method("POST")
                 .uri(format!("{}/machine/map", self.origin))
+                .header("Ts-Lb", node_key)
                 .header("content-type", "application/json")
                 .body(())
                 .map_err(io::Error::other)?;
@@ -395,6 +461,7 @@ impl ControlSession {
             let req = http::Request::builder()
                 .method("POST")
                 .uri(format!("{}/machine/register", self.origin))
+                .header("Ts-Lb", request.node_key.as_str())
                 .header("content-type", "application/json")
                 .body(())
                 .map_err(io::Error::other)?;
@@ -657,7 +724,7 @@ mod tests {
             assert_eq!(value["Hostinfo"]["NetInfo"]["PreferredDERP"], 7);
             assert_eq!(
                 value["Hostinfo"]["IPNVersion"],
-                concat!("1.80.0-rustx", env!("CARGO_PKG_VERSION"))
+                super::super::control::IPN_VERSION
             );
             assert_eq!(value["Stream"], false);
             let json = br#"{"Node":{"ID":1,"Key":"nodekey:test","Addresses":["100.64.0.1/32"]},"Peers":[]}"#;
@@ -702,6 +769,96 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retry_after_validates_seconds_and_http_dates() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(784111777);
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(23));
+        assert_eq!(retry_delay(&date, now), Some(Duration::from_secs(23)));
+        assert_eq!(retry_delay("7", now), Some(Duration::from_secs(7)));
+        assert_eq!(retry_delay("3600", now), Some(Duration::from_secs(300)));
+        for value in [
+            "",
+            "no date",
+            "0",
+            "-1",
+            "3601",
+            "Sun, 06 Nov 1994 08:49:36 GMT",
+        ] {
+            assert!(retry_delay(value, now).is_none(), "{value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_rpc_rate_limits_preserve_retry_after() {
+        let (client, server) = tokio::io::duplex(65536);
+        let task = tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server).await.unwrap();
+            for (path, code, header) in [
+                ("/machine/register", 429u16, Some("7")),
+                ("/machine/map", 503, Some("8")),
+                ("/machine/map", 200, None),
+                ("/machine/map", 503, Some("9")),
+                ("/machine/map", 503, None),
+                ("/machine/register", 429, Some("private-test-value")),
+            ] {
+                let (request, mut sender) = connection.accept().await.unwrap().unwrap();
+                assert_eq!(request.uri().path(), path);
+                body(http::Response::new(request.into_body()))
+                    .await
+                    .unwrap();
+                let mut response = http::Response::builder().status(code);
+                if let Some(value) = header {
+                    response = response.header(http::header::RETRY_AFTER, value);
+                }
+                sender
+                    .send_response(response.body(()).unwrap(), true)
+                    .unwrap();
+            }
+            while connection.accept().await.is_some() {}
+        });
+        let (send, connection) = h2::client::handshake(client).await.unwrap();
+        let mut session = ControlSession {
+            send,
+            origin: "https://example.com".into(),
+            _tasks: Tasks(vec![
+                task,
+                tokio::spawn(async move {
+                    let _ = connection.await;
+                }),
+            ]),
+        };
+        let request = RegisterRequest {
+            version: CAPABILITY_VERSION,
+            node_key: "nodekey:test".into(),
+            auth: None,
+            hostinfo: super::super::control::Hostinfo::new("test", &[]),
+            ephemeral: false,
+            followup: None,
+        };
+        let error = session.register(&request).await.unwrap_err();
+        assert_eq!(retry_after(&error), Some(Duration::from_secs(7)));
+        let error = session
+            .initial_map("nodekey:test", "test")
+            .await
+            .unwrap_err();
+        assert_eq!(retry_after(&error), Some(Duration::from_secs(8)));
+        let error = session
+            .map_stream("nodekey:test", "test", None, [1; 32])
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(retry_after(&error), Some(Duration::from_secs(9)));
+        let error = session
+            .initial_map("nodekey:test", "test")
+            .await
+            .unwrap_err();
+        assert_eq!(retry_after(&error), None);
+        let error = session.register(&request).await.unwrap_err();
+        let delay = retry_after(&error).unwrap().as_millis();
+        assert!((5000..10000).contains(&delay));
+        assert!(!error.to_string().contains("private-test-value"));
+    }
+
     #[tokio::test]
     async fn stream_and_announcement_preserve_client_hostinfo() {
         let (client, server) = tokio::io::duplex(65536);
@@ -715,10 +872,7 @@ mod tests {
                 let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(value["Stream"], streaming);
                 let info = &value["Hostinfo"];
-                assert_eq!(
-                    info["IPNVersion"],
-                    concat!("1.80.0-rustx", env!("CARGO_PKG_VERSION"))
-                );
+                assert_eq!(info["IPNVersion"], super::super::control::IPN_VERSION);
                 assert!(info.get("Distro").is_some());
                 assert!(info.get("DistroVersion").is_some());
                 assert_eq!(info["RoutableIPs"][0], "192.168.1.0/24");

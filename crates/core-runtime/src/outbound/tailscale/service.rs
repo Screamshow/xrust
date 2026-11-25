@@ -276,15 +276,19 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
                     stay_stopped();
                     return Ok(());
                 }
+                let retry_after = super::session::retry_after(&error);
+                let wait = retry_after.unwrap_or_else(|| Duration::from_secs(delay));
                 status(
                     serde_json::json!({"state":"reconnecting", "message":"Ожидаем доступ к интернету и серверу Tailscale…",
-                        "error_kind":format!("{:?}", error.kind()), "error_reason":safe_failure_reason(&error), "retry_in_seconds":delay}),
+                        "error_kind":format!("{:?}", error.kind()), "error_reason":safe_failure_reason(&error), "retry_in_seconds":wait.as_secs()}),
                 )?;
                 if !Path::new("/etc/forkop-tailscale/enabled").exists() {
                     return Ok(());
                 }
-                tokio::time::sleep(Duration::from_secs(delay)).await;
-                delay = (delay * 2).min(30);
+                tokio::time::sleep(wait).await;
+                if retry_after.is_none() {
+                    delay = (delay * 2).min(30);
+                }
             }
         }
     };
@@ -329,6 +333,7 @@ async fn run_inner() -> Result<(), Box<dyn std::error::Error>> {
         status(
             serde_json::json!({"state":if shared.control_connected.load(Ordering::Relaxed) {"connected"} else {"reconnecting"}, "ip":shared.local_ip().to_string(),
             "udp_ready":udp_ready,"transport":shared.transport.read().unwrap().clone(),
+            "stable_tailnet_id":&*shared.stable_tailnet_id.read().unwrap(),
             "lan_ready":lan_ready, "exit_ready":exit_enabled && lan_ready, "exit_approved":shared.exit_approved.load(Ordering::Relaxed), "routes_approved":shared.routes_approved.load(Ordering::Relaxed),
             "message":if lan_ready {None} else {Some("Не удалось настроить передачу трафика Tailscale")},
             "updated_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs()}),

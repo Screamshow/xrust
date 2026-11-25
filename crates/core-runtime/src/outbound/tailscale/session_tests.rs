@@ -15,12 +15,13 @@ async fn client(peer: &fixture::Peer) -> Tailscale {
     .unwrap();
     mesh.update_peers(&[control::PeerObj {
         disco_key: None,
+        is_wireguard_only: false,
         home_derp: None,
         id: 1,
         key: control::node_key_str(&x25519_dalek::PublicKey::from(peer.public_key())),
         name: None,
         addresses: vec!["100.64.0.2/32".into()],
-        allowed_ips: vec![],
+        allowed_ips: None,
         endpoints: Some(vec![peer.address.to_string()]),
         derp: None,
         online: Some(true),

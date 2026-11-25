@@ -1,8 +1,9 @@
-//! Tailscale Control Plane client (SPEC 111 HTTPS 443 coordination).
+//! Tailscale control plane client (HTTPS 443 coordination).
 //!
 //! Handles registration, machine/node key persistence, Noise_IK establishment,
 //! and MapResponse peer/DERP streaming.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
@@ -11,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::outbound::tailscale::derp::DerpMap;
+use crate::outbound::tailscale::derp::DerpMapUpdate;
+
+pub(crate) const IPN_VERSION: &str = concat!("1.104.7-rustx", env!("CARGO_PKG_VERSION"));
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Hostinfo {
@@ -27,6 +30,8 @@ pub struct Hostinfo {
     pub os: String,
     #[serde(rename = "Hostname", default)]
     pub hostname: String,
+    #[serde(rename = "StateEncrypted", default)]
+    pub state_encrypted: bool,
     #[serde(rename = "RoutableIPs", default)]
     pub routable_ips: Vec<String>,
     #[serde(rename = "Services", default, skip_serializing_if = "Vec::is_empty")]
@@ -42,8 +47,8 @@ pub struct Service {
 }
 
 impl Hostinfo {
-    /// The numeric prefix is our control-protocol compatibility baseline, not
-    /// an assertion that this independent client contains the upstream daemon.
+    /// The numeric prefix identifies the reference Tailscale release. The
+    /// control capability version is negotiated separately.
     pub fn new(hostname: &str, routes: &[String]) -> Self {
         Self::from_release(
             hostname,
@@ -88,12 +93,13 @@ impl Hostinfo {
             kernel.trim().into()
         };
         Self {
-            ipn_version: concat!("1.80.0-rustx", env!("CARGO_PKG_VERSION")).into(),
+            ipn_version: IPN_VERSION.into(),
             os: std::env::consts::OS.into(),
             os_version,
             distro,
             distro_version,
             hostname: hostname.into(),
+            state_encrypted: false,
             routable_ips: routes.to_vec(),
             services: if routes.iter().any(|r| r == "0.0.0.0/0") {
                 vec![
@@ -123,6 +129,34 @@ fn default_os() -> String {
 
 #[cfg(test)]
 mod hostinfo_tests {
+    use super::*;
+
+    #[test]
+    fn only_implicit_allowed_ips_inherit_node_addresses() {
+        let map: MapResponse = serde_json::from_value(serde_json::json!({
+            "Node": {"ID": 1, "Key": "nodekey:test", "Addresses": ["100.64.0.1/32"]},
+            "Peers": [{"ID": 2, "Key": "nodekey:peer", "Addresses": ["100.64.0.2/32"], "AllowedIPs": null}]
+        }))
+        .unwrap();
+        let node = map.node.unwrap();
+        assert_eq!(node.allowed_ips(), ["100.64.0.1/32"]);
+        assert_eq!(map.peers.unwrap()[0].allowed_ips(), ["100.64.0.2/32"]);
+
+        let mut wire = serde_json::to_value(node).unwrap();
+        for (allowed, expected) in [
+            (serde_json::Value::Null, vec!["100.64.0.1/32"]),
+            (serde_json::json!([]), vec![]),
+            (
+                serde_json::json!(["192.168.1.0/24", "0.0.0.0/0"]),
+                vec!["192.168.1.0/24", "0.0.0.0/0"],
+            ),
+        ] {
+            wire["AllowedIPs"] = allowed;
+            let node: NodeObj = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(node.allowed_ips(), expected);
+        }
+    }
+
     #[test]
     fn only_a_bare_keepalive_is_skipped() {
         let parse = |raw: &str| serde_json::from_str::<super::MapResponse>(raw).unwrap();
@@ -130,9 +164,26 @@ mod hostinfo_tests {
         assert!(!parse(r#"{"KeepAlive":true,"PeersRemoved":[7]}"#).is_keep_alive_only());
         assert!(!parse(r#"{"KeepAlive":true,"PacketFilter":[]}"#).is_keep_alive_only());
         assert!(!parse(r#"{"PeersChanged":[]}"#).is_keep_alive_only());
+        assert!(!parse(r#"{"KeepAlive":true,"DNSConfig":{}}"#).is_keep_alive_only());
     }
 
-    use super::*;
+    #[test]
+    fn stable_tailnet_id_is_read_from_the_self_node() {
+        let map: MapResponse = serde_json::from_value(serde_json::json!({
+            "Node": {"ID": 1, "Key": "nodekey:test", "StableTailnetID": "tn-test"},
+            "Peers": [{"ID": 2, "Key": "nodekey:peer", "StableTailnetID": "ignored"}]
+        }))
+        .unwrap();
+        let node = map.node.unwrap();
+        assert_eq!(node.stable_tailnet_id(), Some("tn-test"));
+        let mut wire = serde_json::to_value(node).unwrap();
+        for value in [Value::Null, serde_json::json!("")] {
+            wire["StableTailnetID"] = value;
+            let node: NodeObj = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(node.stable_tailnet_id(), None);
+        }
+    }
+
     #[test]
     fn openwrt_hostinfo_preserves_os_family_and_reports_release() {
         let info = Hostinfo::from_release(
@@ -147,10 +198,7 @@ mod hostinfo_tests {
         assert_eq!(value["DistroVersion"], "25.12.5");
         assert_eq!(value["OS"], std::env::consts::OS);
         assert_eq!(value["OSVersion"], "OpenWrt 25.12.5");
-        assert_eq!(
-            value["IPNVersion"],
-            concat!("1.80.0-rustx", env!("CARGO_PKG_VERSION"))
-        );
+        assert_eq!(value["IPNVersion"], IPN_VERSION);
         assert_eq!(value["RoutableIPs"][0], "192.168.1.0/24");
     }
 }
@@ -193,14 +241,38 @@ pub struct NodeObj {
     pub id: u64,
     #[serde(rename = "Key")]
     pub key: String,
+    #[serde(rename = "Name", default)]
+    pub name: Option<String>,
+    #[serde(rename = "Capabilities", default, deserialize_with = "null_default")]
+    pub capabilities: Vec<String>,
+    #[serde(rename = "CapMap", default, deserialize_with = "null_default")]
+    pub cap_map: HashMap<String, Value>,
+    #[serde(
+        rename = "StableTailnetID",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    stable_tailnet_id: Option<String>,
     #[serde(rename = "Addresses", default, deserialize_with = "null_default")]
     pub addresses: Vec<String>,
-    #[serde(rename = "AllowedIPs", default, deserialize_with = "null_default")]
-    pub allowed_ips: Vec<String>,
+    #[serde(rename = "AllowedIPs", default)]
+    allowed_ips: Option<Vec<String>>,
     #[serde(rename = "Endpoints", default, deserialize_with = "null_default")]
     pub endpoints: Vec<String>,
     #[serde(rename = "DERP", default)]
     pub derp: Option<Value>,
+}
+
+impl NodeObj {
+    pub fn allowed_ips(&self) -> &[String] {
+        self.allowed_ips.as_deref().unwrap_or(&self.addresses)
+    }
+
+    pub(crate) fn stable_tailnet_id(&self) -> Option<&str> {
+        self.stable_tailnet_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+    }
 }
 
 fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -251,24 +323,49 @@ pub struct PeerObj {
     pub key: String,
     #[serde(rename = "Name", default)]
     pub name: Option<String>,
-    #[serde(rename = "Addresses", default)]
+    #[serde(rename = "Addresses", default, deserialize_with = "null_default")]
     pub addresses: Vec<String>,
     #[serde(rename = "AllowedIPs", default)]
-    pub allowed_ips: Vec<String>,
+    pub allowed_ips: Option<Vec<String>>,
     #[serde(rename = "Endpoints", default)]
     pub endpoints: Option<Vec<String>>,
     #[serde(rename = "DERP", default)]
     pub derp: Option<Value>,
     #[serde(rename = "Online", default)]
     pub online: Option<bool>,
+    #[serde(rename = "IsWireGuardOnly", default)]
+    pub is_wireguard_only: bool,
+}
+
+impl PeerObj {
+    pub fn allowed_ips(&self) -> &[String] {
+        self.allowed_ips.as_deref().unwrap_or(&self.addresses)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PeerChange {
+    #[serde(rename = "NodeID")]
+    node_id: u64,
+    #[serde(rename = "DERPRegion")]
+    derp_region: Option<u16>,
+    endpoints: Option<Vec<String>>,
+    key: Option<String>,
+    disco_key: Option<String>,
+    online: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MapResponse {
     #[serde(rename = "PeersChanged", default)]
     pub peers_changed: Option<Vec<PeerObj>>,
+    #[serde(rename = "PeersChangedPatch", default)]
+    pub peers_changed_patch: Option<Vec<PeerChange>>,
     #[serde(rename = "PeersRemoved", default)]
     pub peers_removed: Option<Vec<u64>>,
+    #[serde(rename = "OnlineChange", default)]
+    pub online_change: Option<HashMap<u64, bool>>,
     #[serde(rename = "PacketFilter", default)]
     pub packet_filter: Option<Vec<super::access::Rule>>,
     #[serde(rename = "PacketFilters", default)]
@@ -278,7 +375,9 @@ pub struct MapResponse {
     #[serde(rename = "Peers", default)]
     pub peers: Option<Vec<PeerObj>>,
     #[serde(rename = "DERPMap", default)]
-    pub derp_map: Option<DerpMap>,
+    pub derp_map: Option<DerpMapUpdate>,
+    #[serde(rename = "DNSConfig", default)]
+    pub dns_config: Option<super::peer_dns::DnsConfig>,
     #[serde(rename = "KeepAlive", default)]
     pub keep_alive: Option<bool>,
 }
@@ -288,12 +387,59 @@ impl MapResponse {
     pub fn is_keep_alive_only(&self) -> bool {
         self.keep_alive == Some(true)
             && self.peers_changed.is_none()
+            && self.peers_changed_patch.is_none()
             && self.peers_removed.is_none()
+            && self.online_change.is_none()
             && self.packet_filter.is_none()
             && self.packet_filters.is_none()
             && self.node.is_none()
             && self.peers.is_none()
             && self.derp_map.is_none()
+            && self.dns_config.is_none()
+    }
+
+    pub(crate) fn update_peers(&mut self, peers: &mut HashMap<u64, PeerObj>, first: bool) {
+        // Full maps omit Peers when there are no nodes. Deltas on an
+        // established stream may also omit it, while retaining the table.
+        if first {
+            peers.clear();
+        }
+        if let Some(full) = self.peers.take().filter(|full| !full.is_empty()) {
+            peers.clear();
+            peers.extend(full.into_iter().map(|peer| (peer.id, peer)));
+            return;
+        }
+        for id in self.peers_removed.take().into_iter().flatten() {
+            peers.remove(&id);
+        }
+        for peer in self.peers_changed.take().into_iter().flatten() {
+            peers.insert(peer.id, peer);
+        }
+        for (id, online) in self.online_change.take().into_iter().flatten() {
+            if let Some(peer) = peers.get_mut(&id) {
+                peer.online = Some(online);
+            }
+        }
+        for change in self.peers_changed_patch.take().into_iter().flatten() {
+            let Some(peer) = peers.get_mut(&change.node_id) else {
+                continue;
+            };
+            if let Some(region) = change.derp_region.filter(|region| *region != 0) {
+                peer.home_derp = Some(region);
+            }
+            if let Some(endpoints) = change.endpoints {
+                peer.endpoints = Some(endpoints);
+            }
+            if let Some(key) = change.key {
+                peer.key = key;
+            }
+            if let Some(disco_key) = change.disco_key {
+                peer.disco_key = Some(disco_key);
+            }
+            if let Some(online) = change.online {
+                peer.online = Some(online);
+            }
+        }
     }
 }
 
@@ -575,9 +721,9 @@ mod tests {
         let peers = map_resp.peers.unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name.as_deref(), Some("peer-server"));
-        assert_eq!(peers[0].allowed_ips.len(), 2);
+        assert_eq!(peers[0].allowed_ips.as_ref().unwrap().len(), 2);
 
-        let derp_map = map_resp.derp_map.unwrap();
+        let derp_map = super::super::derp::DerpMap::from(map_resp.derp_map.unwrap());
         assert!(derp_map.regions.contains_key("1"));
         let region = &derp_map.regions["1"];
         assert_eq!(region.region_code, "nyc");
@@ -592,5 +738,35 @@ mod tests {
         assert!(formatted.starts_with("nodekey:"));
         let parsed = parse_key_hex(&formatted).unwrap();
         assert_eq!(parsed, pk_bytes);
+    }
+
+    #[test]
+    fn peer_patches_apply_in_wire_order_and_new_streams_clear_old_peers() {
+        let parse = |raw: &str| serde_json::from_str::<MapResponse>(raw).unwrap();
+        let mut peers = HashMap::new();
+        parse(
+            r#"{"Peers":[{"ID":1,"Key":"old","Endpoints":["192.0.2.1:1"]},
+                           {"ID":2,"Key":"removed"}],"PeersRemoved":[1]}"#,
+        )
+        .update_peers(&mut peers, true);
+        let mut patch = parse(
+            r#"{"KeepAlive":true,"PeersRemoved":[2],
+            "PeersChanged":[{"ID":1,"Key":"replacement","Endpoints":["192.0.2.1:1"]}],
+            "OnlineChange":{"1":true},
+            "PeersChangedPatch":[{"NodeID":1,"DERPRegion":8,"DiscoKey":"disco",
+                                  "Key":"rotated","Endpoints":[],"Online":false},
+                                 {"NodeID":3,"Key":"unknown"}]}"#,
+        );
+        assert!(!patch.is_keep_alive_only());
+        patch.update_peers(&mut peers, false);
+        assert_eq!(peers.len(), 1);
+        let peer = &peers[&1];
+        assert_eq!(peer.key, "rotated");
+        assert_eq!(peer.disco_key.as_deref(), Some("disco"));
+        assert_eq!(peer.home_derp, Some(8));
+        assert_eq!(peer.endpoints, Some(vec![]));
+        assert_eq!(peer.online, Some(false));
+        parse(r#"{"Node":{"ID":4,"Key":"self"}}"#).update_peers(&mut peers, true);
+        assert!(peers.is_empty());
     }
 }

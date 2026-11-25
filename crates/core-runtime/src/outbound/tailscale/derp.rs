@@ -42,12 +42,12 @@ pub fn encode_send_packet(dst_key: &[u8; 32], packet: &[u8]) -> Vec<u8> {
     buf
 }
 
-/// Encodes a keepalive frame (`0x05`).
+/// Encodes a keepalive frame (`0x06`).
 pub fn encode_keepalive() -> [u8; 5] {
     [FRAME_KEEP_ALIVE, 0, 0, 0, 0]
 }
 
-/// Encodes a note-preferred frame (`0x06`).
+/// Encodes a note-preferred frame (`0x07`).
 pub fn encode_note_preferred(preferred: bool) -> [u8; 6] {
     [
         FRAME_NOTE_PREFERRED,
@@ -127,7 +127,7 @@ pub async fn read_derp_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result
 }
 
 /// Information about a DERP Region and its nodes.
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct DerpRegion {
     #[serde(rename = "RegionID")]
     pub region_id: u16,
@@ -135,11 +135,13 @@ pub struct DerpRegion {
     pub region_code: String,
     #[serde(rename = "RegionName", default)]
     pub region_name: String,
+    #[serde(rename = "NoMeasureNoHome", default)]
+    pub no_measure_no_home: bool,
     #[serde(rename = "Nodes", default)]
     pub nodes: Vec<DerpNode>,
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct DerpNode {
     #[serde(rename = "STUNPort", default)]
     pub stun_port: i32,
@@ -163,10 +165,81 @@ fn default_derp_port() -> u16 {
     443
 }
 
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
+impl DerpNode {
+    pub fn port(&self) -> u16 {
+        if self.port == 0 {
+            default_derp_port()
+        } else {
+            self.port
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct DerpMap {
     #[serde(rename = "Regions", default)]
     pub regions: HashMap<String, DerpRegion>,
+    #[serde(skip)]
+    pub region_scores: HashMap<u16, f64>,
+}
+
+impl DerpMap {
+    pub fn home_regions(&self) -> impl Iterator<Item = &DerpRegion> {
+        self.regions
+            .values()
+            .filter(|region| !region.no_measure_no_home)
+    }
+
+    pub fn can_home(&self, id: u16) -> bool {
+        self.regions
+            .get(&id.to_string())
+            .is_some_and(|region| !region.no_measure_no_home)
+    }
+
+    pub fn weighted_latency(&self, id: u16, ms: u64) -> f64 {
+        ms as f64
+            * self
+                .region_scores
+                .get(&id)
+                .copied()
+                .filter(|score| *score > 0.0)
+                .unwrap_or(1.0)
+    }
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DerpMapUpdate {
+    regions: Option<HashMap<String, Option<DerpRegion>>>,
+    home_params: Option<DerpHomeParams>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct DerpHomeParams {
+    #[serde(rename = "RegionScore")]
+    region_score: Option<HashMap<u16, f64>>,
+}
+
+impl DerpMapUpdate {
+    pub(crate) fn apply(self, map: &mut DerpMap) {
+        if let Some(regions) = self.regions {
+            map.regions = regions
+                .into_iter()
+                .filter_map(|(id, region)| region.map(|region| (id, region)))
+                .collect();
+        }
+        if let Some(scores) = self.home_params.and_then(|params| params.region_score) {
+            map.region_scores = scores;
+        }
+    }
+}
+
+impl From<DerpMapUpdate> for DerpMap {
+    fn from(update: DerpMapUpdate) -> Self {
+        let mut map = Self::default();
+        update.apply(&mut map);
+        map
+    }
 }
 
 #[cfg(test)]

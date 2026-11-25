@@ -39,7 +39,7 @@ use crate::outbound::tailscale::config::TailscaleConfig;
 use crate::outbound::tailscale::control::{
     Hostinfo, RegisterRequest, RegisterResponse, load_or_create_keys, node_key_str,
 };
-use crate::outbound::tailscale::engine::{Cmd, TailscaleShared, resolve_target};
+use crate::outbound::tailscale::engine::{Cmd, TailscaleShared};
 use crate::outbound::tailscale::session::{CAPABILITY_VERSION, ControlSession};
 
 const CALLER_BUF: usize = 65_536;
@@ -200,27 +200,28 @@ impl Tailscale {
                 "tailscale: authorization required; retrieve AuthURL through register()",
             ));
         }
-        let local_ips =
-            assigned_addresses(response.node.as_ref().ok_or_else(|| {
-                io::Error::other("tailscale: registration has no assigned address")
-            })?)?;
+        let local = response
+            .node
+            .as_ref()
+            .ok_or_else(|| io::Error::other("tailscale: registration has no assigned address"))?;
+        let local_ips = assigned_addresses(local)?;
         let local_vip = local_ips[0];
         let mut expected_addresses = local_ips.clone();
         let (_cmd_tx, cmd_rx) = mpsc::channel(128);
         let mut mesh =
             mesh::DirectMesh::bind(node_key.clone(), local_ips, self.cfg.listen_port).await?;
-        let (network_tx, mut network_rx) =
-            tokio::sync::watch::channel(connectivity::NetworkInfo::default());
-        let mut home = None;
-        if let Some(derp_map) = map.as_ref().and_then(|m| m.derp_map.clone()) {
-            network_rx = mesh.discover(derp_map.clone()).await?;
-            home = network_rx.borrow().home_derp;
-            mesh.set_relay(derp_client::RelayManager::new(
-                node_key.clone(),
-                derp_map,
-                home,
-            ));
-        }
+        let mut derp_map = map
+            .as_ref()
+            .and_then(|m| m.derp_map.clone())
+            .map(derp::DerpMap::from)
+            .unwrap_or_default();
+        let mut network_rx = mesh.discover(derp_map.clone()).await?;
+        let home = network_rx.borrow().home_derp;
+        mesh.set_relay(derp_client::RelayManager::new(
+            node_key.clone(),
+            derp_map.clone(),
+            home,
+        ));
         mesh.update_peers(map.as_ref().and_then(|m| m.peers.as_deref()).unwrap_or(&[]));
         crate::logging::debug(format_args!("tailscale: selected home relay {:?}", home));
         let disco = mesh.disco_public();
@@ -239,16 +240,24 @@ impl Tailscale {
             Some(mesh),
             tun,
         );
+        *shared.stable_tailnet_id.write().unwrap() = local.stable_tailnet_id().map(str::to_owned);
+        let mut dns_config = map.as_ref().and_then(|map| map.dns_config.clone());
+        shared.update_dns(
+            dns_config.as_ref(),
+            Some(local),
+            map.as_ref()
+                .and_then(|map| map.peers.as_deref())
+                .unwrap_or(&[]),
+        );
+        let mut dns_self = local.clone();
         let weak = Arc::downgrade(&shared);
         let cfg = self.cfg.clone();
         let node = node_key_str(&x25519_dalek::PublicKey::from(&node_key));
         tokio::spawn(async move {
-            // Without a DERP map nothing else holds the sender; a dropped one
-            // would end every map stream at once.
-            let _network_tx = network_tx;
             let mut session = None;
             let mut delay = 1;
             let mut stream = None;
+            let mut first_map = true;
             let mut peers = std::collections::HashMap::new();
             let mut rules = vec![];
             let mut named_rules = std::collections::HashMap::new();
@@ -264,6 +273,7 @@ impl Tailscale {
                             Some(ControlSession::connect(&cfg.control_url, machine.clone()).await?);
                     }
                     if stream.is_none() {
+                        first_map = true;
                         stream = Some(
                             session
                                 .as_mut()
@@ -292,12 +302,19 @@ impl Tailscale {
                                 if changed {return Ok(None);}
                             }
                         }
-                    }.map(Some)
+                    }.and_then(|map| {
+                        if first_map && !map.is_keep_alive_only() && map.node.is_none() {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                                "tailscale: first map is missing the local node"));
+                        }
+                        Ok(Some(map))
+                    })
                 }
                 .await;
                 let Some(shared) = weak.upgrade() else {
                     break;
                 };
+                let mut retry_after = None;
                 match result {
                     Ok(None) => {
                         stream = None;
@@ -307,7 +324,15 @@ impl Tailscale {
                     // Control sends one about every minute; rebuilding every
                     // peer for it only burned CPU.
                     Ok(Some(map)) if map.is_keep_alive_only() => delay = 0,
-                    Ok(Some(map)) => {
+                    Ok(Some(mut map)) => {
+                        if first_map {
+                            named_rules.clear();
+                            dns_config = None;
+                        }
+                        map.update_peers(&mut peers, std::mem::take(&mut first_map));
+                        if let Some(config) = map.dns_config.take() {
+                            dns_config = Some(config);
+                        }
                         if let Some(filter) = map.packet_filter.clone() {
                             named_rules.insert("base".to_string(), filter);
                         }
@@ -316,6 +341,9 @@ impl Tailscale {
                                 named_rules.clear();
                             }
                             for (name, value) in filters {
+                                if name == "*" {
+                                    continue;
+                                }
                                 if let Some(value) = value {
                                     named_rules.insert(name.clone(), value.clone());
                                 } else {
@@ -324,22 +352,10 @@ impl Tailscale {
                             }
                         }
                         rules = named_rules.values().flatten().cloned().collect();
-                        if let Some(full) = &map.peers {
-                            peers.clear();
-                            for peer in full {
-                                peers.insert(peer.id, peer.clone());
-                            }
-                        }
-                        if let Some(changed) = &map.peers_changed {
-                            for peer in changed {
-                                peers.insert(peer.id, peer.clone());
-                            }
-                        }
-                        if let Some(removed) = &map.peers_removed {
-                            for id in removed {
-                                peers.remove(id);
-                            }
-                        }
+                        let derp_update = map.derp_map.take().map(|update| {
+                            update.apply(&mut derp_map);
+                            derp_map.clone()
+                        });
                         if shared
                             .cmd_tx
                             .send(Cmd::UpdateAccess {
@@ -353,6 +369,9 @@ impl Tailscale {
                         // A map may reassign our IP while retaining the node key.
                         // Wait for the data plane to apply it before reporting ready.
                         if let Some(local) = &map.node {
+                            dns_self = local.clone();
+                            *shared.stable_tailnet_id.write().unwrap() =
+                                local.stable_tailnet_id().map(str::to_owned);
                             let next = assigned_addresses(local);
                             addresses_valid = false;
                             if let Ok(next) = next {
@@ -378,7 +397,7 @@ impl Tailscale {
                                     addresses_valid = true;
                                 }
                             }
-                            let (lan, exit) = cfg.route_approvals(&local.allowed_ips);
+                            let (lan, exit) = cfg.route_approvals(local.allowed_ips());
                             shared
                                 .exit_approved
                                 .store(addresses_valid && exit, Ordering::Relaxed);
@@ -391,6 +410,11 @@ impl Tailscale {
                         } else {
                             vec![]
                         };
+                        shared.update_dns(
+                            dns_config.as_ref(),
+                            addresses_valid.then_some(&dns_self),
+                            &peers,
+                        );
                         let _ = shared
                             .cmd_tx
                             .send(Cmd::UpdateLanApproval {
@@ -404,7 +428,7 @@ impl Tailscale {
                             .cmd_tx
                             .send(Cmd::UpdatePeers {
                                 peers,
-                                derp_map: map.derp_map,
+                                derp_map: derp_update,
                             })
                             .await
                             .is_err()
@@ -417,6 +441,7 @@ impl Tailscale {
                             .store(addresses_valid, std::sync::atomic::Ordering::Relaxed);
                     }
                     Err(error) => {
+                        retry_after = session::retry_after(&error);
                         // Like the reference client, keep the last network map
                         // while control is away: peers, WireGuard sessions,
                         // access rules and route approvals stay as they were,
@@ -435,11 +460,13 @@ impl Tailscale {
                         // Filters arrive as deltas within one stream; a new
                         // stream must not inherit names the old one set.
                         named_rules.clear();
-                        delay = retry_delay(delay);
+                        if retry_after.is_none() {
+                            delay = retry_delay(delay);
+                        }
                     }
                 }
                 drop(shared);
-                tokio::time::sleep(Duration::from_secs(delay)).await;
+                tokio::time::sleep(retry_after.unwrap_or_else(|| Duration::from_secs(delay))).await;
             }
         });
         *guard = Some(Arc::clone(&shared));
@@ -447,8 +474,8 @@ impl Tailscale {
     }
 
     pub async fn connect(&self, target: &Target) -> io::Result<AnyStream> {
-        let dst = resolve_target(target).await?;
         let shared = self.shared().await?;
+        let dst = shared.resolve_target(target).await?;
         let id = shared.next_id.fetch_add(1, Ordering::Relaxed);
         let (local, remote) = tokio::io::duplex(CALLER_BUF);
         let (caller_read, caller_write) = tokio::io::split(local);
@@ -528,8 +555,8 @@ impl Tailscale {
     }
 
     pub async fn connect_udp(&self, target: &Target) -> io::Result<UdpSocket> {
-        let dst = resolve_target(target).await?;
         let shared = self.shared().await?;
+        let dst = shared.resolve_target(target).await?;
         let (local, peer) = udp_loopback_pair().await?;
         let (resp_tx, resp_rx) = oneshot::channel();
 

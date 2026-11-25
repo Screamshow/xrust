@@ -45,6 +45,8 @@ pub enum Kind {
     Dhcp,
     /// systemd-resolved local stub resolver
     Resolved,
+    /// MagicDNS answers from a configured Tailscale endpoint's live netmap.
+    Tailscale,
 }
 
 pub struct ServerConfig {
@@ -73,6 +75,8 @@ pub struct ServerConfig {
     pub neighbor_domain: Vec<String>,
     /// `type: mdns`: the interfaces to query, empty for all of them
     pub mdns_interfaces: Vec<String>,
+    pub tailscale_endpoint: Option<String>,
+    pub tailscale_search_domain: bool,
     doh_h2: Mutex<Option<DohH2Conn>>,
 }
 
@@ -806,8 +810,24 @@ impl ServerConfig {
             "group" => Kind::Group,
             "dhcp" => Kind::Dhcp,
             "resolved" => Kind::Resolved,
+            "tailscale" => Kind::Tailscale,
             other => anyhow::bail!("{at}: dns server type {other:?} not implemented yet"),
         };
+        let tailscale_endpoint = if kind == Kind::Tailscale {
+            if map.get("accept_default_resolvers").and_then(Value::as_bool) == Some(true) {
+                anyhow::bail!("{at}: external Tailscale default resolvers are not supported");
+            }
+            let endpoint = map
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .filter(|tag| !tag.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("{at}: missing tailscale endpoint tag"))?;
+            Some(endpoint.to_owned())
+        } else {
+            None
+        };
+        let tailscale_search_domain = kind == Kind::Tailscale
+            && map.get("accept_search_domain").and_then(Value::as_bool) == Some(true);
         let hosts = match kind {
             Kind::Hosts => {
                 let mut sources = Hosts::default();
@@ -865,7 +885,8 @@ impl ServerConfig {
                 | Kind::Hosts
                 | Kind::Mdns
                 | Kind::Group
-                | Kind::Dhcp => 0,
+                | Kind::Dhcp
+                | Kind::Tailscale => 0,
             });
         // dns tls/https/quic/h3 servers implicitly use TLS: the reference
         // forces `enabled` on when the key is absent, and builds a client with
@@ -935,6 +956,7 @@ impl ServerConfig {
                 | Kind::Group
                 | Kind::Dhcp
                 | Kind::Resolved
+                | Kind::Tailscale
         );
         if needs_server && server.is_empty() {
             anyhow::bail!("{at}: missing server");
@@ -1054,6 +1076,8 @@ impl ServerConfig {
             group,
             neighbor_domain,
             mdns_interfaces,
+            tailscale_endpoint,
+            tailscale_search_domain,
             doh_h2: Mutex::new(None),
         })
     }
@@ -1208,7 +1232,8 @@ pub async fn exchange(
             | Kind::Hosts
             | Kind::Group
             | Kind::Dhcp
-            | Kind::Resolved => Err(io::Error::other(
+            | Kind::Resolved
+            | Kind::Tailscale => Err(io::Error::other(
                 "dns: this transport answers without reaching the wire",
             )),
         }

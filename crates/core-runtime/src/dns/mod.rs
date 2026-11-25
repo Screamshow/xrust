@@ -622,6 +622,15 @@ impl DnsService {
                     .map_err(std::io::Error::other)?;
                 return codec::set_id(&raw, info.id);
             }
+            Kind::Tailscale => {
+                let endpoint = self.tailscale_dns_endpoint(&target).await?;
+                return endpoint.exchange_dns(
+                    &query_msg,
+                    &info.name,
+                    target.tailscale_search_domain,
+                    opts.rewrite_ttl.unwrap_or(codec::DEFAULT_TTL),
+                );
+            }
             _ => {}
         }
 
@@ -837,6 +846,15 @@ impl DnsService {
         cfg: &ServerConfig,
         query: &[u8],
     ) -> std::io::Result<Vec<u8>> {
+        if cfg.kind == Kind::Tailscale {
+            let (query, info) = codec::parse_query(query)?;
+            return self.tailscale_dns_endpoint(cfg).await?.exchange_dns(
+                &query,
+                &info.name,
+                cfg.tailscale_search_domain,
+                codec::DEFAULT_TTL,
+            );
+        }
         if cfg.kind == Kind::Mdns {
             // no address to resolve: the query goes to the multicast group
             return self.mdns_exchange(cfg, query).await;
@@ -850,6 +868,37 @@ impl DnsService {
         };
         let raw = transport::exchange(cfg, addr, &query, &self.dialer()).await?;
         Ok(raw)
+    }
+
+    async fn tailscale_dns_endpoint(
+        &self,
+        cfg: &ServerConfig,
+    ) -> std::io::Result<Arc<crate::outbound::tailscale::engine::TailscaleShared>> {
+        let tag = cfg
+            .tailscale_endpoint
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("dns: missing tailscale endpoint tag"))?;
+        let router = self.dialer().router.ok_or_else(|| {
+            std::io::Error::other("dns: tailscale endpoint router is unavailable")
+        })?;
+        let inner = router.inner();
+        let endpoint = inner
+            .outbound_table()
+            .find_map(|(_, candidate, outbound)| match outbound {
+                crate::route::Outbound::Tailscale(endpoint) if candidate == tag => Some(endpoint),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                std::io::Error::other(format!("dns: tailscale endpoint {tag:?} not found"))
+            })?;
+        tokio::time::timeout(cfg.timeout, endpoint.shared())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "dns: tailscale endpoint timed out",
+                )
+            })?
     }
 
     /// The mDNS lookup behind a `mdns` server. The reference waits one second
@@ -1080,6 +1129,11 @@ impl DnsService {
                     None => system_lookup(host).await,
                 })
             }
+            Kind::Tailscale => Some(
+                self.tailscale_dns_endpoint(resolver)
+                    .await?
+                    .lookup_dns(host, resolver.tailscale_search_domain),
+            ),
             _ => None,
         };
         if let Some(mut addresses) = local_addresses {
@@ -1410,6 +1464,23 @@ pub(crate) async fn system_lookup(host: &str) -> Vec<std::net::IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn tailscale_transport_requires_a_matching_runtime_endpoint() {
+        let root = serde_json::json!({
+            "dns": {"servers": [{"type":"tailscale","tag":"tail-dns","endpoint":"not-a-tailnet"}]},
+            "outbounds": [{"type":"direct","tag":"not-a-tailnet"}],
+        });
+        let dns = DnsService::build(&root).unwrap().unwrap();
+        dns.set_router(crate::route::Router::new(&root).unwrap());
+        let query = codec::build_query(17, "peer.tailnet.ts.net", RecordType::AAAA).unwrap();
+        let error = dns.exchange_member("tail-dns", &query).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tailscale endpoint \"not-a-tailnet\" not found")
+        );
+    }
+
     #[tokio::test]
     async fn a_fast_family_survives_a_stalled_other_family_and_cancels_it() {
         use std::sync::atomic::{AtomicBool, Ordering};

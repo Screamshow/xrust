@@ -78,13 +78,9 @@ impl DerpClient {
         preferred: bool,
     ) -> io::Result<Self> {
         tokio::time::timeout(Duration::from_secs(20), async {
-            let uri: http::Uri = format!(
-                "https://{}:{}",
-                node.host_name,
-                if node.port == 0 { 443 } else { node.port }
-            )
-            .parse()
-            .map_err(|_| bad("derp: invalid server name"))?;
+            let uri: http::Uri = format!("https://{}:{}", node.host_name, node.port())
+                .parse()
+                .map_err(|_| bad("derp: invalid server name"))?;
             let mut stream = super::session::tls(&uri, b"http/1.1").await?;
             let request = format!(
                 "GET /derp HTTP/1.1\r\nHost: {}\r\nConnection: Upgrade\r\nUpgrade: DERP\r\n\r\n",
@@ -312,6 +308,7 @@ pub struct RelayManager {
 
 impl RelayManager {
     pub fn set_home(&mut self, home: Option<u16>) {
+        let home = home.filter(|id| self.map.can_home(*id));
         if self.home == home {
             return;
         }
@@ -327,14 +324,17 @@ impl RelayManager {
         self.regions.retain(|id, _| {
             let old = self.map.regions.get(&id.to_string());
             let new = map.regions.get(&id.to_string());
-            matches!((old, new), (Some(old), Some(new)) if serde_json::to_vec(old).ok() == serde_json::to_vec(new).ok())
+            matches!((old, new), (Some(old), Some(new)) if old.nodes == new.nodes)
         });
         self.map = map;
-        if let Some(home) = self.home {
+        if self.home.is_some_and(|id| !self.map.can_home(id)) {
+            self.set_home(None);
+        } else if let Some(home) = self.home {
             self.ensure(home);
         }
     }
     pub fn new(private: StaticSecret, map: DerpMap, home: Option<u16>) -> Self {
+        let home = home.filter(|id| map.can_home(*id));
         let (to_mesh, rx) = mpsc::channel(256);
         let (health_tx, health_rx) = mpsc::channel(64);
         let mut manager = Self {
@@ -528,7 +528,13 @@ mod tests {
 
     #[tokio::test]
     async fn home_change_preserves_existing_region_connections() {
-        let map = DerpMap::default();
+        let map = serde_json::from_str(
+            r#"{"Regions":{
+            "1":{"RegionID":1,"RegionCode":"one"},
+            "22":{"RegionID":22,"RegionCode":"waw"}
+        }}"#,
+        )
+        .unwrap();
         let mut manager = RelayManager::new(StaticSecret::from([9; 32]), map, None);
         let (tx, _) = mpsc::channel(1);
         let (preferred, _) = watch::channel(false);
@@ -548,6 +554,15 @@ mod tests {
         assert!(manager.regions.contains_key(&1));
         assert!(!*manager.regions[&1].preferred.borrow());
         assert!(!manager.regions[&1].task.is_finished());
+        manager.set_home(Some(1));
+        let mut map = manager.map.clone();
+        map.regions.get_mut("1").unwrap().no_measure_no_home = true;
+        manager.update_map(map);
+        assert_eq!(manager.home, None);
+        assert!(!*manager.regions[&1].preferred.borrow());
+        assert!(!manager.regions[&1].task.is_finished());
+        manager.set_home(Some(1));
+        assert_eq!(manager.home, None);
     }
 
     #[tokio::test]

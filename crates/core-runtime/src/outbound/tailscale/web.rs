@@ -6,6 +6,7 @@ use smoltcp::{
 };
 use std::{
     collections::HashMap,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 use tokio::{
@@ -33,21 +34,33 @@ impl Drop for Connection {
 pub struct WebBridge {
     connections: HashMap<SocketHandle, Connection>,
     rules: Vec<Rule>,
+    luci_access: bool,
     ssh_access: bool,
     exit_access: bool,
     exit_approved: bool,
+    dns: Arc<RwLock<super::peer_dns::DnsState>>,
 }
 impl WebBridge {
     pub fn new(ssh_access: bool) -> Self {
         Self::with_exit(ssh_access, false)
     }
     pub fn with_exit(ssh_access: bool, exit_access: bool) -> Self {
+        Self::with_access(true, ssh_access, exit_access, Arc::default())
+    }
+    pub(crate) fn with_access(
+        luci_access: bool,
+        ssh_access: bool,
+        exit_access: bool,
+        dns: Arc<RwLock<super::peer_dns::DnsState>>,
+    ) -> Self {
         Self {
             connections: HashMap::new(),
             rules: vec![],
+            luci_access,
             ssh_access,
             exit_access,
             exit_approved: false,
+            dns,
         }
     }
     pub fn set_exit_approved(&mut self, approved: bool) {
@@ -92,9 +105,10 @@ impl WebBridge {
                 let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
                 let (reply, replies) = mpsc::channel::<Vec<u8>>(16);
                 let port = connection.port;
+                let dns = Arc::clone(&self.dns);
                 connection.task = Some(tokio::spawn(async move {
                     if port == super::peer_dns::PORT {
-                        super::peer_dns::serve(rx, reply).await;
+                        super::peer_dns::serve(rx, reply, dns).await;
                         return;
                     }
                     let stream = match tokio::time::timeout(
@@ -173,10 +187,11 @@ impl WebBridge {
             sockets.remove(handle);
         }
         for port in [80, 443, 22, super::peer_dns::PORT] {
-            if port == super::peer_dns::PORT && !self.exit_access {
-                continue;
-            }
-            if port == 22 && !self.ssh_access {
+            if !match port {
+                super::peer_dns::PORT => self.exit_access,
+                22 => self.luci_access && self.ssh_access,
+                _ => self.luci_access,
+            } {
                 continue;
             }
             if self.connections.len() >= 32 {
@@ -224,6 +239,15 @@ mod tests {
         bridge.poll(&mut sockets);
         assert!(!bridge.connections.is_empty());
         assert!(!bridge.active(&sockets));
+    }
+
+    #[test]
+    fn exit_only_exposes_the_dns_peer_api() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut bridge = WebBridge::with_access(false, true, true, Arc::default());
+        bridge.poll(&mut sockets);
+        let ports: Vec<_> = bridge.connections.values().map(|c| c.port).collect();
+        assert_eq!(ports, [super::super::peer_dns::PORT]);
     }
 
     #[test]

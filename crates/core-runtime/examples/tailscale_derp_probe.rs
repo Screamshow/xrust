@@ -16,7 +16,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let map = control
         .initial_map(&node_key_str(&PublicKey::from(&node)), "rust-x-native-test")
         .await?;
-    let regions = map.derp_map.ok_or("no DERP map")?;
+    let regions =
+        core_runtime::outbound::tailscale::derp::DerpMap::from(map.derp_map.ok_or("no DERP map")?);
     let region = regions
         .regions
         .values()
@@ -55,6 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let peer = |key: [u8; 32], address: &str| PeerObj {
         disco_key: None,
+        is_wireguard_only: false,
         id: 1,
         home_derp: Some(region.region_id),
         key: format!(
@@ -63,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         name: None,
         addresses: vec![format!("{address}/32")],
-        allowed_ips: vec![],
+        allowed_ips: None,
         endpoints: None,
         derp: None,
         online: Some(true),

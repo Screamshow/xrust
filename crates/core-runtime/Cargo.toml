@@ -60,6 +60,7 @@ if-addrs.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 http.workspace = true
+httpdate = "1.0.3"
 # raw DEFLATE for the external_ui bundle; miniz_oxide keeps it pure Rust
 flate2.workspace = true
 quinn.workspace = true

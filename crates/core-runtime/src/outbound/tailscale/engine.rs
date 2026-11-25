@@ -4,8 +4,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
@@ -20,10 +20,11 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 use tokio::sync::{mpsc, oneshot};
 
 use super::mesh::DirectMesh;
+use super::peer_dns::{DnsConfig, DnsState};
 use crate::inbound::Target;
 use crate::logging;
 use crate::outbound::tailscale::config::TailscaleConfig;
-use crate::outbound::tailscale::control::PeerObj;
+use crate::outbound::tailscale::control::{NodeObj, PeerObj};
 use crate::outbound::tailscale::derp::DerpMap;
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSock};
 
@@ -82,6 +83,8 @@ pub enum Cmd {
 
 pub struct TailscaleShared {
     pub transport: std::sync::RwLock<serde_json::Value>,
+    pub(crate) stable_tailnet_id: RwLock<Option<String>>,
+    dns: Arc<RwLock<DnsState>>,
     pub cmd_tx: mpsc::Sender<Cmd>,
     pub next_id: AtomicU32,
     local_ip: std::sync::RwLock<IpAddr>,
@@ -93,6 +96,54 @@ pub struct TailscaleShared {
 impl TailscaleShared {
     pub fn local_ip(&self) -> IpAddr {
         *self.local_ip.read().unwrap()
+    }
+
+    pub(crate) fn update_dns<'a>(
+        &self,
+        config: Option<&DnsConfig>,
+        local: Option<&NodeObj>,
+        peers: impl IntoIterator<Item = &'a PeerObj>,
+    ) {
+        *self.dns.write().unwrap() = DnsState::from_netmap(config, local, peers);
+    }
+
+    pub(crate) async fn resolve_target(&self, target: &Target) -> io::Result<SocketAddr> {
+        if let Target::Domain(host, port) = target {
+            let addresses = self
+                .dns
+                .read()
+                .unwrap()
+                .lookup(host)
+                .map(|ips| ips.first().copied());
+            if let Some(ip) = addresses {
+                return ip.map(|ip| SocketAddr::new(ip, *port)).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "tailscale: peer has no usable DNS address",
+                    )
+                });
+            }
+        }
+        resolve_target(target).await
+    }
+
+    pub(crate) fn lookup_dns(&self, name: &str, search: bool) -> Vec<IpAddr> {
+        self.dns
+            .read()
+            .unwrap()
+            .lookup_with_search(name, search)
+            .unwrap_or_default()
+            .to_vec()
+    }
+
+    pub(crate) fn exchange_dns(
+        &self,
+        query: &hickory_proto::op::Message,
+        name: &str,
+        search: bool,
+        ttl: u32,
+    ) -> io::Result<Vec<u8>> {
+        self.dns.read().unwrap().exchange(query, name, search, ttl)
     }
 }
 
@@ -246,6 +297,8 @@ pub fn spawn_tailscale_engine_with_tun(
 
     let shared = Arc::new(TailscaleShared {
         transport: std::sync::RwLock::new(serde_json::Value::Null),
+        stable_tailnet_id: RwLock::new(None),
+        dns: Arc::default(),
         local_ip: std::sync::RwLock::new(local_ip),
         control_connected: std::sync::atomic::AtomicBool::new(false),
         routes_approved: std::sync::atomic::AtomicBool::new(false),
@@ -255,6 +308,7 @@ pub fn spawn_tailscale_engine_with_tun(
     });
 
     let weak = Arc::downgrade(&shared);
+    let dns = Arc::clone(&shared.dns);
     tokio::spawn(async move {
         let mtu = cfg.system_interface_mtu.unwrap_or(1280).min(1280) as usize;
         let mut lan_rules = vec![];
@@ -292,9 +346,17 @@ pub fn spawn_tailscale_engine_with_tun(
             .add_default_ipv6_route(std::net::Ipv6Addr::UNSPECIFIED);
 
         let mut sockets = SocketSet::new(vec![]);
-        let mut web = cfg
-            .luci_access
-            .then(|| super::web::WebBridge::with_exit(cfg.ssh_access, cfg.advertise_exit_node));
+        let new_web = || {
+            (cfg.luci_access || cfg.advertise_exit_node).then(|| {
+                super::web::WebBridge::with_access(
+                    cfg.luci_access,
+                    cfg.ssh_access,
+                    cfg.advertise_exit_node,
+                    Arc::clone(&dns),
+                )
+            })
+        };
+        let mut web = new_web();
         let mut tcp_conns: HashMap<u32, TcpConn> = HashMap::new();
         type UdpSession = (SocketHandle, SocketAddr, mpsc::Sender<Vec<u8>>, Instant);
         let mut udp_sessions: HashMap<u16, UdpSession> = HashMap::new();
@@ -337,11 +399,7 @@ pub fn spawn_tailscale_engine_with_tun(
                         // them before permitting any packets for the new identity.
                         tcp_conns.clear();
                         udp_sessions.clear();
-                        web = cfg.luci_access.then(|| {
-                            let mut bridge = super::web::WebBridge::with_exit(
-                                cfg.ssh_access,
-                                cfg.advertise_exit_node,
-                            );
+                        web = new_web().map(|mut bridge| {
                             bridge.update_rules(lan_rules.clone());
                             bridge.set_exit_approved(exit_approved);
                             bridge
@@ -756,12 +814,13 @@ mod mesh_tests {
     fn node(secret: &StaticSecret, ip: &str, port: u16) -> PeerObj {
         PeerObj {
             disco_key: None,
+            is_wireguard_only: false,
             home_derp: None,
             id: 1,
             key: super::super::control::node_key_str(&x25519_dalek::PublicKey::from(secret)),
             name: None,
             addresses: vec![format!("{ip}/32")],
-            allowed_ips: vec![],
+            allowed_ips: None,
             endpoints: Some(vec![format!("127.0.0.1:{port}")]),
             derp: None,
             online: Some(true),

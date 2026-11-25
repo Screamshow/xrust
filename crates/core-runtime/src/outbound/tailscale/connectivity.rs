@@ -109,7 +109,7 @@ pub fn stun_response(bytes: &[u8], tx: &[u8; 12]) -> Option<SocketAddr> {
 
 async fn relay_scores(map: &DerpMap) -> Vec<(u16, u64)> {
     let mut jobs = JoinSet::new();
-    for region in map.regions.values().take(64) {
+    for region in map.home_regions().take(64) {
         let id = region.region_id;
         let nodes: Vec<_> = region
             .nodes
@@ -127,9 +127,9 @@ async fn relay_scores(map: &DerpMap) -> Vec<(u16, u64)> {
                     .and_then(|s| s.parse::<Ipv4Addr>().ok());
                 let result = tokio::time::timeout(PROBE_TIMEOUT, async {
                     if let Some(ip) = address {
-                        TcpStream::connect((ip, node.port)).await
+                        TcpStream::connect((ip, node.port())).await
                     } else {
-                        TcpStream::connect((node.host_name.as_str(), node.port)).await
+                        TcpStream::connect((node.host_name.as_str(), node.port())).await
                     }
                 })
                 .await;
@@ -146,7 +146,11 @@ async fn relay_scores(map: &DerpMap) -> Vec<(u16, u64)> {
             scores.push(score);
         }
     }
-    scores.sort_by_key(|&(id, ms)| (ms, id));
+    scores.sort_by(|&(a_id, a_ms), &(b_id, b_ms)| {
+        map.weighted_latency(a_id, a_ms)
+            .total_cmp(&map.weighted_latency(b_id, b_ms))
+            .then_with(|| a_id.cmp(&b_id))
+    });
     // Verify only a short list: a fast TCP accept is not proof of a working DERP.
     let mut verified = JoinSet::new();
     for (id, _) in scores.into_iter().take(4) {
@@ -188,13 +192,22 @@ async fn relay_scores(map: &DerpMap) -> Vec<(u16, u64)> {
     scores
 }
 
-fn select_home(info: &mut NetworkInfo, map: &DerpMap, scores: Vec<(u16, u64)>) {
+fn select_home(info: &mut NetworkInfo, map: &DerpMap, mut scores: Vec<(u16, u64)>) {
+    scores.retain(|&(id, _)| map.can_home(id));
+    let weight = |&(id, ms): &(u16, u64)| map.weighted_latency(id, ms);
+    scores.sort_by(|a, b| weight(a).total_cmp(&weight(b)).then_with(|| a.0.cmp(&b.0)));
     let best = scores.first().copied();
     // Keep a healthy home if the difference is just measurement noise.
     let selected = info
         .home_derp
         .and_then(|id| scores.iter().copied().find(|s| s.0 == id))
-        .filter(|&(_, ms)| best.is_some_and(|(_, best)| ms <= best + 5 || ms <= best * 12 / 10))
+        .filter(|current| {
+            best.is_some_and(|best| {
+                let best = weight(&best);
+                let current = weight(current);
+                current <= best + 5.0 || current <= best * 1.2
+            })
+        })
         .or(best);
     info.home_derp = selected.map(|s| s.0);
     info.derp_latency_ms = selected.map(|s| s.1);
@@ -265,12 +278,25 @@ impl Connectivity {
         let tcp_task = tokio::spawn(async move {
             let mut failures = 0;
             loop {
-                let map = map_rx.borrow().clone();
-                let scores = relay_scores(&map).await;
+                let map = map_rx.borrow_and_update().clone();
+                let scores = tokio::select! {
+                    biased;
+                    result = map_rx.changed() => {
+                        if result.is_err() { break; }
+                        continue;
+                    }
+                    scores = relay_scores(&map) => scores,
+                };
                 let mut delay = Duration::from_secs(180);
-                task_info.send_modify(|info| {
-                    delay = apply_measurement(info, &map, scores, &mut failures)
-                });
+                {
+                    let current_map = map_rx.borrow();
+                    if *current_map != map {
+                        continue;
+                    }
+                    task_info.send_modify(|info| {
+                        delay = apply_measurement(info, &map, scores, &mut failures)
+                    });
+                }
                 tokio::select! {
                     _=tokio::time::sleep(delay)=>{
                         // The periodic round measures every region (TCP to
@@ -309,15 +335,23 @@ impl Connectivity {
         this.update_map(map);
         this.tick(socket, false).await;
         // Only this code reads the socket before the engine starts.
-        let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
-        let mut bytes = [0; 2048];
-        while let Ok(Ok((n, source))) =
-            tokio::time::timeout_at(deadline, socket.recv_from(&mut bytes)).await
-        {
-            this.receive(&bytes[..n], source);
+        if !this.targets.is_empty() {
+            let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+            let mut bytes = [0; 2048];
+            while let Ok(Ok((n, source))) =
+                tokio::time::timeout_at(deadline, socket.recv_from(&mut bytes)).await
+            {
+                this.receive(&bytes[..n], source);
+            }
         }
         // TCP probes have a bounded second-node retry; don't pick a hardcoded region.
-        if this.info.borrow().home_derp.is_none() {
+        if this.info.borrow().home_derp.is_none()
+            && this
+                .map_tx
+                .borrow()
+                .home_regions()
+                .any(|r| !r.nodes.is_empty())
+        {
             let mut rx = this.info.subscribe();
             let _ = tokio::time::timeout(PROBE_TIMEOUT, rx.changed()).await;
         }
@@ -325,8 +359,7 @@ impl Connectivity {
     }
     pub fn update_map(&mut self, map: DerpMap) {
         self.targets = map
-            .regions
-            .values()
+            .home_regions()
             .take(64)
             .filter_map(|r| {
                 r.nodes
@@ -353,8 +386,18 @@ impl Connectivity {
             })
             .collect();
         // Identical keepalive maps must not cause continuous probing.
-        if serde_json::to_value(&*self.map_tx.borrow()).ok() != serde_json::to_value(&map).ok() {
+        if *self.map_tx.borrow() != map {
+            self.pending
+                .retain(|_, tx| self.targets.contains(&tx.target));
+            self.observations
+                .retain(|target, _| self.targets.contains(target));
+            self.stun_due = true;
             self.map_tx.send_replace(map);
+            let map = self.map_tx.borrow();
+            self.info.send_modify(|info| {
+                let scores = std::mem::take(&mut info.derp_latencies);
+                select_home(info, &map, scores);
+            });
         }
     }
     pub fn relay_health(&mut self, health: super::derp_client::RelayHealth) {
@@ -362,7 +405,7 @@ impl Connectivity {
         if let Some(ms) = health.latency_ms {
             if current.home_derp.is_none() {
                 let map = self.map_tx.borrow().clone();
-                if map.regions.contains_key(&health.region.to_string()) {
+                if map.can_home(health.region) {
                     self.info
                         .send_modify(|info| select_home(info, &map, vec![(health.region, ms)]));
                 }
@@ -492,7 +535,8 @@ mod tests {
             home_derp: Some(22),
             ..Default::default()
         };
-        let map = DerpMap::default();
+        let map = serde_json::from_str(r#"{"Regions":{"22":{"RegionID":22,"RegionCode":"waw"}}}"#)
+            .unwrap();
         let mut failures = 0;
         for seconds in [5, 15, 30, 30] {
             assert_eq!(
@@ -534,7 +578,14 @@ mod tests {
     }
     #[test]
     fn measured_relay_selection_has_no_region_id_preference() {
-        let map = DerpMap::default();
+        let map = serde_json::from_str(
+            r#"{"Regions":{
+            "1":{"RegionID":1,"RegionCode":"one"},
+            "4":{"RegionID":4,"RegionCode":"four"},
+            "22":{"RegionID":22,"RegionCode":"waw"}
+        }}"#,
+        )
+        .unwrap();
         let mut info = NetworkInfo::default();
         select_home(&mut info, &map, vec![(22, 30), (1, 150)]);
         assert_eq!(info.home_derp, Some(22));
@@ -543,6 +594,36 @@ mod tests {
         select_home(&mut info, &map, vec![(4, 20)]);
         assert_eq!(info.home_derp, Some(4));
         select_home(&mut info, &map, vec![]);
+        assert_eq!(info.home_derp, None);
+    }
+
+    #[test]
+    fn partial_derp_updates_preserve_relays_and_apply_home_policy() {
+        let update =
+            |raw: &str| serde_json::from_str::<super::super::derp::DerpMapUpdate>(raw).unwrap();
+        let mut map = DerpMap::from(update(
+            r#"{"Regions":{
+            "1":{"RegionID":1,"RegionCode":"reserved","NoMeasureNoHome":true},
+            "2":{"RegionID":2,"RegionCode":"near"},
+            "3":{"RegionID":3,"RegionCode":"preferred"}
+        }}"#,
+        ));
+        update(r#"{"Regions":null,"HomeParams":{"RegionScore":{"3":0.5}}}"#).apply(&mut map);
+        assert_eq!(map.regions.len(), 3);
+        assert!(map.regions.contains_key("1"));
+        assert_eq!(map.home_regions().count(), 2);
+        let mut info = NetworkInfo {
+            home_derp: Some(1),
+            ..Default::default()
+        };
+        select_home(&mut info, &map, vec![(1, 1), (2, 50), (3, 60)]);
+        assert_eq!(info.home_derp, Some(3));
+        assert_eq!(info.derp_latency_ms, Some(60));
+        update(r#"{"HomeParams":{"RegionScore":{}}}"#).apply(&mut map);
+        assert_eq!(map.regions.len(), 3);
+        assert!(map.region_scores.is_empty());
+        update(r#"{"Regions":{}}"#).apply(&mut map);
+        select_home(&mut info, &map, vec![(3, 60)]);
         assert_eq!(info.home_derp, None);
     }
 
