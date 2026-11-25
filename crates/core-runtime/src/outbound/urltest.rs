@@ -785,8 +785,17 @@ mod tests {
         let url = format!("http://{}/", health.local_addr().unwrap());
         let health_worker = tokio::spawn(async move {
             while let Ok((mut stream, _)) = health.accept().await {
-                let mut request = [0; 1024];
-                stream.read(&mut request).await.unwrap();
+                use tokio::io::{AsyncBufReadExt, BufReader};
+
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_until(b'\n', &mut line).await.unwrap(), 0);
+                    if line == b"\r\n" {
+                        break;
+                    }
+                }
                 stream
                     .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
                     .await
