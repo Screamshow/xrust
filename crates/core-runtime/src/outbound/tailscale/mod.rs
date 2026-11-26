@@ -193,6 +193,13 @@ impl Tailscale {
             return Ok(Arc::clone(shared));
         }
 
+        // Keep registration and discovery state on the cold path.
+        let shared = Box::pin(self.initialize_shared()).await?;
+        *guard = Some(Arc::clone(&shared));
+        Ok(shared)
+    }
+
+    async fn initialize_shared(&self) -> io::Result<Arc<TailscaleShared>> {
         let (response, map, node_key, machine) = self.register_context(None).await?;
         if response.machine_authorized != Some(true) {
             return Err(io::Error::new(
@@ -469,7 +476,6 @@ impl Tailscale {
                 tokio::time::sleep(retry_after.unwrap_or_else(|| Duration::from_secs(delay))).await;
             }
         });
-        *guard = Some(Arc::clone(&shared));
         Ok(shared)
     }
 
