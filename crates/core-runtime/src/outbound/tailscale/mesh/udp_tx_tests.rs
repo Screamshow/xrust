@@ -118,7 +118,7 @@ async fn receive(receiver: &mut DirectMesh, count: usize) -> Vec<Vec<u8>> {
 async fn sends_consecutive_background_batches_before_inline_packet() {
     let (mut left, mut right) = open_pair().await;
     let expected: Vec<_> = (0..49).map(|id| packet(LEFT, RIGHT, id)).collect();
-    for packets in expected[..48].chunks_exact(24) {
+    for packets in expected[..48].as_chunks::<24>().0 {
         let mut batch = packets.to_vec();
         assert_eq!(left.send_direct_batch(&mut batch).await, Some(0));
         assert!(batch.is_empty());
