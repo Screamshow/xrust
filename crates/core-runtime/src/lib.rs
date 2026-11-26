@@ -501,7 +501,7 @@ fn checked_reload_config(
 
 async fn reload_instance(
     instance: BoxInstance,
-    previous: &Value,
+    previous: &str,
     next: &Value,
 ) -> anyhow::Result<(BoxInstance, bool)> {
     instance.shutdown_wait().await;
@@ -511,7 +511,9 @@ async fn reload_instance(
             logging::warn(format_args!(
                 "reload failed, restoring previous configuration: {error:#}"
             ));
-            let restored = start(previous)
+            let previous = serde_json::from_str(previous)
+                .context("decode previous configuration after reload failure")?;
+            let restored = start(&previous)
                 .await
                 .context("restore previous configuration after reload failure")?;
             Ok((restored, false))
@@ -611,8 +613,13 @@ pub async fn run_with_loader(
             signal(SignalKind::hangup())?,
         )
     };
-    let mut root = checked_config(&load()?)?;
-    let mut instance = start(&root).await?;
+    // The instance already keeps the settings needed to compare reloads.
+    // Keep the full last accepted configuration as compact JSON for rollback.
+    let (mut instance, mut applied_json) = {
+        let root = checked_config(&load()?)?;
+        let instance = start(&root).await?;
+        (instance, root.to_string().into_boxed_str())
+    };
     loop {
         #[cfg(unix)]
         let reload = tokio::select! {
@@ -643,9 +650,9 @@ pub async fn run_with_loader(
                 continue;
             }
         };
-        if can_reload_in_place(&root, &next) {
+        if can_reload_in_place(&instance.reload_boundary, &next) {
             match instance.reload_in_place(&next).await {
-                Ok(()) => root = next,
+                Ok(()) => applied_json = next.to_string().into_boxed_str(),
                 Err(error) => {
                     logging::warn(format_args!("hot reload failed: {error:#}"));
                     instance.router().record_rejected_reload(Some(&next));
@@ -653,10 +660,10 @@ pub async fn run_with_loader(
             }
             continue;
         }
-        let (reloaded, accepted) = reload_instance(instance, &root, &next).await?;
+        let (reloaded, accepted) = reload_instance(instance, &applied_json, &next).await?;
         instance = reloaded;
         if accepted {
-            root = next;
+            applied_json = next.to_string().into_boxed_str();
             logging::info(format_args!("configuration reloaded after SIGHUP"));
         }
     }
@@ -730,7 +737,9 @@ mod tests {
         socks_ready(port).await;
         let mut next = old.clone();
         next["inbounds"][0]["tag"] = json!("new");
-        let (instance, accepted) = reload_instance(instance, &old, &next).await.unwrap();
+        let (instance, accepted) = reload_instance(instance, &old.to_string(), &next)
+            .await
+            .unwrap();
         assert!(accepted);
         assert_eq!(instance.inbound_addrs()[0].0, "new");
         socks_ready(port).await;
@@ -741,7 +750,9 @@ mod tests {
             .unwrap()
             .push(json!({"type":"mixed","tag":"busy",
             "listen":"127.0.0.1","listen_port":busy.local_addr().unwrap().port()}));
-        let (instance, accepted) = reload_instance(instance, &next, &broken).await.unwrap();
+        let (instance, accepted) = reload_instance(instance, &next.to_string(), &broken)
+            .await
+            .unwrap();
         assert!(!accepted);
         assert_eq!(instance.inbound_addrs().len(), 1);
         assert_eq!(instance.inbound_addrs()[0].0, "new");
