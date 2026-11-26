@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Rule {
     #[serde(rename = "SrcIPs", default)]
     pub sources: Vec<String>,
@@ -13,7 +13,7 @@ pub struct Rule {
     #[serde(rename = "SrcBits", default)]
     pub source_bits: Vec<u8>,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Destination {
     #[serde(rename = "IP")]
     pub ip: String,
@@ -22,7 +22,7 @@ pub struct Destination {
     #[serde(rename = "Bits", default)]
     pub bits: Option<u8>,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Ports {
     #[serde(rename = "First")]
     pub first: u16,

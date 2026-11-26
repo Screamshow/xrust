@@ -310,6 +310,8 @@ pub fn spawn_tailscale_engine_with_tun(
     let weak = Arc::downgrade(&shared);
     let dns = Arc::clone(&shared.dns);
     tokio::spawn(async move {
+        let tun = tun.map(Arc::new);
+        let mut tun_reader: Option<super::lan::TunReader> = None;
         let mtu = cfg.system_interface_mtu.unwrap_or(1280).min(1280) as usize;
         let mut lan_rules = vec![];
         let mut lan_approved = false;
@@ -370,6 +372,7 @@ pub fn spawn_tailscale_engine_with_tun(
         let mut tun_read_packets = 0u64;
         let mut tun_write_errors = 0u64;
         let mut tun_send_errors = 0u64;
+        let mut tun_tx = Vec::with_capacity(super::mesh::TUN_TX_BATCH);
         let mut busy_cycles = 0u64;
         let mut transport_updated = Instant::now() - Duration::from_secs(2);
 
@@ -377,11 +380,18 @@ pub fn spawn_tailscale_engine_with_tun(
             let now = SmolInstant::now();
             let mut queued_work = false;
             let mut tun_read_healthy = true;
+            let mut reset_tun_reader = false;
 
             // 1. Drain commands
             while let Some(cmd) = woken_cmd.take().or_else(|| internal_cmd_rx.try_recv().ok()) {
+                if let Some(mesh) = &mut mesh {
+                    mesh.finish_udp_tx().await;
+                }
                 match cmd {
-                    Cmd::UpdateForwardingReady { ready } => forwarding_ready = ready,
+                    Cmd::UpdateForwardingReady { ready } => {
+                        reset_tun_reader |= forwarding_ready != ready;
+                        forwarding_ready = ready;
+                    }
                     Cmd::UpdateLocalAddresses { addresses, resp } => {
                         if addresses.is_empty()
                             || addresses.len() > 2
@@ -397,6 +407,7 @@ pub fn spawn_tailscale_engine_with_tun(
                         }
                         // Existing sessions belong to the old local address. Drop
                         // them before permitting any packets for the new identity.
+                        reset_tun_reader = true;
                         tcp_conns.clear();
                         udp_sessions.clear();
                         web = new_web().map(|mut bridge| {
@@ -429,6 +440,7 @@ pub fn spawn_tailscale_engine_with_tun(
                         approved,
                         exit_approved: exit,
                     } => {
+                        reset_tun_reader |= lan_approved != approved || exit_approved != exit;
                         lan_approved = approved;
                         exit_approved = exit;
                         if let Some(web) = &mut web {
@@ -436,6 +448,7 @@ pub fn spawn_tailscale_engine_with_tun(
                         }
                     }
                     Cmd::UpdateAccess { rules } => {
+                        reset_tun_reader |= lan_rules != rules;
                         lan_rules = rules.clone();
                         if let Some(web) = &mut web {
                             web.update_rules(rules);
@@ -558,6 +571,20 @@ pub fn spawn_tailscale_engine_with_tun(
                 }
             }
 
+            if reset_tun_reader {
+                // Discard pending TUN batches when routing authority changes.
+                // Wait for the previous reader before restarting it on this FD.
+                if let Some(reader) = tun_reader.take() {
+                    reader.stop().await;
+                }
+                if forwarding_ready
+                    && mesh.is_some()
+                    && let Some(tun) = &tun
+                {
+                    tun_reader = tun.start_reader(super::mesh::TUN_TX_BATCH);
+                }
+            }
+
             // 2. Pump TCP data from caller to smoltcp sockets
             for conn in tcp_conns.values_mut() {
                 let socket = sockets.get_mut::<TcpSock>(conn.handle);
@@ -592,6 +619,7 @@ pub fn spawn_tailscale_engine_with_tun(
             }
 
             if let Some(mesh) = &mut mesh {
+                tun_send_errors += mesh.take_udp_tx_errors() as u64;
                 if transport_updated.elapsed() >= Duration::from_secs(1) {
                     if let Some(shared) = weak.upgrade() {
                         let mut diagnostics = mesh.diagnostics();
@@ -629,22 +657,54 @@ pub fn spawn_tailscale_engine_with_tun(
                     }
                 }
                 if forwarding_ready && let Some(tun) = &tun {
-                    for index in 0..256 {
-                        match tun.read() {
-                            Ok(Some(packet)) => {
-                                tun_read_packets += 1;
-                                if index == 255 {
-                                    queued_work = true;
+                    if let Some(reader) = &mut tun_reader {
+                        // Keep the same 256-packet fairness budget as the inline path.
+                        const BATCH_BUDGET: usize = 256 / super::mesh::TUN_TX_BATCH;
+                        for index in 0..BATCH_BUDGET {
+                            match reader.try_recv() {
+                                Ok(mut batch) => {
+                                    tun_read_packets += batch.len() as u64;
+                                    tun_send_errors += mesh.send_batch(&mut batch).await as u64;
+                                    queued_work |= index + 1 == BATCH_BUDGET;
                                 }
-                                if mesh.send(packet).await.is_err() {
-                                    tun_send_errors += 1;
+                                Err(mpsc::error::TryRecvError::Disconnected) => {
+                                    tun_read_healthy = false;
+                                    break;
+                                }
+                                Err(mpsc::error::TryRecvError::Empty) => break,
+                            }
+                        }
+                        if !tun_read_healthy {
+                            // The failed reader has released the channel. Join it
+                            // before allowing the next loop to read inline.
+                            if let Some(reader) = tun_reader.take() {
+                                reader.stop().await;
+                            }
+                            queued_work = true;
+                        }
+                    } else {
+                        for index in 0..256 {
+                            match tun.read() {
+                                Ok(Some(packet)) => {
+                                    tun_read_packets += 1;
+                                    if index == 255 {
+                                        queued_work = true;
+                                    }
+                                    tun_tx.push(packet);
+                                    if tun_tx.len() == super::mesh::TUN_TX_BATCH {
+                                        tun_send_errors +=
+                                            mesh.send_batch(&mut tun_tx).await as u64;
+                                    }
+                                }
+                                Ok(None) => break,
+                                Err(_) => {
+                                    tun_read_healthy = false;
+                                    break;
                                 }
                             }
-                            Ok(None) => break,
-                            Err(_) => {
-                                tun_read_healthy = false;
-                                break;
-                            }
+                        }
+                        if !tun_tx.is_empty() {
+                            tun_send_errors += mesh.send_batch(&mut tun_tx).await as u64;
                         }
                     }
                 }
@@ -730,6 +790,9 @@ pub fn spawn_tailscale_engine_with_tun(
             }
 
             if internal_cmd_rx.is_closed() && internal_cmd_rx.is_empty() {
+                if let Some(mesh) = &mut mesh {
+                    mesh.finish_udp_tx().await;
+                }
                 break;
             }
 
@@ -747,7 +810,9 @@ pub fn spawn_tailscale_engine_with_tun(
                     }
                 };
                 let forwarding = async {
-                    if forwarding_ready
+                    if let Some(reader) = &mut tun_reader {
+                        reader.wait().await;
+                    } else if forwarding_ready
                         && tun_read_healthy
                         && let Some(tun) = &tun
                     {

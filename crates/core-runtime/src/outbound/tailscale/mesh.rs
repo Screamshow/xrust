@@ -1,5 +1,8 @@
 //! Bounded WireGuard mesh with direct UDP, disco and DERP.
 mod tsmp;
+mod udp_rx;
+#[cfg(target_os = "linux")]
+mod udp_tx;
 
 use super::control::{PeerObj, parse_key_hex};
 use super::derp_client::RelayManager;
@@ -8,6 +11,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::net::UdpSocket;
@@ -16,6 +20,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const MAX_PENDING: usize = 32;
 const MAX_PEERS: usize = 1024;
 const MAX_IP_PACKET: usize = 1280;
+pub(super) const TUN_TX_BATCH: usize = 64;
 const RETRY: Duration = Duration::from_secs(5);
 const GIVE_UP: Duration = Duration::from_secs(90);
 const REKEY: Duration = Duration::from_secs(120);
@@ -230,7 +235,8 @@ fn disco_packet(private: &StaticSecret, public: [u8; 32], plain: &[u8]) -> io::R
 }
 pub struct DirectMesh {
     disco: StaticSecret,
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
+    udp_rx: udp_rx::Receiver,
     private: StaticSecret,
     public: [u8; 32],
     local: Vec<IpAddr>,
@@ -240,6 +246,8 @@ pub struct DirectMesh {
     connectivity: Option<super::connectivity::Connectivity>,
     more_work: bool,
     network_endpoints: Vec<SocketAddr>,
+    #[cfg(target_os = "linux")]
+    udp_tx: udp_tx::UdpTx,
 }
 
 // Linux reports twice the requested SO_RCVBUF (including kernel accounting).
@@ -298,7 +306,8 @@ impl DirectMesh {
         }
         Ok(Self {
             disco: StaticSecret::from(disco),
-            socket,
+            socket: Arc::new(socket),
+            udp_rx: udp_rx::Receiver::default(),
             public: PublicKey::from(&private).to_bytes(),
             private,
             local,
@@ -308,6 +317,8 @@ impl DirectMesh {
             connectivity: None,
             more_work: false,
             network_endpoints: vec![],
+            #[cfg(target_os = "linux")]
+            udp_tx: udp_tx::UdpTx::default(),
         })
     }
 
@@ -483,8 +494,8 @@ impl DirectMesh {
         self.peers = next;
     }
 
-    pub async fn send(&mut self, packet: Vec<u8>) -> io::Result<()> {
-        let (source, dest, length) = packet_ips(&packet).ok_or_else(|| {
+    fn packet_route(&self, packet: &[u8]) -> io::Result<(IpAddr, usize)> {
+        let (source, dest, length) = packet_ips(packet).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "tailscale: invalid IP packet")
         })?;
         if length > MAX_IP_PACKET {
@@ -504,6 +515,43 @@ impl DirectMesh {
                 "tailscale: invalid source address",
             ));
         }
+        Ok((dest, length))
+    }
+
+    pub(super) async fn send_batch(&mut self, packets: &mut Vec<Vec<u8>>) -> usize {
+        #[cfg(target_os = "linux")]
+        if let Some(errors) = self.send_direct_batch(packets).await {
+            return errors;
+        }
+
+        let mut errors = 0;
+        for packet in packets.drain(..) {
+            errors += usize::from(self.send(packet).await.is_err());
+        }
+        errors
+    }
+
+    // Commands and socket writes outside the bulk path must run after any
+    // accepted batch, including changes to peer mappings and session keys.
+    pub(super) async fn finish_udp_tx(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.udp_tx.finish().await;
+    }
+
+    pub(super) fn take_udp_tx_errors(&mut self) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            self.udp_tx.take_failures()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            0
+        }
+    }
+
+    pub async fn send(&mut self, mut packet: Vec<u8>) -> io::Result<()> {
+        self.finish_udp_tx().await;
+        let (dest, length) = self.packet_route(&packet)?;
         let Some((key, peer)) = self
             .peers
             .iter_mut()
@@ -521,7 +569,8 @@ impl DirectMesh {
                 "tailscale: peer queue full",
             ));
         }
-        peer.pending.push_back(packet[..length].to_vec());
+        packet.truncate(length);
+        peer.pending.push_back(packet);
         Self::flush(
             &self.socket,
             &mut self.relay,
@@ -644,6 +693,7 @@ impl DirectMesh {
 
     /// Drain a bounded number of UDP messages; called by the endpoint's stack task.
     pub async fn poll(&mut self) -> io::Result<Vec<Vec<u8>>> {
+        self.finish_udp_tx().await;
         self.more_work = false;
         if let Some(c) = &mut self.connectivity {
             if let Some(relay) = &mut self.relay {
@@ -666,32 +716,16 @@ impl DirectMesh {
             }
         }
         let mut packets = Vec::new();
-        // Anything over 2048 bytes is dropped below; a longer datagram reads
-        // truncated to 2049 and is dropped the same way. Zeroing 64 KiB on
-        // every poll cost more than the receive itself.
-        let mut buffer = [0; 2049];
         let mut inbound = Vec::new();
-        for index in 0..256 {
-            let (length, endpoint) = match self.socket.try_recv_from(&mut buffer) {
-                Ok(value) => value,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
-            };
-            if index == 255 {
-                self.more_work = true;
-            }
-            if length > 2048 {
-                continue;
-            }
-            if self
+        self.more_work = self.udp_rx.drain_ready(&self.socket, |bytes, endpoint| {
+            if !self
                 .connectivity
                 .as_mut()
-                .is_some_and(|c| c.receive(&buffer[..length], endpoint))
+                .is_some_and(|c| c.receive(bytes, endpoint))
             {
-                continue;
+                inbound.push((bytes.to_vec(), Path::Udp(endpoint), None));
             }
-            inbound.push((buffer[..length].to_vec(), Path::Udp(endpoint), None));
-        }
+        })?;
         if let Some(relay) = &mut self.relay {
             relay.release_idle();
             for index in 0..256 {
@@ -701,7 +735,7 @@ impl DirectMesh {
                 if index == 255 {
                     self.more_work = true;
                 }
-                if packet.packet.len() <= 2048 {
+                if packet.packet.len() <= udp_rx::MAX_DATAGRAM {
                     inbound.push((packet.packet, Path::Derp(region), Some(packet.source)));
                 }
             }
@@ -1351,6 +1385,55 @@ mod tests {
         let response = packet([100, 64, 0, 2], [100, 64, 0, 1], 43);
         b.send(response.clone()).await.unwrap();
         assert_eq!(receive(&mut b, &mut a).await, response);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_batch_keeps_packets_ordered_and_uses_declared_ip_lengths() {
+        let (mut a, mut b) = pair().await;
+        let source = [100, 64, 0, 1];
+        let destination = [100, 64, 0, 2];
+        let initial = packet(source, destination, 42);
+        a.send(initial.clone()).await.unwrap();
+        assert_eq!(receive(&mut a, &mut b).await, initial);
+
+        let expected: Vec<_> = (0..24)
+            .map(|index| {
+                let len = if index % 4 == 3 { 700u16 } else { 1200u16 };
+                let mut ip = packet(source, destination, index);
+                ip.resize(usize::from(len), index);
+                ip[2..4].copy_from_slice(&len.to_be_bytes());
+                ip
+            })
+            .collect();
+        let mut batch = expected.clone();
+        for ip in &mut batch {
+            ip.extend_from_slice(&[0; 15]);
+        }
+        assert_eq!(a.send_direct_batch(&mut batch).await, Some(0));
+        assert!(batch.is_empty());
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while received.len() < expected.len() {
+                b.readable().await.unwrap();
+                received.extend(b.poll().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, expected);
+
+        // A later invalid packet must leave earlier packets untouched for
+        // the ordinary path to validate and consume in their original order.
+        let mut fallback = expected[..4].to_vec();
+        fallback[0].extend_from_slice(&[0; 15]);
+        fallback.insert(1, vec![0]);
+        let original = fallback.clone();
+        assert_eq!(a.send_direct_batch(&mut fallback).await, None);
+        assert_eq!(fallback, original);
+        assert_eq!(a.send_batch(&mut fallback).await, 1);
+        assert!(fallback.is_empty());
     }
 
     #[tokio::test]

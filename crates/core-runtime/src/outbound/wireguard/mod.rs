@@ -2493,7 +2493,7 @@ async fn run(
     }
 }
 
-enum UdpGso {
+pub(super) enum UdpGso {
     #[cfg(target_os = "linux")]
     Disabled,
     Equal,
@@ -2525,7 +2525,7 @@ fn send_datagrams(sock: &UdpSocket, items: &[(SocketAddr, Vec<u8>)], tag: &str, 
 
 /// One `sendmmsg(2)`: how many of `chunk` (1..=SEND_BATCH) the kernel took.
 #[cfg(target_os = "linux")]
-fn send_some(
+pub(super) fn send_some(
     sock: &UdpSocket,
     chunk: &[(SocketAddr, Vec<u8>)],
     gso: &mut UdpGso,

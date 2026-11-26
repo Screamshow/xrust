@@ -1,7 +1,9 @@
 //! Optional Linux TUN for approved subnet forwarding; absent in LuCI-only mode.
 use super::access::{Rule, allows_protocol};
 use smoltcp::wire::IpCidr;
+use std::sync::Arc;
 use std::{io, net::IpAddr};
+use tokio::sync::mpsc;
 
 /// Internet forwarding must not implicitly grant access to LAN, router services
 /// or other tailnet nodes. FakeIP pools are deliberately eligible for Forkop.
@@ -137,23 +139,69 @@ impl LanTun {
         }
         Ok(())
     }
-    pub fn read(&self) -> io::Result<Option<Vec<u8>>> {
+    fn read_packet(fd: &std::os::fd::OwnedFd) -> io::Result<Vec<u8>> {
         use std::os::fd::AsRawFd;
-        match self.fd.try_io(tokio::io::Interest::READABLE, |fd| {
-            let mut bytes = vec![0; 1280];
-            let n = unsafe { libc::read(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) };
-            if n < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN closed"));
-            }
-            bytes.truncate(n as usize);
-            Ok(bytes)
-        }) {
+        let mut bytes = vec![0; 1280];
+        let n = unsafe { libc::read(fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "TUN closed"));
+        }
+        bytes.truncate(n as usize);
+        Ok(bytes)
+    }
+    pub fn read(&self) -> io::Result<Option<Vec<u8>>> {
+        match self
+            .fd
+            .try_io(tokio::io::Interest::READABLE, Self::read_packet)
+        {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
             Err(e) => Err(e),
+        }
+    }
+    pub(super) fn start_reader(self: &Arc<Self>, batch_size: usize) -> Option<TunReader> {
+        if tokio::runtime::Handle::current().metrics().num_workers() == 1 {
+            return None;
+        }
+        Some(self.spawn_reader(batch_size))
+    }
+    fn spawn_reader(self: &Arc<Self>, batch_size: usize) -> TunReader {
+        let tun = Arc::clone(self);
+        let (send, batches) = mpsc::channel(2);
+        let task = tokio::spawn(async move {
+            // Reserve capacity before reading so the reader cannot build an
+            // additional backlog when the mesh is blocked on UDP or DERP.
+            while let Ok(permit) = send.reserve().await {
+                let Ok(mut ready) = tun.fd.readable().await else {
+                    break;
+                };
+                let mut batch = Vec::with_capacity(batch_size);
+                let mut failed = false;
+                for _ in 0..batch_size {
+                    match ready.try_io(|fd| Self::read_packet(fd.get_ref())) {
+                        Ok(Ok(packet)) => batch.push(packet),
+                        Ok(Err(_)) => {
+                            failed = true;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !batch.is_empty() {
+                    permit.send(batch);
+                }
+                if failed {
+                    break;
+                }
+            }
+        });
+        TunReader {
+            batches,
+            pending: None,
+            task,
         }
     }
     pub async fn readable(&self) -> io::Result<()> {
@@ -174,8 +222,43 @@ impl LanTun {
     pub fn read(&self) -> io::Result<Option<Vec<u8>>> {
         Ok(None)
     }
+    pub(super) fn start_reader(self: &Arc<Self>, _: usize) -> Option<TunReader> {
+        None
+    }
     pub async fn readable(&self) -> io::Result<()> {
         std::future::pending().await
+    }
+}
+
+pub(super) struct TunReader {
+    batches: mpsc::Receiver<Vec<Vec<u8>>>,
+    pending: Option<Vec<Vec<u8>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TunReader {
+    pub(super) fn try_recv(&mut self) -> Result<Vec<Vec<u8>>, mpsc::error::TryRecvError> {
+        match self.pending.take() {
+            Some(batch) => Ok(batch),
+            None => self.batches.try_recv(),
+        }
+    }
+
+    pub(super) async fn wait(&mut self) {
+        if self.pending.is_none() {
+            self.pending = self.batches.recv().await;
+        }
+    }
+
+    pub(super) async fn stop(mut self) {
+        self.task.abort();
+        let _ = (&mut self.task).await;
+    }
+}
+
+impl Drop for TunReader {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -205,6 +288,45 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn tun_reader_bounds_backlog_and_drops_pending_batches_on_stop() {
+        use std::time::Duration;
+
+        let (left, right) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        left.set_nonblocking(true).unwrap();
+        let tun = Arc::new(LanTun {
+            fd: tokio::io::unix::AsyncFd::new(std::os::fd::OwnedFd::from(left)).unwrap(),
+        });
+        let reader = tun.spawn_reader(2);
+        for sequence in 0u8..8 {
+            right.send(&[sequence]).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while reader.batches.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        reader.stop().await;
+        assert_eq!(Arc::strong_count(&tun), 1);
+
+        // A full queue prevented any additional packets being read, and
+        // reopening the reader cannot return packets from the old queue.
+        let mut reader = tun.spawn_reader(2);
+        for expected in [[4u8, 5], [6, 7]] {
+            tokio::time::timeout(Duration::from_secs(1), reader.wait())
+                .await
+                .unwrap();
+            assert_eq!(reader.try_recv().unwrap(), expected.map(|byte| vec![byte]));
+        }
+        reader.stop().await;
+        assert_eq!(Arc::strong_count(&tun), 1);
+        assert!(tun.read().unwrap().is_none());
+    }
+
     #[test]
     fn exit_does_not_grant_lan_tailnet_or_special_networks() {
         for ip in [

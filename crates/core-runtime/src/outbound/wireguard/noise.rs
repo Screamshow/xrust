@@ -583,13 +583,13 @@ impl TransportHeader {
 
 /// An assigned transport nonce and its immutable key for exactly one seal.
 /// The endpoint retains all session/rekey state.
-pub(super) struct PreparedSeal {
+pub(in crate::outbound) struct PreparedSeal {
     header: TransportHeader,
     cipher: Arc<ChaChaPoly>,
 }
 
 impl PreparedSeal {
-    pub(super) fn seal(
+    pub(in crate::outbound) fn seal(
         self,
         packet: &[u8],
         padded_len: usize,
@@ -634,6 +634,15 @@ impl Session {
         self.send_counter <= REJECT_AFTER_MESSAGES
     }
 
+    #[cfg(target_os = "linux")]
+    pub(in crate::outbound) fn can_reserve_seals(&self, count: usize) -> bool {
+        count == 0
+            || self
+                .send_counter
+                .checked_add((count - 1) as u64)
+                .is_some_and(|last| last <= REJECT_AFTER_MESSAGES)
+    }
+
     fn reserve_transport(&mut self) -> Option<TransportHeader> {
         if !self.can_seal_transport() {
             return None;
@@ -647,7 +656,7 @@ impl Session {
         })
     }
 
-    pub(super) fn reserve_seal(&mut self) -> Option<PreparedSeal> {
+    pub(in crate::outbound) fn reserve_seal(&mut self) -> Option<PreparedSeal> {
         let header = self.reserve_transport()?;
         Some(PreparedSeal {
             cipher: Arc::clone(&self.send_cipher),
