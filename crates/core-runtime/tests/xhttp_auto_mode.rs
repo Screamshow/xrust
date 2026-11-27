@@ -3,10 +3,9 @@
 //! both in this process.
 //!
 //! Xray resolves `auto` to stream-one under REALITY and to packet-up
-//! otherwise (splithttp/dialer.go). The two are told apart by the TCP
-//! connections the client opens to the server over HTTP/1.1: stream-one
-//! carries the session in one request on one connection, packet-up opens its
-//! download GET and its upload POSTs on connections of their own.
+//! otherwise (splithttp/dialer.go). REALITY uses HTTP/2, where both modes
+//! can carry a session over one TCP connection. With TLS pinned to HTTP/1.1,
+//! packet-up opens separate connections for its GET and POST requests.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -89,6 +88,7 @@ async fn stand(mode: &str, security: Security) -> Stand {
             server_in["tls"] = json!({
                 "enabled": true,
                 "server_name": "www.example.com",
+                "alpn": ["h2"],
                 "reality": {
                     "enabled": true,
                     "private_key": key_b64(&PRIVATE),
@@ -99,7 +99,7 @@ async fn stand(mode: &str, security: Security) -> Stand {
                 "enabled": true,
                 "server_name": "www.example.com",
                 "utls": {"enabled": true, "fingerprint": "chrome"},
-                "alpn": ["http/1.1"],
+                "alpn": ["h2"],
                 "reality": {
                     "enabled": true,
                     "public_key": reality_public(),
@@ -241,12 +241,9 @@ async fn explicit_stream_one_over_reality_is_one_connection() {
 }
 
 #[tokio::test]
-async fn explicit_packet_up_over_reality_stays_packet_up() {
+async fn explicit_packet_up_over_reality_reuses_one_h2_connection() {
     let stand = stand("packet-up", Security::Reality).await;
-    assert!(
-        connections_for_one_session(&stand).await >= 2,
-        "packet-up opens its download and its uploads apart"
-    );
+    assert_eq!(connections_for_one_session(&stand).await, 1);
 }
 
 #[tokio::test]
