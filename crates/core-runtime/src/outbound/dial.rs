@@ -41,11 +41,11 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// `sing/common/network.DefaultFallbackDelay`: how long the first address gets
 /// before the other family starts.
 const DEFAULT_FALLBACK_DELAY: Duration = Duration::from_millis(300);
-/// `C.TCPKeepAliveInitial` and `C.TCPKeepAliveInterval` (sing-box 1.14).
+/// Xray's default idle time and probe interval for outbound TCP keepalive.
 #[cfg_attr(not(unix), allow(dead_code))]
-const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(300);
+const KEEP_ALIVE_IDLE: Duration = Duration::from_secs(45);
 #[cfg_attr(not(unix), allow(dead_code))]
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(75);
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(45);
 /// Go's `net.KeepAliveConfig` sends 9 probes when `Count` is left at zero,
 /// which the reference dialer does.
 #[cfg(unix)]
@@ -1353,13 +1353,12 @@ mod tests {
         }
     }
 
-    /// A dialed socket carries the reference's keep-alive whether or not
-    /// any dial option sends it down the socket-options path: 300 s idle,
-    /// 75 s interval, 9 probes; `disable_tcp_keep_alive` turns it off, and
-    /// zero durations fall back to the defaults.
+    /// Both dial paths use the 45-second idle time and probe interval by
+    /// default. Explicit overrides replace either timer. Zero durations
+    /// use the defaults, and `disable_tcp_keep_alive` turns probes off.
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn dialed_sockets_carry_the_reference_keep_alive() {
+    async fn dialed_sockets_apply_keep_alive_defaults_and_overrides() {
         use std::os::fd::AsRawFd;
         let get = |stream: &TcpStream, level: libc::c_int, name: libc::c_int| {
             let mut value: libc::c_int = 0;
@@ -1386,14 +1385,14 @@ mod tests {
             }
         });
         let cases = [
-            (DialOptions::default(), Some((300, 75))),
+            (DialOptions::default(), Some((45, 45))),
             (
                 // an unrelated option takes the socket-options path
                 DialOptions {
                     reuse_addr: true,
                     ..Default::default()
                 },
-                Some((300, 75)),
+                Some((45, 45)),
             ),
             (
                 DialOptions {
@@ -1401,7 +1400,15 @@ mod tests {
                     tcp_keep_alive_interval: Some(Duration::from_millis(1500)),
                     ..Default::default()
                 },
-                Some((300, 2)),
+                Some((45, 2)),
+            ),
+            (
+                DialOptions {
+                    tcp_keep_alive: Some(Duration::from_secs(30)),
+                    tcp_keep_alive_interval: Some(Duration::from_secs(15)),
+                    ..Default::default()
+                },
+                Some((30, 15)),
             ),
             (
                 DialOptions {
@@ -1429,12 +1436,11 @@ mod tests {
     }
 
     #[test]
-    fn keep_alive_defaults_to_the_reference_pair_and_off_means_off() {
+    fn keep_alive_defaults_to_45_seconds_and_can_be_disabled() {
         let default = DialOptions::default();
         assert_eq!(
             default.keep_alive(),
-            Some((KEEP_ALIVE_IDLE, KEEP_ALIVE_INTERVAL)),
-            "the reference enables keep-alive with its own idle and interval"
+            Some((Duration::from_secs(45), Duration::from_secs(45)))
         );
         let off = DialOptions {
             disable_tcp_keep_alive: true,
