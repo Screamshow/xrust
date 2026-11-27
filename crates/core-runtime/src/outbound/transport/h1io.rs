@@ -41,6 +41,7 @@ pub(crate) struct Head {
     pub framing: Framing,
     /// The connection cannot carry another request.
     pub close: bool,
+    gzip: bool,
 }
 
 const MAX_HEAD: usize = 16 * 1024;
@@ -162,6 +163,7 @@ fn parse_head(raw: &[u8]) -> io::Result<Head> {
     let mut chunked = false;
     let mut content_length: Option<u64> = None;
     let mut close = false;
+    let mut gzip = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -183,6 +185,9 @@ fn parse_head(raw: &[u8]) -> io::Result<Head> {
                 })?);
             }
             "connection" => close = value.to_ascii_lowercase().contains("close"),
+            "content-encoding" if gzip.is_none() => {
+                gzip = Some(value.eq_ignore_ascii_case("gzip"));
+            }
             _ => {}
         }
     }
@@ -204,6 +209,7 @@ fn parse_head(raw: &[u8]) -> io::Result<Head> {
         status,
         framing,
         close: close || framing == Framing::UntilClose,
+        gzip: gzip.unwrap_or(false),
     })
 }
 
@@ -233,6 +239,7 @@ pub(crate) struct Body {
     pending: BytesMut,
     /// the head said the connection is spent, whatever the framing says
     close: bool,
+    gzip: bool,
 }
 
 impl Body {
@@ -250,7 +257,12 @@ impl Body {
             // a body that runs to the close spends the connection even when the
             // head did not say so
             close: head.close || head.framing == Framing::UntilClose,
+            gzip: head.gzip,
         }
+    }
+
+    pub(crate) fn is_gzip(&self) -> bool {
+        self.gzip
     }
 
     /// Take the connection back out. `None` while the body still owes bytes, and
@@ -496,22 +508,20 @@ fn find_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(2).position(|w| w == b"\r\n")
 }
 
-/// One-shot exchange: write the request with a `Content-Length` body, then read
-/// the response head. The body is handed back unconsumed — the caller wraps it
-/// into a [`Body`] when it wants the bytes (a download) and drains it when it
-/// only wants the connection back (an upload).
-pub(crate) async fn send(
+/// Submit a fixed-length request, leaving its response unread.
+pub(crate) async fn write_request(
     io: &mut AnyStream,
     request: &http::Request<()>,
     host: &str,
     body: &[u8],
     close: bool,
-) -> io::Result<(Head, BytesMut)> {
-    let framing = if body.is_empty() {
-        Framing::None
-    } else {
-        Framing::Length(body.len() as u64)
-    };
+) -> io::Result<()> {
+    let framing =
+        if !body.is_empty() || matches!(request.method().as_str(), "POST" | "PUT" | "PATCH") {
+            Framing::Length(body.len() as u64)
+        } else {
+            Framing::None
+        };
     let mut head = Vec::with_capacity(256);
     write_head(&mut head, request, host, framing, close);
     io.write_all(&head).await?;
@@ -524,23 +534,7 @@ pub(crate) async fn send(
         request.method(),
         request.uri()
     ));
-    let out = read_head(io).await;
-    match &out {
-        Ok((head, _)) => crate::logging::debug(format_args!(
-            "h1: << {} {} -> status={} framing={:?} close={}",
-            request.method(),
-            request.uri(),
-            head.status,
-            head.framing,
-            head.close
-        )),
-        Err(e) => crate::logging::debug(format_args!(
-            "h1: << head err for {} {}: {e}",
-            request.method(),
-            request.uri()
-        )),
-    }
-    out
+    Ok(())
 }
 
 /// Chunked framing for one body write: `<hex len>\r\n<payload>\r\n`.
@@ -853,6 +847,7 @@ mod tests {
             status: 403,
             framing: Framing::Length(0),
             close: false,
+            gzip: false,
         };
         let e = expect_ok(&refused, "upload")
             .expect_err("refused")
@@ -862,6 +857,7 @@ mod tests {
             status: 200,
             framing: Framing::Length(0),
             close: false,
+            gzip: false,
         };
         assert!(expect_ok(&fine, "upload").is_ok());
     }
@@ -886,6 +882,7 @@ mod tests {
             status: 200,
             framing,
             close: false,
+            gzip: false,
         };
         let (io, peer) = tokio::io::duplex(1);
         drop(peer);

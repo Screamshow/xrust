@@ -206,7 +206,7 @@ fn version_is_the_shape_forkop_parses() {
     // ones go at the end
     assert!(
         lines.contains(
-            &"Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended,outbound.transport-mark,transport.xhttp.split,transport.grpc.multi,tls.xray-pins,tls.verify-name"
+            &"Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,transport.xhttp.http3,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended,outbound.transport-mark,transport.xhttp.split,transport.grpc.multi,tls.xray-pins,tls.verify-name"
         ),
         "{said}"
     );

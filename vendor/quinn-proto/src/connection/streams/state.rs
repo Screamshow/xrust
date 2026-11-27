@@ -1,5 +1,5 @@
 use std::{
-    collections::{VecDeque, hash_map},
+    collections::{hash_map, VecDeque},
     convert::TryFrom,
     mem,
 };
@@ -13,12 +13,57 @@ use super::{
     StreamHalf, ThinRetransmits,
 };
 use crate::{
-    Dir, MAX_STREAM_COUNT, Side, StreamId, TransportError, VarInt,
     coding::BufMutExt,
     connection::stats::FrameStats,
     frame::{self, FrameStruct, StreamMetaVec},
     transport_parameters::TransportParameters,
+    Dir, Duration, Instant, Side, StreamId, TransportError, VarInt, MAX_STREAM_COUNT,
 };
+
+/// Receive-window epoch for the opt-in QUIC profile. Advance it after
+/// consuming over half the last window. Rapid consumers get more credit up
+/// to the configured ceiling, according to the quic-go tuning rule.
+#[derive(Debug)]
+pub(super) struct WindowEpoch {
+    at: Instant,
+    consumed: u64,
+}
+
+impl WindowEpoch {
+    pub(super) fn start(at: Instant, consumed: u64) -> Self {
+        Self { at, consumed }
+    }
+
+    pub(super) fn grow(
+        &mut self,
+        now: Instant,
+        rtt: Duration,
+        consumed: u64,
+        current: u64,
+        ceiling: u64,
+    ) -> u64 {
+        let bytes = consumed.saturating_sub(self.consumed);
+        if bytes <= current / 2 || current >= ceiling || rtt.is_zero() {
+            return current;
+        }
+        let fraction = bytes as f64 / current as f64;
+        let fast = now.saturating_duration_since(self.at).as_secs_f64()
+            < 4.0 * fraction * rtt.as_secs_f64();
+        *self = Self::start(now, consumed);
+        if fast {
+            current.saturating_mul(2).min(ceiling)
+        } else {
+            current
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WindowLimits {
+    stream: u64,
+    connection: u64,
+    epoch: Option<WindowEpoch>,
+}
 
 /// Wrapper around `Recv` that facilitates reusing `Recv` instances
 #[derive(Debug)]
@@ -112,6 +157,7 @@ pub struct StreamsState {
     pub(super) max_data: u64,
     /// The initial receive window
     receive_window: u64,
+    window_limits: Option<Box<WindowLimits>>,
     /// Limit on incoming data, which is transmitted through `MAX_DATA` frames
     local_max_data: u64,
     /// The last value of `MAX_DATA` which had been queued for transmission in
@@ -174,6 +220,7 @@ impl StreamsState {
             connection_blocked: Vec::new(),
             max_data: 0,
             receive_window: receive_window.into(),
+            window_limits: None,
             local_max_data: receive_window.into(),
             sent_max_data: receive_window,
             data_sent: 0,
@@ -254,13 +301,33 @@ impl StreamsState {
         self.data_blocked_limit = None;
     }
 
-    /// Process incoming stream frame
-    ///
-    /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
-    pub(crate) fn received(
+    pub(in crate::connection) fn tune_receive_windows(&mut self, limits: Option<(VarInt, VarInt)>) {
+        self.window_limits = limits.map(|(stream, connection)| {
+            Box::new(WindowLimits {
+                stream: stream.into(),
+                connection: connection.into(),
+                epoch: None,
+            })
+        });
+    }
+
+    #[cfg(test)]
+    fn received(
         &mut self,
         frame: frame::Stream,
         payload_len: usize,
+    ) -> Result<ShouldTransmit, TransportError> {
+        self.received_at(frame, payload_len, Instant::now())
+    }
+
+    /// Process incoming stream frame
+    ///
+    /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
+    pub(crate) fn received_at(
+        &mut self,
+        frame: frame::Stream,
+        payload_len: usize,
+        now: Instant,
     ) -> Result<ShouldTransmit, TransportError> {
         let id = frame.id;
         self.validate_receive_id(id).inspect_err(|_e| {
@@ -284,8 +351,17 @@ impl StreamsState {
             return Ok(ShouldTransmit(false));
         }
 
+        let first_data = rs.end == 0;
         let (new_bytes, closed) =
             rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data)?;
+        if let Some(limits) = self.window_limits.as_mut().filter(|_| new_bytes > 0) {
+            if self.data_recvd == 0 {
+                limits.epoch = Some(WindowEpoch::start(now, 0));
+            }
+            if first_data && !rs.stopped {
+                rs.start_tuning(now, self.stream_receive_window);
+            }
+        }
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
         if !rs.stopped {
@@ -441,7 +517,9 @@ impl StreamsState {
         retransmits: &mut ThinRetransmits,
         stats: &mut FrameStats,
         max_size: usize,
+        timing: (Instant, Duration),
     ) {
+        let (now, rtt) = timing;
         // RESET_STREAM
         while buf.len() + frame::ResetStream::SIZE_BOUND < max_size {
             let (id, error_code) = match pending.reset_stream.pop() {
@@ -489,6 +567,19 @@ impl StreamsState {
         if pending.max_data && buf.len() + 9 < max_size {
             pending.max_data = false;
 
+            if let Some((ceiling, epoch)) = self.window_limits.as_mut().and_then(|limits| {
+                limits
+                    .epoch
+                    .as_mut()
+                    .map(|epoch| (limits.connection, epoch))
+            }) {
+                let consumed = self.local_max_data.saturating_sub(self.receive_window);
+                let grown = epoch.grow(now, rtt, consumed, self.receive_window, ceiling);
+                if grown > self.receive_window {
+                    self.set_receive_window(VarInt::try_from(grown).unwrap_or(VarInt::MAX));
+                }
+            }
+
             // `local_max_data` can grow bigger than `VarInt`.
             // For transmission inside QUIC frames we need to clamp it to the
             // maximum allowed `VarInt` size.
@@ -509,6 +600,7 @@ impl StreamsState {
         }
 
         // MAX_STREAM_DATA
+        let mut min_connection_window = self.receive_window;
         while buf.len() + 17 < max_size {
             let id = match pending.max_stream_data.iter().next() {
                 Some(x) => *x,
@@ -529,6 +621,14 @@ impl StreamsState {
             }
             retransmits.get_or_create().max_stream_data.insert(id);
 
+            if let Some(limits) = &self.window_limits {
+                if let Some(grown) = rs.grow_receive_window(now, rtt, limits.stream) {
+                    // Go keeps the connection window at least 1.5 times the
+                    // growing stream window, subject to its independent ceiling.
+                    min_connection_window =
+                        min_connection_window.max((grown + grown / 2).min(limits.connection));
+                }
+            }
             let (max, _) = rs.max_stream_data(self.stream_receive_window);
             rs.record_sent_max_stream_data(max);
 
@@ -537,6 +637,15 @@ impl StreamsState {
             buf.write(id);
             buf.write_var(max);
             stats.max_stream_data += 1;
+        }
+
+        if min_connection_window > self.receive_window {
+            self.set_receive_window(VarInt::try_from(min_connection_window).unwrap_or(VarInt::MAX));
+            let consumed = self.local_max_data.saturating_sub(self.receive_window);
+            if let Some(limits) = &mut self.window_limits {
+                limits.epoch = Some(WindowEpoch::start(now, consumed));
+            }
+            pending.max_data = true;
         }
 
         // MAX_STREAMS
@@ -550,7 +659,8 @@ impl StreamsState {
             self.sent_max_remote[dir as usize] = self.max_remote[dir as usize];
             trace!(
                 value = self.max_remote[dir as usize],
-                "MAX_STREAMS ({:?})", dir
+                "MAX_STREAMS ({:?})",
+                dir
             );
             buf.write(match dir {
                 Dir::Uni => frame::FrameType::MAX_STREAMS_UNI,
@@ -982,7 +1092,8 @@ impl StreamsState {
         // the decision, to accommodate for connection using bigger windows requiring
         // less updates.
         let diff = self.local_max_data - self.sent_max_data.into_inner();
-        ShouldTransmit(diff >= (self.receive_window / 8))
+        let divisor = if self.window_limits.is_some() { 4 } else { 8 };
+        ShouldTransmit(diff >= self.receive_window / divisor)
     }
 
     /// Update counters for removal of a stream
@@ -1046,8 +1157,8 @@ pub(super) fn get_or_insert_recv(
 mod tests {
     use super::*;
     use crate::{
-        ReadableError, RecvStream, SendStream, TransportErrorCode, WriteError,
-        connection::State as ConnState, connection::Streams,
+        connection::State as ConnState, connection::Streams, ReadableError, RecvStream, SendStream,
+        TransportErrorCode, WriteError,
     };
     use bytes::Bytes;
 
@@ -1509,12 +1620,10 @@ mod tests {
 
         let error_code = 0u32.into();
         stream.state.received_stop_sending(id, error_code);
-        assert!(
-            stream
-                .state
-                .events
-                .contains(&StreamEvent::Stopped { id, error_code })
-        );
+        assert!(stream
+            .state
+            .events
+            .contains(&StreamEvent::Stopped { id, error_code }));
         stream.state.events.clear();
 
         assert_eq!(stream.write(&[]), Err(WriteError::Stopped(error_code)));
@@ -2077,6 +2186,18 @@ mod tests {
             assert_eq!(client.max_remote[Dir::Uni as usize], 200);
             assert_eq!(client.max_remote[Dir::Bi as usize], 201);
         }
+    }
+
+    #[test]
+    fn receive_window_tuning_grows_only_when_fast_and_caps_growth() {
+        let start = Instant::now();
+        let rtt = Duration::from_millis(40);
+        let mut epoch = WindowEpoch::start(start, 0);
+        let clipped = epoch.grow(start + rtt, rtt, 600, 1000, 1500);
+        assert_eq!(clipped, 1500);
+        assert_eq!(epoch.grow(start + rtt * 2, rtt, 1200, 1500, 3000), 1500);
+        assert_eq!(epoch.grow(start + rtt * 20, rtt, 1400, 1500, 3000), 1500);
+        assert_eq!(epoch.grow(start + rtt * 21, rtt, 2400, 1500, 3000), 3000);
     }
 
     #[test]

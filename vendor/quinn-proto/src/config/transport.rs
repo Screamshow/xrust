@@ -8,8 +8,8 @@ use qlog::streamer::QlogStreamer;
 #[cfg(feature = "qlog")]
 use crate::QlogStream;
 use crate::{
-    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
-    connection::qlog::QlogSink,
+    congestion, connection::qlog::QlogSink, Duration, VarInt, VarIntBoundsExceeded, INITIAL_MTU,
+    MAX_UDP_PAYLOAD,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -30,6 +30,7 @@ pub struct TransportConfig {
     pub(crate) max_idle_timeout: Option<VarInt>,
     pub(crate) stream_receive_window: VarInt,
     pub(crate) receive_window: VarInt,
+    pub(crate) receive_window_limits: Option<(VarInt, VarInt)>,
     pub(crate) send_window: u64,
     pub(crate) send_fairness: bool,
 
@@ -129,6 +130,17 @@ impl TransportConfig {
     /// stream while another is blocked.
     pub fn receive_window(&mut self, value: VarInt) -> &mut Self {
         self.receive_window = value;
+        self
+    }
+
+    /// Opt in to RTT-based receive-window tuning, with separate stream and
+    /// connection caps. Initial credit still comes from the usual window setters.
+    pub fn receive_window_limits(
+        &mut self,
+        max_stream: VarInt,
+        max_connection: VarInt,
+    ) -> &mut Self {
+        self.receive_window_limits = Some((max_stream, max_connection));
         self
     }
 
@@ -397,8 +409,8 @@ impl Default for TransportConfig {
     fn default() -> Self {
         const EXPECTED_RTT: u32 = 100; // ms
         const MAX_STREAM_BANDWIDTH: u32 = 12500 * 1000; // bytes/s
-        // Window size needed to avoid pipeline
-        // stalls
+                                                        // Window size needed to avoid pipeline
+                                                        // stalls
         const STREAM_RWND: u32 = MAX_STREAM_BANDWIDTH / 1000 * EXPECTED_RTT;
 
         Self {
@@ -408,6 +420,7 @@ impl Default for TransportConfig {
             max_idle_timeout: Some(VarInt(30_000)),
             stream_receive_window: STREAM_RWND.into(),
             receive_window: VarInt::MAX,
+            receive_window_limits: None,
             send_window: (8 * STREAM_RWND).into(),
             send_fairness: true,
 
@@ -449,6 +462,7 @@ impl fmt::Debug for TransportConfig {
             max_idle_timeout,
             stream_receive_window,
             receive_window,
+            receive_window_limits,
             send_window,
             send_fairness,
             packet_threshold,
@@ -481,6 +495,7 @@ impl fmt::Debug for TransportConfig {
             .field("max_idle_timeout", max_idle_timeout)
             .field("stream_receive_window", stream_receive_window)
             .field("receive_window", receive_window)
+            .field("receive_window_limits", receive_window_limits)
             .field("send_window", send_window)
             .field("send_fairness", send_fairness)
             .field("packet_threshold", packet_threshold)

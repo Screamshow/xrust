@@ -7,6 +7,8 @@ pub(crate) mod h1io;
 pub(crate) mod h2io;
 mod http;
 pub(crate) mod xhttp;
+mod xhttp_gzip;
+mod xhttp_h3;
 pub(crate) mod xmux;
 
 use std::future::Future;
@@ -407,24 +409,11 @@ impl Transport {
                 let dialer = self.dialer(tls, server, port, dial);
                 return cfg.connect_split(tls, server, port, dial, dialer).await;
             }
-            match cfg.connect_h2_stream(tls, server, port, dial).await? {
-                xhttp::H2Connect::Stream(stream) => return Ok(stream),
-                xhttp::H2Connect::Fallback(stream) => {
-                    let has_reality = tls.and_then(|t| t.reality()).is_some();
-                    let dialer = self.dialer(tls, server, port, dial);
-                    let stream = xhttp::connect(
-                        stream,
-                        tls.is_some(),
-                        has_reality,
-                        server,
-                        port,
-                        cfg,
-                        dialer,
-                    )
-                    .await?;
-                    return Ok(stream);
-                }
-                xhttp::H2Connect::Skip => {}
+            if let Some(tls) = tls.filter(|tls| xhttp_h3::selected(Some(tls))) {
+                return cfg.connect_h3(tls, server, port, dial).await;
+            }
+            if let Some(tls) = tls.filter(|tls| !cfg.h1_only(Some(tls))) {
+                return cfg.connect_h2_stream(tls, server, port, dial).await;
             }
         }
 
@@ -609,6 +598,11 @@ impl Transport {
         port: u16,
         dial: &crate::outbound::dial::DialOptions,
     ) -> io::Result<AnyStream> {
+        if matches!(&self.kind, Kind::Xhttp(_)) && xhttp_h3::selected(tls) {
+            return Err(io::Error::other(
+                "xhttp: HTTP/3 requires a UDP dial, not a connected TCP stream",
+            ));
+        }
         let tls_forced = self.h1_forced_tls(tls);
         let tls = tls_forced.as_ref().or(tls);
         let default_alpn = self.default_alpn(tls.is_some());
@@ -702,12 +696,18 @@ impl Transport {
                 .await?
             }
             Kind::Xhttp(cfg) => {
-                let dialer = self.dialer(tls, server, port, dial);
+                let reality = tls.and_then(TlsOptions::reality).is_some();
+                let dialer = match tls.filter(|_| xhttp::uses_h2(&stream, reality)) {
+                    Some(tls) => xhttp::h2_dialer(tls, server, port, dial),
+                    None => self.dialer(tls, server, port, dial),
+                };
                 xhttp::connect(
                     stream,
                     tls.is_some(),
-                    tls.and_then(|t| t.reality()).is_some(),
-                    server,
+                    reality,
+                    tls.map(TlsOptions::server_name)
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(server),
                     port,
                     cfg,
                     dialer,

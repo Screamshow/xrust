@@ -76,34 +76,43 @@ async fn preserves_large_upload_under_backpressure_and_reports_rejection() {
                     scheme: "https".into(), authority: "local".into(),
                     session_id: "session".into(), seq: 0,
                     dialer: std::sync::Arc::new(|| Box::pin(async { Err(io::Error::other("must not use H1")) })),
-                    h2_client: Some(client),
+                    h2_client: Some(super::H2PacketClient {
+                        sender: client,
+                        redial: None,
+                        replacement: None,
+                    }),
                     first_connection: None,
+                    h1_client: None,
+                    h3_client: None,
                 };
                 let worker = tokio::spawn(packet_upload_worker(reader, writer, failure.clone(), flushed.clone(), std::sync::Arc::new(tokio::sync::Notify::new())));
                 let data: Vec<u8> = (0..2_100_013).map(|i| (i % 251) as u8).collect();
                 let written = input.write_all(&data).await;
                 drop(input);
                 worker.await.unwrap();
+                let mut ordered = std::collections::BTreeMap::new();
+                while let Ok((seq, chunk, status)) = seen_rx.try_recv() {
+                    assert!(ordered.insert(seq, (chunk, status)).is_none(), "POST replayed");
+                }
                 let mut received = Vec::new();
                 let mut seq = 0;
                 let mut accepted = 0;
-                loop {
-                    let (actual_seq, chunk, status) = seen_rx.recv().await.unwrap();
-                    assert_eq!(actual_seq, seq);
+                while let Some((chunk, status)) = ordered.remove(&seq) {
                     received.extend_from_slice(&chunk);
                     seq += 1;
                     if status != 200 { break; }
                     accepted += chunk.len();
-                    if accepted == data.len() { break; }
                 }
                 assert_eq!(received, data[..received.len()]);
-                assert_eq!(flushed.load(std::sync::atomic::Ordering::Acquire), accepted as u64);
+                let confirmed = flushed.load(std::sync::atomic::Ordering::Acquire);
                 if reject {
                     assert_eq!(seq, 2);
+                    assert!(confirmed <= accepted as u64);
                     assert!(failure.error().unwrap().to_string().contains("403"));
                 } else {
                     written.unwrap();
                     assert_eq!(received, data);
+                    assert_eq!(confirmed, accepted as u64);
                     assert!(failure.error().is_none());
                 }
                 driver.abort(); server.abort();

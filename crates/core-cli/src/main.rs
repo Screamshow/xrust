@@ -56,7 +56,7 @@ fn version_line() -> String {
     let version = env!("CARGO_PKG_VERSION");
     format!(
         "xrust version {version}\n\
-         Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended,outbound.transport-mark,transport.xhttp.split,transport.grpc.multi,tls.xray-pins,tls.verify-name\n\
+         Features: transport.xhttp,transport.xhttp.http1,transport.xhttp.http2,transport.xhttp.http3,outbound.trojan,outbound.vless.encryption,sniff.bittorrent-extended,outbound.transport-mark,transport.xhttp.split,transport.grpc.multi,tls.xray-pins,tls.verify-name\n\
          Tags: with_utls,with_clash_api,with_tailscale\n"
     )
 }

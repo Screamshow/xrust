@@ -159,6 +159,13 @@ use brutal::BrutalConfig;
 #[cfg(test)]
 mod brutal_wire_tests;
 
+pub(crate) fn xhttp_brutal_controller(
+    bytes_per_second: u64,
+    compensate_loss: bool,
+) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
+    Arc::new(BrutalConfig::new(bytes_per_second).loss_compensation(compensate_loss))
+}
+
 /// Parsed `QUICOutFields` with per-protocol defaults applied at build time.
 #[derive(Debug)]
 pub(crate) struct QuicTunnelOptions {

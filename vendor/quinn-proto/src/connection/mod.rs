@@ -10,14 +10,11 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
-use rand::{RngExt, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, RngExt, SeedableRng};
 use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
-    MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
-    TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
     cid_queue::CidQueue,
     coding::BufMutExt,
@@ -35,6 +32,9 @@ use crate::{
     },
     token::{ResetToken, Token, TokenPayload},
     transport_parameters::TransportParameters,
+    Dir, Duration, EndpointConfig, Frame, Instant, Side, StreamId, TokenStore, Transmit,
+    TransportError, TransportErrorCode, VarInt, INITIAL_MTU, MAX_CID_SIZE, MAX_STREAM_COUNT,
+    MIN_INITIAL_SIZE, TIMER_GRANULARITY,
 };
 
 mod ack_frequency;
@@ -365,6 +365,10 @@ impl Connection {
             stats: ConnectionStats::default(),
             version,
         };
+        if this.config.receive_window_limits.is_some() {
+            this.streams
+                .tune_receive_windows(this.config.receive_window_limits);
+        }
         if path_validated {
             this.on_path_validated();
         }
@@ -823,7 +827,9 @@ impl Connection {
                         buf,
                         &mut self.stats,
                         buf_capacity,
-                        self.config.chrome_initial && self.side.is_client() && space_id != SpaceId::Data,
+                        self.config.chrome_initial
+                            && self.side.is_client()
+                            && space_id != SpaceId::Data,
                     );
                 }
 
@@ -961,9 +967,7 @@ impl Connection {
             // Keep both the Handshake ACK and Finished in their own batches.
             // Neither tiny packet may set the GSO segment size for the queued
             // CRYPTO / application data, which must retain the normal MTU.
-            if self.config.chrome_initial
-                && self.side.is_client()
-                && space_id == SpaceId::Handshake
+            if self.config.chrome_initial && self.side.is_client() && space_id == SpaceId::Handshake
             {
                 break;
             }
@@ -976,10 +980,12 @@ impl Connection {
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
                 // xrust: the full send size when asked for it
-                builder.pad_to(self.initial_padding(
-                    segment_size,
-                    buf_capacity >= datagram_start + segment_size,
-                ));
+                builder.pad_to(
+                    self.initial_padding(
+                        segment_size,
+                        buf_capacity >= datagram_start + segment_size,
+                    ),
+                );
             }
 
             // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
@@ -1831,7 +1837,8 @@ impl Connection {
             self.stats.path.lost_bytes += size_of_lost_packets;
             trace!(
                 "packets lost: {:?}, bytes lost: {}",
-                lost_packets, size_of_lost_packets
+                lost_packets,
+                size_of_lost_packets
             );
 
             for &packet in &lost_packets {
@@ -2873,7 +2880,11 @@ impl Connection {
                     self.read_crypto(SpaceId::Data, &frame, payload_len)?;
                 }
                 Frame::Stream(frame) => {
-                    if self.streams.received(frame, payload_len)?.should_transmit() {
+                    if self
+                        .streams
+                        .received_at(frame, payload_len, now)?
+                        .should_transmit()
+                    {
                         self.spaces[SpaceId::Data].pending.max_data = true;
                     }
                 }
@@ -3225,9 +3236,8 @@ impl Connection {
         pn: u64,
     ) -> SentFrames {
         let mut sent = SentFrames::default();
-        let chrome_handshake = self.config.chrome_initial
-            && self.side.is_client()
-            && space_id != SpaceId::Data;
+        let chrome_handshake =
+            self.config.chrome_initial && self.side.is_client() && space_id != SpaceId::Data;
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();
@@ -3340,9 +3350,8 @@ impl Connection {
         }
 
         // CRYPTO
-        let chrome = self.config.chrome_initial
-            && self.side.is_client()
-            && space_id == SpaceId::Initial;
+        let chrome =
+            self.config.chrome_initial && self.side.is_client() && space_id == SpaceId::Initial;
         if chrome && !space.pending.crypto.is_empty() {
             let (frames, pings) =
                 chrome_initial::write(&mut space.pending.crypto, buf, max_size, &mut self.rng);
@@ -3398,6 +3407,7 @@ impl Connection {
                 &mut sent.retransmits,
                 &mut self.stats.frame_tx,
                 max_size,
+                (now, self.path.rtt.get()),
             );
         }
 

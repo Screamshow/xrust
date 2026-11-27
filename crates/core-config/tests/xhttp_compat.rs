@@ -17,7 +17,8 @@ fn xhttp_session_id_space_counts_the_whole_range() {
         ("ab", "1-30", false),
         ("a", "1-100", false),
         ("Base62", "0-8", false),
-        ("Base62", "8-4", false),
+        ("Base62", "8-4", true),
+        ("яф", "32", false),
         ("Base62", "4-bad", false),
     ] {
         for (table_key, length_key) in [
@@ -78,4 +79,41 @@ fn xhttp_accepts_extended_options_and_numbers() {
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     );
     assert_eq!(core_config::xhttp_session_table("number"), "0123456789");
+}
+
+#[test]
+fn xhttp_accepts_http3_only_on_upload_and_download() {
+    for alpn in [serde_json::json!("h3"), serde_json::json!(["h3"])] {
+        let mut config = serde_json::json!({
+            "outbounds": [{
+                "type": "vless",
+                "tag": "proxy",
+                "server": "127.0.0.1",
+                "server_port": 443,
+                "uuid": "00000000-0000-0000-0000-000000000001",
+                "tls": {"enabled": true, "alpn": alpn},
+                "transport": {"type": "xhttp"}
+            }]
+        });
+        check_str(&config.to_string()).unwrap();
+        config["outbounds"][0]["tls"]["max_version"] = serde_json::json!("1.2");
+        let error = check_str(&config.to_string()).unwrap_err();
+        assert!(
+            error.contains("XHTTP over HTTP/3 requires TLS 1.3"),
+            "{error}"
+        );
+        config["outbounds"][0]["tls"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_version");
+        let outbound = &mut config["outbounds"][0];
+        let tls = outbound["tls"].take();
+        outbound["transport"]["download_settings"] = serde_json::json!({
+            "server": "127.0.0.1",
+            "server_port": 443,
+            "tls": tls,
+            "transport": {"type": "xhttp"}
+        });
+        check_str(&config.to_string()).unwrap();
+    }
 }

@@ -204,6 +204,8 @@ pub(crate) struct H2Stream {
     write_chunk: usize,
     report: usize,
     eof: bool,
+    request_gzip: bool,
+    gzip: Option<Box<super::xhttp_gzip::H2Decoder>>,
     /// `None` when a shared owner drives the connection, as mux does
     conn_task: Option<JoinHandle<()>>,
 }
@@ -225,6 +227,11 @@ impl H2Stream {
         self
     }
 
+    pub(crate) fn with_gzip(mut self, requested: bool) -> Self {
+        self.request_gzip = requested;
+        self
+    }
+
     pub(crate) fn shared(response: ResponseFuture, send: h2::SendStream<Bytes>) -> Self {
         Self::build(response, send, None)
     }
@@ -242,6 +249,8 @@ impl H2Stream {
             write_chunk: WRITE_CHUNK,
             report: 0,
             eof: true,
+            request_gzip: false,
+            gzip: None,
             conn_task: None,
         }
     }
@@ -267,6 +276,8 @@ impl H2Stream {
             write_chunk: WRITE_CHUNK,
             report: 0,
             eof: false,
+            request_gzip: false,
+            gzip: None,
             conn_task,
         }
     }
@@ -298,6 +309,8 @@ impl H2Stream {
             write_chunk: WRITE_CHUNK,
             report: 0,
             eof: false,
+            request_gzip: false,
+            gzip: None,
             conn_task,
         }
     }
@@ -531,11 +544,25 @@ impl H2Stream {
                         resp.status()
                     ))));
                 }
+                if self.request_gzip
+                    && super::xhttp_gzip::encoded(resp.headers())
+                    && !resp.body().is_end_stream()
+                {
+                    self.gzip = Some(Box::new(super::xhttp_gzip::H2Decoder::new()));
+                }
                 self.recv = Some(resp.into_body());
                 self.response = None;
             }
 
             let recv = self.recv.as_mut().expect("recv set above");
+            if let Some(gzip) = &mut self.gzip {
+                let result = gzip.poll_read(cx, recv, out, false);
+                if matches!(result, Poll::Ready(Err(_))) {
+                    self.eof = true;
+                    self.recv = None;
+                }
+                return result;
+            }
             match recv.poll_data(cx) {
                 Poll::Ready(Some(Ok(mut chunk))) => {
                     let len = chunk.len();
@@ -1228,9 +1255,35 @@ pub(crate) struct H2Counter {
     active: std::sync::atomic::AtomicUsize,
     notify: std::sync::Arc<tokio::sync::Notify>,
     activity: tokio::sync::Notify,
+    xmux: Option<super::xmux::Lifetime>,
+    retiring: std::sync::atomic::AtomicBool,
 }
 
 impl H2Counter {
+    pub(crate) fn try_take_packet(&self) -> bool {
+        self.xmux
+            .as_ref()
+            .is_none_or(|limits| limits.try_take_packet())
+    }
+
+    fn retire(&self) {
+        self.retiring
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.activity.notify_waiters();
+    }
+
+    async fn retired_and_idle(&self) -> &'static str {
+        loop {
+            let notified = self.activity.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.retiring.load(std::sync::atomic::Ordering::Acquire) && !self.has_streams() {
+                return "xmux client retired";
+            }
+            notified.await;
+        }
+    }
+
     fn add_stream(&self) {
         if self.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
             self.activity.notify_waiters();
@@ -1279,6 +1332,7 @@ struct H2PoolState {
 }
 
 pub(crate) struct H2Pool {
+    xmux: Option<super::xmux::XmuxConfig>,
     state: std::sync::Mutex<H2PoolState>,
     notify: std::sync::Arc<tokio::sync::Notify>,
 }
@@ -1359,6 +1413,10 @@ impl CounterGuard {
         Self(Some(c))
     }
 
+    pub(crate) fn counter(&self) -> &std::sync::Arc<H2Counter> {
+        self.0.as_ref().expect("counter present")
+    }
+
     pub(crate) fn into_inner(mut self) -> std::sync::Arc<H2Counter> {
         self.0.take().expect("counter present")
     }
@@ -1374,7 +1432,16 @@ impl Drop for CounterGuard {
 
 impl H2Pool {
     pub(crate) fn new() -> Self {
+        Self::new_with_xmux(None)
+    }
+
+    pub(crate) fn new_xmux(config: super::xmux::XmuxConfig) -> Self {
+        Self::new_with_xmux(Some(config))
+    }
+
+    fn new_with_xmux(xmux: Option<super::xmux::XmuxConfig>) -> Self {
         Self {
+            xmux,
             state: std::sync::Mutex::new(H2PoolState {
                 clients: Vec::new(),
                 active_dials: 0,
@@ -1388,6 +1455,15 @@ impl H2Pool {
         max_conns: usize,
         max_concurrency: usize,
     ) -> H2Acquire {
+        self.acquire_requests(max_conns, max_concurrency, 0).await
+    }
+
+    pub(crate) async fn acquire_requests(
+        self: &std::sync::Arc<Self>,
+        max_conns: usize,
+        max_concurrency: usize,
+        requests: i32,
+    ) -> H2Acquire {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -1395,43 +1471,45 @@ impl H2Pool {
             let candidate = {
                 let mut guard = self.state.lock().expect("h2 pool");
 
-                let has_capacity = max_concurrency > 0
-                    && guard.clients.iter().any(|client| {
-                        client
-                            .active_streams
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                            < max_concurrency
+                if self.xmux.is_some() {
+                    guard.clients.retain(|client| {
+                        let counter = &client.active_streams;
+                        let reusable = counter
+                            .xmux
+                            .as_ref()
+                            .is_none_or(|limits| limits.can_reuse());
+                        if !reusable {
+                            counter.retire();
+                        }
+                        reusable
                     });
-                if !has_capacity && guard.clients.len() + guard.active_dials < max_conns {
+                }
+                let chosen = guard
+                    .clients
+                    .iter()
+                    .filter_map(|client| {
+                        let active = client
+                            .active_streams
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        (max_concurrency == 0 || active < max_concurrency)
+                            .then_some((client, active))
+                    })
+                    .min_by_key(|(_, active)| *active);
+                if (max_concurrency == 0 || chosen.is_none())
+                    && guard.clients.len() + guard.active_dials < max_conns
+                {
                     guard.active_dials += 1;
                     return H2Acquire::NeedDial(H2DialGuard(self.clone()));
                 }
-
-                if guard.clients.is_empty() {
-                    None
-                } else {
-                    let best = guard
-                        .clients
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, c)| {
-                            max_concurrency == 0
-                                || c.active_streams.load(std::sync::atomic::Ordering::Relaxed)
-                                    < max_concurrency
-                        })
-                        .min_by_key(|(_, c)| {
-                            c.active_streams.load(std::sync::atomic::Ordering::Relaxed)
-                        })
-                        .map(|(_, best)| best);
-                    if let Some(best) = best {
-                        let client = best.client.clone();
-                        let active = best.active_streams.clone();
-                        active.add_stream();
-                        Some((client, active))
-                    } else {
-                        None
+                chosen.map(|(chosen, _)| {
+                    let counter = chosen.active_streams.clone();
+                    if let Some(limits) = &counter.xmux {
+                        limits.take_use();
+                        limits.take_requests(requests);
                     }
-                }
+                    counter.add_stream();
+                    (chosen.client.clone(), counter)
+                })
             };
 
             let Some((candidate, active_streams)) = candidate else {
@@ -1480,16 +1558,36 @@ impl H2Pool {
         client: Option<h2::client::SendRequest<Bytes>>,
         max_conns: usize,
     ) -> Option<std::sync::Arc<H2Counter>> {
+        self.finish_dial_requests(client, max_conns, 0).await
+    }
+
+    pub(crate) async fn finish_dial_requests(
+        &self,
+        client: Option<h2::client::SendRequest<Bytes>>,
+        max_conns: usize,
+        requests: i32,
+    ) -> Option<std::sync::Arc<H2Counter>> {
         let mut guard = self.state.lock().expect("h2 pool");
         let mut counter = None;
         if let Some(c) = client {
+            let xmux = self.xmux.map(|config| {
+                let limits = config.lifetime();
+                limits.take_use();
+                limits.take_requests(requests);
+                limits
+            });
             let cnt = std::sync::Arc::new(H2Counter {
                 active: std::sync::atomic::AtomicUsize::new(1),
                 notify: self.notify.clone(),
                 activity: tokio::sync::Notify::new(),
+                xmux,
+                retiring: std::sync::atomic::AtomicBool::new(false),
             });
             if guard.clients.len() >= max_conns {
-                guard.clients.remove(0);
+                let old = guard.clients.remove(0);
+                if self.xmux.is_some() {
+                    old.active_streams.retire();
+                }
             }
             guard.clients.push(PooledClient {
                 client: c,
@@ -1779,9 +1877,18 @@ pub(crate) async fn drive_h2_connection(
 ) {
     let ping_pong = keep_alive.and_then(|times| Some((connection.ping_pong()?, times)));
     let idle = async {
-        match idle_limit {
-            Some(limit) => h2_idle_expired(&counter, limit).await,
-            None => std::future::pending().await,
+        let timeout = async {
+            match idle_limit {
+                Some(limit) => h2_idle_expired(&counter, limit).await,
+                None => std::future::pending().await,
+            }
+        };
+        if counter.xmux.is_none() {
+            return timeout.await;
+        }
+        tokio::select! {
+            why = timeout => why,
+            why = counter.retired_and_idle() => why,
         }
     };
     tokio::pin!(idle);

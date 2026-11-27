@@ -24,13 +24,20 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub(super) struct BrutalConfig {
     bytes_per_second: u64,
+    compensate_loss: bool,
 }
 
 impl BrutalConfig {
     pub(super) fn new(bytes_per_second: u64) -> Self {
         Self {
             bytes_per_second: bytes_per_second.max(1),
+            compensate_loss: true,
         }
+    }
+
+    pub(super) fn loss_compensation(mut self, enabled: bool) -> Self {
+        self.compensate_loss = enabled;
+        self
     }
 }
 
@@ -66,6 +73,9 @@ impl ControllerFactory for BrutalConfig {
 
 impl Brutal {
     fn sample(&mut self, now: Instant, acked: u64, lost: u64) {
+        if !self.config.compensate_loss {
+            return;
+        }
         let second = now.saturating_duration_since(self.epoch).as_secs();
         let slot = &mut self.samples[(second % 5) as usize];
         if slot.second != Some(second) {

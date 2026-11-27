@@ -5121,7 +5121,7 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
         "sc_min_posts_interval_ms",
         "sc_stream_up_server_secs",
     ] {
-        if let Some(value) = normalized.get(field).and_then(Value::as_u64) {
+        if let Some(value) = normalized.get(field).and_then(Value::as_i64) {
             normalized.insert(field.to_owned(), Value::String(value.to_string()));
         }
     }
@@ -5158,12 +5158,14 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
         "sc_max_buffered_posts",
         "sc_stream_up_server_secs",
         "download_settings",
+        "quic_params",
     ];
     for k in t.keys() {
         if !KNOWN.contains(&k.as_str()) {
             return Err(format!("{at}.{k}: json: unknown field \"{k}\""));
         }
     }
+    crate::xhttp_quic::Params::parse(t.get("quic_params"), &format!("{at}.quic_params"))?;
     let mode = t.get("mode").and_then(Value::as_str).unwrap_or("");
     match mode {
         "" | "auto" | "packet-up" | "stream-up" | "stream-one" => {}
@@ -5279,7 +5281,7 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
             "v2ray-xhttp: uplink_data_placement can be {uplink} only in packet-up mode"
         ));
     }
-    // Ranged string fields: "N" | "N-M", N <= M.
+    // Xray accepts integers and signed ranges, sorting the two bounds.
     for f in [
         "x_padding_bytes",
         "session_length",
@@ -5291,27 +5293,13 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
         if let Some(v) = t.get(f).and_then(Value::as_str)
             && !v.is_empty()
         {
-            let parts: Vec<&str> = v.split('-').collect();
-            if parts.len() > 2 {
-                return Err(format!(
-                    "{at}.{f}: invalid range \"{v}\": expected int or \"min-max\""
-                ));
+            let (lo, hi) = crate::xhttp_int_range(v)
+                .ok_or_else(|| format!("{at}.{f}: invalid integer range \"{v}\""))?;
+            if lo < 0 && f != "sc_min_posts_interval_ms" {
+                return Err(format!("{at}.{f}: invalid negative range \"{v}\""));
             }
-            let parse = |s: &str| -> Result<i64, String> {
-                s.trim().parse::<i64>().map_err(|_| {
-                    format!("{at}.{f}: invalid range \"{v}\": parse \"{s}\": invalid syntax")
-                })
-            };
-            let lo = parse(parts[0])?;
-            let hi = if parts.len() == 2 {
-                parse(parts[1])?
-            } else {
-                lo
-            };
-            if hi < lo {
-                return Err(format!(
-                    "{at}.{f}: invalid range \"{v}\": range start > end"
-                ));
+            if lo == 0 && hi > 0 && matches!(f, "x_padding_bytes" | "sc_max_each_post_bytes") {
+                return Err(format!("{at}.{f}: expected a positive range"));
             }
         }
     }
@@ -5332,17 +5320,15 @@ fn validate_xhttp_transport(t: &Map<String, Value>, at: &str) -> Result<(), Stri
                 "{at}.session_table: required when session_length is set"
             ));
         }
-        let (lo, hi) = length.split_once('-').unwrap_or((&length, &length));
-        let parse = |value: &str| {
-            value
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| format!("{at}.session_length: invalid range \"{length}\""))
-        };
-        let (lo, hi) = (parse(lo)?, parse(hi)?);
-        if lo == 0 {
+        if !table.is_ascii() {
+            return Err(format!("{at}.session_table: expected ASCII characters"));
+        }
+        let (lo, hi) = crate::xhttp_int_range(&length)
+            .ok_or_else(|| format!("{at}.session_length: invalid range \"{length}\""))?;
+        if lo <= 0 {
             return Err(format!("{at}.session_length: must be above 0"));
         }
+        let (lo, hi) = (lo as u64, hi as u64);
         // Xray roomSize and sing-box X sessionIDRoom count all lengths,
         // not just the shortest one. Stop once the validation threshold is met.
         let base = crate::xhttp_session_table(&table).chars().count() as u64;
@@ -5475,6 +5461,29 @@ fn validate_trojan_client(i: usize, obj: &Map<String, Value>) -> Result<(), Stri
 }
 
 /// Listable[string] → joined content (reference `strings.Join(list, "\n")`).
+fn validate_xhttp_client_tls(tls: Option<&Value>, at: &str) -> Result<(), String> {
+    let Some(tls) = tls.filter(|tls| tls_enabled(Some(tls))) else {
+        return Ok(());
+    };
+    let reality = tls
+        .get("reality")
+        .and_then(|reality| reality.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let h3 = tls.get("alpn").is_some_and(|alpn| {
+        alpn.as_str() == Some("h3")
+            || alpn
+                .as_array()
+                .is_some_and(|alpn| alpn.len() == 1 && alpn[0].as_str() == Some("h3"))
+    });
+    if h3 && !reality && tls.get("max_version").and_then(Value::as_str) == Some("1.2") {
+        return Err(format!(
+            "{at}.tls.max_version: XHTTP over HTTP/3 requires TLS 1.3"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_xhttp_download_settings(value: &Value, at: &str) -> Result<(), String> {
     let settings = value
         .as_object()
@@ -5514,6 +5523,7 @@ fn validate_xhttp_download_settings(value: &Value, at: &str) -> Result<(), Strin
             "{at}.transport.download_settings: nested downloads are unsupported"
         ));
     }
+    validate_xhttp_client_tls(settings.get("tls"), at)?;
     validate_xhttp_transport(transport, &format!("{at}.transport"))
 }
 
@@ -6323,6 +6333,7 @@ fn validate_outbound(
             return Err(format!("{at}: create client transport: quic: TLS required"));
         }
         if transport_ty == "xhttp" {
+            validate_xhttp_client_tls(obj.get("tls"), &at)?;
             validate_xhttp_transport(transport, &format!("outbounds[{i}].transport"))?;
         } else if matches!(
             transport_ty,

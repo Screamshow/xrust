@@ -4,11 +4,11 @@ use std::mem;
 use thiserror::Error;
 use tracing::debug;
 
-use super::state::get_or_insert_recv;
+use super::state::{get_or_insert_recv, WindowEpoch};
 use super::{ClosedStream, Retransmits, ShouldTransmit, StreamId, StreamsState};
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::connection::streams::state::StreamRecv;
-use crate::{TransportError, VarInt, frame};
+use crate::{frame, Duration, Instant, TransportError, VarInt};
 
 #[derive(Debug, Default)]
 pub(super) struct Recv {
@@ -16,8 +16,15 @@ pub(super) struct Recv {
     state: RecvState,
     pub(super) assembler: Assembler,
     sent_max_stream_data: u64,
+    tuning: Option<Box<StreamTuning>>,
     pub(super) end: u64,
     pub(super) stopped: bool,
+}
+
+#[derive(Debug)]
+struct StreamTuning {
+    window: u64,
+    epoch: WindowEpoch,
 }
 
 impl Recv {
@@ -26,6 +33,7 @@ impl Recv {
             state: RecvState::default(),
             assembler: Assembler::new(),
             sent_max_stream_data: initial_max_data,
+            tuning: None,
             end: 0,
             stopped: false,
         })
@@ -36,6 +44,7 @@ impl Recv {
         self.state = RecvState::default();
         self.assembler.reinit();
         self.sent_max_stream_data = initial_max_data;
+        self.tuning = None;
         self.end = 0;
         self.stopped = false;
     }
@@ -102,6 +111,27 @@ impl Recv {
         Ok((read_credits, ShouldTransmit(self.is_receiving())))
     }
 
+    pub(super) fn start_tuning(&mut self, now: Instant, window: u64) {
+        self.tuning = Some(Box::new(StreamTuning {
+            window,
+            epoch: WindowEpoch::start(now, self.assembler.bytes_read()),
+        }));
+    }
+
+    pub(super) fn grow_receive_window(
+        &mut self,
+        now: Instant,
+        rtt: Duration,
+        ceiling: u64,
+    ) -> Option<u64> {
+        let tuning = self.tuning.as_mut()?;
+        let previous = tuning.window;
+        tuning.window = tuning
+            .epoch
+            .grow(now, rtt, self.assembler.bytes_read(), previous, ceiling);
+        (tuning.window > previous).then_some(tuning.window)
+    }
+
     /// Returns the window that should be advertised in a `MAX_STREAM_DATA` frame
     ///
     /// The method returns a tuple which consists of the window that should be
@@ -110,7 +140,15 @@ impl Recv {
     /// `false` the new window should only be transmitted if a previous transmission
     /// had failed.
     pub(super) fn max_stream_data(&mut self, stream_receive_window: u64) -> (u64, ShouldTransmit) {
-        let max_stream_data = self.assembler.bytes_read() + stream_receive_window;
+        let (window, divisor) = self
+            .tuning
+            .as_ref()
+            .map_or((stream_receive_window, 8), |tuning| (tuning.window, 4));
+        let max_stream_data = self
+            .assembler
+            .bytes_read()
+            .saturating_add(window)
+            .min(VarInt::MAX.into_inner());
 
         // Only announce a window update if it's significant enough
         // to make it worthwhile sending a MAX_STREAM_DATA frame.
@@ -120,7 +158,7 @@ impl Recv {
         // smaller than `stream_receive_window` in order to make sure the stream
         // does not get stuck.
         let diff = max_stream_data - self.sent_max_stream_data;
-        let transmit = self.can_send_flow_control() && diff >= (stream_receive_window / 8);
+        let transmit = self.can_send_flow_control() && diff >= window / divisor;
         (max_stream_data, ShouldTransmit(transmit))
     }
 

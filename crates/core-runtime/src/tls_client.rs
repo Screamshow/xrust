@@ -300,17 +300,15 @@ impl TlsOptions {
             .get("disable_sni")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let alpn = tls
-            .get("alpn")
-            .and_then(Value::as_array)
-            .map(|list| {
-                list.iter()
-                    .map(|v| v.as_str().map(str::as_bytes).map(<[u8]>::to_vec))
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| anyhow::anyhow!("{at}: tls.alpn entries must be strings"))
-            })
-            .transpose()?
-            .unwrap_or_default();
+        let alpn = match tls.get("alpn") {
+            Some(Value::String(value)) => vec![value.as_bytes().to_vec()],
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| v.as_str().map(str::as_bytes).map(<[u8]>::to_vec))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| anyhow::anyhow!("{at}: tls.alpn entries must be strings"))?,
+            _ => Vec::new(),
+        };
 
         let min_tls13 = match tls.get("min_version").and_then(Value::as_str) {
             None | Some("") => false,
@@ -731,6 +729,24 @@ impl TlsOptions {
         &self,
         default_alpn: &[&[u8]],
     ) -> io::Result<core_tls::quic::QuicClientConfig> {
+        self.build_quic_config(default_alpn, false)
+    }
+
+    pub(crate) fn xhttp_quic_config(&self) -> io::Result<core_tls::quic::QuicClientConfig> {
+        if self.max_tls12 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "xhttp: HTTP/3 requires TLS 1.3",
+            ));
+        }
+        self.build_quic_config(&[b"h3"], self.disable_sni)
+    }
+
+    fn build_quic_config(
+        &self,
+        default_alpn: &[&[u8]],
+        disable_sni: bool,
+    ) -> io::Result<core_tls::quic::QuicClientConfig> {
         self.refuse_reality("QUIC")?;
         let provider = if !self.cipher_suites.is_empty() {
             let suites: Vec<_> = self
@@ -768,6 +784,7 @@ impl TlsOptions {
         // cache: every hello is a full handshake with both key shares. A
         // rustls ticket would add pre_shared_key/early_data, and its key
         // exchange hint would shrink key_share to the group used last time.
+        config.enable_sni = !disable_sni;
         config.resumption = rustls::client::Resumption::disabled();
         core_tls::quic::QuicClientConfig::try_from_rustls(Arc::new(config))
             .map_err(|e| io::Error::other(format!("QUIC initial suite: {e}")))

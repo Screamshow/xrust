@@ -1,8 +1,8 @@
 //! XHTTP connection reuse ("XMUX").
 //!
 //! Ported from `transport/v2rayxhttp/xmux.go`, which mirrors Xray's
-//! `XmuxConfig`. Nothing here changes what goes on the wire — the server
-//! identifies a session by its session id, not by the connection carrying it —
+//! `XmuxConfig`. Nothing here changes what goes on the wire â€” the server
+//! identifies a session by its session id, not by the connection carrying it â€”
 //! so pooling is purely a client-side policy. What it buys is behaving like an
 //! Xray client (subscription configs routinely carry an xmux section) and not
 //! paying a fresh TCP+TLS handshake for every stream.
@@ -12,10 +12,8 @@
 //! deferred: a connection with live streams stays up until the last one leaves.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::time::{Duration, Instant};
-
-use portable_atomic::AtomicI64;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 
@@ -63,6 +61,9 @@ impl IntRange {
             .1
             .parse()
             .map_err(|_| anyhow::anyhow!("{at}: invalid range {:?}", pair.1))?;
+        if lo > i32::MAX as u64 || hi > i32::MAX as u64 {
+            anyhow::bail!("{at}: value exceeds i32::MAX");
+        }
         Ok(Self(lo.min(hi), lo.max(hi)))
     }
 
@@ -156,137 +157,147 @@ impl XmuxConfig {
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0),
         };
+        if config.max_connections == IntRange::zero()
+            && config.max_concurrency == IntRange::zero()
+            && config.c_max_reuse_times == IntRange::zero()
+            && config.h_max_request_times == IntRange::zero()
+            && config.h_max_reusable_secs == IntRange::zero()
+            && config.keep_alive_period == 0
+        {
+            return Ok(Self::default());
+        }
         Ok(config)
     }
+
+    pub(crate) fn lifetime(&self) -> Lifetime {
+        let limit = |range: IntRange| match range.roll() as i32 {
+            0 => i32::MAX,
+            value => value,
+        };
+        let secs = self.h_max_reusable_secs.roll();
+        Lifetime {
+            uses: AtomicI32::new(limit(self.c_max_reuse_times)),
+            requests: AtomicI32::new(limit(self.h_max_request_times)),
+            deadline: (secs > 0).then(|| tokio::time::Instant::now() + Duration::from_secs(secs)),
+        }
+    }
 }
 
-/// One pooled connection: a keep-alive HTTP/1.1 connection plus its retirement
-/// counters.
-///
-/// The connection is lent out one request at a time — that is what HTTP/1.1 is,
-/// so `max_concurrency` has nothing left to bound here and the pooled unit is
-/// the connection rather than a multiplexed stream on top of one.
-pub(crate) struct Client {
-    pub io: std::sync::Mutex<Option<AnyStream>>,
-    open_usage: AtomicI32,
-    left_usage: AtomicI32,
-    left_requests: AtomicI64,
-    unreusable_at: Option<Instant>,
-    closed: AtomicBool,
+/// Lifetime of a logical XMUX client. Connection retirement excludes new
+/// tunnels while existing streams can finish on the same connection.
+pub(crate) struct Lifetime {
+    uses: AtomicI32,
+    requests: AtomicI32,
+    deadline: Option<tokio::time::Instant>,
 }
 
-impl Client {
-    fn new(io: AnyStream, cfg: &XmuxConfig) -> Self {
-        let reuse = cfg.c_max_reuse_times.roll();
-        let requests = cfg.h_max_request_times.roll();
-        let secs = cfg.h_max_reusable_secs.roll();
+impl Lifetime {
+    fn deadline_passed(&self) -> bool {
+        self.deadline
+            .is_some_and(|at| tokio::time::Instant::now() >= at)
+    }
+
+    pub(crate) fn can_reuse(&self) -> bool {
+        self.uses.load(Ordering::Relaxed) > 0
+            && self.requests.load(Ordering::Relaxed) > 0
+            && !self.deadline_passed()
+    }
+
+    pub(crate) fn take_use(&self) {
+        self.uses.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn take_requests(&self, count: i32) {
+        self.requests.fetch_sub(count, Ordering::Relaxed);
+    }
+
+    /// An active packet-up tunnel may keep its current client after the
+    /// handout budget has run out. Rotate the upload when its HTTP request
+    /// budget or age is exhausted, without moving the download stream.
+    pub(crate) fn try_take_packet(&self) -> bool {
+        let mut left = self.requests.load(Ordering::Relaxed);
+        while left > 0 && !self.deadline_passed() {
+            match self.requests.compare_exchange_weak(
+                left,
+                left - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(current) => left = current,
+            }
+        }
+        false
+    }
+}
+
+/// Like Xray's HTTP/1.1 dialer, each XMUX client owns a pool of raw POST
+/// sockets while the GET and streaming POST run on dedicated sockets.
+struct H1Client {
+    sockets: std::sync::Mutex<Vec<AnyStream>>,
+    running: AtomicUsize,
+    lifetime: Lifetime,
+}
+
+impl H1Client {
+    fn new(config: &XmuxConfig) -> Self {
         Self {
-            io: std::sync::Mutex::new(Some(io)),
-            // The fresh connection is already reserved for its caller. Charge
-            // that first handout exactly once before publishing it in the pool.
-            open_usage: AtomicI32::new(1),
-            left_usage: AtomicI32::new(if reuse > 0 { reuse as i32 - 1 } else { -1 }),
-            left_requests: AtomicI64::new(if requests > 0 {
-                requests as i64
-            } else {
-                i64::MAX
-            }),
-            unreusable_at: (secs > 0).then(|| Instant::now() + Duration::from_secs(secs)),
-            closed: AtomicBool::new(false),
+            sockets: std::sync::Mutex::new(Vec::new()),
+            running: AtomicUsize::new(0),
+            lifetime: config.lifetime(),
         }
-    }
-
-    /// Take the connection out for one request, or `None` when somebody else
-    /// has it. An HTTP/1.1 connection serves one request at a time, so this is
-    /// what keeps two uploads from interleaving on one socket.
-    pub(crate) fn take(&self) -> Option<AnyStream> {
-        self.io.lock().ok().and_then(|mut slot| slot.take())
-    }
-
-    pub(crate) fn has_io(&self) -> bool {
-        self.io.lock().ok().is_some_and(|slot| slot.is_some())
-    }
-
-    /// Put it back for the next request, unless it has been retired.
-    pub(crate) fn give(&self, io: AnyStream) {
-        if self.closed.load(Ordering::SeqCst) {
-            return;
-        }
-        if let Ok(mut slot) = self.io.lock() {
-            *slot = Some(io);
-        }
-    }
-
-    /// One HTTP request against `h_max_request_times`. A packet-up stream issues
-    /// one POST per write, and a connection that ignored those would outlive the
-    /// limit the server was told about.
-    pub(crate) fn take_request(&self) {
-        self.left_requests.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        let _ = self.take();
-    }
-
-    fn evict_cause(&self) -> Option<&'static str> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Some("closed");
-        }
-        if !self.has_io() && self.open_usage.load(Ordering::SeqCst) == 0 {
-            return Some("no_io");
-        }
-        if self.left_usage.load(Ordering::SeqCst) == 0 {
-            return Some("reuse");
-        }
-        if self.left_requests.load(Ordering::SeqCst) <= 0 {
-            return Some("requests");
-        }
-        if self.unreusable_at.is_some_and(|at| Instant::now() > at) {
-            return Some("expired");
-        }
-        None
-    }
-
-    fn acquire(&self) {
-        self.open_usage.fetch_add(1, Ordering::SeqCst);
-        if self.left_usage.load(Ordering::SeqCst) > 0 {
-            self.left_usage.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    fn release(&self) {
-        self.open_usage.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-/// One upload request owns one usage slot across every await.
-pub(crate) struct Lease {
-    pub(crate) client: Arc<Client>,
-    taken: bool,
+struct H1Usage {
+    client: Arc<H1Client>,
 }
-impl Lease {
-    pub(crate) fn new(client: Arc<Client>) -> Self {
-        Self {
-            client,
-            taken: false,
-        }
-    }
-    pub(crate) fn take(&mut self) -> Option<AnyStream> {
-        let io = self.client.take();
-        self.taken = io.is_some();
-        io
-    }
-}
-impl Drop for Lease {
+
+impl Drop for H1Usage {
     fn drop(&mut self) {
-        if self.taken && !self.client.has_io() {
-            self.client.close();
-        }
-        self.client.release();
-        if self.client.closed.load(Ordering::SeqCst) {
-            let _ = self.client.take();
-        }
+        self.client.running.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A logical tunnel can use its client for both upload and download. Cloning
+/// its lease shares that one reservation, so two requests still count as one
+/// tunnel toward maxConcurrency.
+#[derive(Clone)]
+pub(crate) struct H1Session(Arc<H1Usage>);
+
+impl H1Session {
+    fn new(client: Arc<H1Client>) -> Self {
+        client.running.fetch_add(1, Ordering::Relaxed);
+        client.lifetime.take_use();
+        Self(Arc::new(H1Usage { client }))
+    }
+
+    fn client(&self) -> &H1Client {
+        &self.0.client
+    }
+
+    pub(crate) fn take_request(&self) {
+        self.client().lifetime.take_requests(1);
+    }
+
+    pub(crate) fn try_take_packet(&self) -> bool {
+        self.client().lifetime.try_take_packet()
+    }
+
+    pub(crate) fn take_socket(&self) -> Option<AnyStream> {
+        self.client()
+            .sockets
+            .lock()
+            .expect("xhttp H1 sockets")
+            .pop()
+    }
+
+    pub(crate) fn return_socket(&self, io: AnyStream) {
+        self.client()
+            .sockets
+            .lock()
+            .expect("xhttp H1 sockets")
+            .push(io);
     }
 }
 
@@ -296,7 +307,7 @@ pub(crate) struct Pool {
     /// rolled once at construction, like the reference
     concurrency: u64,
     connections: u64,
-    clients: Mutex<Vec<Arc<Client>>>,
+    clients: Mutex<Vec<Arc<H1Client>>>,
 }
 
 impl Pool {
@@ -326,6 +337,18 @@ impl Pool {
         }
     }
 
+    pub(crate) fn h3_keep_alive(&self) -> Option<Duration> {
+        match self.config.keep_alive_period {
+            0 => Some(Duration::from_secs(10)),
+            secs if secs < 0 => None,
+            secs => Some(Duration::from_secs(secs as u64)),
+        }
+    }
+
+    pub(crate) fn lifetime(&self) -> Lifetime {
+        self.config.lifetime()
+    }
+
     pub(crate) fn max_connections(&self) -> usize {
         if self.connections > 0 {
             self.connections as usize
@@ -334,66 +357,32 @@ impl Pool {
             // one is busy; it is mutually exclusive with maxConnections.
             usize::MAX
         } else {
-            3
+            1
         }
     }
 
-    /// A pooled connection that is free and not retired, or `None` so the caller
-    /// dials a fresh one.
-    pub(crate) async fn acquire(self: &Arc<Self>) -> Option<Arc<Client>> {
-        let mut guard = self.clients.lock().await;
-        // eviction is deferred: a retired connection with a request on it stays
-        // up until that request is over
-        let mut evicted = Vec::new();
-        guard.retain(|client| match client.evict_cause() {
-            Some(_) => {
-                evicted.push(Arc::clone(client));
-                false
-            }
-            None => true,
-        });
-        for client in evicted {
-            client.closed.store(true, Ordering::SeqCst);
-        }
-        if guard.is_empty() {
-            return None;
-        }
-        let mut candidates: Vec<Arc<Client>> = Vec::with_capacity(guard.len());
-        for client in guard.iter() {
-            // The socket can still be parked between a handout and `take`,
-            // or between `give` and release. Idle requires both conditions.
-            if client.open_usage.load(Ordering::SeqCst) == 0 && client.has_io() {
-                candidates.push(Arc::clone(client));
+    pub(crate) async fn h1_session(&self) -> H1Session {
+        let mut clients = self.clients.lock().await;
+        clients.retain(|client| client.lifetime.can_reuse());
+        if self.connections == 0 || clients.len() >= self.connections as usize {
+            let candidates: Vec<_> = clients
+                .iter()
+                .filter(|client| {
+                    self.concurrency == 0
+                        || client.running.load(Ordering::Relaxed) < self.concurrency as usize
+                })
+                .collect();
+            if !candidates.is_empty() {
+                return H1Session::new(candidates[pick(candidates.len())].clone());
             }
         }
-        if !candidates.is_empty() {
-            let index = pick(candidates.len());
-            let client = Arc::clone(&candidates[index]);
-            client.acquire();
-            return Some(client);
-        }
-        None
-    }
-
-    /// Adds a freshly dialled connection, created for the caller.
-    pub(crate) async fn insert(self: &Arc<Self>, io: AnyStream) -> Arc<Client> {
-        let client = Arc::new(Client::new(io, &self.config));
-        self.clients.lock().await.push(Arc::clone(&client));
-        client
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn release(&self, client: &Arc<Client>) {
-        client.release();
-        // a connection that fell out of the pool while it was still in use is
-        // torn down only now that its last request is over
-        if client.closed.load(Ordering::SeqCst) {
-            let _ = client.take();
-        }
+        let client = Arc::new(H1Client::new(&self.config));
+        clients.push(client.clone());
+        H1Session::new(client)
     }
 }
 
-fn pick(len: usize) -> usize {
+pub(crate) fn pick(len: usize) -> usize {
     if len <= 1 {
         return 0;
     }
@@ -405,35 +394,40 @@ fn pick(len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
-    async fn a_reserved_http1_socket_is_not_given_to_a_second_upload() {
-        let pool = Pool::new(XmuxConfig::default());
+    async fn h1_tunnels_share_logical_clients_but_not_borrowed_sockets() {
+        let pool = Pool::new(XmuxConfig {
+            max_connections: IntRange(1, 1),
+            ..XmuxConfig::default()
+        });
+        let first = pool.h1_session().await;
         let (io, _peer) = tokio::io::duplex(1024);
-        let fresh = pool.insert(Box::new(io)).await;
-        assert!(pool.acquire().await.is_none(), "fresh handout is reserved");
-
-        let mut lease = Lease::new(fresh.clone());
-        let io = lease.take().unwrap();
-        fresh.give(io);
-        assert!(pool.acquire().await.is_none(), "return in progress");
-        drop(lease);
-
-        let reused = pool.acquire().await.unwrap();
-        assert!(Arc::ptr_eq(&fresh, &reused));
-        assert!(pool.acquire().await.is_none(), "reused handout is reserved");
+        first.return_socket(Box::new(io));
+        let borrowed = first
+            .take_socket()
+            .expect("first upload borrows the socket");
+        let second = pool.h1_session().await;
+        assert!(std::ptr::eq(first.client(), second.client()));
+        assert!(second.take_socket().is_none(), "the socket is in use");
+        first.return_socket(borrowed);
+        assert!(second.take_socket().is_some(), "the socket is reusable");
     }
 
     #[tokio::test]
     async fn fresh_http1_handout_counts_once_against_reuse_times() {
         let pool = Pool::new(XmuxConfig {
+            max_connections: IntRange(1, 1),
             c_max_reuse_times: IntRange(2, 2),
             ..XmuxConfig::default()
         });
-        let (io, _peer) = tokio::io::duplex(1024);
-        let client = pool.insert(Box::new(io)).await;
-        pool.release(&client).await;
-        let reused = pool.acquire().await.expect("room for the second handout");
-        pool.release(&reused).await;
-        assert!(pool.acquire().await.is_none());
+        let first = pool.h1_session().await;
+        let reused = pool.h1_session().await;
+        assert!(std::ptr::eq(first.client(), reused.client()));
+        assert!(
+            first.try_take_packet(),
+            "an existing tunnel can still upload"
+        );
+        let next = pool.h1_session().await;
+        assert!(!std::ptr::eq(first.client(), next.client()));
     }
 
     #[test]
@@ -453,25 +447,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_request_releases_usage_and_removes_incomplete_connection() {
-        let pool = Pool::new(XmuxConfig::parse(None, "pool").unwrap());
+    async fn h1_session_clone_does_not_double_count_and_cancel_releases_usage() {
+        let pool = Pool::new(XmuxConfig {
+            max_concurrency: IntRange(1, 1),
+            max_connections: IntRange::zero(),
+            ..XmuxConfig::default()
+        });
+        let session = pool.h1_session().await;
+        let client = session.0.client.clone();
+        let held = session.clone();
+        assert_eq!(client.running.load(Ordering::Relaxed), 1);
         let (io, _peer) = tokio::io::duplex(1024);
-        let client = pool.insert(Box::new(io)).await;
-        let held = client.clone();
+        session.return_socket(Box::new(io));
+        drop(session);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let request = tokio::spawn(async move {
-            let mut lease = Lease::new(held);
-            let _io = lease.take().unwrap();
+            let _io = held.take_socket().unwrap();
             ready_tx.send(()).unwrap();
             std::future::pending::<()>().await;
         });
         ready_rx.await.unwrap();
-        assert_eq!(client.open_usage.load(Ordering::SeqCst), 1);
+        let second = pool.h1_session().await;
+        assert!(!std::ptr::eq(client.as_ref(), second.client()));
         request.abort();
         let _ = request.await;
-        assert_eq!(client.open_usage.load(Ordering::SeqCst), 0);
-        assert!(client.closed.load(Ordering::SeqCst));
-        assert!(pool.acquire().await.is_none());
+        let reused = pool.h1_session().await;
+        assert!(std::ptr::eq(client.as_ref(), reused.client()));
+        assert!(
+            reused.take_socket().is_none(),
+            "cancellation drops the socket"
+        );
     }
 
     use super::*;
@@ -550,42 +555,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acquire_and_reuse_flow() {
+    async fn h1_pool_retires_a_client_after_its_http_requests() {
         let config = XmuxConfig::parse(
             Some(&serde_json::json!({
-                "max_concurrency": "1-4",
-                "c_max_reuse_times": "32-64",
-                "h_max_request_times": "200-400",
-                "h_max_reusable_secs": "120-300",
+                "max_connections": 1,
+                "h_max_request_times": 2
             })),
             "xmux",
         )
         .unwrap();
         let pool = Pool::new(config);
 
-        // 1. Initially empty
-        assert!(pool.acquire().await.is_none());
-
-        // 2. Insert mock stream
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let s1 = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (s2, _) = listener.accept().await.unwrap();
-        drop(s2);
-        let client = pool.insert(Box::new(s1)).await;
-        let io = client.take();
-        assert!(io.is_some());
-
-        // While in use, acquire should fail if concurrency <= 1 or client has no io
-        // 3. Put it back
-        client.give(io.unwrap());
-        pool.release(&client).await;
-
-        // 4. Now acquire should find it!
-        let acq = pool.acquire().await;
-        assert!(acq.is_some(), "should acquire released client");
-        let client2 = acq.unwrap();
-        let io2 = client2.take();
-        assert!(io2.is_some(), "should take io from released client");
+        let first = pool.h1_session().await;
+        first.take_request(); // initial download GET
+        assert!(first.try_take_packet());
+        assert!(!first.try_take_packet(), "the next upload rotates");
+        let next = pool.h1_session().await;
+        assert!(!std::ptr::eq(first.client(), next.client()));
+        assert!(next.try_take_packet());
     }
 }

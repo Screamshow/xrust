@@ -6,8 +6,26 @@ pub mod srs;
 pub mod validate;
 pub mod vless_enc;
 pub mod wireguard;
+pub mod xhttp_quic;
 
 use serde_json::Value;
+
+/// Parse an Xray XHTTP signed integer or range and normalize its bounds.
+pub fn xhttp_int_range(raw: &str) -> Option<(i32, i32)> {
+    let raw = raw.trim();
+    let separator = raw.char_indices().skip(1).find(|(_, ch)| *ch == '-');
+    let (from, to) = match separator {
+        Some((i, _)) => (
+            raw[..i].trim().parse::<i32>().ok()?,
+            raw[i + 1..].trim().parse::<i32>().ok()?,
+        ),
+        None => {
+            let value = raw.parse::<i32>().ok()?;
+            (value, value)
+        }
+    };
+    Some((from.min(to), from.max(to)))
+}
 
 /// Named session alphabets used by Xray/sing-box X XHTTP configurations.
 pub fn xhttp_session_table(table: &str) -> &str {
