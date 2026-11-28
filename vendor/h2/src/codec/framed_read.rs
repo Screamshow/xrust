@@ -1,4 +1,5 @@
 use super::payload_pool;
+use super::INITIAL_BUFFER_CAPACITY;
 use crate::frame::{self, Frame, Kind, Reason};
 use crate::frame::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_SETTINGS_HEADER_TABLE_SIZE, MAX_MAX_FRAME_SIZE,
@@ -21,10 +22,13 @@ use tokio_util::codec::{LengthDelimitedCodec, LengthDelimitedCodecError};
 
 // 16 MB "sane default" taken from golang http2
 const DEFAULT_SETTINGS_MAX_HEADER_LIST_SIZE: usize = 16 << 20;
+const BULK_READ_CAPACITY: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub struct FramedRead<T> {
     inner: InnerFramedRead<T, LengthDelimitedCodec>,
+    read_capacity: usize,
+    large_buffer: bool,
 
     // hpack decoder state
     hpack: hpack::Decoder,
@@ -62,6 +66,8 @@ impl<T> FramedRead<T> {
             calc_max_continuation_frames(max_header_list_size, inner.decoder().max_frame_length());
         FramedRead {
             inner,
+            read_capacity: INITIAL_BUFFER_CAPACITY,
+            large_buffer: false,
             hpack: hpack::Decoder::new(DEFAULT_SETTINGS_HEADER_TABLE_SIZE),
             max_header_list_size,
             max_continuation_frames,
@@ -72,6 +78,34 @@ impl<T> FramedRead<T> {
 
     pub(crate) fn set_recycle_data(&mut self, enabled: bool) {
         self.recycle_data = enabled;
+    }
+
+    pub(crate) fn can_trim_buffer(&self) -> bool {
+        self.partial.is_none()
+            && self.inner.read_buffer().is_empty()
+            && (self.large_buffer || self.inner.read_buffer().capacity() > INITIAL_BUFFER_CAPACITY)
+    }
+
+    pub(crate) fn trim_buffer(&mut self) {
+        *self.inner.read_buffer_mut() = BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY);
+        self.read_capacity = INITIAL_BUFFER_CAPACITY;
+        self.large_buffer = false;
+    }
+
+    fn observe_read(&mut self, frame_len: usize) {
+        let buffer = self.inner.read_buffer_mut();
+        // split_to narrows the visible capacity, but unread bytes and returned
+        // payloads can still share the original allocation.
+        self.large_buffer |= frame_len + buffer.capacity() > INITIAL_BUFFER_CAPACITY;
+        // Grow when the input regularly fills the current read buffer. Frame
+        // sizes beyond the bulk target are still handled by the length decoder.
+        if self.read_capacity < BULK_READ_CAPACITY
+            && frame_len + buffer.len() >= self.read_capacity * 3 / 4
+        {
+            self.read_capacity *= 2;
+            buffer.reserve(self.read_capacity - buffer.len().min(self.read_capacity));
+            self.large_buffer = true;
+        }
     }
 
     pub fn get_ref(&self) -> &T {
@@ -413,6 +447,7 @@ where
                 None => return Poll::Ready(None),
             };
 
+            self.observe_read(bytes.len());
             tracing::trace!(read.bytes = bytes.len());
             let Self {
                 ref mut hpack,

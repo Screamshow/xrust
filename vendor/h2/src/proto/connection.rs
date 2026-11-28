@@ -334,6 +334,8 @@ where
                                 continue;
                             }
 
+                            self.codec
+                                .poll_idle_buffers(cx, || self.inner.streams.has_streams());
                             return Poll::Pending;
                         }
                     };

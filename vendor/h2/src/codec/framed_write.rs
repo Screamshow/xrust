@@ -1,5 +1,6 @@
 use crate::codec::UserError;
 use crate::codec::UserError::*;
+use crate::codec::INITIAL_BUFFER_CAPACITY;
 use crate::frame::{self, Frame, FrameSize};
 use crate::hpack;
 
@@ -70,8 +71,8 @@ enum Next<B> {
     Continuation(frame::Continuation),
 }
 
-/// Initialize the connection with this amount of write buffer.
-const DEFAULT_BUFFER_CAPACITY: usize = 128 * 1_024;
+/// Preserve the batching limit as the backing buffer grows on demand.
+const BULK_WRITE_CAPACITY: usize = 128 * 1024;
 
 /// Chain payloads bigger than this when vectored I/O is enabled.
 ///
@@ -104,7 +105,7 @@ where
             final_flush_done: false,
             encoder: Encoder {
                 hpack: hpack::Encoder::default(),
-                buf: Cursor::new(BytesMut::with_capacity(DEFAULT_BUFFER_CAPACITY)),
+                buf: Cursor::new(BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY)),
                 next: None,
                 last_data_frame: None,
                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
@@ -115,6 +116,16 @@ where
                 exact_credit_boundary: false,
             },
         }
+    }
+
+    pub(crate) fn can_trim_buffer(&self) -> bool {
+        self.encoder.next.is_none()
+            && self.encoder.buf.get_ref().is_empty()
+            && self.encoder.buf.get_ref().capacity() > INITIAL_BUFFER_CAPACITY
+    }
+
+    pub(crate) fn trim_buffer(&mut self) {
+        self.encoder.buf = Cursor::new(BytesMut::with_capacity(INITIAL_BUFFER_CAPACITY));
     }
 
     /// Returns `Ready` when `send` is able to accept a frame
@@ -362,9 +373,9 @@ where
         if self.frame_per_write && !self.buf.get_ref().is_empty() && !self.only_window_updates {
             return false;
         }
+        let buf = self.buf.get_ref();
         self.next.is_none()
-            && (self.buf.get_ref().capacity() - self.buf.get_ref().len()
-                >= self.min_buffer_capacity)
+            && buf.capacity().max(BULK_WRITE_CAPACITY) - buf.len() >= self.min_buffer_capacity
     }
 
     fn is_empty(&self) -> bool {

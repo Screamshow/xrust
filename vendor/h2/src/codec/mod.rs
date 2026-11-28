@@ -14,17 +14,24 @@ use crate::proto::Error;
 use bytes::Buf;
 use futures_core::Stream;
 use futures_sink::Sink;
+use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::{self, Sleep};
 use tokio_util::codec::length_delimited;
 use tokio_util::codec::FramedRead as InnerFramedRead;
 
 use std::io;
 
+const INITIAL_BUFFER_CAPACITY: usize = 32 * 1024;
+const BUFFER_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Debug)]
 pub struct Codec<T, B> {
     inner: FramedRead<FramedWrite<T, B>>,
+    buffer_idle: Option<Pin<Box<Sleep>>>,
 }
 
 impl<T, B> Codec<T, B>
@@ -43,21 +50,24 @@ where
         // Wrap with writer
         let framed_write = FramedWrite::new(io);
 
-        // Delimit the frames with 256 KiB read buffer to match bulk transfer throughput
         let codec = length_delimited::Builder::new()
             .big_endian()
             .length_field_length(3)
             .length_adjustment(9)
             .num_skip(0) // Don't skip the header
             .new_codec();
-        let delimited = InnerFramedRead::with_capacity(framed_write, codec, 256 * 1024);
+        let delimited =
+            InnerFramedRead::with_capacity(framed_write, codec, INITIAL_BUFFER_CAPACITY);
 
         let mut inner = FramedRead::new(delimited);
 
         // Use FramedRead's method since it checks the value is within range.
         inner.set_max_frame_size(max_frame_size);
 
-        Codec { inner }
+        Codec {
+            inner,
+            buffer_idle: None,
+        }
     }
 }
 
@@ -138,6 +148,33 @@ where
     T: AsyncWrite + Unpin,
     B: Buf,
 {
+    /// Called after the connection has finished flushing all pending writes.
+    pub(crate) fn poll_idle_buffers(
+        &mut self,
+        cx: &mut Context<'_>,
+        has_streams: impl FnOnce() -> bool,
+    ) {
+        let trim_read = self.inner.can_trim_buffer();
+        let trim_write = self.framed_write().can_trim_buffer();
+        if !(trim_read || trim_write) || has_streams() {
+            self.buffer_idle = None;
+            return;
+        }
+
+        let timer = self
+            .buffer_idle
+            .get_or_insert_with(|| Box::pin(time::sleep(BUFFER_IDLE_TIMEOUT)));
+        if timer.as_mut().poll(cx).is_ready() {
+            if trim_read {
+                self.inner.trim_buffer();
+            }
+            if trim_write {
+                self.framed_write().trim_buffer();
+            }
+            self.buffer_idle = None;
+        }
+    }
+
     /// Returns `Ready` when the codec can buffer a frame
     pub fn poll_ready(&mut self, cx: &mut Context) -> Poll<io::Result<()>> {
         self.framed_write().poll_ready(cx)
@@ -174,6 +211,14 @@ where
     ///
     /// TODO: Rename this to avoid conflicts with Sink::buffer
     pub fn buffer(&mut self, item: Frame<B>) -> Result<(), UserError> {
+        if self.buffer_idle.is_some()
+            && matches!(
+                item,
+                Frame::Headers(_) | Frame::Data(_) | Frame::PushPromise(_)
+            )
+        {
+            self.buffer_idle = None;
+        }
         self.framed_write().buffer(item)
     }
 
@@ -195,7 +240,18 @@ where
     type Item = Result<Frame, Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner).poll_next(cx)
+        let result = Pin::new(&mut self.inner).poll_next(cx);
+        if self.buffer_idle.is_some()
+            && matches!(
+                result,
+                Poll::Ready(Some(Ok(Frame::Headers(_)
+                    | Frame::Data(_)
+                    | Frame::PushPromise(_))))
+            )
+        {
+            self.buffer_idle = None;
+        }
+        result
     }
 }
 
@@ -233,5 +289,73 @@ where
 {
     fn from(src: T) -> Self {
         Self::new(src)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::future::poll_fn;
+    use tokio::io::{duplex, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn idle_buffer_trim_preserves_partial_frame_and_write_batching() {
+        let (io, mut peer) = duplex(256 * 1024);
+        let mut codec = Codec::<_, Bytes>::with_max_recv_frame_size(io, 96 * 1024);
+        let stream = frame::StreamId::from(1);
+        let payload = Bytes::from(vec![0x42; 96 * 1024]);
+        // Write a valid DATA frame in two pieces, stopping partway through its
+        // payload. The frame exceeds the initial read buffer.
+        peer.write_all(&[1, 128, 0, 0, 0, 0, 0, 0, 1])
+            .await
+            .unwrap();
+        peer.write_all(&payload[..4096]).await.unwrap();
+        poll_fn(|cx| {
+            assert!(Pin::new(&mut codec).poll_next(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(!codec.inner.can_trim_buffer());
+        peer.write_all(&payload[4096..]).await.unwrap();
+        let frame = poll_fn(|cx| Pin::new(&mut codec).poll_next(cx)).await;
+        assert!(matches!(frame, Some(Ok(Frame::Data(data))) if data.payload() == &payload));
+        assert!(codec.inner.can_trim_buffer());
+
+        // A 32 KiB backing allocation still accepts the same batch as 128 KiB.
+        for _ in 0..6 {
+            assert!(codec.has_send_capacity());
+            codec
+                .buffer(Frame::Data(Data::new(stream, payload.slice(..16 * 1024))))
+                .unwrap();
+        }
+        assert!(!codec.has_send_capacity());
+        assert!(!codec.framed_write().can_trim_buffer());
+        poll_fn(|cx| codec.flush(cx)).await.unwrap();
+        assert!(codec.framed_write().can_trim_buffer());
+
+        poll_fn(|cx| {
+            codec.poll_idle_buffers(cx, || true);
+            assert!(codec.buffer_idle.is_none());
+            codec.poll_idle_buffers(cx, || false);
+            assert!(codec.buffer_idle.is_some());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(codec.inner.can_trim_buffer());
+        assert!(codec.framed_write().can_trim_buffer());
+        let elapsed = time::Instant::now() - BUFFER_IDLE_TIMEOUT;
+        codec.buffer_idle.as_mut().unwrap().as_mut().reset(elapsed);
+        poll_fn(|cx| {
+            codec.poll_idle_buffers(cx, || false);
+            if codec.buffer_idle.is_none() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        assert!(!codec.inner.can_trim_buffer());
+        assert!(!codec.framed_write().can_trim_buffer());
     }
 }
