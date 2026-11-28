@@ -255,7 +255,14 @@ struct H1Usage {
 
 impl Drop for H1Usage {
     fn drop(&mut self) {
-        self.client.running.fetch_sub(1, Ordering::Relaxed);
+        if self.client.running.fetch_sub(1, Ordering::Relaxed) == 1
+            && !self.client.lifetime.can_reuse()
+        {
+            // No tunnel can borrow these POST sockets again. The pool may
+            // see no more dials for the lifetime of the router process.
+            let mut sockets = self.client.sockets.lock().expect("xhttp H1 sockets");
+            *sockets = Vec::new();
+        }
     }
 }
 
@@ -552,6 +559,23 @@ mod tests {
             let value = IntRange(5, 9).roll();
             assert!((5..=9).contains(&value), "rolled {value} out of range");
         }
+    }
+
+    #[tokio::test]
+    async fn last_tunnel_drops_retired_sockets_without_another_dial() {
+        let pool = Pool::new(XmuxConfig {
+            c_max_reuse_times: IntRange(1, 1),
+            ..XmuxConfig::default()
+        });
+        let tunnel = pool.h1_session().await;
+        let client = tunnel.0.client.clone();
+        let (socket, _peer) = tokio::io::duplex(1024);
+        tunnel.return_socket(Box::new(socket));
+        let active = tunnel.clone();
+        drop(tunnel);
+        assert_eq!(client.sockets.lock().unwrap().len(), 1);
+        drop(active);
+        assert_eq!(client.sockets.lock().unwrap().capacity(), 0);
     }
 
     #[tokio::test]

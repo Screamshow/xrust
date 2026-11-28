@@ -268,10 +268,7 @@ impl DnsService {
         let client_subnet = parse_client_subnet(map.get("client_subnet"))?;
 
         Ok(Some(Arc::new(Self {
-            cache_identity: {
-                use sha2::{Digest, Sha256};
-                Sha256::digest(serde_json::to_vec(dns)?).into()
-            },
+            cache_identity: crate::json_digest(dns).into(),
             servers,
             rules,
             final_tag,
@@ -286,7 +283,7 @@ impl DnsService {
             server_addr_inflight: std::sync::Mutex::new(HashMap::new()),
             router: RwLock::new(None),
             reverse: reverse_mapping
-                .then(|| RwLock::new(lru::LruCache::new(REVERSE_CAPACITY.try_into().unwrap()))),
+                .then(|| RwLock::new(cache::growing_lru(REVERSE_CAPACITY.try_into().unwrap()))),
             client_subnet,
         })))
     }

@@ -491,7 +491,7 @@ async fn a_host_header_is_written_once() {
 /// A socket that hands out at most `piece` bytes per read, so a websocket frame
 /// is guaranteed to land across many reads. `widest` records the largest buffer
 /// a read was ever asked for: that is how the direct path is told apart from
-/// the staging one, which can only ever ask for `WS_READ`.
+/// the staging one, which only buffers headers and control frames.
 struct Trickle {
     data: Vec<u8>,
     at: usize,
@@ -530,12 +530,7 @@ impl AsyncWrite for Trickle {
     }
 }
 
-/// Once a frame is known and nothing is left to unmask, `poll_read` hands the
-/// caller's own buffer to the socket instead of staging the payload and copying
-/// it out. `poll_more` reserves exactly `WS_READ` and reads into whatever is
-/// spare, so a read through it can never ask for more than that -- which makes
-/// "asked for more than WS_READ" proof that the direct path ran. Without this
-/// the widest request stays at WS_READ and the payload pays a memmove per read.
+/// A socket read bigger than a whole control frame goes straight to the caller.
 #[tokio::test]
 async fn an_unmasked_payload_is_read_straight_into_the_callers_buffer() {
     const LEN: usize = 200_000;
@@ -568,18 +563,15 @@ async fn an_unmasked_payload_is_read_straight_into_the_callers_buffer() {
     assert_eq!(got, LEN, "a split frame must come back whole");
     assert!(out[..got] == payload, "and in order");
     assert!(
-        widest.load(Ordering::Relaxed) > WS_READ,
-        "no read ever asked for more than {WS_READ} bytes, so the payload was staged"
+        widest.load(Ordering::Relaxed) > 32 * 1024,
+        "bulk payload reads were staged"
     );
 }
 
-/// A masked frame still has to be unmasked, so it cannot take the direct path:
-/// the payload has to be staged, which is the one case where the read buffer
-/// outgrows its allocation. Sized past `WS_READ` so that growth is what is
-/// being tested, not a payload that happens to fit.
+/// A masked frame split across non-word-aligned reads retains its key offset.
 #[tokio::test]
 async fn a_masked_frame_bigger_than_the_buffer_still_reads_out_whole() {
-    const LEN: usize = WS_READ + 1000;
+    const LEN: usize = 32 * 1024 + 1000;
     let payload: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
     let key = [0xde, 0xad, 0xbe, 0xef];
     let mut wire = vec![0x82, 127 | 0x80];
@@ -595,7 +587,7 @@ async fn a_masked_frame_bigger_than_the_buffer_still_reads_out_whole() {
     let stream: crate::inbound::AnyStream = Box::new(Trickle {
         data: wire,
         at: 0,
-        piece: 4096,
+        piece: 4093,
         widest: Arc::new(AtomicUsize::new(0)),
     });
     let mut ws = WsStream::new(stream);
@@ -603,6 +595,30 @@ async fn a_masked_frame_bigger_than_the_buffer_still_reads_out_whole() {
     ws.read_to_end(&mut got).await.expect("read frame");
     assert_eq!(got.len(), LEN, "the masking key must still be applied");
     assert!(got == payload, "and the payload must come back in order");
+}
+
+#[tokio::test]
+async fn a_split_ping_uses_only_header_and_control_storage() {
+    use tokio::io::AsyncWriteExt;
+    let (client, mut peer) = tokio::io::duplex(512);
+    let mut ws = WsStream::new(Box::new(client));
+    peer.write_all(&[0x89]).await.unwrap();
+    let mut one = [0];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), ws.read(&mut one))
+            .await
+            .is_err()
+    );
+    assert_eq!(&ws.rbuf[ws.rpos..], &[0x89]);
+    assert!(ws.rbuf.capacity() <= 256);
+    let ping = [0x34; 125];
+    peer.write_all(&[125]).await.unwrap();
+    peer.write_all(&ping).await.unwrap();
+    peer.write_all(&[0x82, 1, 0x7d]).await.unwrap();
+    ws.read_exact(&mut one).await.unwrap();
+    assert_eq!(one, [0x7d]);
+    assert_eq!(ws.pong.as_deref(), Some(ping.as_slice()));
+    assert!(ws.rbuf.capacity() <= 256);
 }
 
 /// A websocket waiting for its socket holds no buffers: an empty read buffer

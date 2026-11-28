@@ -365,17 +365,14 @@ impl RemoteRuleSet {
 
     /// Load a cached copy; `Ok(false)` when there is nothing usable.
     fn restore_from_cache(&mut self, cache: &SharedCacheFile) -> io::Result<bool> {
-        let raw = {
+        let mut saved = {
             let guard = cache.lock().expect("cache file");
-            guard.get(BUCKET_RULE_SET, self.tag().as_bytes())
+            let Some(raw) = guard.rule_set(self.tag().as_bytes()) else {
+                return Ok(false);
+            };
+            saved_binary::unmarshal(raw)
+                .ok_or_else(|| io::Error::other("malformed cached rule-set"))?
         };
-        let Some(raw) = raw else {
-            return Ok(false);
-        };
-        let mut saved = saved_binary::unmarshal(&raw)
-            .ok_or_else(|| io::Error::other("malformed cached rule-set"))?;
-        // `saved` owns a copy of the content; neither is kept past decoding
-        drop(raw);
         if saved.url_hash != url_hash(&self.spec.url) {
             logging::info(format_args!(
                 "cached rule-set was downloaded from another URL, will refetch"
@@ -399,8 +396,13 @@ impl RemoteRuleSet {
         } else {
             Some(saved.last_etag)
         };
-        self.last_updated =
-            Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(saved.last_updated));
+        // Keep usable rules available offline when only the timestamp is
+        // damaged. An expired stamp schedules the next network refresh.
+        self.last_updated = Some(
+            std::time::UNIX_EPOCH
+                .checked_add(std::time::Duration::from_secs(saved.last_updated))
+                .unwrap_or(std::time::UNIX_EPOCH),
+        );
         logging::info(format_args!("restored rule-set {} from cache", self.tag()));
         Ok(true)
     }
@@ -567,26 +569,15 @@ impl RemoteRuleSet {
 
     /// 304 keeps the content; only the timestamp moves (reference behaviour).
     fn touch_cache(&self, cache: &SharedCacheFile) {
-        let raw = {
-            let guard = cache.lock().expect("cache file");
-            guard.get(BUCKET_RULE_SET, self.tag().as_bytes())
-        };
-        let Some(mut saved) = raw.as_deref().and_then(saved_binary::unmarshal) else {
-            return;
-        };
-        if saved.url_hash != url_hash(&self.spec.url) {
-            return;
-        }
-        saved.last_updated = self
+        let stamp = self
             .last_updated
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs())
             .unwrap_or_else(saved_binary::now_unix);
-        let mut guard = cache.lock().expect("cache file");
-        guard.put(
-            BUCKET_RULE_SET,
+        cache.lock().expect("cache file").touch_rule_set(
             self.tag().as_bytes(),
-            saved_binary::marshal(&saved),
+            url_hash(&self.spec.url),
+            stamp,
         );
     }
 }
@@ -1324,7 +1315,13 @@ mod tests {
         assert!(!remote.restore_from_cache(&cache).unwrap());
         assert!(!provenance_path(&path).exists());
         remote.spec.url = "http://rules.test/data.tsrs".into();
+        cache.lock().unwrap().touch_rule_set(
+            remote.tag().as_bytes(),
+            url_hash(&remote.spec.url),
+            u64::MAX,
+        );
         assert!(remote.restore_from_cache(&cache).unwrap());
+        assert_eq!(remote.last_updated, Some(std::time::UNIX_EPOCH));
         assert!(remote.set.mmap().is_some());
         assert_eq!(
             cached_digest(&path, &remote.spec.url),

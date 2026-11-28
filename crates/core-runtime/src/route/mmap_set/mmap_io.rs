@@ -24,7 +24,10 @@ unsafe impl Sync for MmapBuffer {}
 
 impl MmapBuffer {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = File::open(path)?;
+        Self::from_file(File::open(path)?)
+    }
+
+    pub(super) fn from_file(file: File) -> io::Result<Self> {
         let metadata = file.metadata()?;
         let len = metadata.len() as usize;
         if len == 0 {

@@ -895,13 +895,19 @@ fn process_rss_bytes() -> u64 {
 /// The `/connections` snapshot: totals, memory and one entry per live conn.
 fn connections_snapshot() -> Value {
     let (views, up, down) = clash_state::snapshot();
-    let connections: Vec<Value> = views.iter().map(connection_json).collect();
-    json!({
+    let mut body = json!({
         "downloadTotal": down,
         "uploadTotal": up,
-        "connections": connections,
+        "connections": null,
         "memory": process_rss_bytes(),
-    })
+    });
+    body["connections"] = Value::Array(
+        views
+            .into_iter()
+            .map(|view| connection_json(&view))
+            .collect(),
+    );
+    body
 }
 
 /// `?interval=` for the websocket stream, in milliseconds (reference default
@@ -959,18 +965,15 @@ async fn handle_connection(
     cors: &[String],
 ) -> std::io::Result<bool> {
     match method {
-        "GET" => {
-            let (views, _, _) = clash_state::snapshot();
-            match views.iter().find(|view| view.id == id.to_string()) {
-                Some(view) => {
-                    let body = connection_json(view);
-                    respond_json(stream, 200, "OK", &body, cors).await?;
-                }
-                None => {
-                    respond_json(stream, 404, "Not Found", &not_found(), cors).await?;
-                }
+        "GET" => match clash_state::connection(id) {
+            Some(view) => {
+                let body = connection_json(&view);
+                respond_json(stream, 200, "OK", &body, cors).await?;
             }
-        }
+            None => {
+                respond_json(stream, 404, "Not Found", &not_found(), cors).await?;
+            }
+        },
         _ => {
             if clash_state::close(id) {
                 respond_no_content(stream, cors).await?;

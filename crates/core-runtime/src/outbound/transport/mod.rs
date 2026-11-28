@@ -58,7 +58,7 @@ pub(crate) struct Transport {
     /// a node sees one TLS handshake where a connection per tunnel showed one
     /// each. XHTTP has had a pool of its own since it was written; this one
     /// serves the gRPC and HTTP/2 transports.
-    h2_pool: std::sync::Arc<h2io::H2Pool>,
+    h2_pool: Option<std::sync::Arc<h2io::H2Pool>>,
     /// Pool limits, [`H2_POOL_CONCURRENCY`] and [`H2_POOL_CONNECTIONS`] unless
     /// a test narrows them.
     h2_limits: (usize, usize),
@@ -196,8 +196,9 @@ impl Default for Transport {
 impl Transport {
     fn with_kind(kind: Kind) -> Self {
         Self {
+            h2_pool: matches!(kind, Kind::Grpc { .. } | Kind::Http { .. })
+                .then(|| std::sync::Arc::new(h2io::H2Pool::new())),
             kind,
-            h2_pool: std::sync::Arc::new(h2io::H2Pool::new()),
             h2_limits: (H2_POOL_CONNECTIONS, H2_POOL_CONCURRENCY),
             h2_idle: h2io::h2_conn_idle(),
         }
@@ -221,7 +222,7 @@ impl Transport {
     /// How many connections this outbound's pool holds.
     #[cfg(test)]
     pub(crate) fn pooled_connections(&self) -> usize {
-        self.h2_pool.pooled()
+        self.h2_pool.as_ref().map_or(0, |pool| pool.pooled())
     }
 
     /// Parse the outbound `transport` object (absent/null → no transport).
@@ -417,8 +418,8 @@ impl Transport {
             }
         }
 
-        if self.pools_h2(tls.is_some()) {
-            return self.connect_pooled_h2(tls, server, port, dial).await;
+        if let Some(pool) = self.h2_pool(tls.is_some()) {
+            return self.connect_pooled_h2(pool, tls, server, port, dial).await;
         }
 
         let tcp = crate::outbound::dial::connect_tcp(server, port, dial).await?;
@@ -429,12 +430,10 @@ impl Transport {
     /// gRPC always speaks HTTP/2 -- prior knowledge without TLS, ALPN `h2`
     /// with it -- and the HTTP/2 transport does so over TLS, plaintext there
     /// being HTTP/1.1. XHTTP has its own pool and is handled above.
-    fn pools_h2(&self, secure: bool) -> bool {
-        match &self.kind {
-            Kind::Grpc { .. } => true,
-            Kind::Http { .. } => secure,
-            _ => false,
-        }
+    fn h2_pool(&self, secure: bool) -> Option<&std::sync::Arc<h2io::H2Pool>> {
+        self.h2_pool
+            .as_ref()
+            .filter(|_| secure || matches!(self.kind, Kind::Grpc { .. }))
     }
 
     /// What this transport calls itself in the pool's log lines and errors.
@@ -453,6 +452,7 @@ impl Transport {
     /// handshake rather than three.
     async fn connect_pooled_h2(
         &self,
+        pool: &std::sync::Arc<h2io::H2Pool>,
         tls: Option<&TlsOptions>,
         server: &str,
         port: u16,
@@ -460,7 +460,7 @@ impl Transport {
     ) -> io::Result<AnyStream> {
         let (max_conns, max_concurrency) = self.h2_limits;
         let label = self.h2_label();
-        match self.h2_pool.acquire(max_conns, max_concurrency).await {
+        match pool.acquire(max_conns, max_concurrency).await {
             h2io::H2Acquire::Ready(send_req, counter) => {
                 let guard = h2io::CounterGuard::new(counter.clone());
                 match self.open_pooled_tunnel(send_req, tls, server) {
@@ -473,7 +473,7 @@ impl Transport {
                         // A connection that will not open a stream is spent,
                         // whatever is wrong with it; the next dial starts a
                         // fresh one.
-                        self.h2_pool.evict(&counter).await;
+                        pool.evict(&counter).await;
                         Err(e)
                     }
                 }
@@ -487,8 +487,7 @@ impl Transport {
                         return Err(e);
                     }
                 };
-                let counter = self
-                    .h2_pool
+                let counter = pool
                     .finish_dial(Some(send_request.clone()), max_conns)
                     .await
                     .expect("counter present");
@@ -500,7 +499,7 @@ impl Transport {
                     connection,
                     clock,
                     keep_alive,
-                    std::sync::Arc::downgrade(&self.h2_pool),
+                    std::sync::Arc::downgrade(pool),
                     counter.clone(),
                     self.h2_idle,
                     label,
@@ -511,7 +510,7 @@ impl Transport {
                     Ok(req) => req,
                     Err(e) => {
                         drop(guard);
-                        self.h2_pool.evict(&counter).await;
+                        pool.evict(&counter).await;
                         return Err(io::Error::other(format!("{label}: h2 ready: {e}")));
                     }
                 };
@@ -522,7 +521,7 @@ impl Transport {
                     ))),
                     Err(e) => {
                         drop(guard);
-                        self.h2_pool.evict(&counter).await;
+                        pool.evict(&counter).await;
                         Err(e)
                     }
                 }
@@ -1230,16 +1229,13 @@ async fn httpupgrade_handshake(
 /// RFC 6455 websocket carrying the protocol bytes as binary messages; frames
 /// are concatenated into a byte stream in each direction.
 ///
-/// Reading keeps a read-ahead buffer: the socket (usually a TLS stream) is read
-/// in big gulps, frame headers are parsed out of the buffer, and the payload is
-/// unmasked where it lies and copied once, to the caller. Writing builds a
-/// frame in one reusable buffer and masks it word by word.
+/// Reading stages frame headers and control payloads. Data frames stream into
+/// the caller's buffer, where masked bytes are unmasked in place. Writing builds
+/// a frame in one reusable buffer and masks it word by word.
 pub(crate) struct WsStream {
     inner: AnyStream,
     /// bytes off the wire not consumed yet: `rbuf[rpos..]`, its length being the
-    /// filled part. [`WS_READ`] big and grown only if it ever fills up: a buffer
-    /// that follows the traffic means a realloc, and every realloc over glibc's
-    /// mmap threshold is a fresh mmap and munmap pair on the hot path. While the
+    /// filled part. Grows beyond a header only for control frames. While the
     /// socket has nothing to read, an empty buffer goes back to [`WS_READ_POOL`].
     rbuf: Vec<u8>,
     rpos: usize,
@@ -1274,9 +1270,6 @@ impl Drop for WsStream {
         WS_WRITE_POOL.give(std::mem::take(&mut self.wbuf));
     }
 }
-
-/// What one read asks the socket for at least.
-const WS_READ: usize = 32 * 1024;
 
 /// Buffers of websocket streams that wait for their socket, as in the TLS stack.
 static WS_READ_POOL: crate::bufpool::Pool = crate::bufpool::Pool::new();
@@ -1378,9 +1371,6 @@ impl WsStream {
 
     /// Read more of the wire into the buffer; `false` on a clean end.
     fn poll_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<bool>> {
-        // Only a masked payload fills this buffer, and a server never masks: what
-        // gets staged here is a frame header, or the head of a payload when a mask
-        // is in play. So the common case has room and never reallocates.
         if self.rbuf.capacity() == 0 {
             self.rbuf = WS_READ_POOL.take();
         }
@@ -1392,15 +1382,12 @@ impl WsStream {
                 self.rpos = 0;
             }
             if self.rbuf.len() == self.rbuf.capacity() {
-                self.rbuf.reserve(WS_READ);
+                self.rbuf.reserve(HEAD_PROBE);
             }
         }
         let have = self.rbuf.len();
-        // At a frame boundary only the head is wanted, and it is at most 14 bytes.
-        // Reading a whole buffer's worth here staged the payload as well, and the
-        // caller then copied that out to reach it: an extra pass over every frame,
-        // which showed up as a sixth of the client CPU. Once a head is in, read in
-        // full -- that is the masked case, where the payload has to be staged.
+        // At a frame boundary probe just the head even if an earlier control
+        // frame grew this buffer.
         let room = if have == 0 {
             HEAD_PROBE.min(self.rbuf.capacity())
         } else {
@@ -1504,7 +1491,7 @@ impl WsStream {
     ) -> Poll<io::Result<()>> {
         let me = self;
         loop {
-            if me.eof {
+            if me.eof || out.remaining() == 0 {
                 return Poll::Ready(Ok(()));
             }
             let avail = me.rbuf.len() - me.rpos;
@@ -1521,25 +1508,25 @@ impl WsStream {
                     me.left -= n;
                     return Poll::Ready(Ok(()));
                 }
-                // Nothing staged and nothing to unmask: hand the caller's own
-                // buffer to the socket. Staging the payload and then copying it
-                // out cost a memmove per read on top of the one rustls already
-                // does, and on this path the payload is most of the traffic.
-                if me.mask.is_none() && out.remaining() > 0 {
-                    let n = me.left.min(out.remaining());
-                    let mut direct = ReadBuf::new(out.initialize_unfilled_to(n));
-                    ready!(Pin::new(&mut me.inner).poll_read(cx, &mut direct))?;
-                    let got = direct.filled().len();
-                    if got == 0 {
-                        return Poll::Ready(Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            "ws: payload ended mid-frame",
-                        )));
-                    }
-                    me.left -= got;
-                    out.advance(got);
-                    return Poll::Ready(Ok(()));
+                // The rest of this frame can be read directly, including
+                // masked payloads whose key continues across socket reads.
+                let n = me.left.min(out.remaining());
+                let mut direct = ReadBuf::new(out.initialize_unfilled_to(n));
+                ready!(Pin::new(&mut me.inner).poll_read(cx, &mut direct))?;
+                let got = direct.filled().len();
+                if got == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "ws: payload ended mid-frame",
+                    )));
                 }
+                if let Some(mask) = me.mask {
+                    xor_mask(direct.filled_mut(), mask, me.mask_at);
+                    me.mask_at += got;
+                }
+                me.left -= got;
+                out.advance(got);
+                return Poll::Ready(Ok(()));
             } else if let Some(head) = parse_head(&me.rbuf[me.rpos..])? {
                 let is_control = head.opcode >= 0x8;
                 if is_control {

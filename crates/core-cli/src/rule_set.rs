@@ -70,6 +70,7 @@ fn read_input(path: &str) -> Result<Vec<u8>, String> {
 /// `*fs.PathError` text: Go prints the bare syscall message, and the message is
 /// localized on this host, so the Windows codes are mapped like the reference.
 fn go_io_error(_path: &str, err: &std::io::Error) -> String {
+    #[cfg(windows)]
     if let Some(code) = err.raw_os_error() {
         let text = match code {
             2 => "The system cannot find the file specified.",

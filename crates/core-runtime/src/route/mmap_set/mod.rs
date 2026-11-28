@@ -62,12 +62,21 @@ impl MmapRuleSet {
 
     /// Open an existing .tsrs file with the specified MmapMode.
     pub fn open_with_mode<P: AsRef<Path>>(path: P, mode: MmapMode) -> std::io::Result<Self> {
-        let p = path.as_ref().to_path_buf();
+        Self::from_file(std::fs::File::open(&path)?, path.as_ref(), mode)
+    }
+
+    pub(super) fn from_file(
+        mut file: std::fs::File,
+        path: &Path,
+        mode: MmapMode,
+    ) -> std::io::Result<Self> {
+        use std::io::Read;
         let buffer = if mode == MmapMode::Memory {
-            let data = std::fs::read(&p)?;
+            let mut data = Vec::new();
+            file.read_to_end(&mut data)?;
             MmapBuffer::from_bytes(&data)
         } else {
-            MmapBuffer::open(&p)?
+            MmapBuffer::from_file(file)?
         };
         if MmapView::parse(&buffer).is_none() {
             return Err(std::io::Error::new(
@@ -77,7 +86,7 @@ impl MmapRuleSet {
         }
         Ok(Self {
             buffer,
-            path: Some(p),
+            path: Some(path.to_owned()),
         })
     }
 

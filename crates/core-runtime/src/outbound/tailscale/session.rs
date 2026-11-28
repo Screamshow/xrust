@@ -155,7 +155,7 @@ pub(crate) async fn tls(
         core_tls::rustls::ClientConfig::builder_with_provider(Arc::new(core_crypto::provider()))
             .with_safe_default_protocol_versions()
             .map_err(io::Error::other)?
-            .with_root_certificates(core_tls::verify::WebpkiVerifier::mozilla_store())
+            .with_root_certificates(core_tls::verify::WebpkiVerifier::shared_mozilla_store())
             .with_no_client_auth();
     cfg.alpn_protocols = vec![alpn.to_vec()];
     let name = core_tls::rustls::pki_types::ServerName::try_from(host.to_owned())

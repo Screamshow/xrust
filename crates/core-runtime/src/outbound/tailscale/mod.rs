@@ -592,16 +592,15 @@ impl Tailscale {
         let udp_timeout = self.cfg.udp_timeout;
         // Reset one idle timer for either direction of this UDP session.
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65_535];
             loop {
                 tokio::select! {
                     reply = replies.recv() => {
                         let Some(bytes) = reply else { break; };
                         if peer.send(&bytes).await.is_err() { break; }
                     }
-                    incoming = peer.recv(&mut buf) => {
-                        let Ok(n) = incoming else { break; };
-                        if cmd_tx.send(Cmd::UdpSend { port, bytes: buf[..n].to_vec() }).await.is_err() { break; }
+                    incoming = crate::inbound::udp::recv_with(&peer, <[u8]>::to_vec) => {
+                        let Ok(bytes) = incoming else { break; };
+                        if cmd_tx.send(Cmd::UdpSend { port, bytes }).await.is_err() { break; }
                     }
                     _ = tokio::time::sleep(udp_timeout) => break,
                 }

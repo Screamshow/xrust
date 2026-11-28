@@ -133,22 +133,16 @@ impl<T: Network> PrefixSet<T> {
     }
 
     fn build(&mut self) {
-        self.pending.sort_unstable();
-        self.pending.dedup();
-        self.lens = self.pending.iter().map(|(len, _)| *len).collect();
-        // `pending` is sorted, so equal lengths are adjacent.
-        self.lens.dedup();
-        self.buckets = vec![Vec::new(); self.lens.len()];
-        for (len, network) in self.pending.drain(..) {
-            let at = self
-                .lens
-                .binary_search(&len)
-                .expect("the length came out of this very list");
-            self.buckets[at].push(network);
-        }
-        for bucket in &mut self.buckets {
-            bucket.sort_unstable();
-            bucket.dedup();
+        let mut pending = std::mem::take(&mut self.pending);
+        pending.sort_unstable();
+        pending.dedup();
+        self.lens.clear();
+        self.buckets.clear();
+        // Each group already contains distinct networks in binary-search order.
+        for group in pending.chunk_by(|a, b| a.0 == b.0) {
+            self.lens.push(group[0].0);
+            self.buckets
+                .push(group.iter().map(|&(_, net)| net).collect());
         }
     }
 
@@ -617,7 +611,7 @@ impl RuleSetIndex {
         if !self.keywords_raw.is_empty() {
             // Only "does any pattern occur" is asked, so a leftmost-first
             // automaton is enough and no match offsets are ever collected.
-            self.keywords = AhoCorasick::new(self.keywords_raw.drain(..)).ok();
+            self.keywords = AhoCorasick::new(std::mem::take(&mut self.keywords_raw)).ok();
         }
     }
 

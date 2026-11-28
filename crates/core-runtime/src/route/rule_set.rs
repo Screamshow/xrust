@@ -223,12 +223,11 @@ struct FileStamp {
 impl RuleSetOrigin {
     /// `None` when the file cannot be identified: such a set is always rebuilt.
     pub(crate) fn new(entry: &serde_json::Map<String, Value>, file: Option<&str>) -> Option<Self> {
-        use sha2::{Digest, Sha256};
         let file = match file {
             Some(path) => Some(FileStamp::of(path)?),
             None => None,
         };
-        let entry = Sha256::digest(serde_json::to_vec(entry).ok()?).into();
+        let entry = crate::json_digest(entry).into();
         Some(Self { entry, file })
     }
 }

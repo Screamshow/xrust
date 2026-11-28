@@ -466,11 +466,19 @@ pub(crate) fn build_rule_sets_reusing(
             "local" => {
                 let path = entry.get("path").and_then(Value::as_str).unwrap_or("");
                 let resolved_path = resolve_rule_set_path(path, &tags);
-                let data = std::fs::read(&resolved_path)
-                    .map_err(|err| anyhow::anyhow!("{at}: read {path}: {err}"))?;
-                if data.starts_with(b"TSRS") {
-                    let mmap_set = std::sync::Arc::new(mmap_set::MmapRuleSet::open_with_mode(
-                        &resolved_path,
+                use std::io::{Read, Seek};
+                let read_error = |err| anyhow::anyhow!("{at}: read {path}: {err}");
+                let mut file = std::fs::File::open(&resolved_path).map_err(read_error)?;
+                let mut data = Vec::with_capacity(4);
+                (&mut file)
+                    .take(4)
+                    .read_to_end(&mut data)
+                    .map_err(read_error)?;
+                if data == b"TSRS" {
+                    file.rewind().map_err(read_error)?;
+                    let mmap_set = std::sync::Arc::new(mmap_set::MmapRuleSet::from_file(
+                        file,
+                        resolved_path.as_ref(),
                         mode,
                     )?);
                     logging::info(format_args!(
@@ -483,6 +491,8 @@ pub(crate) fn build_rule_sets_reusing(
                         origin.clone(),
                     );
                 } else {
+                    file.read_to_end(&mut data).map_err(read_error)?;
+                    drop(file);
                     let rules = parse_rule_set_payload(&data, entry, &at)?;
                     // the file is not needed once decoded
                     drop(data);

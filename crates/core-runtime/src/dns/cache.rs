@@ -53,10 +53,17 @@ pub struct Cache {
     entries: LruCache<CacheKey, CacheEntry>,
 }
 
+/// Keep the eviction limit without reserving all hash buckets at startup.
+pub(super) fn growing_lru<K: std::hash::Hash + Eq, V>(capacity: NonZeroUsize) -> LruCache<K, V> {
+    let mut entries = LruCache::unbounded();
+    entries.resize(capacity);
+    entries
+}
+
 impl Cache {
     pub fn new(capacity: usize) -> Self {
         Self {
-            entries: LruCache::new(NonZeroUsize::new(capacity.max(16)).expect("max(16)")),
+            entries: growing_lru(NonZeroUsize::new(capacity.max(16)).expect("max(16)")),
         }
     }
 

@@ -697,8 +697,11 @@ const INBOUND_LISTEN_STRUCT: &[(&str, &str)] = &[
     ("tproxy", "TProxyInboundOptions"),
     ("redirect", "RedirectInboundOptions"),
     ("direct", "DirectInboundOptions"),
+    #[cfg(feature = "server-inbounds")]
     ("vless", "VLESSInboundOptions"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "HysteriaInboundOptions"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria2", "Hysteria2InboundOptions"),
 ];
 
@@ -720,7 +723,9 @@ const INBOUND_OWN_FIELDS: &[(&str, &[&str])] = &[
     ),
     ("redirect", &[]),
     ("direct", &["network", "override_address", "override_port"]),
+    #[cfg(feature = "server-inbounds")]
     ("vless", &["users", "multiplex", "transport", "tls"]),
+    #[cfg(feature = "server-inbounds")]
     (
         "hysteria",
         &[
@@ -802,6 +807,7 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         "option.InboundTLSOptions",
         true,
     ),
+    #[cfg(feature = "server-inbounds")]
     (
         "vless",
         "tls",
@@ -816,6 +822,7 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         "option.InboundTLSOptions",
         true,
     ),
+    #[cfg(feature = "server-inbounds")]
     (
         "hysteria",
         "tls",
@@ -823,6 +830,7 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         "option.InboundTLSOptions",
         true,
     ),
+    #[cfg(feature = "server-inbounds")]
     (
         "hysteria2",
         "tls",
@@ -830,6 +838,7 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         "option.InboundTLSOptions",
         true,
     ),
+    #[cfg(feature = "server-inbounds")]
     (
         "vless",
         "multiplex",
@@ -837,6 +846,7 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
         "option.InboundMultiplexOptions",
         true,
     ),
+    #[cfg(feature = "server-inbounds")]
     (
         "vless",
         "transport",
@@ -847,7 +857,9 @@ const INBOUND_CONTAINERS: &[(&str, &str, &str, &str, bool)] = &[
     ("mixed", "users", "users", "[]auth.User", false),
     ("http", "users", "users", "[]auth.User", false),
     ("socks", "users", "users", "[]auth.User", false),
+    #[cfg(feature = "server-inbounds")]
     ("vless", "users", "users", "[]option.VLESSUser", false),
+    #[cfg(feature = "server-inbounds")]
     (
         "hysteria2",
         "users",
@@ -871,24 +883,35 @@ const INBOUND_FIELD_KINDS: &[(&str, &str, &str)] = &[
     ("direct", "network", "network_list"),
     ("direct", "override_address", "string"),
     ("direct", "override_port", "uint16"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "up", "network_bytes"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "down", "network_bytes"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "up_mbps", "int"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "down_mbps", "int"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "obfs", "string"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "recv_window_conn", "uint64"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "recv_window_client", "uint64"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "max_conn_client", "int"),
+    #[cfg(feature = "server-inbounds")]
     ("hysteria", "disable_mtu_discovery", "bool"),
 ];
 
 /// `byteformats.NetworkBytesCompat` (sing/common/byteformats): a byte count, or
 /// a digit prefix plus one of the case-sensitive network units.
+#[cfg(feature = "server-inbounds")]
 const NETWORK_UNITS: &[&str] = &[
     "Bps", "Kbps", "KBps", "Mbps", "MBps", "Gbps", "GBps", "Tbps", "TBps", "Pbps", "PBps", "Ebps",
     "EBps",
 ];
 
+#[cfg(feature = "server-inbounds")]
 fn check_network_bytes(
     value: &Value,
     at: &str,
@@ -2728,6 +2751,7 @@ fn validate_inbound_fields(i: usize, ty: &str, obj: &Map<String, Value>) -> Resu
             "uint16" => check_uint_field(value, &field_at, go_struct, field, 16)?,
             "uint32" => check_uint_field(value, &field_at, go_struct, field, 32)?,
             "uint64" => check_uint_field(value, &field_at, go_struct, field, 64)?,
+            #[cfg(feature = "server-inbounds")]
             "network_bytes" => check_network_bytes(value, &field_at, go_struct, field)?,
             _ => {}
         }

@@ -472,8 +472,23 @@ pub async fn run_str(raw: &str) -> anyhow::Result<()> {
     run_with_loader(|| Ok(raw.to_string())).await
 }
 
-fn checked_config(raw: &str) -> anyhow::Result<Value> {
-    let value = serde_json::from_str(raw).map_err(|error| anyhow::Error::msg(error.to_string()))?;
+/// A single config source, or a document already parsed while merging sources.
+pub enum ConfigInput {
+    Json(String),
+    Parsed(Value),
+}
+
+impl ConfigInput {
+    pub fn into_value(self) -> serde_json::Result<Value> {
+        match self {
+            Self::Json(raw) => serde_json::from_str(&raw),
+            Self::Parsed(value) => Ok(value),
+        }
+    }
+}
+
+fn checked_config(input: ConfigInput) -> anyhow::Result<Value> {
+    let value = input.into_value()?;
     for warning in
         core_config::validate::validate_with_warnings(&value).map_err(anyhow::Error::msg)?
     {
@@ -487,10 +502,11 @@ fn checked_config(raw: &str) -> anyhow::Result<Value> {
 /// decoded a second time. A rejection keeps the parsed value, when there is
 /// one, so the status can name the configuration it rejected.
 fn checked_reload_config(
-    raw: &str,
+    input: ConfigInput,
     running: &Router,
 ) -> Result<Value, (Option<Value>, anyhow::Error)> {
-    let value: Value = serde_json::from_str(raw)
+    let value = input
+        .into_value()
         .map_err(|error| (None, anyhow::Error::new(error).context("decode config")))?;
     let unchanged = running.rule_sets().unchanged_local_paths(&value);
     match core_config::check_value_with_loaded_rule_sets(&value, &unchanged) {
@@ -543,11 +559,18 @@ fn reload_boundary(root: &Value) -> Value {
 
 /// Canonical parsed-config identity shared by the CLI planner and live API.
 pub fn configuration_fingerprint(root: &Value) -> String {
+    format!("{:x}", json_digest(root))
+}
+
+fn json_digest(value: &impl serde::Serialize) -> sha2::digest::Output<sha2::Sha256> {
     use sha2::{Digest, Sha256};
-    format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(root).expect("config JSON"))
-    )
+    use std::io::{BufWriter, Write};
+    let mut digest = Sha256::new();
+    let mut writer = BufWriter::new(&mut digest);
+    serde_json::to_writer(&mut writer, value).expect("config JSON");
+    writer.flush().expect("in-memory digest");
+    drop(writer);
+    digest.finalize()
 }
 
 fn direct_proxy_inbound(root: &Value) -> Option<&Value> {
@@ -604,6 +627,13 @@ pub fn can_reload_in_place(old_root: &Value, new_root: &Value) -> bool {
 pub async fn run_with_loader(
     mut load: impl FnMut() -> anyhow::Result<String>,
 ) -> anyhow::Result<()> {
+    run_with_config_loader(|| load().map(ConfigInput::Json)).await
+}
+
+/// Reload single or merged configuration sources on SIGHUP.
+pub async fn run_with_config_loader(
+    mut load: impl FnMut() -> anyhow::Result<ConfigInput>,
+) -> anyhow::Result<()> {
     // Register HUP before startup, including potentially slow remote downloads.
     #[cfg(unix)]
     let (mut term, mut hup) = {
@@ -616,7 +646,7 @@ pub async fn run_with_loader(
     // The instance already keeps the settings needed to compare reloads.
     // Keep the full last accepted configuration as compact JSON for rollback.
     let (mut instance, mut applied_json) = {
-        let root = checked_config(&load()?)?;
+        let root = checked_config(load()?)?;
         let instance = start(&root).await?;
         (instance, root.to_string().into_boxed_str())
     };
@@ -639,7 +669,7 @@ pub async fn run_with_loader(
         }
         let checked = load()
             .map_err(|error| (None, error))
-            .and_then(|raw| checked_reload_config(&raw, &instance.router()));
+            .and_then(|input| checked_reload_config(input, &instance.router()));
         let next = match checked {
             Ok(next) => next,
             Err((parsed, error)) => {
@@ -799,8 +829,13 @@ mod tests {
 
     #[test]
     fn reload_validation_rejects_bad_configuration() {
-        assert!(checked_config("{broken").is_err());
-        assert!(checked_config(r#"{"inbounds":[{"type":"unknown"}]}"#).is_err());
+        assert!(checked_config(ConfigInput::Json("{broken".into())).is_err());
+        assert!(
+            checked_config(ConfigInput::Json(
+                r#"{"inbounds":[{"type":"unknown"}]}"#.into()
+            ))
+            .is_err()
+        );
     }
 
     #[test]

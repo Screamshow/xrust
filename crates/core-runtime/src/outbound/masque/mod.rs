@@ -785,23 +785,16 @@ impl Masque {
 
         // sends: loopback peer socket → stack (mirrors the hysteria2 bridge).
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 65_535];
             let check_interval = udp_timeout.min(Duration::from_secs(5));
             loop {
-                match tokio::time::timeout(check_interval, peer.recv(&mut buf)).await {
-                    Ok(Ok(n)) => {
+                let receive = crate::inbound::udp::recv_with(&peer, <[u8]>::to_vec);
+                match tokio::time::timeout(check_interval, receive).await {
+                    Ok(Ok(bytes)) => {
                         last_act_tx.store(
                             crate::inbound::udp::now_ms(),
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        if cmd_tx
-                            .send(Cmd::UdpSend {
-                                port,
-                                bytes: buf[..n].to_vec(),
-                            })
-                            .await
-                            .is_err()
-                        {
+                        if cmd_tx.send(Cmd::UdpSend { port, bytes }).await.is_err() {
                             break;
                         }
                     }

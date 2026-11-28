@@ -180,19 +180,28 @@ pub fn snapshot() -> (Vec<ConnView>, u64, u64) {
         .unwrap_or_default();
     let views = entries
         .into_iter()
-        .map(|entry| ConnView {
-            id: entry.id.to_string(),
-            upload: entry.upload.load(Ordering::Relaxed),
-            download: entry.download.load(Ordering::Relaxed),
-            start: entry.start,
-            meta: entry.meta.clone(),
-        })
+        .map(|entry| connection_view(&entry))
         .collect();
     (
         views,
         UPLOAD_TOTAL.load(Ordering::Relaxed),
         DOWNLOAD_TOTAL.load(Ordering::Relaxed),
     )
+}
+
+fn connection_view(entry: &Shared) -> ConnView {
+    ConnView {
+        id: entry.id.to_string(),
+        upload: entry.upload.load(Ordering::Relaxed),
+        download: entry.download.load(Ordering::Relaxed),
+        start: entry.start,
+        meta: entry.meta.clone(),
+    }
+}
+
+pub(crate) fn connection(id: u64) -> Option<ConnView> {
+    let entry = registry().lock().ok()?.get(&id)?.clone();
+    Some(connection_view(&entry))
 }
 
 /// `DELETE /connections/{id}`; `false` when the id is unknown.
@@ -424,6 +433,7 @@ mod tests {
 
         let id: u64 = view.id.parse().expect("id");
         assert_eq!(id, handle.id());
+        assert_eq!(connection(id).unwrap().upload, view.upload);
         assert!(close(id), "close reports the connection was found");
         tokio::select! {
             _ = signal.wait() => {}
@@ -431,6 +441,8 @@ mod tests {
                 panic!("close signal not delivered")
             }
         }
+        drop(handle);
+        assert!(connection(id).is_none());
         assert!(!close(id + 10_000), "unknown ids report false");
     }
 

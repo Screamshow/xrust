@@ -94,7 +94,7 @@ fn config_path_from(args: &[String]) -> Option<PathBuf> {
     None
 }
 
-fn load_config(args: &[String]) -> Result<String, String> {
+fn load_config(args: &[String]) -> Result<core_runtime::ConfigInput, String> {
     let mut config_files = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -156,7 +156,9 @@ fn load_config(args: &[String]) -> Result<String, String> {
 
     if expanded.len() == 1 {
         let path = &expanded[0];
-        return std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()));
+        return std::fs::read_to_string(path)
+            .map(core_runtime::ConfigInput::Json)
+            .map_err(|e| format!("read {}: {e}", path.display()));
     }
 
     let mut merged = serde_json::Value::Object(serde_json::Map::new());
@@ -166,14 +168,17 @@ fn load_config(args: &[String]) -> Result<String, String> {
             serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", p.display()))?;
         merge_json_values(&mut merged, val);
     }
-    serde_json::to_string_pretty(&merged).map_err(|e| format!("encode: {e}"))
+    Ok(core_runtime::ConfigInput::Parsed(merged))
 }
 
 fn cmd_check(args: &[String]) -> Result<(), String> {
-    let raw = load_config(args).map_err(|e| format!("check: {e}"))?;
+    let value = load_config(args)
+        .map_err(|e| format!("check: {e}"))?
+        .into_value()
+        .map_err(|e| format!("check: {e}"))?;
     // like the reference, `check` reports errors only — the ResolveLX
     // deprecation warnings surface at run time
-    core_config::check_str(&raw).map_err(|e| format!("check: {e}"))?;
+    core_config::validate::validate_with_warnings(&value).map_err(|e| format!("check: {e}"))?;
     Ok(())
 }
 
@@ -212,7 +217,8 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("run: {e}"))?;
     runtime
         .block_on(async {
-            core_runtime::run_with_loader(|| load_config(args).map_err(anyhow::Error::msg)).await
+            core_runtime::run_with_config_loader(|| load_config(args).map_err(anyhow::Error::msg))
+                .await
         })
         .map_err(|e| format!("run: {e:#}"))
 }
@@ -228,8 +234,8 @@ fn cmd_reload_plan(args: &[String]) -> Result<(), String> {
     // The running core decodes every changed rule-set file itself before it
     // applies a reload and reports a refusal; a manager may leave that to it.
     let skip_payloads = args.iter().any(|arg| arg == "--skip-rule-set-payloads");
-    let raw = load_config(args)?;
-    let next: serde_json::Value = serde_json::from_str(&raw)
+    let next = load_config(args)?
+        .into_value()
         .map_err(|_| "reload-plan: candidate configuration rejected".to_string())?;
     if skip_payloads {
         core_config::check_value_without_rule_set_payloads(&next)

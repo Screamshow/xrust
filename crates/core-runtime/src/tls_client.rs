@@ -556,7 +556,7 @@ impl TlsOptions {
         let chain = if has_xray_pins {
             None
         } else {
-            Some(core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?.into_inner())
+            Some(core_tls::verify::WebpkiVerifier::new(self.root_store()?)?.into_inner())
         };
         let verifier = Arc::new(core_tls::verify::XrayVerifier::new(
             self.xray_pinned_peer_cert_sha256.clone(),
@@ -593,8 +593,7 @@ impl TlsOptions {
                     self.certificate_public_key_sha256.clone(),
                 )?
             } else {
-                let inner = core_tls::verify::WebpkiVerifier::new(Arc::new(self.root_store()?))?
-                    .into_inner();
+                let inner = core_tls::verify::WebpkiVerifier::new(self.root_store()?)?.into_inner();
                 core_tls::verify::PinVerifier::new(
                     inner,
                     self.certificate_sha256.clone(),
@@ -621,13 +620,13 @@ impl TlsOptions {
         Ok(())
     }
 
-    fn root_store(&self) -> io::Result<rustls::RootCertStore> {
+    fn root_store(&self) -> io::Result<Arc<rustls::RootCertStore>> {
         // No `ca` in the config means "no pin", not "trust nothing": an empty
         // store here failed every DoH query and every plain-rustls handshake
         // with `invalid peer certificate: UnknownIssuer`, so no domain ever
         // resolved. `establish` already fell back to the Mozilla roots.
         if self.ca_certs.is_empty() {
-            return Ok(core_tls::verify::WebpkiVerifier::mozilla_store());
+            return Ok(core_tls::verify::WebpkiVerifier::shared_mozilla_store());
         }
         let mut roots = rustls::RootCertStore::empty();
         for cert in &self.ca_certs {
@@ -635,7 +634,7 @@ impl TlsOptions {
                 .add(cert.clone())
                 .map_err(|e| io::Error::other(format!("bad CA certificate: {e}")))?;
         }
-        Ok(roots)
+        Ok(Arc::new(roots))
     }
 
     /// The `ClientConfig` for these options, shared across connects. Building
@@ -1090,7 +1089,7 @@ pub(crate) fn parse_short_id(value: &str) -> Result<Vec<u8>, String> {
 /// roots also work on OpenWrt without a system CA package. Additional roots
 /// use the existing top-level certificate configuration.
 pub(crate) fn probe_connector(root: &Value) -> anyhow::Result<TlsConnector> {
-    let mut roots = core_tls::verify::WebpkiVerifier::mozilla_store();
+    let mut roots = core_tls::verify::WebpkiVerifier::shared_mozilla_store();
     if let Some(options) = root.get("certificate") {
         for field in ["certificate", "certificate_path"] {
             let Some(value) = options.get(field).filter(|v| !v.is_null()) else {
@@ -1127,7 +1126,7 @@ pub(crate) fn probe_connector(root: &Value) -> anyhow::Result<TlsConnector> {
                     "certificate.{field}: no PEM certificates"
                 );
                 for cert in parsed {
-                    roots.add(cert)?;
+                    Arc::make_mut(&mut roots).add(cert)?;
                 }
             }
         }

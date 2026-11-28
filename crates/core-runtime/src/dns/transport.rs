@@ -295,10 +295,10 @@ impl FakeIpStore {
                 cur4,
                 cur6,
                 addr_to_domain: std::collections::HashMap::new(),
-                domain_to_v4: lru::LruCache::new(
+                domain_to_v4: super::cache::growing_lru(
                     std::num::NonZeroUsize::new(FAKEIP_MAP_CAPACITY).expect("nonzero"),
                 ),
-                domain_to_v6: lru::LruCache::new(
+                domain_to_v6: super::cache::growing_lru(
                     std::num::NonZeroUsize::new(FAKEIP_MAP_CAPACITY).expect("nonzero"),
                 ),
             }),

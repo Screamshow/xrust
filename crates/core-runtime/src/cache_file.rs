@@ -195,6 +195,28 @@ impl CacheFile {
             .cloned()
     }
 
+    pub(crate) fn rule_set(&self, key: &[u8]) -> Option<&[u8]> {
+        self.buckets
+            .get(BUCKET_RULE_SET)?
+            .get(key)
+            .map(Vec::as_slice)
+    }
+
+    pub(crate) fn touch_rule_set(&mut self, key: &[u8], hash: [u8; 32], timestamp: u64) {
+        let Some(record) = self
+            .buckets
+            .get_mut(BUCKET_RULE_SET)
+            .and_then(|b| b.get_mut(key))
+        else {
+            return;
+        };
+        if saved_binary::update_timestamp(record, hash, timestamp) {
+            self.pending += key.len() + record.len();
+            self.dirty = true;
+            self.flush_if_due();
+        }
+    }
+
     pub fn put(&mut self, bucket: &str, key: &[u8], value: Vec<u8>) {
         if let Some(existing) = self.buckets.get(bucket).and_then(|b| b.get(key))
             && existing == &value
@@ -501,24 +523,88 @@ pub mod saved_binary {
         out
     }
 
-    pub fn unmarshal(raw: &[u8]) -> Option<SavedBinary> {
+    fn decode(raw: &[u8]) -> Option<(SavedBinaryRef<'_>, usize)> {
         let mut at = 1usize;
-        let content_len = take_uvarint(raw, &mut at)? as usize;
-        let content = raw.get(at..at + content_len)?.to_vec();
-        at += content_len;
-        let stamp = raw.get(at..at + 8)?;
+        let content_len = usize::try_from(take_uvarint(raw, &mut at)?).ok()?;
+        let stamp_at = at.checked_add(content_len)?;
+        let content = raw.get(at..stamp_at)?;
+        at = stamp_at.checked_add(8)?;
+        let stamp = raw.get(stamp_at..at)?;
         let last_updated = u64::from_be_bytes(stamp.try_into().ok()?);
-        at += 8;
-        let etag_len = take_uvarint(raw, &mut at)? as usize;
-        let last_etag = String::from_utf8(raw.get(at..at + etag_len)?.to_vec()).ok()?;
-        at += etag_len;
-        let url_hash: [u8; 32] = raw.get(at..at + 32)?.try_into().ok()?;
+        let etag_len = usize::try_from(take_uvarint(raw, &mut at)?).ok()?;
+        let end = at.checked_add(etag_len)?;
+        let last_etag = std::str::from_utf8(raw.get(at..end)?).ok()?;
+        let url_hash = raw.get(end..)?.get(..32)?.try_into().ok()?;
+        Some((
+            SavedBinaryRef {
+                content,
+                last_updated,
+                last_etag,
+                url_hash,
+            },
+            stamp_at,
+        ))
+    }
+
+    pub(super) fn update_timestamp(raw: &mut Vec<u8>, hash: [u8; 32], timestamp: u64) -> bool {
+        let Some((saved, at)) = decode(raw) else {
+            return false;
+        };
+        if saved.url_hash != hash {
+            return false;
+        }
+        if raw[0] != VERSION {
+            // The original decoder accepts older records with this layout;
+            // the next successful conditional fetch upgrades their encoding.
+            *raw = marshal_ref(&SavedBinaryRef {
+                last_updated: timestamp,
+                ..saved
+            });
+            return true;
+        }
+        if saved.last_updated == timestamp {
+            return false;
+        }
+        raw[at..at + 8].copy_from_slice(&timestamp.to_be_bytes());
+        true
+    }
+
+    pub fn unmarshal(raw: &[u8]) -> Option<SavedBinary> {
+        let (saved, _) = decode(raw)?;
         Some(SavedBinary {
-            last_updated,
-            content,
-            last_etag,
-            url_hash,
+            content: saved.content.to_vec(),
+            last_updated: saved.last_updated,
+            last_etag: saved.last_etag.to_owned(),
+            url_hash: saved.url_hash,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn touch_preserves_payload_and_metadata() {
+            let mut record = marshal_ref(&SavedBinaryRef {
+                content: &[42; 4096],
+                last_etag: "cached",
+                last_updated: 4,
+                url_hash: [1; 32],
+            });
+            let original = record.clone();
+            assert!(!update_timestamp(&mut record, [2; 32], 5));
+            assert!(!update_timestamp(&mut record, [1; 32], 4));
+            assert_eq!(record, original);
+            assert!(update_timestamp(&mut record, [1; 32], 5));
+            assert_eq!(unmarshal(&record).unwrap().last_updated, 5);
+            assert!(update_timestamp(&mut record, [1; 32], 4));
+            assert_eq!(record, original);
+            record[0] = 1;
+            assert!(update_timestamp(&mut record, [1; 32], 4));
+            assert_eq!(record, original);
+            record.truncate(48);
+            assert!(!update_timestamp(&mut record, [1; 32], 5));
+        }
     }
 }
 

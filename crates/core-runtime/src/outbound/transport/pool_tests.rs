@@ -311,22 +311,22 @@ fn only_the_http2_transports_pool() {
         Transport::parse(obj.as_object().expect("an object"), "outbounds[0]").expect("parse")
     };
     let grpc = kind(serde_json::json!({"type": "grpc", "service_name": "s"}));
-    assert!(grpc.pools_h2(true) && grpc.pools_h2(false));
+    assert!(grpc.h2_pool(true).is_some() && grpc.h2_pool(false).is_some());
     let h2 = kind(serde_json::json!({"type": "http", "path": "/h"}));
-    assert!(h2.pools_h2(true), "the h2 transport pools over TLS");
-    assert!(!h2.pools_h2(false), "plaintext http is HTTP/1.1");
+    assert!(
+        h2.h2_pool(true).is_some(),
+        "the h2 transport pools over TLS"
+    );
+    assert!(h2.h2_pool(false).is_none(), "plaintext http is HTTP/1.1");
     for bare in [
         serde_json::json!({"type": "ws", "path": "/w"}),
         serde_json::json!({"type": "httpupgrade", "path": "/u"}),
         serde_json::json!({"type": "xhttp", "path": "/x"}),
     ] {
         let transport = kind(bare.clone());
-        assert!(
-            !transport.pools_h2(true) && !transport.pools_h2(false),
-            "{bare}"
-        );
+        assert!(transport.h2_pool.is_none(), "{bare}");
     }
-    assert!(!Transport::default().pools_h2(true));
+    assert!(Transport::default().h2_pool.is_none());
 }
 
 /// The HTTP/2 transport's pooled request: a tunnel opened on a connection the

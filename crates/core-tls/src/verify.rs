@@ -696,12 +696,16 @@ impl WebpkiVerifier {
 
     /// The Mozilla root store, which is what the reference ships with.
     pub fn mozilla_store() -> RootCertStore {
-        static STORE: std::sync::OnceLock<RootCertStore> = std::sync::OnceLock::new();
+        Self::shared_mozilla_store().as_ref().clone()
+    }
+
+    pub fn shared_mozilla_store() -> Arc<RootCertStore> {
+        static STORE: std::sync::OnceLock<Arc<RootCertStore>> = std::sync::OnceLock::new();
         STORE
             .get_or_init(|| {
                 let mut roots = RootCertStore::empty();
                 roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-                roots
+                Arc::new(roots)
             })
             .clone()
     }
@@ -709,10 +713,10 @@ impl WebpkiVerifier {
     /// The Mozilla root store, which is what the reference ships with.
     pub fn mozilla_roots() -> io::Result<Self> {
         static VERIFIER: std::sync::OnceLock<Option<WebpkiVerifier>> = std::sync::OnceLock::new();
-        if let Some(v) = VERIFIER.get_or_init(|| Self::new(Arc::new(Self::mozilla_store())).ok()) {
+        if let Some(v) = VERIFIER.get_or_init(|| Self::new(Self::shared_mozilla_store()).ok()) {
             return Ok(v.clone());
         }
-        Self::new(Arc::new(Self::mozilla_store()))
+        Self::new(Self::shared_mozilla_store())
     }
 
     /// The underlying rustls verifier, for [PinVerifier] to wrap.

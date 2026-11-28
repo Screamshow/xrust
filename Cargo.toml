@@ -75,7 +75,8 @@ libc = "0.2"
 # true LRU for the dns response cache: eviction was a full scan of the map
 lru = "0.12"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "log"] }
-regex = "1"
+# The client tests for matches without extracting capture groups.
+regex = { version = "1", default-features = false, features = ["std", "unicode", "perf-cache", "perf-dfa", "perf-inline", "perf-literal", "perf-backtrack"] }
 # Already in the tree through `regex`, so linking it directly costs no extra
 # binary size: `rule_keyword` matching is substring search, which is exactly what
 # an Aho-Corasick automaton is for.
