@@ -31,7 +31,7 @@ smoltcp = { path = "vendor/smoltcp" }
 quinn-proto = { path = "vendor/quinn-proto" }
 
 [workspace.package]
-version = "0.0.52"
+version = "0.0.53"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/Screamshow/xrust"
